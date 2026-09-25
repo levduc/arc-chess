@@ -1,0 +1,16 @@
+{
+  "name": "@arena/vectors",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "tsx src/generate.ts",
+    "test": "tsx --test src/encode.test.ts"
+  },
+  "dependencies": {
+    "chess.js": "1.4.0",
+    "viem": "2.56.9"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15"
+  }
+}
