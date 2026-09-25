@@ -77,6 +77,28 @@ export function fenOf(s: State): string {
   return positionToFen(s.board, s.meta);
 }
 
+/** Whether the side to move in `s` is in check (false if the position cannot be loaded). */
+export function inCheck(s: State): boolean {
+  return load(s)?.inCheck() ?? false;
+}
+
+export type Outcome = "playing" | "checkmate" | "stalemate" | "white_won" | "black_won" | "draw";
+
+/**
+ * The game's result as recorded in `s`, or — for a PLAYING/DRAW_OFFERED position — whether the side to move is
+ * checkmated or stalemated (no legal moves). Neither is detected on-chain: the mated side is expected to sign
+ * RESIGN and the stalemated side CLAIM_STALEMATE (spec §4.5).
+ */
+export function outcome(s: State): Outcome {
+  const st = statusOf(s);
+  if (st === STATUS.WHITE_WON) return "white_won";
+  if (st === STATUS.BLACK_WON) return "black_won";
+  if (st === STATUS.DRAW) return "draw";
+  const game = load(s);
+  if (!game || game.moves().length > 0) return "playing";
+  return game.inCheck() ? "checkmate" : "stalemate";
+}
+
 /** Legal moves for the side to move, as UCI strings (e.g. "e2e4", "a7a8q"). */
 export function legalMoves(s: State): string[] {
   const game = load(s);

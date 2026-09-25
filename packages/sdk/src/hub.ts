@@ -11,7 +11,7 @@ import {
 import { channelHubAbi, mockUsdcAbi } from "./abi.js";
 import { decodeSignedState, encodeParams, encodeProof, encodeSignedState } from "./abiCodec.js";
 import type { TxSender } from "./tx.js";
-import type { Params, Proof, SignedState, State } from "./types.js";
+import type { CloseTransaction, Params, Proof, SignedState, State } from "./types.js";
 
 export const PHASE = ["None", "Funding", "Open", "Challenged", "Finalized", "Reclaimed"] as const;
 export type Phase = (typeof PHASE)[number];
@@ -30,6 +30,7 @@ export type DisputeEvent = {
   kind: "Challenged" | "Responded";
   blockNumber: bigint;
   logIndex: number;
+  transactionHash: Hex;
   turnNum: bigint;
   signed: SignedState;
   challenger?: number;
@@ -85,7 +86,10 @@ export class HubClient {
     return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "deposit", args: [encodeParams(p)] }));
   }
 
-  closeCooperative(sender: TxSender, ss: SignedState): Promise<TransactionReceipt> {
+  /** Submits a cooperative close. Takes only a `CloseTransaction` (see `ChannelSession.closeTransaction()`). */
+  closeCooperative(sender: TxSender, tx: CloseTransaction): Promise<TransactionReceipt> {
+    if (tx.kind !== "close") throw new TypeError('closeCooperative needs a CloseTransaction (kind: "close")');
+    const ss = { state: tx.state, sigA: tx.sigA, sigB: tx.sigB }; // strip `kind` before ABI encoding
     return this.call(
       sender,
       encodeFunctionData({ abi: channelHubAbi, functionName: "closeCooperative", args: [encodeSignedState(ss)] }),
@@ -133,15 +137,19 @@ export class HubClient {
 
   /** Challenged/Responded events for a channel in chain order, with the signed state each one carries. */
   async disputeEvents(id: Hex, fromBlock: bigint = 0n): Promise<DisputeEvent[]> {
+    // One head for both queries, so a block mined between them cannot appear in one list but not the other.
+    // cacheTime 0: viem otherwise serves a cached head for up to a polling interval and would hide fresh events.
+    const toBlock = await this.client.getBlockNumber({ cacheTime: 0 });
     const [challenged, responded] = await Promise.all([
-      this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName: "Challenged", args: { channelId: id }, fromBlock }),
-      this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName: "Responded", args: { channelId: id }, fromBlock }),
+      this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName: "Challenged", args: { channelId: id }, fromBlock, toBlock }),
+      this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName: "Responded", args: { channelId: id }, fromBlock, toBlock }),
     ]);
     const events: DisputeEvent[] = [
       ...challenged.map((l) => ({
         kind: "Challenged" as const,
         blockNumber: l.blockNumber,
         logIndex: l.logIndex,
+        transactionHash: l.transactionHash,
         turnNum: l.args.turnNum as bigint,
         signed: decodeSignedState(l.args.signedState as Hex),
         challenger: Number(l.args.challenger),
@@ -151,6 +159,7 @@ export class HubClient {
         kind: "Responded" as const,
         blockNumber: l.blockNumber,
         logIndex: l.logIndex,
+        transactionHash: l.transactionHash,
         turnNum: l.args.turnNum as bigint,
         signed: decodeSignedState(l.args.signedState as Hex),
       })),

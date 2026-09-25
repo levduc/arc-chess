@@ -37,6 +37,13 @@ export type SignedState = {
   sigB: Hex;
 };
 
+/**
+ * A SignedState whose sigA/sigB are EIP-712 `Close` signatures (not state signatures) — the only input
+ * `HubClient.closeCooperative` accepts. Produced by `ChannelSession.closeTransaction()`; `kind` is stripped
+ * before ABI encoding.
+ */
+export type CloseTransaction = SignedState & { readonly kind: "close" };
+
 /** Mirrors Solidity `Proof`. */
 export type Proof = {
   hasPrev: boolean;

@@ -7,16 +7,19 @@ import {
   fenOf,
   fenToPosition,
   forfeitBalances,
+  inCheck,
   initialState,
   isCheckpoint,
   isGameOver,
   legalMoves,
   mover,
+  outcome,
   parseMove,
   squareIndex,
   statusOf,
   successor,
   unpackMeta,
+  withStatus,
   type Params,
   type State,
 } from "../src/index.js";
@@ -158,5 +161,35 @@ describe("chess mirror of ChessRules", () => {
     const s0 = initialState(ID, P);
     expect(successor(s0, 0, P).ok).toBe(false);
     for (let k = 7; k < 16; k++) expect(successor(s0, kind(k), P).ok).toBe(false);
+  });
+
+  it("M6: inCheck and outcome describe the position", () => {
+    const s0 = initialState(ID, P);
+    expect(inCheck(s0)).toBe(false);
+    expect(outcome(s0)).toBe("playing");
+
+    let s = s0;
+    for (const m of ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]) s = step(s, uci(s, m));
+    expect(inCheck(s)).toBe(true); // scholar's mate on the board, black to move
+    expect(outcome(s)).toBe("checkmate");
+    expect(outcome(step(s, kind(KIND.RESIGN)))).toBe("white_won");
+
+    const checked = at("4k3/8/8/8/8/8/8/4K2R w K - 0 1");
+    const afterCheck = step(checked, uci(checked, "h1h8"));
+    expect(inCheck(afterCheck)).toBe(true);
+    expect(outcome(afterCheck)).toBe("playing"); // in check but can escape
+
+    const stale = at("7k/5Q2/6K1/8/8/8/8/8 b - - 0 21");
+    expect(inCheck(stale)).toBe(false);
+    expect(outcome(stale)).toBe("stalemate");
+    expect(outcome(step(stale, kind(KIND.CLAIM_STALEMATE)))).toBe("draw");
+    expect(outcome(at("7k/6Q1/6K1/8/8/8/8/8 b - - 0 21"))).toBe("checkmate");
+
+    const mateOnLimit = at("7k/Q7/6K1/8/8/8/8/8 w - - 99 76");
+    expect(outcome(step(mateOnLimit, uci(mateOnLimit, "a7g7")))).toBe("white_won");
+    // DRAW_OFFERED is still in progress: "playing", or checkmate/stalemate if the side to move has no move.
+    expect(outcome(step(s0, uci(s0, "e2e4", KIND.NORMAL_OFFER_DRAW)))).toBe("playing");
+    expect(outcome({ ...s, meta: withStatus(s.meta, STATUS.DRAW_OFFERED) })).toBe("checkmate");
+    expect(outcome({ ...s0, meta: withStatus(s0.meta, STATUS.BLACK_WON) })).toBe("black_won");
   });
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { PublicClient } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import {
   ChannelSession,
@@ -7,6 +8,7 @@ import {
   LocalKeyTxSender,
   MemoryStore,
   signState,
+  type CloseTransaction,
   type SessionConfig,
 } from "../src/index.js";
 import { ANVIL_KEYS, CHAIN, RPC, deployArena, increaseTime, mintUsdc, now, setEthBalance, usdcBalance } from "./helpers/chain.js";
@@ -92,6 +94,8 @@ describe("channel lifecycle on Anvil", () => {
     // Bob's watchtower sees the challenge, answers on-chain; Alice adopts the answer from the event.
     const events = await x.hub.disputeEvents(b.id);
     expect(events.map((e) => e.kind)).toEqual(["Challenged"]);
+    const challengeReceipt = await x.env.pub.getTransactionReceipt({ hash: events[0].transactionHash });
+    expect(challengeReceipt.blockNumber).toBe(events[0].blockNumber);
     expect(await b.ingestOnChain(events[0].signed)).toBe(false); // Bob already had it
     await b.move("e7e5");
     await x.hub.respond(x.bob, b.challengeProof());
@@ -129,9 +133,12 @@ describe("channel lifecycle on Anvil", () => {
     const { a, b } = await open(x);
     await b.receive(await a.move("e2e4"));
     await a.receive(await b.resign());
-    // State co-signatures are not a close intent: the hub rejects them.
+    // State co-signatures are not a close intent: the hub rejects them. This is deliberately WRONG input: it is
+    // labelled `kind: "close"` only to get past the CloseTransaction type, but carries State signatures instead
+    // of Close signatures, to prove the hub itself refuses them.
     const s = a.latest.state;
-    const cosigned = {
+    const cosigned: CloseTransaction = {
+      kind: "close",
       state: s,
       sigA: await signState(x.sessionKeys[0], s, x.env.domain),
       sigB: await signState(x.sessionKeys[1], s, x.env.domain),
@@ -219,6 +226,7 @@ describe("channel lifecycle on Anvil", () => {
 
     const ev = (await x.hub.disputeEvents(a.id)).at(-1)!;
     expect(ev.kind).toBe("Challenged");
+    expect(ev.transactionHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(ev.turnNum).toBe(a.latest.state.turnNum + 2n);
     expect(await a.ingestOnChain(ev.signed)).toBe(true);
     expect(a.isMyTurn()).toBe(true);
@@ -237,5 +245,28 @@ describe("channel lifecycle on Anvil", () => {
     expect(await b.ingestOnChain(responded.signed)).toBe(true);
     await play(a, b, ["g1f3"]);
     expect(a.isMyTurn()).toBe(true);
+  });
+});
+
+describe("HubClient.disputeEvents", () => {
+  it("M7: reads the head once and bounds both event queries by it", async () => {
+    const calls: Array<{ eventName: string; fromBlock: bigint; toBlock: bigint }> = [];
+    let heads = 0;
+    const fake = {
+      getBlockNumber: async (opts?: { cacheTime?: number }) => {
+        heads++;
+        expect(opts?.cacheTime).toBe(0); // a cached head would hide events mined since the last poll
+        return 42n;
+      },
+      getContractEvents: async (q: { eventName: string; fromBlock: bigint; toBlock: bigint }) => {
+        calls.push({ eventName: q.eventName, fromBlock: q.fromBlock, toBlock: q.toBlock });
+        return [];
+      },
+    } as unknown as PublicClient;
+    const hub = new HubClient("0x000000000000000000000000000000000000beef", fake);
+    expect(await hub.disputeEvents(`0x${"11".repeat(32)}`, 7n)).toEqual([]);
+    expect(heads).toBe(1);
+    expect(calls.map((c) => c.eventName).sort()).toEqual(["Challenged", "Responded"]);
+    for (const c of calls) expect([c.fromBlock, c.toBlock]).toEqual([7n, 42n]);
   });
 });

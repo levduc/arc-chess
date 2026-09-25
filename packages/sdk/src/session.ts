@@ -13,7 +13,7 @@ import {
   type ArenaDomain,
 } from "./eip712.js";
 import type { SessionSnapshot, SessionStore } from "./store.js";
-import type { Params, PlayerIndex, Proof, SignedState, State } from "./types.js";
+import type { CloseTransaction, Params, PlayerIndex, Proof, SignedState, State } from "./types.js";
 
 export class ArenaProtocolError extends Error {
   constructor(message: string) {
@@ -118,7 +118,7 @@ export class ChannelSession {
   move(input: string, opts: { offerDraw?: boolean } = {}): Promise<SignedState> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
-      if (!this.turnCheck(draft)) throw new ArenaProtocolError("not your turn");
+      this.requireMyTurn(draft);
       const kind = opts.offerDraw ? KIND.NORMAL_OFFER_DRAW : KIND.NORMAL;
       let encoded: number;
       try {
@@ -133,7 +133,7 @@ export class ChannelSession {
   resign(): Promise<SignedState> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
-      if (!this.turnCheck(draft)) throw new ArenaProtocolError("not your turn");
+      this.requireMyTurn(draft);
       return this.applyMove(draft, encodeMove(0, 0, 0, KIND.RESIGN));
     });
   }
@@ -141,7 +141,7 @@ export class ChannelSession {
   acceptDraw(): Promise<SignedState> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
-      if (!this.turnCheck(draft)) throw new ArenaProtocolError("not your turn");
+      this.requireMyTurn(draft);
       return this.applyMove(draft, encodeMove(0, 0, 0, KIND.ACCEPT_DRAW));
     });
   }
@@ -149,7 +149,7 @@ export class ChannelSession {
   claimStalemate(): Promise<SignedState> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
-      if (!this.turnCheck(draft)) throw new ArenaProtocolError("not your turn");
+      this.requireMyTurn(draft);
       return this.applyMove(draft, encodeMove(0, 0, 0, KIND.CLAIM_STALEMATE));
     });
   }
@@ -310,14 +310,14 @@ export class ChannelSession {
    * verified against the exact state closeTransaction is about to return — a signature captured against a state
    * that stopped being current (see `closeSigTargets`) never gets paired with the wrong `closeState`.
    */
-  closeTransaction(): SignedState | null {
+  closeTransaction(): CloseTransaction | null {
     const target = this.data.closeState;
     const [sigA, sigB] = this.data.closeSigs;
     const [targetA, targetB] = this.data.closeSigTargets;
     if (!target || sigA === NO_SIG || sigB === NO_SIG) return null;
     const wanted = hashState(target.state, this.domain);
     if (targetA !== wanted || targetB !== wanted) return null;
-    return structuredClone({ state: target.state, sigA, sigB });
+    return structuredClone({ kind: "close", state: target.state, sigA, sigB });
   }
 
   /** Proof that the latest state is supported (spec §4.3), for challenge() or respond(). */
@@ -369,6 +369,12 @@ export class ChannelSession {
       () => undefined,
     );
     return result;
+  }
+
+  /** M3: a closing session reports "closing" rather than "not your turn", so callers can tell the two apart. */
+  private requireMyTurn(d: SessionSnapshot): void {
+    if (d.closeState !== null) throw new ArenaProtocolError(CLOSING_MESSAGE);
+    if (!this.turnCheck(d)) throw new ArenaProtocolError("not your turn");
   }
 
   private turnCheck(d: SessionSnapshot): boolean {

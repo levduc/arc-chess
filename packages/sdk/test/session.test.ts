@@ -275,16 +275,6 @@ describe("ChannelSession", () => {
     expect(closed || proposed).toBe(true);
   });
 
-  it("I1: two concurrent receive() calls do not both validate against the same latest", async () => {
-    const { a, b } = await setup();
-    const e4 = await a.move("e2e4");
-    const e4Bad = { ...e4, state: { ...e4.state, board: e4.state.board ^ 1n } };
-    const [r1, r2] = await Promise.allSettled([b.receive(e4), b.receive(e4Bad)]);
-    const outcomes = [r1, r2].map((r) => r.status);
-    expect(outcomes.filter((s) => s === "fulfilled")).toHaveLength(1);
-    expect(b.latest.state.turnNum).toBe(1n);
-  });
-
   it("I2: a failed persist leaves move() unsigned and unretained; retry signs and persists", async () => {
     const store = flakyStore();
     const { a } = await setup(undefined, store);
@@ -577,5 +567,50 @@ describe("ChannelSession", () => {
     expect(a.snapshot().pendingCheckpoint).toBeNull();
     expect(a.isMyTurn()).toBe(true);
     expect(await b.receive(await a.move("e7e5"))).toBe("move");
+  });
+
+  // --- Final-review minors ---------------------------------------------------------------------------------
+
+  it("M3: a closing session refuses moves with a 'closing' error, not 'not your turn'", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b);
+    await a.signClose();
+    for (const call of [() => a.move("e2e4"), () => a.resign(), () => a.acceptDraw(), () => a.claimStalemate()]) {
+      await expect(call()).rejects.toThrow(/closing/);
+    }
+    expect(a.isMyTurn()).toBe(false);
+
+    // A closing snapshot on a non-terminal state (e.g. one written before R8) where A would otherwise be on move.
+    const fresh = await setup();
+    const snap = fresh.a.snapshot();
+    const closing = ChannelSession.restore(fresh.cfgA, { ...snap, closeState: snap.latest });
+    expect(closing.isMyTurn()).toBe(false);
+    expect(closing.legalMoves()).toEqual([]);
+    await expect(closing.move("e2e4")).rejects.toThrow(/closing/);
+    await expect(closing.resign()).rejects.toThrow(/closing/);
+  });
+
+  it("M5: closeTransaction() is tagged kind 'close'", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b);
+    await b.receiveClose(await a.signClose());
+    await a.receiveClose(await b.signClose());
+    const tx = a.closeTransaction();
+    expect(tx?.kind).toBe("close");
+    expect(Object.keys(tx!).sort()).toEqual(["kind", "sigA", "sigB", "state"]);
+  });
+
+  it("T5: two concurrent receive() calls of the same valid move apply it exactly once", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    const results = await Promise.allSettled([b.receive(e4), b.receive(structuredClone(e4))]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled") as PromiseFulfilledResult<string>[];
+    const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+    expect(fulfilled.map((r) => r.value)).toEqual(["move"]);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toBeInstanceOf(ArenaProtocolError);
+    expect(String(rejected[0].reason.message)).toMatch(/unexpected turn/);
+    expect(b.latest.state.turnNum).toBe(1n);
+    expect(b.latest).toEqual(e4);
   });
 });
