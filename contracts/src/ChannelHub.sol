@@ -187,6 +187,26 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         token.safeTransfer(to, amount);
     }
 
+    // ----------------------------------------------------------------- close
+
+    /// @notice Settle immediately on a state signed by both players: the opening state, a NEW_GAME checkpoint,
+    /// or a finished game. Game results are already applied to balances in such states.
+    function closeCooperative(bytes calldata encodedSignedState) external nonReentrant {
+        SignedState memory ss = abi.decode(encodedSignedState, (SignedState));
+        State memory s = ss.state;
+        bytes32 id = s.channelId;
+        Channel storage c = _channels[id];
+        if (c.phase != Phase.Open && c.phase != Phase.Challenged) revert WrongPhase();
+        Params memory p = c.params;
+        _checkBalances(p, s);
+        bytes32 h = hashState(s);
+        if (!_signedBy(p.signers[0], h, ss.sigA) || !_signedBy(p.signers[1], h, ss.sigB)) revert BadSignature();
+        IGameRules rules = IGameRules(p.rules);
+        if (s.turnNum != 0 && !rules.isCheckpoint(s) && !rules.isGameOver(s)) revert NotClosable();
+        if (c.hasRegistered && s.turnNum < c.registered.turnNum) revert StaleState();
+        _finalize(id, c, p, s.balanceA, s.balanceB);
+    }
+
     // ----------------------------------------------------------------- admin
 
     /// @notice Set the fee for channels created from now on. Existing channels keep their snapshot.
@@ -228,5 +248,23 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
         owed[to] += amount;
         emit PayoutDeferred(to, amount);
+    }
+
+    function _finalize(bytes32 id, Channel storage c, Params memory p, uint256 a, uint256 b) private {
+        if (a + b != 2 * p.deposit) revert BalanceMismatch();
+        c.phase = Phase.Finalized;
+        uint256 fee = 2 * p.feePerPlayer;
+        emit Finalized(id, a, b, fee);
+        _pay(p.participants[0], a);
+        _pay(p.participants[1], b);
+        _pay(p.feeRecipient, fee);
+    }
+
+    function _checkBalances(Params memory p, State memory s) private pure {
+        if (s.balanceA + s.balanceB != 2 * p.deposit) revert BalanceMismatch();
+    }
+
+    function _signedBy(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
+        return sig.length != 0 && SignatureChecker.isValidSignatureNow(signer, hash, sig);
     }
 }
