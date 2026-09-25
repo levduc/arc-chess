@@ -11,6 +11,8 @@ contract ChessMovesTerminalTest is Test, ChessTestUtils {
     uint8 internal constant BK = B.KING | B.BLACK;
     uint8 internal constant BB = B.BISHOP | B.BLACK;
     uint8 internal constant BN = B.KNIGHT | B.BLACK;
+    uint8 internal constant BP = B.PAWN | B.BLACK;
+    uint8 internal constant BQ = B.QUEEN | B.BLACK;
 
     ChessMovesHarness internal h;
 
@@ -63,6 +65,47 @@ contract ChessMovesTerminalTest is Test, ChessTestUtils {
         assertFalse(ChessMoves.isInsufficientMaterial(place(kk, "g2", B.PAWN)));
         assertFalse(ChessMoves.isInsufficientMaterial(place(place(kk, "g1", B.KNIGHT), "g2", B.KNIGHT)));
         assertFalse(ChessMoves.isInsufficientMaterial(B.INITIAL_BOARD));
+    }
+
+    function test_hasLegalMove_enPassantOnly() public pure {
+        // 8/8/1b6/pP6/8/6q1/5k2/7K w - a6 0 1
+        // chess.js 1.4.0: moves({verbose:true}) -> exactly 1 move, b5a6 (e.p.). inCheck: false.
+        uint256 board = place(0, "h1", B.KING);
+        board = place(board, "g3", BQ);
+        board = place(board, "f2", BK);
+        board = place(board, "b6", BB);
+        board = place(board, "b5", B.PAWN);
+        board = place(board, "a5", BP);
+        uint256 meta = metaOf(B.WHITE_SIDE, 0, uint8(sq("a6")), 0, 0);
+        assertTrue(ChessMoves.hasLegalMove(board, meta));
+
+        // Same board, ep square cleared: chess.js reports 0 moves (isStalemate: true, inCheck: false).
+        uint256 metaNoEp = metaOf(B.WHITE_SIDE, 0, B.NO_EP, 0, 0);
+        assertFalse(ChessMoves.inCheck(board, metaNoEp));
+        assertFalse(ChessMoves.hasLegalMove(board, metaNoEp));
+    }
+
+    function test_hasLegalMove_promotionOnly() public pure {
+        // 8/1P6/8/8/8/6q1/5k2/7K w - - 0 1
+        // chess.js 1.4.0: moves({verbose:true}) -> exactly 4 moves, all b7b8=Q/R/B/N. inCheck: false.
+        uint256 board = place(0, "h1", B.KING);
+        board = place(board, "g3", BQ);
+        board = place(board, "f2", BK);
+        board = place(board, "b7", B.PAWN);
+        uint256 meta = metaOf(B.WHITE_SIDE, 0, B.NO_EP, 0, 0);
+        assertFalse(ChessMoves.inCheck(board, meta));
+        assertTrue(ChessMoves.hasLegalMove(board, meta));
+    }
+
+    function test_stalemate_whiteToMove() public pure {
+        // 8/8/8/8/8/6k1/5q2/7K w - - 0 1
+        // chess.js 1.4.0: isStalemate: true, isCheckmate: false, inCheck: false, 0 legal moves.
+        uint256 board = place(0, "h1", B.KING);
+        board = place(board, "g3", BK);
+        board = place(board, "f2", BQ);
+        uint256 meta = metaOf(B.WHITE_SIDE, 0, B.NO_EP, 0, 0);
+        assertFalse(ChessMoves.inCheck(board, meta));
+        assertFalse(ChessMoves.hasLegalMove(board, meta));
     }
 
     function test_gas_hasLegalMove_fullBoardCheckmate() public {
