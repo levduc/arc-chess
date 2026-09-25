@@ -174,8 +174,9 @@ Draw offers ride on a move (`NORMAL_OFFER_DRAW` → status `DRAW_OFFERED`); the
 opponent either plays `ACCEPT_DRAW` (board unchanged, status `DRAW`) or a
 `NORMAL` move, which implicitly declines (status back to `PLAYING`).
 
-Signatures are verified with OpenZeppelin `SignatureChecker.isValidSignatureNow`
-(ECDSA for session keys; ERC-1271 also accepted if a signer is a contract).
+Signatures are verified ECDSA-first (OpenZeppelin `ECDSA.tryRecover`); only if that fails is ERC-1271
+consulted (`SignatureChecker.isValidERC1271SignatureNow`), so a contract signer is accepted, and a session
+key that later gains code cannot revoke its earlier ECDSA signatures.
 
 ### 4.4 `IGameRules`
 

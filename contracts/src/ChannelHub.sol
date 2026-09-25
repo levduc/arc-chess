@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -352,8 +353,13 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (s.balanceA + s.balanceB != 2 * p.deposit) revert BalanceMismatch();
     }
 
+    /// @dev ECDSA first, then ERC-1271. Unlike SignatureChecker.isValidSignatureNow, a signer that later gains
+    /// code (e.g. an EIP-7702 delegation) cannot revoke its earlier ECDSA signatures (ruling R13).
     function _signedBy(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
-        return sig.length != 0 && SignatureChecker.isValidSignatureNow(signer, hash, sig);
+        if (sig.length == 0) return false;
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
+        if (err == ECDSA.RecoverError.NoError && recovered == signer) return true;
+        return SignatureChecker.isValidERC1271SignatureNow(signer, hash, sig);
     }
 
     /// @dev Spec §4.3 support rule. Returns the supported latest state and its EIP-712 hash.
