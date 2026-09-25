@@ -1,0 +1,9 @@
+{
+  "name": "agent-arena",
+  "private": true,
+  "packageManager": "pnpm@12.6.0",
+  "scripts": {
+    "vectors": "pnpm --filter @arena/vectors generate",
+    "test:contracts": "pnpm vectors && forge test --root contracts"
+  }
+}
