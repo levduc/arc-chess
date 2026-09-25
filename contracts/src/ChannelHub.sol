@@ -207,6 +207,63 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         _finalize(id, c, p, s.balanceA, s.balanceB);
     }
 
+    // --------------------------------------------------------------- dispute
+
+    /// @notice Register a supported state on-chain and start the clock for the player on move.
+    /// Callable by either player's wallet or session key. A state with the same turnNum as the registered
+    /// one is accepted only if it is identical, which lets the waiting player challenge after a response.
+    function challenge(bytes calldata encodedProof) external nonReentrant {
+        Proof memory proof = abi.decode(encodedProof, (Proof));
+        bytes32 id = proof.latest.state.channelId;
+        Channel storage c = _channels[id];
+        if (c.phase != Phase.Open) revert WrongPhase();
+        Params memory p = c.params;
+        uint8 who = _playerIndex(p, msg.sender);
+        if (block.timestamp < c.cooldownUntil[who]) revert InCooldown();
+        (State memory s, bytes32 h) = _supported(c, p, id, proof);
+        if (c.hasRegistered) {
+            uint64 reg = c.registered.turnNum;
+            if (s.turnNum < reg || (s.turnNum == reg && h != c.registeredHash)) revert StaleState();
+        }
+        _register(c, s, h);
+        c.challenger = who;
+        c.deadline = uint64(block.timestamp) + p.challengeTimeout;
+        c.phase = Phase.Challenged;
+        emit Challenged(id, who, s.turnNum, c.deadline, abi.encode(proof.latest));
+    }
+
+    /// @notice Answer a challenge with any supported newer state. Returns the channel to off-chain play and
+    /// puts the challenger in cooldown for one challengeTimeout.
+    function respond(bytes calldata encodedProof) external nonReentrant {
+        Proof memory proof = abi.decode(encodedProof, (Proof));
+        bytes32 id = proof.latest.state.channelId;
+        Channel storage c = _channels[id];
+        if (c.phase != Phase.Challenged) revert WrongPhase();
+        if (block.timestamp >= c.deadline) revert DeadlinePassed();
+        Params memory p = c.params;
+        (State memory s, bytes32 h) = _supported(c, p, id, proof);
+        if (s.turnNum <= c.registered.turnNum) revert StaleState();
+        _register(c, s, h);
+        c.cooldownUntil[c.challenger] = uint64(block.timestamp) + p.challengeTimeout;
+        c.phase = Phase.Open;
+        emit Responded(id, s.turnNum, abi.encode(proof.latest));
+    }
+
+    /// @notice After an unanswered challenge: the player on move forfeits the current game, or a finished
+    /// game settles as-is. Anyone may call.
+    function timeout(bytes32 id) external nonReentrant {
+        Channel storage c = _channels[id];
+        if (c.phase != Phase.Challenged) revert WrongPhase();
+        if (block.timestamp < c.deadline) revert TooEarly();
+        State memory s = c.registered;
+        Params memory p = c.params;
+        IGameRules rules = IGameRules(p.rules);
+        uint256 a = s.balanceA;
+        uint256 b = s.balanceB;
+        if (!rules.isGameOver(s)) (a, b) = rules.forfeitBalances(s, p);
+        _finalize(id, c, p, a, b);
+    }
+
     // ----------------------------------------------------------------- admin
 
     /// @notice Set the fee for channels created from now on. Existing channels keep their snapshot.
@@ -266,5 +323,54 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
 
     function _signedBy(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
         return sig.length != 0 && SignatureChecker.isValidSignatureNow(signer, hash, sig);
+    }
+
+    /// @dev Spec §4.3 support rule. Returns the supported latest state and its EIP-712 hash.
+    function _supported(Channel storage c, Params memory p, bytes32 id, Proof memory proof)
+        private
+        view
+        returns (State memory s, bytes32 h)
+    {
+        s = proof.latest.state;
+        _checkBalances(p, s);
+        h = hashState(s);
+        IGameRules rules = IGameRules(p.rules);
+        if (!proof.hasPrev) {
+            if (s.turnNum == 0 && _isOpening(rules, id, p, h)) return (s, h);
+            if (_signedBy(p.signers[0], h, proof.latest.sigA) && _signedBy(p.signers[1], h, proof.latest.sigB)) {
+                return (s, h);
+            }
+            revert Unsupported();
+        }
+
+        State memory prev = proof.prev.state;
+        if (prev.channelId != id || rules.isCheckpoint(s)) revert Unsupported();
+        bytes32 ph = hashState(prev);
+        if (s.prevHash != ph || s.turnNum != prev.turnNum + 1) revert Unsupported();
+        uint8 m = rules.mover(prev, p);
+        if (!_signedBy(p.signers[m], h, m == 0 ? proof.latest.sigA : proof.latest.sigB)) revert BadSignature();
+        if (!rules.validTransition(prev, s, p)) revert InvalidTransition();
+
+        bool prevEndorsed = (c.hasRegistered && ph == c.registeredHash)
+            || (prev.turnNum == 0 && _isOpening(rules, id, p, ph))
+            || (_signedBy(p.signers[0], ph, proof.prev.sigA) && _signedBy(p.signers[1], ph, proof.prev.sigB))
+            || _signedBy(p.signers[1 - m], ph, m == 0 ? proof.prev.sigB : proof.prev.sigA);
+        if (!prevEndorsed) revert Unsupported();
+    }
+
+    function _isOpening(IGameRules rules, bytes32 id, Params memory p, bytes32 h) private view returns (bool) {
+        return h == hashState(rules.initialState(id, p));
+    }
+
+    function _register(Channel storage c, State memory s, bytes32 h) private {
+        c.registered = s;
+        c.registeredHash = h;
+        c.hasRegistered = true;
+    }
+
+    function _playerIndex(Params memory p, address who) private pure returns (uint8) {
+        if (who == p.participants[0] || who == p.signers[0]) return 0;
+        if (who == p.participants[1] || who == p.signers[1]) return 1;
+        revert NotParticipant();
     }
 }
