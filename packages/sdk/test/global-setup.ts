@@ -27,7 +27,12 @@ export default async function setup(): Promise<() => Promise<void>> {
   const build = spawnSync("forge", ["build"], { cwd: contracts, env, stdio: "inherit" });
   if (build.status !== 0) throw new Error("forge build failed");
   const anvil = spawn("anvil", ["--port", String(ANVIL_PORT), "--silent"], { env, stdio: "ignore" });
-  await waitForRpc(`http://127.0.0.1:${ANVIL_PORT}`);
+  try {
+    await waitForRpc(`http://127.0.0.1:${ANVIL_PORT}`);
+  } catch (err) {
+    anvil.kill();
+    throw err;
+  }
   return async () => {
     anvil.kill();
   };
