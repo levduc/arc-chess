@@ -720,4 +720,57 @@ describe("ChannelSession", () => {
     await expect(a.receive(forged)).rejects.toThrow(/signature/);
     expect(await a.receive(e5)).toBe("move");
   });
+
+  it("does not adopt a finished game on an uncountersigned checkpoint (N1)", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b); // A white wins game 0
+    const terminal = a.latest;
+    const proposal = await a.proposeNewGame();
+    await b.receive(proposal);
+    const full = await b.countersignNewGame(); // withheld from A for now
+    const resign = await b.resign(); // B is white in game 1 and resigns on move 1
+    await expect(a.receive(resign)).rejects.toThrow(/countersign/);
+    expect(a.latest).toEqual(terminal); // A keeps a provable state
+    expect(a.challengeProof().latest).toEqual(terminal);
+    // Once the countersignature arrives, the resignation is accepted normally.
+    expect(await a.receive(full)).toBe("checkpoint-complete");
+    expect(await a.receive(resign)).toBe("move");
+  });
+
+  it("repairs prev with a late countersignature after adopting a move on its own checkpoint", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b);
+    await b.receive(await a.proposeNewGame());
+    const full = await b.countersignNewGame(); // withheld
+    const e4 = await b.move("e2e4");
+    expect(await a.receive(e4)).toBe("move"); // R9 adoption
+    expect(() => a.challengeProof()).toThrow(/countersign/);
+    expect(await a.receive(full)).toBe("checkpoint-repaired");
+    const proof = a.challengeProof();
+    expect(proof.hasPrev).toBe(true);
+    expect(proof.prev.sigA).not.toBe("0x");
+    expect(proof.prev.sigB).not.toBe("0x");
+    expect(proof.latest.state).toEqual(e4.state);
+  });
+
+  it("opens from a loadable store: create first, restore afterwards", async () => {
+    const { cfgA } = await setup();
+    const store = new MemoryStore();
+    const first = await ChannelSession.open({ ...cfgA, store });
+    await first.move("e2e4");
+    const second = await ChannelSession.open({ ...cfgA, store });
+    expect(second.latest).toEqual(first.latest);
+    expect(second.snapshot().lastSignedTurn).toBe(1n);
+    await expect(second.move("d2d4")).rejects.toThrow(/not your turn/);
+  });
+
+  it("restores snapshots without closeSigTargets and rejects malformed ones", async () => {
+    const { a, cfgA } = await setup();
+    const snap = a.snapshot() as Partial<ReturnType<typeof a.snapshot>>;
+    delete snap.closeSigTargets;
+    const restored = ChannelSession.restore(cfgA, snap as ReturnType<typeof a.snapshot>);
+    await expect(restored.move("e2e4")).resolves.toBeDefined();
+    const bad = { ...a.snapshot(), lastSignedTurn: "1" as unknown as bigint };
+    expect(() => ChannelSession.restore(cfgA, bad)).toThrow(ArenaProtocolError);
+  });
 });

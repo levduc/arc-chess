@@ -12,7 +12,7 @@ import {
   signState,
   type ArenaDomain,
 } from "./eip712.js";
-import type { SessionSnapshot, SessionStore } from "./store.js";
+import type { LoadableSessionStore, SessionSnapshot, SessionStore } from "./store.js";
 import type { CloseTransaction, Params, PlayerIndex, Proof, SignedState, State } from "./types.js";
 
 export class ArenaProtocolError extends Error {
@@ -44,6 +44,28 @@ function frozenParams(p: Params): Params {
   });
 }
 const CLOSING_MESSAGE = "channel is closing; no further states are signed or accepted";
+
+/** Validates a snapshot read from storage and fills fields added after it was written. Throws on malformed data. */
+function normalizeSnapshot(raw: SessionSnapshot): SessionSnapshot {
+  const s = structuredClone(raw) as Partial<SessionSnapshot>;
+  const isSigned = (x: unknown): x is SignedState =>
+    typeof x === "object" && x !== null && "state" in x && typeof (x as SignedState).sigA === "string";
+  const ok =
+    typeof s.channelId === "string" &&
+    isSigned(s.latest) &&
+    (s.prev === null || isSigned(s.prev)) &&
+    (s.pendingCheckpoint === null || isSigned(s.pendingCheckpoint)) &&
+    (s.incomingCheckpoint === null || isSigned(s.incomingCheckpoint)) &&
+    (s.lastSignedTurn === null || typeof s.lastSignedTurn === "bigint") &&
+    (s.closeState === null || isSigned(s.closeState)) &&
+    Array.isArray(s.closeSigs) &&
+    s.closeSigs.length === 2;
+  if (!ok) throw new ArenaProtocolError("malformed session snapshot");
+  if (!Array.isArray(s.closeSigTargets) || s.closeSigTargets.length !== 2) {
+    s.closeSigTargets = [ZERO_HASH, ZERO_HASH];
+  }
+  return s as SessionSnapshot;
+}
 
 /**
  * One player's view of one channel. Validates every incoming state exactly as the hub would, signs only through
@@ -101,12 +123,19 @@ export class ChannelSession {
     return session;
   }
 
+  /** Restores this channel's session from `store` if it has a snapshot, otherwise creates it (crash-safe start). */
+  static async open(cfg: SessionConfig & { store: LoadableSessionStore }): Promise<ChannelSession> {
+    const snapshot = await cfg.store.load();
+    return snapshot ? ChannelSession.restore(cfg, snapshot) : ChannelSession.create(cfg);
+  }
+
   static restore(cfg: SessionConfig, snapshot: SessionSnapshot): ChannelSession {
     const expected = channelId(cfg.domain.chainId, cfg.domain.hub, cfg.params);
-    if (snapshot.channelId !== expected) {
+    const data = normalizeSnapshot(snapshot);
+    if (data.channelId !== expected) {
       throw new ArenaProtocolError("snapshot channelId does not match params/domain");
     }
-    return new ChannelSession(cfg, structuredClone(snapshot));
+    return new ChannelSession(cfg, data);
   }
 
   get latest(): SignedState {
@@ -193,7 +222,7 @@ export class ChannelSession {
   }
 
   /** Validates and records an opponent message (a move, or a NEW_GAME proposal/countersignature). */
-  receive(msg: SignedState): Promise<"move" | "checkpoint-proposed" | "checkpoint-complete"> {
+  receive(msg: SignedState): Promise<"move" | "checkpoint-proposed" | "checkpoint-complete" | "checkpoint-repaired"> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
       if (draft.closeState !== null) throw new ArenaProtocolError(CLOSING_MESSAGE);
@@ -209,6 +238,9 @@ export class ChannelSession {
           break;
         case "checkpoint-proposed":
           draft.incomingCheckpoint = v.signed;
+          break;
+        case "checkpoint-repaired":
+          draft.prev = v.signed;
           break;
         case "move":
           this.advanceLatest(draft, v.signed);
@@ -226,7 +258,7 @@ export class ChannelSession {
     msg: SignedState,
   ): Promise<
     | { kind: "on-pending"; pending: SignedState; signed: SignedState }
-    | { kind: "checkpoint-complete" | "checkpoint-proposed" | "move"; signed: SignedState }
+    | { kind: "checkpoint-complete" | "checkpoint-proposed" | "move" | "checkpoint-repaired"; signed: SignedState }
   > {
     const clonedMsg = structuredClone(msg);
     const sigA = this.asHexSig(clonedMsg.sigA);
@@ -234,12 +266,37 @@ export class ChannelSession {
     const s = clonedMsg.state;
     const latest = draft.latest.state;
     if (s.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
+    const prevSigned = draft.prev;
+    if (
+      prevSigned &&
+      isCheckpoint(prevSigned.state) &&
+      !this.endorsed(prevSigned) &&
+      s.turnNum === prevSigned.state.turnNum &&
+      hashState(s, this.domain) === hashState(prevSigned.state, this.domain)
+    ) {
+      // A late countersignature for the checkpoint this player adopted a move on (R9): repair `prev`.
+      const oppSig = this.opponent === 0 ? sigA : sigB;
+      if (!(await this.signedBy(this.opponent, prevSigned.state, oppSig))) {
+        throw new ArenaProtocolError("missing or invalid opponent signature");
+      }
+      const repaired: SignedState =
+        this.opponent === 0 ? { ...prevSigned, sigA: oppSig } : { ...prevSigned, sigB: oppSig };
+      return { kind: "checkpoint-repaired", signed: repaired };
+    }
     const pending = draft.pendingCheckpoint;
     if (pending && s.turnNum === pending.state.turnNum + 1n) {
       // R9: the opponent's first move on the checkpoint this player proposed. Their signature on a move that
       // commits to the checkpoint endorses it (spec §4.3 rule 2), even if their countersignature never arrived.
       const r = await this.moveOnPending(pending, s, sigA, sigB);
       if (!r.ok) throw new ArenaProtocolError(r.reason);
+      if (isGameOver(r.signed.state)) {
+        // N1: adopting a finished game here would leave `prev` a checkpoint signed only by this player, which the
+        // hub rejects as a proof and which no further move can repair. Stay at the terminal state (provable)
+        // until the countersignature arrives.
+        throw new ArenaProtocolError(
+          "refusing a finished game on a new-game checkpoint the opponent has not countersigned; waiting for the countersignature",
+        );
+      }
       return { kind: "on-pending", pending, signed: r.signed };
     }
     if (s.turnNum !== latest.turnNum + 1n) {
@@ -364,8 +421,14 @@ export class ChannelSession {
     if (latest.state.turnNum === 0n || fullySigned) {
       return structuredClone({ hasPrev: false, prev: EMPTY_SIGNED, latest });
     }
-    if (!this.data.prev) throw new ArenaProtocolError("no endorsed predecessor for the latest state");
-    return structuredClone({ hasPrev: true, prev: this.data.prev, latest });
+    const prev = this.data.prev;
+    if (!prev) throw new ArenaProtocolError("no endorsed predecessor for the latest state");
+    if (isCheckpoint(prev.state) && !this.endorsed(prev)) {
+      throw new ArenaProtocolError(
+        "the new-game checkpoint before the latest state lacks the opponent's countersignature; make your next move first or wait for the countersignature",
+      );
+    }
+    return structuredClone({ hasPrev: true, prev, latest });
   }
 
   /**

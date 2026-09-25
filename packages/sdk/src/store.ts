@@ -31,12 +31,22 @@ export interface SessionStore {
   save(snapshot: SessionSnapshot): Promise<void>;
 }
 
+/** A per-channel store that can also read back the last saved snapshot (file store in the daemon). */
+export interface LoadableSessionStore extends SessionStore {
+  load(): Promise<SessionSnapshot | null>;
+}
+
 /** In-memory store for tests and ephemeral sessions. The daemon (Plan 3) provides a file-backed store. */
-export class MemoryStore implements SessionStore {
+export class MemoryStore implements LoadableSessionStore {
   readonly snapshots: SessionSnapshot[] = [];
 
   async save(snapshot: SessionSnapshot): Promise<void> {
     this.snapshots.push(structuredClone(snapshot));
+  }
+
+  async load(): Promise<SessionSnapshot | null> {
+    const last = this.snapshots.at(-1);
+    return last ? structuredClone(last) : null;
   }
 
   get last(): SessionSnapshot | undefined {

@@ -483,4 +483,7 @@ accept-draw / next-game / close buttons.
     opponent who countersigns but withholds it (or a dropped relay message) leaves the proposer unable to accept
     `C+1`; after a challenge with `{prev: C both-signed, latest: C+1}` the proposer cannot respond and forfeits.
     After acceptance the proposer's next move `C+2` is proven as `{prev: C+1 (opponent-signed), latest: C+2}`,
-    which the hub accepts.
+    which the hub accepts. Exception: if C+1 is a finished game (a resignation on move 1) and arrives off-chain,
+    the proposer does not adopt it until the countersignature arrives, because C signed by only one player cannot
+    anchor a proof and no further move can repair it; a late countersignature received after adopting a
+    non-terminal C+1 repairs the stored predecessor.

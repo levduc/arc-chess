@@ -4,7 +4,7 @@ import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 /** Sends a transaction from some wallet (spec §3.1). Implementations: local key (v1), Circle CLI (Plan 6). */
 export interface TxSender {
   readonly address: Address;
-  send(tx: { to: Address; data: Hex }): Promise<Hex>;
+  send(tx: { to: Address; data: Hex; value?: bigint }): Promise<Hex>;
 }
 
 /**
@@ -24,7 +24,13 @@ export class LocalKeyTxSender implements TxSender {
     return this.account.address;
   }
 
-  send(tx: { to: Address; data: Hex }): Promise<Hex> {
-    return this.wallet.sendTransaction({ account: this.account, chain: this.chain, to: tx.to, data: tx.data });
+  send(tx: { to: Address; data: Hex; value?: bigint }): Promise<Hex> {
+    return this.wallet.sendTransaction({
+      account: this.account,
+      chain: this.chain,
+      to: tx.to,
+      data: tx.data,
+      value: tx.value,
+    });
   }
 }
