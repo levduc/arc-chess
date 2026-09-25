@@ -265,16 +265,19 @@ contract ChannelHubDisputeTest is HubFixture {
         hub.respond(ngProof);
         assertEq(hub.registeredState(id).gameIndex, 1);
         assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Open));
-        assertEq(hub.channelInfo(id).cooldownUntil[0], block.timestamp + TIMEOUT);
+        uint64 cooldownEnd = hub.channelInfo(id).cooldownUntil[0];
+        assertEq(cooldownEnd, block.timestamp + TIMEOUT);
 
         vm.prank(alice);
         vm.expectRevert(ChannelHub.InCooldown.selector);
         hub.challenge(ngProof);
 
-        vm.warp(block.timestamp + TIMEOUT);
+        vm.warp(cooldownEnd);
         vm.prank(alice);
         hub.challenge(ngProof); // identical to the registered checkpoint
-        vm.warp(block.timestamp + TIMEOUT);
+        uint64 deadline = hub.channelInfo(id).deadline;
+        assertEq(deadline, cooldownEnd + TIMEOUT);
+        vm.warp(deadline);
         hub.timeout(id);
         assertEq(usdc.balanceOf(alice), 100e6 - FEE + 2 * STAKE);
         assertEq(usdc.balanceOf(bob), 100e6 - FEE - 2 * STAKE);
