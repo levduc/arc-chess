@@ -172,8 +172,8 @@ importers:
         specifier: 1.4.0
         version: 1.4.0
       viem:
-        specifier: 2.56.9
-        version: 2.56.9
+        specifier: 2.56.8
+        version: 2.56.8
     devDependencies:
       tsx:
         specifier: 4.23.15
@@ -406,8 +406,8 @@ packages:
     engines: {node: '>=18.0.0'}
     hasBin: true
 
-  viem@2.56.9:
-    resolution: {integrity: sha512-UC1G0Qz+RbPKqwl6yRrp3dH6ltrOmUcFJMTcOyE1Mg0nO5lxrEBTONh/8OFWPnALGuN/O7LkNcz/IsSj83Svqw==}
+  viem@2.56.8:
+    resolution: {integrity: sha512-vD1DsnYxySMml5/02m/+boWQYfZtWug2VYzm6+hdVT+VDmULBZfpoh9gPDAENdMMBmQKW/2QJ/1DuZaslBJDAg==}
     peerDependencies:
       typescript: '>=5.0.4'
     peerDependenciesMeta:
@@ -590,7 +590,7 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.3
 
-  viem@2.56.9:
+  viem@2.56.8:
     dependencies:
       '@noble/curves': 1.9.1
       '@noble/hashes': 1.8.0

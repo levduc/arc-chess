@@ -4,5 +4,3 @@ packages:
   - "apps/*"
 allowBuilds:
   esbuild: true
-minimumReleaseAgeExclude:
-  - viem@2.56.9
