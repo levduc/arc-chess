@@ -141,4 +141,66 @@ describe("channel lifecycle on Anvil", () => {
     expect((err as HubRevertError).errorName).toBe("BadSignature");
     await expect(x.hub.deposit(x.alice, x.params)).rejects.toThrow(/WrongPhase/);
   });
+
+  // --- R8: Close only on terminal states (regressions for PoC1a/PoC1b) -------------------------------------
+
+  it("R8: a withheld Close counter-signature on a terminal state costs the closer nothing", async () => {
+    const x = await arena("r8-terminal");
+    const { a, b } = await open(x);
+    await b.receive(await a.move("e2e4"));
+    await a.receive(await b.resign()); // terminal: A +stake
+    await b.receiveClose(await a.signClose()); // Alice signs Close; Bob keeps it and withholds his own
+    expect(a.isClosing).toBe(true);
+
+    await x.hub.challenge(x.bob, b.challengeProof()); // Bob registers the terminal state instead
+    const registered = await x.hub.registeredState(a.id);
+    expect(registered).toEqual(a.latest.state);
+    await increaseTime(Number(x.params.challengeTimeout));
+    await x.hub.timeout(x.bob, a.id);
+
+    // Settled exactly as the terminal state says — no forfeit of the frozen closer.
+    const d = x.params.deposit;
+    const f = x.params.feePerPlayer;
+    const s = x.params.stakePerGame;
+    expect([registered.balanceA, registered.balanceB]).toEqual([d + s, d - s]);
+    expect(await usdcBalance(x.env.usdc, x.alice.address)).toBe(START - d - f + registered.balanceA);
+    expect(await usdcBalance(x.env.usdc, x.bob.address)).toBe(START - d - f + registered.balanceB);
+  });
+
+  it("R8: PoC1a/PoC1b cannot start — Close is refused at the opening and at a checkpoint", async () => {
+    // PoC1a: at the opening, neither player will sign Close, so nobody is frozen when Bob challenges.
+    {
+      const x = await arena("r8-poc1a");
+      const { a, b } = await open(x);
+      await expect(a.signClose()).rejects.toThrow(/can only close on a finished game/);
+      await expect(b.signClose()).rejects.toThrow(/can only close on a finished game/);
+      await x.hub.challenge(x.bob, b.challengeProof()); // opening, hasPrev = false
+      const ev = (await x.hub.disputeEvents(a.id)).at(-1)!;
+      expect(await a.ingestOnChain(ev.signed)).toBe(false);
+      expect(a.isMyTurn()).toBe(true); // not frozen: Alice answers the challenge
+      await a.move("e2e4");
+      await x.hub.respond(x.alice, a.challengeProof());
+      expect((await x.hub.channelInfo(a.id)).phase).toBe("Open");
+      await expect(x.hub.timeout(x.bob, a.id)).rejects.toThrow(/WrongPhase/);
+    }
+    // PoC1b: on a both-signed checkpoint (B white, on move), neither player will sign Close either.
+    {
+      const x = await arena("r8-poc1b");
+      const { a, b } = await open(x);
+      await play(a, b, SCHOLARS_MATE);
+      await a.receive(await b.resign());
+      await b.receive(await a.proposeNewGame());
+      await a.receive(await b.countersignNewGame());
+      await expect(b.signClose()).rejects.toThrow(/can only close on a finished game/);
+      await expect(a.signClose()).rejects.toThrow(/can only close on a finished game/);
+      await x.hub.challenge(x.alice, a.challengeProof()); // both-signed checkpoint
+      const ev = (await x.hub.disputeEvents(b.id)).at(-1)!;
+      expect(await b.ingestOnChain(ev.signed)).toBe(false);
+      expect(b.isMyTurn()).toBe(true); // not frozen: Bob answers
+      await b.move("e2e4");
+      await x.hub.respond(x.bob, b.challengeProof());
+      expect((await x.hub.channelInfo(b.id)).phase).toBe("Open");
+      await expect(x.hub.timeout(x.alice, b.id)).rejects.toThrow(/WrongPhase/);
+    }
+  });
 });

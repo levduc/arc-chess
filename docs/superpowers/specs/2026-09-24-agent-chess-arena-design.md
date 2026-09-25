@@ -440,7 +440,7 @@ accept-draw / next-game / close buttons.
 - Legal review: real-money skill-game wagering and host fee in target jurisdictions.
 - Mainnet multisig owner; deployment runbook; monitoring and alerting on the indexer.
 
-## 12. Implementation refinements (from Plan 1)
+## 12. Implementation refinements (from Plans 1 and 2)
 
 1. `IGameRules` also exposes `isCheckpoint(s)`, `isGameOver(s)`, `forfeitBalances(s, p)`; `ChessRules`
    additionally exposes `successor(prev, move, p)`, the canonical next state used for SDK parity.
@@ -454,9 +454,10 @@ accept-draw / next-game / close buttons.
    cheatcodes bind to the next external call (including `hashState`/`successor` staticcalls).
 8. JS tooling pins viem 2.56.8; pnpm's minimum-release-age gate is never bypassed.
 9. Cooperative close requires a separate EIP-712 `Close(bytes32 channelId,bytes32 stateHash)` intent signed
-   by both players; co-signed game states (checkpoints, terminal states) never close a channel by themselves,
-   so a loser cannot roll back to an earlier checkpoint. Daemons must stop signing new states for a channel
-   once they sign Close.
+   by both players; co-signed game states never close a channel by themselves, so a loser cannot roll back to
+   an earlier checkpoint. The hub accepts a Close on the opening, a checkpoint or a terminal state, but daemons
+   sign Close only on terminal states (item 13). Daemons must stop signing new states for a channel once they
+   sign Close.
 10. `MAX_FEE_PER_PLAYER` is an immutable constructor argument (`maxFeePerPlayer`) rather than a constant; a
     channel's snapshotted `feePerPlayer` must also be ≤ it. First deposit additionally rejects a participant
     wallet that equals the other side's signer.
@@ -464,3 +465,13 @@ accept-draw / next-game / close buttons.
     consented to it and it passes the conservation check. With a `prev`, a checkpoint `prev` needs both
     signatures (or must be the registered state); the other signer's lone endorsement covers only move states.
 12. JS tooling needs Node ≥ 20.11.
+13. **R8 (Plan 2) — Close only on terminal states** (replaces R7, which let the player on move close at the
+    opening or on a both-signed checkpoint). A player signs Close only when the latest state is terminal
+    (`WHITE_WON`/`BLACK_WON`/`DRAW`), with no new-game proposal pending and nothing later signed. Why: signing
+    Close freezes the signer, but the opponent may keep that signature and instead challenge the same state.
+    The opening needs no signatures and a both-signed checkpoint is already supported, so the hub registers
+    it; the frozen closer cannot respond, and `timeout` makes them forfeit `stakePerGame` (reproduced on
+    Anvil). On a terminal state `timeout` settles balances as-is, so a withheld counter-signature costs the
+    closer nothing. Exit paths: between games, close on the finished game instead of proposing the next one;
+    before game 0, the player to move plays a move with a draw offer, the opponent accepts, and both close on
+    the `DRAW` state (balances unchanged).

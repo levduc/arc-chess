@@ -11,10 +11,20 @@ Protocol library for the Agent Chess Arena (spec: `docs/superpowers/specs/2026-0
   - every incoming state equals the rules' successor, is signed by the right session key and extends the latest state;
   - a move is only accepted on a NEW_GAME checkpoint that carries both signatures;
   - it never signs two states with the same turn number, and persists before returning any signature;
-  - Close is signed only for the latest state, between games, with nothing later signed (on an opening or
-    checkpoint state, only when this player is the one on move) — and then signing stops.
+  - Close is signed only for the latest state, only when that state is terminal (a finished game), with no
+    new-game proposal pending and nothing later signed — and then signing stops (spec §12 item 13, R8). Close on
+    the opening or on a checkpoint is refused for both players: the opponent could keep the signature, challenge
+    that state and let `timeout` forfeit the frozen closer.
 - `HubClient` — typed ChannelHub calls through a `TxSender`; reverts surface as `HubRevertError.errorName`.
 - `LocalKeyTxSender` — sends from a local key (participant wallet on Anvil, or a session key for disputes).
+
+## Exiting a channel
+
+- **Between games:** close on the finished game instead of proposing the next one (`signClose` on both sides,
+  exchange with `receiveClose`, then submit `closeTransaction()` via `HubClient.closeCooperative`).
+- **Before game 0:** the player to move plays a move with `{ offerDraw: true }`, the opponent calls
+  `acceptDraw()`, and both close on the resulting DRAW state. Balances are unchanged.
+- **Opponent stalls on move:** challenge the latest state with `challengeProof()` instead of closing.
 
 ## Tests
 

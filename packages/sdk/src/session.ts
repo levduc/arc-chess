@@ -235,9 +235,12 @@ export class ChannelSession {
   }
 
   /**
-   * Signs Close for the latest state. Only between games — and, unless the game is over, only when this player
-   * is the one on move (spec R7): closing on an opening/checkpoint state where the opponent is on move would
-   * hand them a free option to keep playing after this player is frozen.
+   * Signs Close for the latest state, and only when that state is terminal (spec §12 R8). Closing on the opening
+   * or on a checkpoint is never safe: the opponent can keep the Close signature, challenge the same state (which
+   * the hub supports without this player's help), and let `timeout` forfeit the frozen closer's stake. On a
+   * terminal state `timeout` settles balances as-is, so a withheld counter-signature costs nothing.
+   * To exit between games, close on the terminal state instead of proposing the next game; to exit before
+   * game 0, play a move with `offerDraw`, let the opponent accept, and close on the DRAW state.
    */
   signClose(): Promise<CloseSignature> {
     return this.lock(async () => {
@@ -252,15 +255,10 @@ export class ChannelSession {
       }
       if (draft.pendingCheckpoint) {
         throw new ArenaProtocolError(
-          "a new-game proposal is pending; close on the checkpoint once countersigned, or challenge",
+          "a new-game proposal is pending; close only once the next game is finished, or challenge",
         );
       }
-      const terminal = isGameOver(s);
-      const openOrCheckpoint = s.turnNum === 0n || (isCheckpoint(s) && this.endorsed(current));
-      const onMove = mover(s) === this.me;
-      if (!terminal && !(openOrCheckpoint && onMove)) {
-        throw new ArenaProtocolError("can only close between games when the opponent cannot move");
-      }
+      if (!isGameOver(s)) throw new ArenaProtocolError("can only close on a finished game");
       if (draft.lastSignedTurn !== null && draft.lastSignedTurn > s.turnNum) {
         throw new ArenaProtocolError("already signed a later state");
       }

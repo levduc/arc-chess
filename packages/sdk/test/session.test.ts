@@ -178,7 +178,7 @@ describe("ChannelSession", () => {
   it("closes only between games, then freezes signing", async () => {
     const { a, b, params } = await setup();
     await b.receive(await a.move("e2e4"));
-    await expect(a.signClose()).rejects.toThrow(/between games/);
+    await expect(a.signClose()).rejects.toThrow(/can only close on a finished game/);
     await a.receive(await b.resign());
     const ca = await a.signClose();
     await expect(a.proposeNewGame()).rejects.toThrow(/closing/);
@@ -430,19 +430,57 @@ describe("ChannelSession", () => {
     expect(() => ChannelSession.restore(otherCfg, snap)).toThrow(ArenaProtocolError);
   });
 
-  it("R7: at the opening, only the player on move (A, white) may sign Close", async () => {
+  // --- R8 (replaces R7): Close only on terminal states --------------------------------------------------
+  // R7 allowed the player on move to sign Close at the opening / a both-signed checkpoint. PoC1a/PoC1b showed
+  // the opponent can keep that signature, challenge the same state and have `timeout` forfeit the frozen closer,
+  // so both players must now be refused there; the positive cases move to terminal states.
+
+  it("R8: refuses Close at the opening for both players", async () => {
     const { a, b } = await setup();
-    await expect(b.signClose()).rejects.toThrow(/cannot move/);
-    const ca = await a.signClose();
-    expect(ca.by).toBe(0);
+    await expect(a.signClose()).rejects.toThrow(/can only close on a finished game/); // on move (white)
+    await expect(b.signClose()).rejects.toThrow(/can only close on a finished game/);
+    expect(a.isClosing).toBe(false);
+    expect(b.isClosing).toBe(false);
+    expect(a.isMyTurn()).toBe(true); // nothing was frozen
   });
 
-  it("R7: on a both-signed checkpoint, only the player on move may sign Close", async () => {
+  it("R8: refuses Close on a both-signed checkpoint for both players", async () => {
     const { a, b } = await setup();
     await finishGame(a, b);
     await newGame(a, b); // gameIndex 1: white = (1 % 2) = B, so B is on move
-    await expect(a.signClose()).rejects.toThrow(/cannot move/);
+    await expect(b.signClose()).rejects.toThrow(/can only close on a finished game/); // on move
+    await expect(a.signClose()).rejects.toThrow(/can only close on a finished game/);
+    expect(a.isClosing || b.isClosing).toBe(false);
+    expect(b.isMyTurn()).toBe(true);
+  });
+
+  it("R8: allows Close for both players on terminal states (win and draw)", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b); // A mates, B resigns: terminal
+    const ca = await a.signClose();
     const cb = await b.signClose();
-    expect(cb.by).toBe(1);
+    expect([ca.by, cb.by]).toEqual([0, 1]);
+    expect(ca.stateHash).toBe(cb.stateHash);
+
+    const s = await setup();
+    await s.b.receive(await s.a.move("e2e4", { offerDraw: true }));
+    await s.a.receive(await s.b.acceptDraw());
+    // The second signer here is the player who is *not* on move — also fine on a terminal state.
+    expect((await s.b.signClose()).by).toBe(1);
+    expect((await s.a.signClose()).by).toBe(0);
+  });
+
+  it("R8: exits before game 0 via a draw offer, accepted, then Close on the DRAW state", async () => {
+    const { a, b, params } = await setup();
+    await b.receive(await a.move("e2e4", { offerDraw: true }));
+    await a.receive(await b.acceptDraw());
+    expect(statusOf(a.latest.state)).toBe(STATUS.DRAW);
+    await b.receiveClose(await a.signClose());
+    await a.receiveClose(await b.signClose());
+    const tx = a.closeTransaction();
+    expect(tx).not.toBeNull();
+    expect(tx).toEqual(b.closeTransaction());
+    expect(tx!.state.turnNum).toBe(2n);
+    expect([tx!.state.balanceA, tx!.state.balanceB]).toEqual([params.deposit, params.deposit]); // unchanged
   });
 });
