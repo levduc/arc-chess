@@ -33,6 +33,16 @@ export type SessionConfig = {
 };
 
 const NO_SIG: Hex = "0x";
+
+/** Deep-cloned, deeply frozen Params (including the participants/signers tuples). */
+function frozenParams(p: Params): Params {
+  const c = structuredClone(p);
+  return Object.freeze({
+    ...c,
+    participants: Object.freeze([...c.participants]) as unknown as Params["participants"],
+    signers: Object.freeze([...c.signers]) as unknown as Params["signers"],
+  });
+}
 const CLOSING_MESSAGE = "channel is closing; no further states are signed or accepted";
 
 /**
@@ -57,13 +67,17 @@ export class ChannelSession {
   private mutex: Promise<void> = Promise.resolve();
 
   private constructor(cfg: SessionConfig, data: SessionSnapshot) {
-    if (privateKeyToAccount(cfg.sessionKey).address.toLowerCase() !== cfg.params.signers[cfg.me].toLowerCase()) {
+    // Private frozen copies: a caller mutating its own params/domain objects later must not change which
+    // signatures this session accepts or produces.
+    const params = frozenParams(cfg.params);
+    const domain: ArenaDomain = Object.freeze(structuredClone(cfg.domain));
+    if (privateKeyToAccount(cfg.sessionKey).address.toLowerCase() !== params.signers[cfg.me].toLowerCase()) {
       throw new ArenaProtocolError("session key does not match params.signers[me]");
     }
-    this.params = cfg.params;
+    this.params = params;
     this.me = cfg.me;
     this.opponent = cfg.me === 0 ? 1 : 0;
-    this.domain = cfg.domain;
+    this.domain = domain;
     this.key = cfg.sessionKey;
     this.store = cfg.store;
     this.id = data.channelId;
@@ -183,66 +197,81 @@ export class ChannelSession {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
       if (draft.closeState !== null) throw new ArenaProtocolError(CLOSING_MESSAGE);
-
-      const clonedMsg = structuredClone(msg);
-      const sigA = this.asHexSig(clonedMsg.sigA);
-      const sigB = this.asHexSig(clonedMsg.sigB);
-      const s = clonedMsg.state;
-      const latest = draft.latest.state;
-      if (s.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
-      const pending = draft.pendingCheckpoint;
-      if (pending && s.turnNum === pending.state.turnNum + 1n) {
-        // R9: the opponent's first move on the checkpoint this player proposed. Their signature on a move that
-        // commits to the checkpoint endorses it (spec §4.3 rule 2), even if their countersignature never arrived.
-        const r = await this.moveOnPending(pending, s, sigA, sigB);
-        if (!r.ok) throw new ArenaProtocolError(r.reason);
-        this.adoptMoveOnPending(draft, pending, r.signed);
-        await this.store.save(draft);
-        this.data = draft;
-        return "move";
-      }
-      if (s.turnNum !== latest.turnNum + 1n) {
-        throw new ArenaProtocolError(`unexpected turn ${s.turnNum}; expected ${latest.turnNum + 1n}`);
-      }
-      // Never trust the received state object itself — recompute it locally from our own canonical predecessor
-      // and only accept the message if it hashes identically. Everything stored from here on is `expected`
-      // (locally computed, canonical types), never `s` (guards against type confusion in received fields).
-      const expected = this.successorFrom(latest, s.move);
-      if (hashState(expected, this.domain) !== hashState(s, this.domain)) {
-        throw new ArenaProtocolError("state does not match the rules");
-      }
-      const oppSig = this.opponent === 0 ? sigA : sigB;
-      if (!(await this.signedBy(this.opponent, expected, oppSig))) {
-        throw new ArenaProtocolError("missing or invalid opponent signature");
-      }
-
-      if (isCheckpoint(expected)) {
-        const pending = draft.pendingCheckpoint;
-        if (pending && hashState(pending.state, this.domain) === hashState(expected, this.domain)) {
-          const merged: SignedState = {
-            state: expected,
-            sigA: pending.sigA !== NO_SIG ? pending.sigA : sigA,
-            sigB: pending.sigB !== NO_SIG ? pending.sigB : sigB,
-          };
-          this.advanceLatest(draft, merged);
+      // Validation only reads `draft`; every write happens below, after it succeeded, and is persisted first.
+      const v = await this.asProtocolError(() => this.classifyIncoming(draft, msg));
+      switch (v.kind) {
+        case "on-pending":
+          this.adoptMoveOnPending(draft, v.pending, v.signed);
+          break;
+        case "checkpoint-complete":
+          this.advanceLatest(draft, v.signed);
           draft.pendingCheckpoint = null;
-          await this.store.save(draft);
-          this.data = draft;
-          return "checkpoint-complete";
-        }
-        draft.incomingCheckpoint = this.withOnly(this.opponent, expected, oppSig);
-        await this.store.save(draft);
-        this.data = draft;
-        return "checkpoint-proposed";
+          break;
+        case "checkpoint-proposed":
+          draft.incomingCheckpoint = v.signed;
+          break;
+        case "move":
+          this.advanceLatest(draft, v.signed);
+          break;
       }
-
-      if (!this.endorsed(draft.latest)) throw new ArenaProtocolError("the new-game checkpoint is not fully signed");
-      if (mover(latest) !== this.opponent) throw new ArenaProtocolError("it is not the opponent's turn");
-      this.advanceLatest(draft, this.withOnly(this.opponent, expected, oppSig));
       await this.store.save(draft);
       this.data = draft;
-      return "move";
+      return v.kind === "on-pending" ? "move" : v.kind;
     });
+  }
+
+  /** Checks an incoming message against `draft` without changing it; returns what to record. */
+  private async classifyIncoming(
+    draft: SessionSnapshot,
+    msg: SignedState,
+  ): Promise<
+    | { kind: "on-pending"; pending: SignedState; signed: SignedState }
+    | { kind: "checkpoint-complete" | "checkpoint-proposed" | "move"; signed: SignedState }
+  > {
+    const clonedMsg = structuredClone(msg);
+    const sigA = this.asHexSig(clonedMsg.sigA);
+    const sigB = this.asHexSig(clonedMsg.sigB);
+    const s = clonedMsg.state;
+    const latest = draft.latest.state;
+    if (s.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
+    const pending = draft.pendingCheckpoint;
+    if (pending && s.turnNum === pending.state.turnNum + 1n) {
+      // R9: the opponent's first move on the checkpoint this player proposed. Their signature on a move that
+      // commits to the checkpoint endorses it (spec §4.3 rule 2), even if their countersignature never arrived.
+      const r = await this.moveOnPending(pending, s, sigA, sigB);
+      if (!r.ok) throw new ArenaProtocolError(r.reason);
+      return { kind: "on-pending", pending, signed: r.signed };
+    }
+    if (s.turnNum !== latest.turnNum + 1n) {
+      throw new ArenaProtocolError(`unexpected turn ${s.turnNum}; expected ${latest.turnNum + 1n}`);
+    }
+    // Never trust the received state object itself — recompute it locally from our own canonical predecessor
+    // and only accept the message if it hashes identically. Everything stored from here on is `expected`
+    // (locally computed, canonical types), never `s` (guards against type confusion in received fields).
+    const expected = this.successorFrom(latest, s.move);
+    if (hashState(expected, this.domain) !== hashState(s, this.domain)) {
+      throw new ArenaProtocolError("state does not match the rules");
+    }
+    const oppSig = this.opponent === 0 ? sigA : sigB;
+    if (!(await this.signedBy(this.opponent, expected, oppSig))) {
+      throw new ArenaProtocolError("missing or invalid opponent signature");
+    }
+
+    if (isCheckpoint(expected)) {
+      if (pending && hashState(pending.state, this.domain) === hashState(expected, this.domain)) {
+        const merged: SignedState = {
+          state: expected,
+          sigA: pending.sigA !== NO_SIG ? pending.sigA : sigA,
+          sigB: pending.sigB !== NO_SIG ? pending.sigB : sigB,
+        };
+        return { kind: "checkpoint-complete", signed: merged };
+      }
+      return { kind: "checkpoint-proposed", signed: this.withOnly(this.opponent, expected, oppSig) };
+    }
+
+    if (!this.endorsed(draft.latest)) throw new ArenaProtocolError("the new-game checkpoint is not fully signed");
+    if (mover(latest) !== this.opponent) throw new ArenaProtocolError("it is not the opponent's turn");
+    return { kind: "move", signed: this.withOnly(this.opponent, expected, oppSig) };
   }
 
   /**
@@ -286,17 +315,25 @@ export class ChannelSession {
   receiveClose(cs: CloseSignature): Promise<void> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
-      const clonedCs = structuredClone(cs);
-      if (clonedCs.by !== this.opponent) throw new ArenaProtocolError("close signature is not from the opponent");
-      const sig = this.asHexSig(clonedCs.sig);
       const target = (draft.closeState ?? draft.latest).state;
-      if (clonedCs.stateHash !== hashState(target, this.domain)) {
-        throw new ArenaProtocolError("close signature is for a different state");
-      }
-      const signer = await recoverCloseSigner(target, sig, this.domain);
-      if (signer.toLowerCase() !== this.params.signers[this.opponent].toLowerCase()) {
-        throw new ArenaProtocolError("invalid close signature");
-      }
+      const sig = await this.asProtocolError(async () => {
+        const clonedCs = structuredClone(cs);
+        if (clonedCs.by !== this.opponent) throw new ArenaProtocolError("close signature is not from the opponent");
+        const cloneSig = this.asHexSig(clonedCs.sig);
+        if (clonedCs.stateHash !== hashState(target, this.domain)) {
+          throw new ArenaProtocolError("close signature is for a different state");
+        }
+        let signer: string;
+        try {
+          signer = await recoverCloseSigner(target, cloneSig, this.domain);
+        } catch {
+          throw new ArenaProtocolError("invalid close signature");
+        }
+        if (signer.toLowerCase() !== this.params.signers[this.opponent].toLowerCase()) {
+          throw new ArenaProtocolError("invalid close signature");
+        }
+        return cloneSig;
+      });
       draft.closeSigs[this.opponent] = sig;
       draft.closeSigTargets[this.opponent] = hashState(target, this.domain);
       await this.store.save(draft);
@@ -341,12 +378,20 @@ export class ChannelSession {
   ingestOnChain(signed: SignedState): Promise<boolean> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
-      const clonedSigned = structuredClone(signed);
-      if (clonedSigned.state.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
-      if (clonedSigned.state.turnNum <= draft.latest.state.turnNum) return false;
-
       const pending = draft.pendingCheckpoint;
-      const accepted = await this.verifyOnChainState(draft, clonedSigned);
+      const accepted = await this.asProtocolError(async () => {
+        const clonedSigned = structuredClone(signed);
+        if (clonedSigned.state.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
+        let turnNum: bigint;
+        try {
+          turnNum = this.canonicalState(clonedSigned.state).turnNum; // malformed fields fail even when stale
+        } catch {
+          throw new ArenaProtocolError("unverifiable on-chain state");
+        }
+        if (turnNum <= draft.latest.state.turnNum) return null;
+        return this.verifyOnChainState(draft, clonedSigned);
+      });
+      if (accepted === null) return false;
 
       if (accepted.onPending && pending) {
         this.adoptMoveOnPending(draft, pending, accepted.signed);
@@ -359,6 +404,22 @@ export class ChannelSession {
       this.data = draft;
       return true;
     });
+  }
+
+  /**
+   * Runs validation of untrusted input and reports any failure as an ArenaProtocolError: malformed fields (a
+   * non-bigint or NaN number, a bad move type, a non-object message) otherwise surface as raw TypeError /
+   * RangeError / viem errors from comparison, hashing or signature recovery. Only wraps validation — never
+   * `store.save`, whose errors callers must see unchanged.
+   */
+  private async asProtocolError<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof ArenaProtocolError) throw err;
+      const detail = err instanceof Error ? err.message.split("\n")[0] : String(err);
+      throw new ArenaProtocolError(`malformed message: ${detail}`);
+    }
   }
 
   /** Serializes every mutating call through a promise chain; a rejection never blocks the next call. */
@@ -522,14 +583,19 @@ export class ChannelSession {
       if (typeof v !== "string" || !/^0x[0-9a-fA-F]*$/.test(v)) throw new Error("not a 0x-hex string");
       return v as Hex;
     };
+    const int = (v: unknown): number => {
+      const n = Number(v);
+      if (!Number.isSafeInteger(n) || n < 0) throw new Error("not a non-negative integer");
+      return n;
+    };
     return {
       channelId: hex(s.channelId),
       turnNum: BigInt(s.turnNum as unknown as bigint),
       prevHash: hex(s.prevHash),
       balanceA: BigInt(s.balanceA as unknown as bigint),
       balanceB: BigInt(s.balanceB as unknown as bigint),
-      gameIndex: Number(s.gameIndex),
-      move: Number(s.move),
+      gameIndex: int(s.gameIndex),
+      move: int(s.move),
       board: BigInt(s.board as unknown as bigint),
       meta: BigInt(s.meta as unknown as bigint),
     };

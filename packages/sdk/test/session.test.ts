@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Address, Hex } from "viem";
 import { keccak256, toHex } from "viem";
-import { generatePrivateKey } from "viem/accounts";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
   ChannelSession,
@@ -19,9 +19,11 @@ import {
   successor,
   withStatus,
   type ArenaDomain,
+  type CloseSignature,
   type SessionConfig,
   type SessionSnapshot,
   type SessionStore,
+  type SignedState,
 } from "../src/index.js";
 import { SCHOLARS_MATE, makeParams } from "./helpers/fixtures.js";
 
@@ -612,5 +614,110 @@ describe("ChannelSession", () => {
     expect(String(rejected[0].reason.message)).toMatch(/unexpected turn/);
     expect(b.latest.state.turnNum).toBe(1n);
     expect(b.latest).toEqual(e4);
+  });
+
+  it("Errors: malformed input to receive/ingestOnChain/receiveClose rejects with ArenaProtocolError", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    const bad = (patch: Record<string, unknown>) => ({ ...e4, state: { ...e4.state, ...patch } }) as unknown as SignedState;
+    const malformed: unknown[] = [
+      null,
+      42,
+      { sigA: e4.sigA, sigB: "0x" }, // no state
+      bad({ board: Number.NaN }),
+      bad({ balanceA: "lots" }),
+      bad({ meta: Symbol("meta") }),
+      bad({ move: BigInt(e4.state.move) }), // bigint move mixes with number bit operations
+      bad({ move: "e2e4" }),
+      bad({ move: { from: 12, to: 28 } }),
+      bad({ turnNum: Number.NaN }),
+    ];
+    for (const m of malformed) {
+      await expect(b.receive(m as SignedState)).rejects.toBeInstanceOf(ArenaProtocolError);
+    }
+    // ingestOnChain coerces value-preserving types (a bigint `move` equal to the number is well-formed, and a
+    // stale well-formed state simply returns false), so it is probed with states that cannot be coerced.
+    const onChainMalformed = [
+      ...malformed.filter((_, i) => i !== 6),
+      bad({ turnNum: 5n, board: Number.NaN }),
+      bad({ turnNum: 5n, move: 1.5 }),
+      bad({ turnNum: 5n, gameIndex: -1 }),
+      bad({ turnNum: 5n, prevHash: 12 }),
+    ];
+    for (const m of onChainMalformed) {
+      await expect(a.ingestOnChain(m as SignedState)).rejects.toBeInstanceOf(ArenaProtocolError);
+    }
+    // Nothing was recorded, and the genuine message still goes through.
+    expect(b.latest.state.turnNum).toBe(0n);
+    expect(await b.receive(e4)).toBe("move");
+
+    await a.receive(await b.resign());
+    const ca = await a.signClose();
+    const closeMalformed: unknown[] = [
+      null,
+      { ...ca, by: 1, sig: "0x1234" }, // wrong length
+      { ...ca, by: 1, sig: `0x${"ff".repeat(65)}` }, // unrecoverable
+      { ...ca, by: 1, stateHash: 7n },
+      { ...ca, by: "1" },
+    ];
+    for (const c of closeMalformed) {
+      await expect(b.receiveClose(c as CloseSignature)).rejects.toBeInstanceOf(ArenaProtocolError);
+    }
+    await b.receiveClose(ca);
+  });
+
+  it("Errors: store failures are not rewrapped as protocol errors", async () => {
+    const store = flakyStore();
+    const { a, b } = await setup(undefined, store);
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    store.fail = true;
+    const err = await a.receive(e5).catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(ArenaProtocolError);
+    expect((err as Error).message).toBe("disk full");
+    store.fail = false;
+    expect(await a.receive(e5)).toBe("move");
+  });
+
+  it("Params: caller mutation of params/domain after construction changes nothing the session accepts", async () => {
+    const keys = [generatePrivateKey(), generatePrivateKey()] as const;
+    const params = makeParams({
+      participants: ["0x00000000000000000000000000000000000000a1", "0x00000000000000000000000000000000000000b2"],
+      sessionKeys: keys,
+      rules: "0x00000000000000000000000000000000000000e5" as Address,
+      feeRecipient: "0x00000000000000000000000000000000000000f6" as Address,
+      fundingDeadline: 2_000_000_000n,
+    });
+    const dom: ArenaDomain = { chainId: 31337, hub: "0x000000000000000000000000000000000000beef" };
+    const a = await ChannelSession.create({ params, me: 0, sessionKey: keys[0], domain: dom, store: new MemoryStore() });
+    const b = await ChannelSession.create({
+      params: structuredClone(params),
+      me: 1,
+      sessionKey: keys[1],
+      domain: { ...dom },
+      store: new MemoryStore(),
+    });
+    const e4 = await a.move("e2e4");
+    await b.receive(e4);
+    const e5 = await b.move("e7e5");
+
+    // The caller now rewires its own objects: an attacker's key as B's signer, a bigger stake, another chain.
+    const attacker = generatePrivateKey();
+    (params.signers as unknown as Address[])[1] = privateKeyToAccount(attacker).address;
+    (params as { stakePerGame: bigint }).stakePerGame = 1n;
+    dom.chainId = 1;
+
+    expect(a.params.signers[1]).toBe(privateKeyToAccount(keys[1]).address);
+    expect(a.params.stakePerGame).toBe(100_000n);
+    expect(Object.isFrozen(a.params)).toBe(true);
+    expect(Object.isFrozen(a.params.signers)).toBe(true);
+    expect(() => {
+      (a.params.signers as unknown as Address[])[1] = privateKeyToAccount(attacker).address;
+    }).toThrow(TypeError);
+
+    // A move signed by the attacker is still refused; B's genuine move (original domain) is still accepted.
+    const forged = { ...e5, sigB: await signState(attacker, e5.state, domain) };
+    await expect(a.receive(forged)).rejects.toThrow(/signature/);
+    expect(await a.receive(e5)).toBe("move");
   });
 });

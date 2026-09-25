@@ -77,33 +77,35 @@ describe("SDK agrees with the deployed contracts", () => {
 
   it("successor matches on limit, stalemate and material positions", async () => {
     const id = channelId(CHAIN.id, env.hub, p);
-    const cases: Array<[string, string | number, number?]> = [
-      ["7k/Q7/6K1/8/8/8/8/8 w - - 99 76", "a7g7"], // mate on the fifty-move limit
-      ["7k/8/8/8/3R4/8/8/K7 w - - 99 76", "d4d5"], // fifty-move draw
-      ["7k/8/8/8/3R4/8/8/K7 b - - 0 150", "h8g8"], // ply cap
-      ["7k/8/8/4p3/8/5N2/8/K7 w - - 10 31", "f3e5"], // insufficient material
-      ["7k/5Q2/6K1/8/8/8/8/8 b - - 0 21", encodeMove(0, 0, 0, KIND.CLAIM_STALEMATE)],
-      ["7k/6Q1/6K1/8/8/8/8/8 b - - 0 21", encodeMove(0, 0, 0, KIND.CLAIM_STALEMATE)],
-      ["8/P7/8/8/8/8/8/k6K w - - 0 1", encodeMove(48, 56, 0, KIND.NORMAL)],
-      ["8/P7/8/8/8/8/8/k6K w - - 0 1", "a7a8n"],
-      ["rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3", "e5f6"],
-      ["r3k2r/8/8/8/8/5q2/8/R3K2R w KQkq - 0 1", encodeMove(4, 6, 0, KIND.NORMAL)],
+    // [fen, move, intended ok, gameIndex?] — `ok` is the intended legality, so a case that silently stops
+    // exercising the branch it was written for (e.g. becomes illegal for an unrelated reason) fails here.
+    const cases: Array<[string, string | number, boolean, number?]> = [
+      ["7k/Q7/6K1/8/8/8/8/8 w - - 99 76", "a7g7", true], // mate on the fifty-move limit
+      ["7k/8/8/8/3R4/8/8/K7 w - - 99 76", "d4d5", true], // fifty-move draw
+      ["7k/8/8/8/3R4/8/8/K7 b - - 0 150", "h8g8", true], // ply cap
+      ["7k/8/8/4p3/8/5N2/8/K7 w - - 10 31", "f3e5", true], // insufficient material
+      ["7k/5Q2/6K1/8/8/8/8/8 b - - 0 21", encodeMove(0, 0, 0, KIND.CLAIM_STALEMATE), true], // real stalemate
+      ["7k/6Q1/6K1/8/8/8/8/8 b - - 0 21", encodeMove(0, 0, 0, KIND.CLAIM_STALEMATE), false], // checkmate, not stalemate
+      ["8/P7/8/8/8/8/8/k6K w - - 0 1", encodeMove(48, 56, 0, KIND.NORMAL), false], // last-rank push without promotion
+      ["8/P7/8/8/8/8/8/k6K w - - 0 1", "a7a8n", true], // under-promotion
+      ["rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3", "e5f6", true], // en passant
+      ["r3k2r/8/8/8/8/5q2/8/R3K2R w KQkq - 0 1", encodeMove(4, 6, 0, KIND.NORMAL), false], // castling through check
       // (a) mate delivered by the move that reaches the fifty-move limit, in an ODD game (B is white).
-      ["7k/Q7/6K1/8/8/8/8/8 w - - 99 76", "a7g7", 1],
+      ["7k/Q7/6K1/8/8/8/8/8 w - - 99 76", "a7g7", true, 1],
       // (b) black mate delivered by the move that reaches the ply cap (299 -> 300); fullmove 150,
       // side b => ply = (150-1)*2+1 = 299. Checked in game 0 and game 1 so the stake shifts to the
       // player the contract's gameIndex/side mapping actually assigns as the winner.
-      ["8/8/8/1q6/8/2k5/8/K7 b - - 0 150", "b5b2", 0],
-      ["8/8/8/1q6/8/2k5/8/K7 b - - 0 150", "b5b2", 1],
+      ["8/8/8/1q6/8/2k5/8/K7 b - - 0 150", "b5b2", true, 0],
+      ["8/8/8/1q6/8/2k5/8/K7 b - - 0 150", "b5b2", true, 1],
       // (d) castling-rights loss after a rook is captured on its home square (black loses queenside rights).
-      ["r3k2r/8/1N6/8/8/8/8/4K2R w Kkq - 0 5", "b6a8"],
+      ["r3k2r/8/1N6/8/8/8/8/4K2R w Kkq - 0 5", "b6a8", true],
       // (e) a promotion that captures.
-      ["r6k/1P6/8/8/8/8/8/K7 w - - 0 1", "b7a8q"],
+      ["r6k/1P6/8/8/8/8/8/K7 w - - 0 1", "b7a8q", true],
     ];
-    for (const [fen, mv, gameIndex] of cases) {
+    for (const [fen, mv, intended, gameIndex] of cases) {
       const { board, meta } = fenToPosition(fen);
       const s: State = { ...initialState(id, p), turnNum: 10n, board, meta, ...(gameIndex !== undefined ? { gameIndex } : {}) };
-      await expectSame(s, typeof mv === "number" ? mv : parseMove(s, mv));
+      expect(await expectSame(s, typeof mv === "number" ? mv : parseMove(s, mv)), `intended ok for ${fen} ${mv}`).toBe(intended);
     }
 
     // (c) en-passant capture where the ep square was recorded by the contract itself after a double push,
