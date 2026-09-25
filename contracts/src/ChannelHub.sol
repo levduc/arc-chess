@@ -362,6 +362,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     /// code (e.g. an EIP-7702 delegation) cannot revoke its earlier ECDSA signatures (ruling R13).
     function _signedBy(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
         if (sig.length == 0) return false;
+        // errArg (third return) only details a failure; any failure falls through to the ERC-1271 check.
+        // slither-disable-next-line unused-return
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
         if (err == ECDSA.RecoverError.NoError && recovered == signer) return true;
         return SignatureChecker.isValidERC1271SignatureNow(signer, hash, sig);
