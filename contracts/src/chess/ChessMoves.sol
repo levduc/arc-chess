@@ -106,6 +106,41 @@ library ChessMoves {
         return (true, newBoard, newMeta);
     }
 
+    /// @notice True if the side to move has at least one legal move. Used only for stalemate/mate proofs.
+    function hasLegalMove(uint256 board, uint256 meta) internal pure returns (bool) {
+        bool black = B.side(meta) == B.BLACK_SIDE;
+        for (uint256 from = 0; from < 64; from++) {
+            uint8 piece = B.pieceAt(board, from);
+            if (piece == 0 || B.isBlack(piece) != black) continue;
+            if (_pieceHasMove(board, meta, from, B.pieceType(piece), black)) return true;
+        }
+        return false;
+    }
+
+    /// @notice Mirrors chess.js isInsufficientMaterial(): K v K, K+minor v K, or only same-coloured bishops.
+    function isInsufficientMaterial(uint256 board) internal pure returns (bool) {
+        uint256 pieces;
+        uint256 bishops;
+        uint256 knights;
+        uint256 bishopsOnEvenSquares;
+        for (uint256 s = 0; s < 64; s++) {
+            uint8 p = B.pieceAt(board, s);
+            if (p == 0) continue;
+            pieces++;
+            uint8 t = p & 7;
+            if (t == B.BISHOP) {
+                bishops++;
+                if ((s % 8 + s / 8) % 2 == 0) bishopsOnEvenSquares++;
+            } else if (t == B.KNIGHT) {
+                knights++;
+            }
+        }
+        if (pieces == 2) return true;
+        if (pieces == 3 && (bishops == 1 || knights == 1)) return true;
+        if (pieces == bishops + 2 && (bishopsOnEvenSquares == 0 || bishopsOnEvenSquares == bishops)) return true;
+        return false;
+    }
+
     function _pieceCanReach(uint256 board, uint8 ptype, uint256 from, uint256 to) private pure returns (bool) {
         int256 df = int256(to % 8) - int256(from % 8);
         int256 dr = int256(to / 8) - int256(from / 8);
@@ -220,5 +255,55 @@ library ChessMoves {
 
     function _abs(int256 x) private pure returns (uint256) {
         return uint256(x >= 0 ? x : -x);
+    }
+
+    function _pieceHasMove(uint256 board, uint256 meta, uint256 from, uint8 ptype, bool black)
+        private
+        pure
+        returns (bool)
+    {
+        int256 f = int256(from % 8);
+        int256 r = int256(from / 8);
+        if (ptype == B.PAWN) {
+            int256 dir = black ? int256(-1) : int256(1);
+            uint8 promo = (r + dir == 0 || r + dir == 7) ? B.QUEEN : 0;
+            return _try(board, meta, from, f, r + dir, promo) || _try(board, meta, from, f - 1, r + dir, promo)
+                || _try(board, meta, from, f + 1, r + dir, promo) || _try(board, meta, from, f, r + 2 * dir, 0);
+        }
+        if (ptype == B.KNIGHT) {
+            int8[8] memory kdf = [int8(1), 2, 2, 1, -1, -2, -2, -1];
+            int8[8] memory kdr = [int8(2), 1, -1, -2, -2, -1, 1, 2];
+            for (uint256 i = 0; i < 8; i++) {
+                if (_try(board, meta, from, f + kdf[i], r + kdr[i], 0)) return true;
+            }
+            return false;
+        }
+        int8[8] memory ddf = [int8(1), -1, 0, 0, 1, 1, -1, -1];
+        int8[8] memory ddr = [int8(0), 0, 1, -1, 1, -1, 1, -1];
+        uint256 dStart = ptype == B.BISHOP ? 4 : 0;
+        uint256 dEnd = ptype == B.ROOK ? 4 : 8;
+        uint256 maxSteps = ptype == B.KING ? 1 : 7;
+        for (uint256 d = dStart; d < dEnd; d++) {
+            int256 nf = f;
+            int256 nr = r;
+            for (uint256 s = 0; s < maxSteps; s++) {
+                nf += ddf[d];
+                nr += ddr[d];
+                if (!_onBoard(nf, nr)) break;
+                if (_try(board, meta, from, nf, nr, 0)) return true;
+                if (B.pieceAt(board, _sq(nf, nr)) != 0) break;
+            }
+        }
+        if (ptype == B.KING) return _try(board, meta, from, f + 2, r, 0) || _try(board, meta, from, f - 2, r, 0);
+        return false;
+    }
+
+    function _try(uint256 board, uint256 meta, uint256 from, int256 f, int256 r, uint8 promo)
+        private
+        pure
+        returns (bool ok)
+    {
+        if (!_onBoard(f, r)) return false;
+        (ok,,) = applyMove(board, meta, from, _sq(f, r), promo);
     }
 }

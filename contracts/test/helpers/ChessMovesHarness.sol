@@ -20,4 +20,12 @@ contract ChessMovesHarness {
     function isSquareAttacked(uint256 board, uint256 sq, bool byBlack) external pure returns (bool) {
         return ChessMoves.isSquareAttacked(board, sq, byBlack);
     }
+
+    function hasLegalMove(uint256 board, uint256 meta) external pure returns (bool) {
+        return ChessMoves.hasLegalMove(board, meta);
+    }
+
+    function isInsufficientMaterial(uint256 board) external pure returns (bool) {
+        return ChessMoves.isInsufficientMaterial(board);
+    }
 }
