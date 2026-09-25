@@ -1,0 +1,23 @@
+{
+  "name": "@arena/sdk",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "abi": "tsx scripts/gen-abi.ts"
+  },
+  "dependencies": {
+    "chess.js": "1.4.0",
+    "viem": "2.56.8"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.8",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "vitest": "5.0.1"
+  }
+}
