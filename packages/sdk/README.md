@@ -9,7 +9,9 @@ Protocol library for the Agent Chess Arena (spec: `docs/superpowers/specs/2026-0
 - `abiCodec` — `encodeParams` (payload of `deposit(bytes)`), `channelId`, SignedState/Proof codecs.
 - `ChannelSession` — one player's channel state machine. It enforces:
   - every incoming state equals the rules' successor, is signed by the right session key and extends the latest state;
-  - a move is only accepted on a NEW_GAME checkpoint that carries both signatures;
+  - a move is only accepted on a NEW_GAME checkpoint that carries both signatures — or on the checkpoint this
+    player proposed, since the opponent's signed move on it endorses it even if their countersignature was lost
+    (spec §12 item 14, R9);
   - it never signs two states with the same turn number, and persists before returning any signature;
   - Close is signed only for the latest state, only when that state is terminal (a finished game), with no
     new-game proposal pending and nothing later signed — and then signing stops (spec §12 item 13, R8). Close on

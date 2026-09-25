@@ -190,6 +190,17 @@ export class ChannelSession {
       const s = clonedMsg.state;
       const latest = draft.latest.state;
       if (s.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
+      const pending = draft.pendingCheckpoint;
+      if (pending && s.turnNum === pending.state.turnNum + 1n) {
+        // R9: the opponent's first move on the checkpoint this player proposed. Their signature on a move that
+        // commits to the checkpoint endorses it (spec §4.3 rule 2), even if their countersignature never arrived.
+        const r = await this.moveOnPending(pending, s, sigA, sigB);
+        if (!r.ok) throw new ArenaProtocolError(r.reason);
+        this.adoptMoveOnPending(draft, pending, r.signed);
+        await this.store.save(draft);
+        this.data = draft;
+        return "move";
+      }
       if (s.turnNum !== latest.turnNum + 1n) {
         throw new ArenaProtocolError(`unexpected turn ${s.turnNum}; expected ${latest.turnNum + 1n}`);
       }
@@ -322,9 +333,10 @@ export class ChannelSession {
 
   /**
    * Adopts a state registered on-chain (Challenged/Responded event). Returns false if not newer. Accepts a
-   * state only if it is independently verifiable — the opening state, a state with both signatures valid, or a
+   * state only if it is independently verifiable — the opening state, a state with both signatures valid, a
    * state that is exactly the canonical successor of `latest` carrying a valid signature by `latest`'s mover
-   * (both signatures if it is a checkpoint) — never a state trusted merely because an RPC produced it.
+   * (both signatures if it is a checkpoint), or (R9) the opponent's signed move on this player's pending
+   * new-game checkpoint — never a state trusted merely because an RPC produced it.
    */
   ingestOnChain(signed: SignedState): Promise<boolean> {
     return this.lock(async () => {
@@ -333,11 +345,16 @@ export class ChannelSession {
       if (clonedSigned.state.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
       if (clonedSigned.state.turnNum <= draft.latest.state.turnNum) return false;
 
+      const pending = draft.pendingCheckpoint;
       const accepted = await this.verifyOnChainState(draft, clonedSigned);
 
-      draft.pendingCheckpoint = null;
-      draft.incomingCheckpoint = null;
-      this.ingestLatest(draft, accepted);
+      if (accepted.onPending && pending) {
+        this.adoptMoveOnPending(draft, pending, accepted.signed);
+      } else {
+        draft.pendingCheckpoint = null;
+        draft.incomingCheckpoint = null;
+        this.ingestLatest(draft, accepted.signed);
+      }
       await this.store.save(draft);
       this.data = draft;
       return true;
@@ -415,6 +432,52 @@ export class ChannelSession {
     this.invalidateOpponentClose(draft);
   }
 
+  /**
+   * R9: checks that `s` is the opponent's move on this player's pending NEW_GAME checkpoint — the next turn,
+   * committing to the checkpoint's hash, exactly the canonical successor, not itself a checkpoint, and signed by
+   * the checkpoint's mover (who must be the opponent). Returns the canonical state with only the opponent's
+   * signature, never the received object.
+   */
+  private async moveOnPending(
+    pending: SignedState,
+    s: State,
+    sigA: Hex,
+    sigB: Hex,
+  ): Promise<{ ok: true; signed: SignedState } | { ok: false; reason: string }> {
+    const base = pending.state;
+    if (s.turnNum !== base.turnNum + 1n || s.prevHash !== hashState(base, this.domain)) {
+      return { ok: false, reason: "state does not extend the pending new-game checkpoint" };
+    }
+    if (mover(base) !== this.opponent) return { ok: false, reason: "it is not the opponent's turn" };
+    let expected: State;
+    try {
+      expected = this.successorFrom(base, s.move);
+    } catch (err) {
+      return { ok: false, reason: (err as Error).message };
+    }
+    if (hashState(expected, this.domain) !== hashState(s, this.domain) || isCheckpoint(expected)) {
+      return { ok: false, reason: "state does not match the rules" };
+    }
+    const oppSig = this.opponent === 0 ? sigA : sigB;
+    if (!(await this.signedBy(this.opponent, expected, oppSig))) {
+      return { ok: false, reason: "missing or invalid opponent signature" };
+    }
+    return { ok: true, signed: this.withOnly(this.opponent, expected, oppSig) };
+  }
+
+  /**
+   * R9: adopts the opponent's move on the pending checkpoint. `prev` becomes the checkpoint with this player's
+   * signature and `latest` the canonical move with the opponent's, so this player's next move yields the proof
+   * `{prev: move (opponent-signed), latest: next move (self-signed)}` that the hub accepts.
+   */
+  private adoptMoveOnPending(draft: SessionSnapshot, pending: SignedState, move: SignedState): void {
+    draft.prev = pending;
+    draft.latest = move;
+    draft.pendingCheckpoint = null;
+    draft.incomingCheckpoint = null;
+    this.invalidateOpponentClose(draft);
+  }
+
   /** Minor 5: a Close signature captured against a state that is no longer `latest` must never be reused. */
   private invalidateOpponentClose(draft: SessionSnapshot): void {
     draft.closeSigs[this.opponent] = NO_SIG;
@@ -467,7 +530,10 @@ export class ChannelSession {
   }
 
   /** I4: accept an on-chain state only if it is independently verifiable; otherwise "unverifiable on-chain state". */
-  private async verifyOnChainState(draft: SessionSnapshot, msg: SignedState): Promise<SignedState> {
+  private async verifyOnChainState(
+    draft: SessionSnapshot,
+    msg: SignedState,
+  ): Promise<{ signed: SignedState; onPending: boolean }> {
     const unverifiable = () => new ArenaProtocolError("unverifiable on-chain state");
     let sigA: Hex;
     let sigB: Hex;
@@ -481,7 +547,7 @@ export class ChannelSession {
     }
 
     // (i) the opening state is always self-evidently the channel's start.
-    if (canonical.turnNum === 0n) return { state: canonical, sigA, sigB };
+    if (canonical.turnNum === 0n) return { signed: { state: canonical, sigA, sigB }, onPending: false };
 
     // (ii) any state with both signatures valid is supported regardless of how far ahead it is.
     const bothSigned =
@@ -489,7 +555,7 @@ export class ChannelSession {
       sigB !== NO_SIG &&
       (await this.signedBy(0, canonical, sigA)) &&
       (await this.signedBy(1, canonical, sigB));
-    if (bothSigned) return { state: canonical, sigA, sigB };
+    if (bothSigned) return { signed: { state: canonical, sigA, sigB }, onPending: false };
 
     // (iii) a state that is exactly the canonical successor of `latest`, signed by latest's mover (both
     // signatures if it is a checkpoint).
@@ -508,8 +574,16 @@ export class ChannelSession {
         const checkpointOk =
           !isCheckpoint(expected) ||
           ((await this.signedBy(0, expected, sigA)) && (await this.signedBy(1, expected, sigB)));
-        if (moverOk && checkpointOk) return { state: expected, sigA, sigB };
+        if (moverOk && checkpointOk) return { signed: { state: expected, sigA, sigB }, onPending: false };
       }
+    }
+
+    // (iv) R9: the opponent's move on this player's pending NEW_GAME checkpoint (e.g. registered by a challenge
+    // after their countersignature was withheld or lost).
+    const pending = draft.pendingCheckpoint;
+    if (pending) {
+      const r = await this.moveOnPending(pending, canonical, sigA, sigB);
+      if (r.ok) return { signed: r.signed, onPending: true };
     }
 
     throw unverifiable();

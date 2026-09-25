@@ -203,4 +203,39 @@ describe("channel lifecycle on Anvil", () => {
       await expect(x.hub.timeout(x.alice, b.id)).rejects.toThrow(/WrongPhase/);
     }
   });
+
+  // --- R9: a move that chains from this player's pending checkpoint (regression for PoC2) ------------------
+
+  it("R9: a withheld countersign plus a challenge on the next move is answered, not forfeited", async () => {
+    const x = await arena("r9-poc2");
+    const { a, b } = await open(x);
+    await play(a, b, SCHOLARS_MATE); // game 0: A mates
+    await a.receive(await b.resign()); // A +stake
+    const proposal = await a.proposeNewGame(); // A's pending checkpoint C
+    expect(await b.receive(proposal)).toBe("checkpoint-proposed");
+    const full = await b.countersignNewGame(); // withheld from A
+    const m = await b.move("e2e4"); // C+1: B is white in game 1
+    await x.hub.challenge(x.bob, { hasPrev: true, prev: full, latest: m });
+
+    const ev = (await x.hub.disputeEvents(a.id)).at(-1)!;
+    expect(ev.kind).toBe("Challenged");
+    expect(ev.turnNum).toBe(a.latest.state.turnNum + 2n);
+    expect(await a.ingestOnChain(ev.signed)).toBe(true);
+    expect(a.isMyTurn()).toBe(true);
+
+    await a.move("e7e5"); // C+2
+    const proof = a.challengeProof();
+    expect(proof.hasPrev).toBe(true);
+    expect(proof.prev.state).toEqual(m.state);
+    await x.hub.respond(x.alice, proof);
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Open");
+    await expect(x.hub.timeout(x.bob, a.id)).rejects.toThrow(/WrongPhase/);
+
+    // Bob picks the answer up from the Responded event and play continues off-chain.
+    const responded = (await x.hub.disputeEvents(b.id)).at(-1)!;
+    expect(responded.kind).toBe("Responded");
+    expect(await b.ingestOnChain(responded.signed)).toBe(true);
+    await play(a, b, ["g1f3"]);
+    expect(a.isMyTurn()).toBe(true);
+  });
 });

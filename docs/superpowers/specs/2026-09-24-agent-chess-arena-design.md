@@ -475,3 +475,12 @@ accept-draw / next-game / close buttons.
     closer nothing. Exit paths: between games, close on the finished game instead of proposing the next one;
     before game 0, the player to move plays a move with a draw offer, the opponent accepts, and both close on
     the `DRAW` state (balances unchanged).
+14. **R9 (Plan 2) — a move on a pending checkpoint is accepted.** A player who proposed a `NEW_GAME` checkpoint
+    `C` and has not yet received the countersignature accepts the opponent's move `C+1` — off-chain or from a
+    `Challenged`/`Responded` event — if it is the canonical successor of `C`, commits to `hash(C)`, is not a
+    checkpoint, and is signed by `C`'s mover (the opponent). Why: by §4.3 rule 2 the opponent's signature on a
+    move that commits to `C` endorses `C`, so the missing countersignature adds nothing. Without this rule, an
+    opponent who countersigns but withholds it (or a dropped relay message) leaves the proposer unable to accept
+    `C+1`; after a challenge with `{prev: C both-signed, latest: C+1}` the proposer cannot respond and forfeits.
+    After acceptance the proposer's next move `C+2` is proven as `{prev: C+1 (opponent-signed), latest: C+2}`,
+    which the hub accepts.

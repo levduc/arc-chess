@@ -144,17 +144,23 @@ describe("ChannelSession", () => {
   });
 
   it("needs both signatures on a new game before its first move", async () => {
-    const { a, b, keys, params } = await setup();
+    const { a, b } = await setup();
     await finishGame(a, b);
     const proposal = await a.proposeNewGame();
     await b.receive(proposal);
     expect(b.isMyTurn()).toBe(false); // B is white in game 1 but the checkpoint is not countersigned yet
     await expect(b.move("e2e4")).rejects.toThrow(/not your turn/);
-    // A move built on the single-signed checkpoint is not accepted by A either.
-    const r = successor(proposal.state, parseMove(proposal.state, "e2e4"), params);
+    // (R9 changed the A side of this test: a B-signed move on A's own pending checkpoint is now accepted, because
+    // B's move endorses the checkpoint — see "R9: accepts the opponent's move on this player's pending
+    // checkpoint". A move on a checkpoint A did NOT propose is still refused until it is countersigned.)
+    const { a: a2, b: b2, keys: keys2, params: params2 } = await setup();
+    await finishGame(a2, b2);
+    await a2.receive(await b2.proposeNewGame()); // B proposes; A holds it without countersigning
+    const inc = a2.snapshot().incomingCheckpoint!.state;
+    const r = successor(inc, parseMove(inc, "e2e4"), params2);
     if (!r.ok) throw new Error(r.reason);
-    const early = { ...r.next, prevHash: hashState(proposal.state, domain) };
-    await expect(a.receive({ state: early, sigA: "0x", sigB: await signState(keys[1], early, domain) })).rejects.toThrow(
+    const early = { ...r.next, prevHash: hashState(inc, domain) };
+    await expect(a2.receive({ state: early, sigA: "0x", sigB: await signState(keys2[1], early, domain) })).rejects.toThrow(
       /unexpected turn/,
     );
     const full = await b.countersignNewGame();
@@ -482,5 +488,94 @@ describe("ChannelSession", () => {
     expect(tx).toEqual(b.closeTransaction());
     expect(tx!.state.turnNum).toBe(2n);
     expect([tx!.state.balanceA, tx!.state.balanceB]).toEqual([params.deposit, params.deposit]); // unchanged
+  });
+
+  // --- R9: a move that chains from this player's pending checkpoint --------------------------------------
+
+  it("R9: accepts the opponent's move on this player's pending checkpoint when the countersign never arrives", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b); // game 0 over; game 1 has B as white
+    const proposal = await a.proposeNewGame();
+    expect(await b.receive(proposal)).toBe("checkpoint-proposed");
+    const full = await b.countersignNewGame(); // never delivered to A
+    const e4 = await b.move("e2e4");
+    expect(a.isMyTurn()).toBe(false);
+
+    expect(await a.receive(e4)).toBe("move");
+    const snap = a.snapshot();
+    expect(snap.pendingCheckpoint).toBeNull();
+    expect(snap.prev).toEqual(proposal); // the checkpoint, with A's own signature
+    expect(snap.latest).toEqual({ state: e4.state, sigA: "0x", sigB: e4.sigB }); // canonical, B's signature only
+    expect(typeof snap.latest.state.meta).toBe("bigint");
+    expect(a.isMyTurn()).toBe(true);
+
+    const e5 = await a.move("e7e5");
+    const proof = a.challengeProof();
+    expect(proof).toEqual({ hasPrev: true, prev: { state: e4.state, sigA: "0x", sigB: e4.sigB }, latest: e5 });
+    expect(await b.receive(e5)).toBe("move");
+    // The late countersignature is now stale and harmless.
+    await expect(a.receive(full)).rejects.toThrow(/unexpected turn/);
+  });
+
+  it("R9: refuses a move on the pending checkpoint that is wrongly signed, illegal or does not chain", async () => {
+    const { a, b, keys, params } = await setup();
+    await finishGame(a, b);
+    const proposal = await a.proposeNewGame();
+    await b.receive(proposal);
+    await b.countersignNewGame();
+    const e4 = await b.move("e2e4");
+    // Signed by A's own key instead of the opponent's.
+    await expect(a.receive({ ...e4, sigB: await signState(keys[0], e4.state, domain) })).rejects.toThrow(/signature/);
+    // A board that does not follow the rules.
+    const cheat = { ...e4.state, board: e4.state.board ^ 1n };
+    await expect(a.receive({ state: cheat, sigA: "0x", sigB: await signState(keys[1], cheat, domain) })).rejects.toThrow(
+      /does not match the rules/,
+    );
+    // Right turn number, but committing to another predecessor.
+    const other = { ...e4.state, prevHash: `0x${"22".repeat(32)}` as Hex };
+    await expect(a.receive({ state: other, sigA: "0x", sigB: await signState(keys[1], other, domain) })).rejects.toThrow(
+      /does not extend the pending/,
+    );
+    // An illegal move on the checkpoint.
+    const r = successor(proposal.state, parseMove(proposal.state, "e2e4"), params);
+    if (!r.ok) throw new Error(r.reason);
+    const illegal = { ...r.next, move: encodeMove(12, 36, 0, KIND.NORMAL), prevHash: hashState(proposal.state, domain) };
+    await expect(a.receive({ state: illegal, sigA: "0x", sigB: await signState(keys[1], illegal, domain) })).rejects.toThrow(
+      /illegal/,
+    );
+    expect(a.snapshot().pendingCheckpoint).toEqual(proposal);
+    expect(await a.receive(e4)).toBe("move");
+  });
+
+  it("R9: refuses a chained move when this player, not the opponent, is white in the proposed game", async () => {
+    const { a, b, keys, params } = await setup();
+    await finishGame(a, b);
+    await newGame(a, b); // game 1: B white
+    await play(a, b, SCHOLARS_MATE); // B mates
+    await b.receive(await a.resign()); // game 1 over
+    const proposal = await a.proposeNewGame(); // game 2: A white, A is the checkpoint's mover
+    const r = successor(proposal.state, parseMove(proposal.state, "e2e4"), params);
+    if (!r.ok) throw new Error(r.reason);
+    const forged = { ...r.next, prevHash: hashState(proposal.state, domain) };
+    await expect(a.receive({ state: forged, sigA: "0x", sigB: await signState(keys[1], forged, domain) })).rejects.toThrow(
+      /not the opponent's turn/,
+    );
+    await expect(a.ingestOnChain({ state: forged, sigA: "0x", sigB: await signState(keys[1], forged, domain) })).rejects.toThrow(
+      /unverifiable/,
+    );
+  });
+
+  it("R9: ingestOnChain adopts the opponent's move on the pending checkpoint", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b);
+    const proposal = await a.proposeNewGame();
+    await b.receive(proposal);
+    await b.countersignNewGame(); // withheld
+    const e4 = await b.move("e2e4");
+    expect(await a.ingestOnChain(e4)).toBe(true);
+    expect(a.snapshot().prev).toEqual(proposal);
+    expect(a.snapshot().pendingCheckpoint).toBeNull();
+    expect(a.isMyTurn()).toBe(true);
+    expect(await b.receive(await a.move("e7e5"))).toBe("move");
   });
 });
