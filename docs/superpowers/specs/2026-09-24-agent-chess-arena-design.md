@@ -457,3 +457,10 @@ accept-draw / next-game / close buttons.
    by both players; co-signed game states (checkpoints, terminal states) never close a channel by themselves,
    so a loser cannot roll back to an earlier checkpoint. Daemons must stop signing new states for a channel
    once they sign Close.
+10. `MAX_FEE_PER_PLAYER` is an immutable constructor argument (`maxFeePerPlayer`) rather than a constant; a
+    channel's snapshotted `feePerPlayer` must also be ≤ it. First deposit additionally rejects a participant
+    wallet that equals the other side's signer.
+11. With no `prev`, the hub accepts any state co-signed by both signers (not only checkpoints): both players
+    consented to it and it passes the conservation check. With a `prev`, a checkpoint `prev` needs both
+    signatures (or must be the registered state); the other signer's lone endorsement covers only move states.
+12. JS tooling needs Node ≥ 20.11.

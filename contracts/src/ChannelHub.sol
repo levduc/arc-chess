@@ -159,7 +159,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
             _validateNewParams(p);
             c.phase = Phase.Funding;
             c.params = p;
-            emit ChannelCreated(id, encodedParams);
+            emit ChannelCreated(id, abi.encode(p));
         } else if (c.phase != Phase.Funding) {
             revert WrongPhase();
         }
@@ -309,13 +309,17 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     function _validateNewParams(Params memory p) private view {
         if (
             // slither-disable-next-line timestamp
-            p.participants[0] == address(0) || p.participants[1] == address(0)
-                || p.participants[0] == p.participants[1] || p.signers[0] == address(0) || p.signers[1] == address(0)
-                || p.signers[0] == p.signers[1] || p.rules.code.length == 0 || p.stakePerGame == 0
-                || p.deposit < p.stakePerGame || p.fundingDeadline <= block.timestamp
+            p.participants[0] == address(0) || p.participants[1] == address(0) || p.participants[0] == p.participants[1]
+                || p.signers[0] == address(0) || p.signers[1] == address(0) || p.signers[0] == p.signers[1]
+                || p.participants[0] == p.signers[1] || p.participants[1] == p.signers[0] || p.rules.code.length == 0
+                || p.stakePerGame == 0 || p.deposit < p.stakePerGame || p.fundingDeadline <= block.timestamp
                 || p.challengeTimeout < MIN_TIMEOUT || p.challengeTimeout > MAX_TIMEOUT
-        ) revert InvalidParams();
-        if (p.feePerPlayer < feePerPlayer || p.feeRecipient != feeRecipient) revert FeeMismatch();
+        ) {
+            revert InvalidParams();
+        }
+        if (p.feePerPlayer < feePerPlayer || p.feePerPlayer > maxFeePerPlayer || p.feeRecipient != feeRecipient) {
+            revert FeeMismatch();
+        }
     }
 
     function _participantIndex(Params memory p, address who) private pure returns (uint8) {
@@ -329,9 +333,10 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     function _pay(address to, uint256 amount) private {
         if (amount == 0) return;
         // Low-level call is intentional (see doc comment above): a reverting/false-returning token must not
-        // block payout. Every external entry point that reaches _pay (deposit, reclaim, claim, closeCooperative,
-        // challenge, respond, timeout) carries the `nonReentrant` modifier, so a malicious token cannot reenter
-        // ChannelHub to exploit the owed[to] write that follows this call.
+        // block payout. The callers reaching _pay are reclaim, closeCooperative and timeout (via _finalize).
+        // Safety rests on the call target being the immutable, hook-free `token` (README trust assumptions),
+        // plus `nonReentrant` on every writer of `owed` (these three and claim), so the owed[to] write that
+        // follows this call cannot be exploited by reentry.
         // slither-disable-next-line reentrancy-no-eth,reentrancy-benign,low-level-calls
         (bool ok, bytes memory ret) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
         if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
@@ -391,7 +396,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         bool prevEndorsed = (c.hasRegistered && ph == c.registeredHash)
             || (prev.turnNum == 0 && _isOpening(rules, id, p, ph))
             || (_signedBy(p.signers[0], ph, proof.prev.sigA) && _signedBy(p.signers[1], ph, proof.prev.sigB))
-            || _signedBy(p.signers[1 - m], ph, m == 0 ? proof.prev.sigB : proof.prev.sigA);
+            || (!rules.isCheckpoint(prev)
+                && _signedBy(p.signers[1 - m], ph, m == 0 ? proof.prev.sigB : proof.prev.sigA));
         if (!prevEndorsed) revert Unsupported();
     }
 

@@ -93,7 +93,7 @@ contract ChannelHubFundingTest is HubFixture {
     }
 
     function test_deposit_revertsForInvalidParams() public {
-        Params[] memory bad = new Params[](8);
+        Params[] memory bad = new Params[](10);
         for (uint256 i = 0; i < bad.length; i++) bad[i] = _params();
         bad[0].participants = [alice, alice];
         bad[1].signers = [aliceSigner, address(0)];
@@ -103,6 +103,8 @@ contract ChannelHubFundingTest is HubFixture {
         bad[5].challengeTimeout = 59;
         bad[6].fundingDeadline = uint64(block.timestamp);
         bad[7].rules = makeAddr("noCode");
+        bad[8].signers = [aliceSigner, alice]; // a participant wallet doubling as the other side's signer
+        bad[9].signers = [bob, bobSigner];
         for (uint256 i = 0; i < bad.length; i++) {
             vm.prank(alice);
             vm.expectRevert(ChannelHub.InvalidParams.selector);
@@ -172,5 +174,25 @@ contract ChannelHubFundingTest is HubFixture {
         );
         bytes32 expected = keccak256(abi.encodePacked(hex"1901", domain, structHash));
         assertEq(hub.hashState(rules.initialState(id, p)), expected);
+    }
+
+    function test_deposit_revertsWhenFeeAboveMax() public {
+        Params memory p = _params();
+        p.feePerPlayer = MAX_FEE + 1;
+        vm.prank(alice);
+        vm.expectRevert(ChannelHub.FeeMismatch.selector);
+        hub.deposit(abi.encode(p));
+    }
+
+    function test_deposit_emitsCanonicalParams_notTrailingCalldata() public {
+        Params memory p = _params();
+        bytes32 id = hub.channelId(p);
+        bytes memory canonical = abi.encode(p);
+        bytes memory withJunk = abi.encodePacked(canonical, hex"deadbeef");
+        vm.expectEmit(true, false, false, true, address(hub));
+        emit ChannelHub.ChannelCreated(id, canonical);
+        vm.prank(alice);
+        hub.deposit(withJunk);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Funding));
     }
 }

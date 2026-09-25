@@ -230,4 +230,54 @@ contract ChannelHubDisputeTest is HubFixture {
         vm.expectRevert(ChannelHub.WrongPhase.selector);
         hub.challenge(proof);
     }
+
+    /// Game 0 ends (bob resigns after 1.e4) and both co-sign NEW_GAME; game 1 opens with bob (white) 1.e4.
+    function _game1() internal view returns (State memory ng, State memory g1) {
+        State memory t = _play(s1, p, _kind(B.KIND_RESIGN));
+        ng = _play(t, p, _kind(B.KIND_NEW_GAME));
+        g1 = _play(ng, p, uci("e2e4"));
+    }
+
+    /// T10a: a NEW_GAME prev needs both signatures (or registration); the non-mover's alone is not enough.
+    function test_challenge_newGamePrevNeedsBothSignatures() public {
+        (State memory ng, State memory g1) = _game1();
+        bytes memory g1Sig = _sign(bobKey, g1);
+        bytes memory ngSigA = _sign(aliceKey, ng);
+        bytes memory ngSigB = _sign(bobKey, ng);
+        bytes memory nonMoverOnly = _moveProof(ng, ngSigA, "", g1, "", g1Sig);
+        bytes memory coSigned = _moveProof(ng, ngSigA, ngSigB, g1, "", g1Sig);
+
+        vm.prank(bob);
+        vm.expectRevert(ChannelHub.Unsupported.selector);
+        hub.challenge(nonMoverOnly);
+
+        vm.prank(bob);
+        hub.challenge(coSigned);
+        assertEq(hub.registeredState(id).turnNum, g1.turnNum);
+    }
+
+    /// M5: respond with a co-signed NEW_GAME, then after the challenger's cooldown a timeout in game 1
+    /// forfeits bob, who is white (on move) in odd-indexed games.
+    function test_respond_withNewGameCheckpoint_thenCooldown_thenTimeoutInGame1() public {
+        (State memory ng,) = _game1();
+        bytes memory ngProof = _soloProof(ng, _sign(aliceKey, ng), _sign(bobKey, ng));
+        _challengeS1();
+        hub.respond(ngProof);
+        assertEq(hub.registeredState(id).gameIndex, 1);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Open));
+        assertEq(hub.channelInfo(id).cooldownUntil[0], block.timestamp + TIMEOUT);
+
+        vm.prank(alice);
+        vm.expectRevert(ChannelHub.InCooldown.selector);
+        hub.challenge(ngProof);
+
+        vm.warp(block.timestamp + TIMEOUT);
+        vm.prank(alice);
+        hub.challenge(ngProof); // identical to the registered checkpoint
+        vm.warp(block.timestamp + TIMEOUT);
+        hub.timeout(id);
+        assertEq(usdc.balanceOf(alice), 100e6 - FEE + 2 * STAKE);
+        assertEq(usdc.balanceOf(bob), 100e6 - FEE - 2 * STAKE);
+        assertEq(usdc.balanceOf(address(hub)), 0);
+    }
 }
