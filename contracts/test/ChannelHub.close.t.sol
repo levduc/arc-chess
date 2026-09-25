@@ -13,7 +13,7 @@ contract ChannelHubCloseTest is HubFixture {
     }
 
     function _closeData(State memory s) internal view returns (bytes memory) {
-        return abi.encode(_ss(s, _sign(aliceKey, s), _sign(bobKey, s)));
+        return abi.encode(_ss(s, _signClose(aliceKey, s), _signClose(bobKey, s)));
     }
 
     function _close(State memory s) internal {
@@ -72,10 +72,10 @@ contract ChannelHubCloseTest is HubFixture {
         Params memory p = _params();
         bytes32 id = _open(p);
         State memory s = _resignedGame(p, id);
-        bytes memory d1 = abi.encode(_ss(s, _sign(aliceKey, s), ""));
+        bytes memory d1 = abi.encode(_ss(s, _signClose(aliceKey, s), ""));
         vm.expectRevert(ChannelHub.BadSignature.selector);
         hub.closeCooperative(d1);
-        bytes memory d2 = abi.encode(_ss(s, _sign(aliceKey, s), _sign(aliceKey, s)));
+        bytes memory d2 = abi.encode(_ss(s, _signClose(aliceKey, s), _signClose(aliceKey, s)));
         vm.expectRevert(ChannelHub.BadSignature.selector);
         hub.closeCooperative(d2);
     }
@@ -124,5 +124,68 @@ contract ChannelHubCloseTest is HubFixture {
         vm.prank(bob);
         vm.expectRevert(ChannelHub.NothingToClaim.selector);
         hub.claim(bobNew);
+    }
+
+    // ---- ruling R12: cooperative close needs an explicit Close intent
+
+    /// A loser cannot roll back to an earlier co-signed NEW_GAME checkpoint: its state signatures do not close.
+    function test_closeCooperative_loserCannotRollBackToCheckpoint() public {
+        Params memory p = _params();
+        bytes32 id = _open(p);
+        State memory t = _resignedGame(p, id); // game 0: alice (white) wins, bob resigned
+        State memory ng = _play(t, p, _kind(B.KIND_NEW_GAME)); // co-signed to start game 1
+        State memory g1 = _play(ng, p, uci("e2e4")); // game 1: bob is white
+        State memory r1 = _play(g1, p, _kind(B.KIND_RESIGN)); // alice (black) resigns game 1
+        assertEq(r1.balanceA, DEPOSIT);
+
+        bytes memory rollback = abi.encode(_ss(ng, _sign(aliceKey, ng), _sign(bobKey, ng)));
+        vm.prank(alice);
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.closeCooperative(rollback);
+
+        // Bob still settles game 1 on alice's signed RESIGN via challenge -> timeout.
+        bytes memory proof = _moveProof(g1, "", _sign(bobKey, g1), r1, _sign(aliceKey, r1), "");
+        vm.prank(bob);
+        hub.challenge(proof);
+        vm.warp(block.timestamp + TIMEOUT);
+        hub.timeout(id);
+        assertEq(usdc.balanceOf(alice), 100e6 - FEE);
+        assertEq(usdc.balanceOf(bob), 100e6 - FEE);
+        assertEq(usdc.balanceOf(address(hub)), 0);
+    }
+
+    /// A terminal state co-signed only with State signatures (not Close) cannot close; mixing one of each
+    /// cannot either.
+    function test_closeCooperative_revertsOnStateSignatures() public {
+        Params memory p = _params();
+        bytes32 id = _open(p);
+        State memory s = _resignedGame(p, id);
+        bytes memory both = abi.encode(_ss(s, _sign(aliceKey, s), _sign(bobKey, s)));
+        bytes memory mixed = abi.encode(_ss(s, _signClose(aliceKey, s), _sign(bobKey, s)));
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.closeCooperative(both);
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.closeCooperative(mixed);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Open));
+    }
+
+    function test_hashClose_matchesManualEip712() public view {
+        Params memory p = _params();
+        bytes32 id = hub.channelId(p);
+        State memory s = rules.initialState(id, p);
+        assertEq(hub.CLOSE_TYPEHASH(), keccak256("Close(bytes32 channelId,bytes32 stateHash)"));
+        bytes32 structHash = keccak256(abi.encode(hub.CLOSE_TYPEHASH(), id, hub.hashState(s)));
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("AgentArena"),
+                keccak256("1"),
+                block.chainid,
+                address(hub)
+            )
+        );
+        bytes32 expected = keccak256(abi.encodePacked(hex"1901", domain, structHash));
+        assertEq(hub.hashClose(s), expected);
+        assertTrue(hub.hashClose(s) != hub.hashState(s));
     }
 }

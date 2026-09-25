@@ -70,6 +70,11 @@ abstract contract HubFixture is Test, ChessTestUtils {
         return abi.encodePacked(r, sg, v);
     }
 
+    function _signClose(uint256 key, State memory s) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 sg) = vm.sign(key, hub.hashClose(s));
+        return abi.encodePacked(r, sg, v);
+    }
+
     function _play(State memory prev, Params memory p, uint32 move) internal view returns (State memory next) {
         bool ok;
         (ok, next) = rules.successor(prev, move, p);

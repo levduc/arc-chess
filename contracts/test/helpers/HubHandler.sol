@@ -78,8 +78,8 @@ contract HubHandler is Test {
         State memory s = rules.initialState(hub.channelId(p), p);
         SignedState memory ss;
         ss.state = s;
-        ss.sigA = _sign(aliceKey, s);
-        ss.sigB = _sign(bobKey, s);
+        ss.sigA = _signClose(aliceKey, s);
+        ss.sigB = _signClose(bobKey, s);
         hub.closeCooperative(abi.encode(ss));
         ghostEscrow -= 2 * (p.deposit + p.feePerPlayer);
     }
@@ -108,8 +108,8 @@ contract HubHandler is Test {
         return (false, none);
     }
 
-    function _sign(uint256 key, State memory s) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 sg) = vm.sign(key, hub.hashState(s));
+    function _signClose(uint256 key, State memory s) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 sg) = vm.sign(key, hub.hashClose(s));
         return abi.encodePacked(r, sg, v);
     }
 }

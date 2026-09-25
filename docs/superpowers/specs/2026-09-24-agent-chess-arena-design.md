@@ -227,7 +227,7 @@ payload (not nested tuples), so they can be invoked via
 |---|---|---|
 | `deposit(bytes params)` | a participant | Validates params (§4.1) on first deposit and records them. Pulls `deposit + feePerPlayer` USDC from `msg.sender` (must be a participant who has not yet deposited; prior `approve` required). When both have deposited → `OPEN`. |
 | `reclaim(channelId)` | anyone | In `FUNDING` after `fundingDeadline`: refunds whoever deposited → `RECLAIMED`. |
-| `closeCooperative(bytes state, sigA, sigB)` | anyone | `OPEN`/`CHALLENGED`; `state` signed by both signers and is the opening state, a checkpoint, or terminal (`WHITE_WON`/`BLACK_WON`/`DRAW`), with `turnNum` ≥ any registered turn. Finalize with its balances. |
+| `closeCooperative(bytes state, sigA, sigB)` | anyone | `OPEN`/`CHALLENGED`; requires both players' `Close(channelId, stateHash)` signatures (EIP-712, by `signers[0]`/`signers[1]`) over `state`, which is the opening state, a checkpoint, or terminal (`WHITE_WON`/`BLACK_WON`/`DRAW`), with `turnNum` ≥ any registered turn. Finalize with its balances. |
 | `challenge(bytes proof)` | player *i*: `participants[i]` or `signers[i]` | `OPEN`; `proof` establishes a supported state `s` (§4.3) with `turnNum` > registered turn. Player *i* must not be in cooldown. Registers `s` and the challenger index, `deadline = now + challengeTimeout` → `CHALLENGED`. |
 | `respond(bytes proof)` | anyone | `CHALLENGED`, before deadline; a supported state with higher `turnNum` than the registered one (normally the challenged player's next move, or a later state superseding a stale challenge). Registers it, sets the challenger's `cooldownUntil = now + challengeTimeout` → `OPEN`. Play resumes off-chain from this state. |
 | `timeout(channelId)` | anyone | `CHALLENGED`, after deadline. If the registered state is `PLAYING`/`DRAW_OFFERED` (incl. opening/checkpoint), the side to move forfeits `stakePerGame`; if terminal, balances as-is. Finalize. |
@@ -249,8 +249,8 @@ challenge again for `challengeTimeout` seconds. A genuinely stalling opponent
 costs the honest player at most one cooldown; a serial griefer forces at most
 one on-chain response per window. Accepted trade-off: a staller who always
 responds just before the deadline throttles the game to roughly one move per
-`2 · challengeTimeout`; the victim can instead stop playing and close on the
-last terminal/checkpoint state, and the staller's challenge history is public.
+`2 · challengeTimeout`; the victim can stop playing and settle via challenge on the latest state,
+and the staller's challenge history is public.
 Challenge counts per address are indexed by the host and shown in the lobby as
 a reputation signal.
 
@@ -312,7 +312,7 @@ holds config, wallet settings, and per-channel state including session keys
 | `arena wait [--channel id] [--timeout s]` | Blocks until any (or the given) channel needs this player's action or control changes; returns channel and reason. |
 | `arena move <SAN\|UCI> [--offer-draw] [--channel id]` | Validate with chess.js, sign, persist, send. |
 | `arena resign` / `accept-draw` | Terminal actions (only on your turn). |
-| `arena next-game` / `close` | Between games: propose or co-sign `NEW_GAME`, or co-sign the terminal state and submit `closeCooperative`. |
+| `arena next-game` / `close` | Between games: propose or co-sign `NEW_GAME`, or sign a `Close` intent for the terminal state (both players) and submit `closeCooperative`. |
 | `arena challenge [--channel id]` | Force the opponent on-chain (respects cooldown). |
 | `arena reclaim [--channel id]` | Recover a deposit from a channel that never fully funded. |
 | `arena handoff human\|agent [--channel id] [--note text]` | Switch controller. |
@@ -452,3 +452,7 @@ accept-draw / next-game / close buttons.
 7. Tests build proofs and signatures before arming `vm.prank`/`vm.expectRevert`, because those
    cheatcodes bind to the next external call (including `hashState`/`successor` staticcalls).
 8. JS tooling pins viem 2.56.8; pnpm's minimum-release-age gate is never bypassed.
+9. Cooperative close requires a separate EIP-712 `Close(bytes32 channelId,bytes32 stateHash)` intent signed
+   by both players; co-signed game states (checkpoints, terminal states) never close a channel by themselves,
+   so a loser cannot roll back to an earlier checkpoint. Daemons must stop signing new states for a channel
+   once they sign Close.

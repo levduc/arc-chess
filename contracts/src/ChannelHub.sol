@@ -49,6 +49,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     bytes32 public constant STATE_TYPEHASH = keccak256(
         "State(bytes32 channelId,uint64 turnNum,bytes32 prevHash,uint256 balanceA,uint256 balanceB,uint32 gameIndex,uint32 move,uint256 board,uint256 meta)"
     );
+    /// @dev Cooperative-close intent. Distinct from STATE_TYPEHASH so co-signed game states never close a channel.
+    bytes32 public constant CLOSE_TYPEHASH = keccak256("Close(bytes32 channelId,bytes32 stateHash)");
     uint64 public constant MIN_TIMEOUT = 60;
     uint64 public constant MAX_TIMEOUT = 7 days;
 
@@ -125,6 +127,11 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         );
     }
 
+    /// @notice EIP-712 digest both signers sign to agree to settle on `s`.
+    function hashClose(State memory s) public view returns (bytes32) {
+        return _hashTypedDataV4(keccak256(abi.encode(CLOSE_TYPEHASH, s.channelId, hashState(s))));
+    }
+
     function channelInfo(bytes32 id) external view returns (ChannelInfo memory info) {
         Channel storage c = _channels[id];
         info = ChannelInfo(
@@ -196,8 +203,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
 
     // ----------------------------------------------------------------- close
 
-    /// @notice Settle immediately on a state signed by both players: the opening state, a NEW_GAME checkpoint,
-    /// or a finished game. Game results are already applied to balances in such states.
+    /// @notice Settle immediately on a state both players signed a `Close` intent for (see `hashClose`): the
+    /// opening state, a NEW_GAME checkpoint, or a finished game. Game results are already applied to balances in
+    /// such states. Co-signed game states alone never close, so an earlier checkpoint cannot be replayed here.
     function closeCooperative(bytes calldata encodedSignedState) external nonReentrant {
         SignedState memory ss = abi.decode(encodedSignedState, (SignedState));
         State memory s = ss.state;
@@ -206,7 +214,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (c.phase != Phase.Open && c.phase != Phase.Challenged) revert WrongPhase();
         Params memory p = c.params;
         _checkBalances(p, s);
-        bytes32 h = hashState(s);
+        bytes32 h = hashClose(s);
         if (!_signedBy(p.signers[0], h, ss.sigA) || !_signedBy(p.signers[1], h, ss.sigB)) revert BadSignature();
         IGameRules rules = IGameRules(p.rules);
         if (s.turnNum != 0 && !rules.isCheckpoint(s) && !rules.isGameOver(s)) revert NotClosable();

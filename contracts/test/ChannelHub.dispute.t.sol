@@ -212,13 +212,13 @@ contract ChannelHubDisputeTest is HubFixture {
     function test_closeCooperative_allowedDuringChallenge() public {
         _challengeS1();
         State memory t = _play(s1, p, _kind(B.KIND_RESIGN));
-        hub.closeCooperative(abi.encode(_ss(t, _sign(aliceKey, t), _sign(bobKey, t))));
+        hub.closeCooperative(abi.encode(_ss(t, _signClose(aliceKey, t), _signClose(bobKey, t))));
         assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Finalized));
     }
 
     function test_closeCooperative_revertsWhenStaleAfterRegistered() public {
         _challengeS1(); // s1 registered, turnNum 1
-        bytes memory data = abi.encode(_ss(s0, _sign(aliceKey, s0), _sign(bobKey, s0)));
+        bytes memory data = abi.encode(_ss(s0, _signClose(aliceKey, s0), _signClose(bobKey, s0)));
         vm.expectRevert(ChannelHub.StaleState.selector);
         hub.closeCooperative(data);
     }
