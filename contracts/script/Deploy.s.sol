@@ -14,9 +14,14 @@ contract Deploy is Script {
         uint256 feePerPlayer = vm.envOr("ARENA_FEE_PER_PLAYER", uint256(5_000));
         uint256 maxFeePerPlayer = vm.envOr("ARENA_MAX_FEE_PER_PLAYER", uint256(1_000_000));
         token = vm.envOr("ARENA_TOKEN", address(0));
+        // MockUSDC is a local-dev convenience only; on any real chain the escrow token must be explicit.
+        bool deployMock = token == address(0);
+        if (deployMock && block.chainid != 31337) {
+            revert("Deploy: ARENA_TOKEN must be set on non-local chains (MockUSDC is deployed only on chain 31337)");
+        }
 
         vm.startBroadcast();
-        if (token == address(0)) token = address(new MockUSDC());
+        if (deployMock) token = address(new MockUSDC());
         rules = new ChessRules();
         hub = new ChannelHub(IERC20(token), owner, feeRecipient, feePerPlayer, maxFeePerPlayer);
         vm.stopBroadcast();
