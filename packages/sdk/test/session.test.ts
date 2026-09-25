@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Address, Hex } from "viem";
+import { keccak256, toHex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -12,17 +13,21 @@ import {
   isGameOver,
   parseMove,
   recoverCloseSigner,
+  signClose,
   signState,
   statusOf,
   successor,
+  withStatus,
   type ArenaDomain,
   type SessionConfig,
+  type SessionSnapshot,
+  type SessionStore,
 } from "../src/index.js";
 import { SCHOLARS_MATE, makeParams } from "./helpers/fixtures.js";
 
 const domain: ArenaDomain = { chainId: 31337, hub: "0x000000000000000000000000000000000000beef" };
 
-async function setup(deposit?: bigint) {
+async function setup(deposit?: bigint, storeA?: SessionStore) {
   const keys = [generatePrivateKey(), generatePrivateKey()] as const;
   const params = makeParams({
     participants: ["0x00000000000000000000000000000000000000a1", "0x00000000000000000000000000000000000000b2"],
@@ -32,12 +37,32 @@ async function setup(deposit?: bigint) {
     fundingDeadline: 2_000_000_000n,
     deposit,
   });
-  const cfg = (me: 0 | 1): SessionConfig => ({ params, me, sessionKey: keys[me], domain, store: new MemoryStore() });
+  const cfg = (me: 0 | 1): SessionConfig => ({
+    params,
+    me,
+    sessionKey: keys[me],
+    domain,
+    store: me === 0 ? (storeA ?? new MemoryStore()) : new MemoryStore(),
+  });
   const cfgA = cfg(0);
   const cfgB = cfg(1);
   const a = await ChannelSession.create(cfgA);
   const b = await ChannelSession.create(cfgB);
   return { a, b, cfgA, cfgB, keys, params };
+}
+
+/** A store whose `save` throws exactly while `.fail` is true, for exercising I2 persist-before-return. */
+function flakyStore(): SessionStore & { fail: boolean; saved: SessionSnapshot[] } {
+  const saved: SessionSnapshot[] = [];
+  const flaky = {
+    fail: false,
+    saved,
+    async save(s: SessionSnapshot) {
+      if (flaky.fail) throw new Error("disk full");
+      saved.push(structuredClone(s));
+    },
+  };
+  return flaky;
 }
 
 async function play(a: ChannelSession, b: ChannelSession, moves: string[]) {
@@ -214,5 +239,210 @@ describe("ChannelSession", () => {
     await expect(b.receive(await other.a.move("e2e4"))).rejects.toThrow(/wrong channel/);
     await expect(a.receive({ ...a.latest })).rejects.toThrow();
     expect(encodeMove(0, 0, 0, KIND.NONE)).toBe(0);
+  });
+
+  // --- Fix round 1 -----------------------------------------------------------------------------------------
+
+  it("I1: serializes concurrent move() calls; exactly one signs turn 1", async () => {
+    const { a } = await setup();
+    const [r1, r2] = await Promise.allSettled([a.move("e2e4"), a.move("d2d4")]);
+    const fulfilled = [r1, r2].filter((r) => r.status === "fulfilled");
+    const rejected = [r1, r2].filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toBeInstanceOf(ArenaProtocolError);
+    // Only one turn-1 signature ever exists, and challengeProof() is still well-formed.
+    const proof = a.challengeProof();
+    expect(proof.latest.state.turnNum).toBe(1n);
+    expect(proof.hasPrev).toBe(true);
+    expect(proof.prev.state.turnNum).toBe(0n);
+  });
+
+  it("I1: racing signClose() against proposeNewGame() releases at most one kind of signature", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b);
+    const [closeRes, proposeRes] = await Promise.allSettled([a.signClose(), a.proposeNewGame()]);
+    const closed = closeRes.status === "fulfilled";
+    const proposed = proposeRes.status === "fulfilled";
+    // Never both: the loser of the race sees the winner's guard (closing, or a pending proposal) and rejects.
+    expect(closed && proposed).toBe(false);
+    expect(closed || proposed).toBe(true);
+  });
+
+  it("I1: two concurrent receive() calls do not both validate against the same latest", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    const e4Bad = { ...e4, state: { ...e4.state, board: e4.state.board ^ 1n } };
+    const [r1, r2] = await Promise.allSettled([b.receive(e4), b.receive(e4Bad)]);
+    const outcomes = [r1, r2].map((r) => r.status);
+    expect(outcomes.filter((s) => s === "fulfilled")).toHaveLength(1);
+    expect(b.latest.state.turnNum).toBe(1n);
+  });
+
+  it("I2: a failed persist leaves move() unsigned and unretained; retry signs and persists", async () => {
+    const store = flakyStore();
+    const { a } = await setup(undefined, store);
+    store.fail = true;
+    await expect(a.move("e2e4")).rejects.toThrow("disk full");
+    expect(a.latest.state.turnNum).toBe(0n);
+    expect(a.snapshot().lastSignedTurn).toBeNull();
+    expect(a.challengeProof().hasPrev).toBe(false);
+    store.fail = false;
+    const signed = await a.move("e2e4");
+    expect(a.latest).toEqual(signed);
+    expect(store.saved.at(-1)?.latest).toEqual(signed);
+    expect(store.saved.at(-1)?.lastSignedTurn).toBe(1n);
+  });
+
+  it("I2: signClose retries cleanly after a failed persist", async () => {
+    const store = flakyStore();
+    const { a, b } = await setup(undefined, store);
+    await finishGame(a, b); // a wins; a.latest is terminal
+    store.fail = true;
+    await expect(a.signClose()).rejects.toThrow("disk full");
+    expect(a.isClosing).toBe(false);
+    expect(store.saved.at(-1)?.closeState ?? null).toBeNull();
+    store.fail = false;
+    const cs = await a.signClose();
+    expect(a.isClosing).toBe(true);
+    expect(store.saved.at(-1)?.closeState).not.toBeNull();
+    expect(store.saved.at(-1)?.closeSigs[0]).toBe(cs.sig);
+  });
+
+  it("I2: proposeNewGame retries cleanly after a failed persist", async () => {
+    const store = flakyStore();
+    const { a, b } = await setup(undefined, store);
+    await finishGame(a, b);
+    store.fail = true;
+    await expect(a.proposeNewGame()).rejects.toThrow("disk full");
+    expect(a.snapshot().pendingCheckpoint).toBeNull();
+    store.fail = false;
+    const proposal = await a.proposeNewGame();
+    expect(a.snapshot().pendingCheckpoint).toEqual(proposal);
+    expect(store.saved.at(-1)?.pendingCheckpoint).toEqual(proposal);
+  });
+
+  it("I3: never wedges on a state with non-canonical (number) field types", async () => {
+    const { a, b } = await setup();
+    const msg = await a.move("e2e4");
+
+    // meta as a JS number hashes identically to the bigint value, so it is accepted -- but must be stored as the
+    // locally computed canonical (bigint) state, never the received object, so the session keeps working.
+    const evilMeta = { ...msg, state: { ...msg.state, meta: Number(msg.state.meta) as unknown as bigint } };
+    const outcome = await b.receive(evilMeta);
+    expect(outcome).toBe("move");
+    expect(typeof b.latest.state.meta).toBe("bigint");
+    expect(b.isMyTurn()).toBe(true);
+    expect(b.legalMoves()).toHaveLength(20);
+    await expect(b.move("e7e5")).resolves.toBeDefined();
+
+    // turnNum as a JS number is never equal (`!==`) to the expected bigint turn, so it is rejected outright --
+    // and rejection must not wedge the session either.
+    const { a: a2, b: b2 } = await setup();
+    const msg2 = await a2.move("e2e4");
+    const evilTurn = { ...msg2, state: { ...msg2.state, turnNum: Number(msg2.state.turnNum) as unknown as bigint } };
+    await expect(b2.receive(evilTurn)).rejects.toThrow(/unexpected turn/);
+    expect(() => b2.isMyTurn()).not.toThrow();
+    expect(() => b2.legalMoves()).not.toThrow();
+    expect(b2.latest.state.turnNum).toBe(0n);
+    await expect(b2.receive(msg2)).resolves.toBe("move");
+  });
+
+  it("I4: ingestOnChain accepts only cryptographically verifiable on-chain states", async () => {
+    const { a, b, params } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const L = a.latest.state;
+    const forged = {
+      ...L,
+      turnNum: L.turnNum + 5n,
+      balanceA: 0n,
+      balanceB: 2n * params.deposit,
+      meta: withStatus(L.meta, STATUS.BLACK_WON),
+      prevHash: `0x${"11".repeat(32)}` as Hex,
+    };
+    await expect(a.ingestOnChain({ state: forged, sigA: "0x", sigB: "0x" })).rejects.toThrow(/unverifiable/);
+
+    const wedge = { ...L, turnNum: 2n ** 64n - 1n };
+    await expect(a.ingestOnChain({ state: wedge, sigA: "0x", sigB: "0x" })).rejects.toThrow(/unverifiable/);
+
+    const e5 = await b.move("e7e5"); // never delivered off-chain; only carries B's signature
+    expect(await a.ingestOnChain(e5)).toBe(true);
+    expect(a.isMyTurn()).toBe(true);
+    expect(await a.ingestOnChain(e5)).toBe(false);
+
+    // A both-signed checkpoint also ingests, for a fresh session that never saw the game.
+    const { a: c, b: d, keys: keysCD, params: paramsCD } = await setup();
+    await finishGame(c, d);
+    const proposal = await c.proposeNewGame();
+    await d.receive(proposal);
+    const full = await d.countersignNewGame();
+    const fresh = await ChannelSession.create({ params: paramsCD, me: 0, sessionKey: keysCD[0], domain, store: new MemoryStore() });
+    expect(await fresh.ingestOnChain(full)).toBe(true);
+    expect(fresh.latest).toEqual(full);
+  });
+
+  it("Minor 5: clears a stale opponent Close signature once latest moves past it", async () => {
+    const { a, b, keys } = await setup();
+    await finishGame(a, b); // G1 terminal for both
+    // B's real key signs Close for G1 directly (as the hub would see it), without freezing b's own session --
+    // mirrors receiving a genuine Close signature out of band, before b's session itself decides to close.
+    const G1 = a.latest.state;
+    const cb1 = { stateHash: hashState(G1, domain), by: 1 as const, sig: await signClose(keys[1], G1, domain) };
+    await a.receiveClose(cb1); // a holds b's Close signature for G1; a has not signed yet
+    expect(a.closeTransaction()).toBeNull();
+
+    await newGame(a, b); // advances latest past G1 -> the stale opponent signature must be cleared
+    await finishGame(a, b); // resolves the new game to a fresh terminal state G2
+
+    const ca2 = await a.signClose();
+    expect(ca2.stateHash).not.toBe(cb1.stateHash);
+    expect(a.closeTransaction()).toBeNull(); // b has not (yet) closed G2; the stale G1 signature must not count
+
+    const cb2 = await b.signClose();
+    await a.receiveClose(cb2);
+    const tx = a.closeTransaction();
+    expect(tx).not.toBeNull();
+    expect(tx!.state.gameIndex).toBe(1);
+  });
+
+  it("Minor 6: does not alias returned or received objects with internal state", async () => {
+    const { a, b } = await setup();
+    const msg = await a.move("e2e4");
+    (msg as { sigA: string }).sigA = "0xdead";
+    expect(a.latest.sigA).not.toBe("0xdead");
+
+    const proof = a.challengeProof();
+    (proof.latest as { sigA: string }).sigA = "0xdead";
+    expect(a.latest.sigA).not.toBe("0xdead");
+
+    const s = await setup();
+    const m2 = await s.a.move("e2e4");
+    await s.b.receive(m2);
+    (m2.state as { balanceB: bigint }).balanceB = 0n;
+    expect(s.b.latest.state.balanceB).not.toBe(0n);
+  });
+
+  it("Minor 7: restore() rejects a snapshot from a different channel", async () => {
+    const { a, cfgA, params } = await setup();
+    const snap = a.snapshot();
+    const otherParams = { ...params, salt: keccak256(toHex("different-salt")) };
+    const otherCfg: SessionConfig = { ...cfgA, params: otherParams };
+    expect(() => ChannelSession.restore(otherCfg, snap)).toThrow(ArenaProtocolError);
+  });
+
+  it("R7: at the opening, only the player on move (A, white) may sign Close", async () => {
+    const { a, b } = await setup();
+    await expect(b.signClose()).rejects.toThrow(/cannot move/);
+    const ca = await a.signClose();
+    expect(ca.by).toBe(0);
+  });
+
+  it("R7: on a both-signed checkpoint, only the player on move may sign Close", async () => {
+    const { a, b } = await setup();
+    await finishGame(a, b);
+    await newGame(a, b); // gameIndex 1: white = (1 % 2) = B, so B is on move
+    await expect(a.signClose()).rejects.toThrow(/cannot move/);
+    const cb = await b.signClose();
+    expect(cb.by).toBe(1);
   });
 });

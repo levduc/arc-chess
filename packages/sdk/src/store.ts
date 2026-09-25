@@ -18,6 +18,13 @@ export type SessionSnapshot = {
   closeState: SignedState | null;
   /** Close signatures by player index ("0x" = absent). */
   closeSigs: [Hex, Hex];
+  /**
+   * The exact state hash each entry of `closeSigs` was verified against when it was stored (own signature: the
+   * state just signed; opponent signature: the target checked in `receiveClose`). Cleared whenever `latest`
+   * changes so a signature captured against a state that is no longer current can never be paired with a later
+   * `closeState` in `closeTransaction` (fix for a stale-signature pairing defect).
+   */
+  closeSigTargets: [Hex, Hex];
 };
 
 export interface SessionStore {
