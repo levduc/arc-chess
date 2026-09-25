@@ -438,3 +438,17 @@ accept-draw / next-game / close buttons.
 - External smart-contract audit of `ChannelHub` and `ChessRules`.
 - Legal review: real-money skill-game wagering and host fee in target jurisdictions.
 - Mainnet multisig owner; deployment runbook; monitoring and alerting on the indexer.
+
+## 12. Implementation refinements (from Plan 1)
+
+1. `IGameRules` also exposes `isCheckpoint(s)`, `isGameOver(s)`, `forfeitBalances(s, p)`; `ChessRules`
+   additionally exposes `successor(prev, move, p)`, the canonical next state used for SDK parity.
+2. Move kind `NONE = 0` marks the opening state; other kinds are numbered 1–6 in the order of §4.2.
+3. Payouts are push-with-fallback: a refused USDC transfer is credited to `owed[recipient]` and
+   withdrawn with `claim(to)`, so one blocklisted participant cannot lock the other's funds.
+4. `challenge` accepts a state equal to the registered `turnNum` only if identical (same hash).
+5. A checkmate delivered by the move that reaches the 50-move or 300-ply limit is a win, not a draw.
+6. Exact encodings of board, meta and move are documented in `contracts/README.md`.
+7. Tests build proofs and signatures before arming `vm.prank`/`vm.expectRevert`, because those
+   cheatcodes bind to the next external call (including `hashState`/`successor` staticcalls).
+8. JS tooling pins viem 2.56.8; pnpm's minimum-release-age gate is never bypassed.

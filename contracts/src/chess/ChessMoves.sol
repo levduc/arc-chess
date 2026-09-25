@@ -119,9 +119,15 @@ library ChessMoves {
 
     /// @notice Mirrors chess.js isInsufficientMaterial(): K v K, K+minor v K, or only same-coloured bishops.
     function isInsufficientMaterial(uint256 board) internal pure returns (bool) {
+        // Plain uint256 counters, not storage pointers; Solidity zero-initializes value-type locals, which is
+        // exactly the starting count each of these needs.
+        // slither-disable-next-line uninitialized-local
         uint256 pieces;
+        // slither-disable-next-line uninitialized-local
         uint256 bishops;
+        // slither-disable-next-line uninitialized-local
         uint256 knights;
+        // slither-disable-next-line uninitialized-local
         uint256 bishopsOnEvenSquares;
         for (uint256 s = 0; s < 64; s++) {
             uint8 p = B.pieceAt(board, s);

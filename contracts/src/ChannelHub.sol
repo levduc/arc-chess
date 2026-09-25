@@ -68,6 +68,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     event Reclaimed(bytes32 indexed channelId);
     event PayoutDeferred(address indexed to, uint256 amount);
     event Claimed(address indexed from, address indexed to, uint256 amount);
+    // Admin-only, emitted once per setFee call; indexing feeRecipient would not help off-chain filtering
+    // since it always changes together with feePerPlayer.
+    // slither-disable-next-line unindexed-event-address
     event FeeUpdated(uint256 feePerPlayer, address feeRecipient);
 
     error WrongPhase();
@@ -152,6 +155,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         } else if (c.phase != Phase.Funding) {
             revert WrongPhase();
         }
+        // Funding deadlines are minutes-to-days long; ~seconds of miner drift cannot flip this comparison.
+        // slither-disable-next-line timestamp
         if (block.timestamp > p.fundingDeadline) revert FundingClosed();
         uint8 i = _participantIndex(p, msg.sender);
         if (c.funded[i]) revert AlreadyFunded();
@@ -170,6 +175,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         Channel storage c = _channels[id];
         if (c.phase != Phase.Funding) revert WrongPhase();
         Params memory p = c.params;
+        // Same fundingDeadline check as deposit(); miner-scale drift is immaterial against a minutes-to-days window.
+        // slither-disable-next-line timestamp
         if (block.timestamp <= p.fundingDeadline) revert TooEarly();
         c.phase = Phase.Reclaimed;
         emit Reclaimed(id);
@@ -219,6 +226,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (c.phase != Phase.Open) revert WrongPhase();
         Params memory p = c.params;
         uint8 who = _playerIndex(p, msg.sender);
+        // Cooldown windows equal challengeTimeout (bounded by MIN_TIMEOUT/MAX_TIMEOUT), far larger than any
+        // miner-controllable drift.
+        // slither-disable-next-line timestamp
         if (block.timestamp < c.cooldownUntil[who]) revert InCooldown();
         (State memory s, bytes32 h) = _supported(c, p, id, proof);
         if (c.hasRegistered) {
@@ -239,6 +249,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         bytes32 id = proof.latest.state.channelId;
         Channel storage c = _channels[id];
         if (c.phase != Phase.Challenged) revert WrongPhase();
+        // Same challengeTimeout-scale deadline as timeout() below; not sensitive to miner-scale timestamp drift.
+        // slither-disable-next-line timestamp
         if (block.timestamp >= c.deadline) revert DeadlinePassed();
         Params memory p = c.params;
         (State memory s, bytes32 h) = _supported(c, p, id, proof);
@@ -254,6 +266,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     function timeout(bytes32 id) external nonReentrant {
         Channel storage c = _channels[id];
         if (c.phase != Phase.Challenged) revert WrongPhase();
+        // challengeTimeout-scale deadline; miner-scale drift cannot meaningfully move a dispute window
+        // measured in minutes or more.
+        // slither-disable-next-line timestamp
         if (block.timestamp < c.deadline) revert TooEarly();
         State memory s = c.registered;
         Params memory p = c.params;
@@ -280,8 +295,11 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         emit FeeUpdated(feePerPlayer_, feeRecipient_);
     }
 
+    // fundingDeadline must simply lie in the future relative to channel creation; miner-scale drift on
+    // block.timestamp is immaterial to a minutes-to-days-long window.
     function _validateNewParams(Params memory p) private view {
         if (
+            // slither-disable-next-line timestamp
             p.participants[0] == address(0) || p.participants[1] == address(0)
                 || p.participants[0] == p.participants[1] || p.signers[0] == address(0) || p.signers[1] == address(0)
                 || p.signers[0] == p.signers[1] || p.rules.code.length == 0 || p.stakePerGame == 0
@@ -301,6 +319,11 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     /// so one blocked recipient can never lock the other party's funds.
     function _pay(address to, uint256 amount) private {
         if (amount == 0) return;
+        // Low-level call is intentional (see doc comment above): a reverting/false-returning token must not
+        // block payout. Every external entry point that reaches _pay (deposit, reclaim, claim, closeCooperative,
+        // challenge, respond, timeout) carries the `nonReentrant` modifier, so a malicious token cannot reenter
+        // ChannelHub to exploit the owed[to] write that follows this call.
+        // slither-disable-next-line reentrancy-no-eth,reentrancy-benign,low-level-calls
         (bool ok, bytes memory ret) = address(token).call(abi.encodeCall(IERC20.transfer, (to, amount)));
         if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
         owed[to] += amount;
