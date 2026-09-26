@@ -13,7 +13,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
-import { mockUsdcAbi, type ArenaDomain } from "../../src/index.js";
+import { channelHubAbi, mockUsdcAbi, type ArenaDomain } from "../../src/index.js";
 import { ANVIL_PORT } from "../global-setup.js";
 
 export const RPC = `http://127.0.0.1:${ANVIL_PORT}`;
@@ -90,4 +90,21 @@ export async function setEthBalance(who: Address, wei: bigint): Promise<void> {
 
 export async function now(): Promise<bigint> {
   return (await publicClient().getBlock()).timestamp;
+}
+
+/** Sets the hub's launch limits (spec §13) from the deployer/owner account. */
+export async function setLimits(hub: Address, maxDepositPerPlayer: bigint, maxCommittedEscrow: bigint): Promise<void> {
+  const hash = await deployer.writeContract({
+    address: hub,
+    abi: channelHubAbi,
+    functionName: "setLimits",
+    args: [maxDepositPerPlayer, maxCommittedEscrow],
+  });
+  await publicClient().waitForTransactionReceipt({ hash });
+}
+
+/** Pauses/unpauses the hub (spec §13) from the deployer/owner account. */
+export async function setPaused(hub: Address, paused: boolean): Promise<void> {
+  const hash = await deployer.writeContract({ address: hub, abi: channelHubAbi, functionName: "setPaused", args: [paused] });
+  await publicClient().waitForTransactionReceipt({ hash });
 }

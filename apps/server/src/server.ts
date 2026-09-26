@@ -121,7 +121,29 @@ async function withLobbyErrors(res: http.ServerResponse, fn: () => Promise<void>
   }
 }
 
-function templateEntry(cfg: ServerConfig, url: string) {
+/** Task 2 (spec §13): the current launch limits for /templates, as decimal strings and a boolean, or `null` if
+ *  the chain read fails -- a host outage must not take down the whole route (the rest of the entry is still
+ *  useful, and is otherwise all static config). */
+async function templateLimits(chain: ChainReader): Promise<{
+  maxDepositPerPlayer: string;
+  maxCommittedEscrow: string;
+  committedEscrow: string;
+  paused: boolean;
+} | null> {
+  try {
+    const l = await chain.limits();
+    return {
+      maxDepositPerPlayer: decStr(l.maxDepositPerPlayer),
+      maxCommittedEscrow: decStr(l.maxCommittedEscrow),
+      committedEscrow: decStr(l.committedEscrow),
+      paused: l.paused,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader) {
   return {
     id: "chess",
     version: "1",
@@ -138,6 +160,7 @@ function templateEntry(cfg: ServerConfig, url: string) {
     fundingWindow: decStr(cfg.fundingWindow),
     skillUrl: `${url}/templates/chess/skill.md`,
     audit: cfg.audit,
+    limits: await templateLimits(chain),
   };
 }
 
@@ -300,7 +323,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     },
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/templates") return false;
-      sendJson(ctx.res, 200, [templateEntry(cfg, self.url)]);
+      sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, chain)]);
       return true;
     },
     async (ctx) => {

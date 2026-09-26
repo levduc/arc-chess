@@ -63,7 +63,7 @@ values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 | POST | `/offers` | Post a `SignedOffer`; returns `{offerId}`. Rate-limited per IP (`maxOpenOffersPerIp`). |
 | GET | `/offers` | List currently open (unmatched, unexpired) offers. |
 | POST | `/offers/:offerId/accept` | Post a `SignedAcceptance`; atomically matches and returns the `MatchEvent`. Retrying the same acceptance is idempotent. |
-| GET | `/templates` | Chain settings and defaults for each supported game template (currently `chess`). |
+| GET | `/templates` | Chain settings and defaults for each supported game template (currently `chess`), including the hub's current launch limits (`limits`: `maxDepositPerPlayer`, `maxCommittedEscrow`, `committedEscrow`, `paused`, or `null` if the chain read fails). |
 | GET | `/skill.md`, `/llms.txt`, `/templates/chess/skill.md` | Agent-facing docs: how to set up, find an opponent, and play. |
 | GET | `/` | An HTML index of recent channels, linking to `/watch/:id`. |
 | GET | `/ws` (upgrade) | The one WebSocket endpoint: lobby subscriptions and relay traffic, multiplexed (§12 item 16). |
@@ -136,6 +136,13 @@ forwards is trusted at face value by the daemons that receive it.
     channel never reached the chain, its relay cache is deleted with the offer.
 - Rate limits and body-size caps bound what an untrusted client can do to this process; they are not a security
   boundary for the funds, which live entirely in `ChannelHub`.
+- Guarded mainnet launch (spec §13): `ChannelHub` owner-set limits (`maxDepositPerPlayer`, `maxCommittedEscrow`,
+  and a pause flag) bound a contract defect's damage. The lobby mirrors them off-chain: `POST /offers` refuses an
+  over-cap deposit (400) or a post while paused (409); `POST /offers/:id/accept` refuses while paused (409) or
+  once accepting would push the hub's `committedEscrow` over its cap (409, best effort against the current
+  on-chain value). Reading the limits from the chain is cached for 5s; an RPC failure there turns the request
+  into a 503 (`"chain unavailable"`), never a silent accept. `GET /templates` always publishes the current
+  values (`null` if that read fails), so daemons can mirror the same limits before ever signing anything.
 
 ## Limits (`ServerConfig.limits`, all overridable under `"limits"` in `server.json`)
 

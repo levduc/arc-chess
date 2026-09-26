@@ -153,6 +153,75 @@ describe("lobby http", () => {
     expect(third.body.error).toMatch(/open offers/);
   });
 
+  it("Task 2 (spec §13): rejects an offer over the hub's per-player deposit cap (400)", async () => {
+    const chain = new FakeChain();
+    chain.hubLimits = { ...chain.hubLimits, maxDepositPerPlayer: 500_000n };
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain); // deposit 1_000_000n > cap
+    const res = await postOffer(server, so);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("deposit exceeds the hub's per-player cap of 500000 base units");
+  });
+
+  it("Task 2 (spec §13): rejects a posted offer while the hub is paused (409)", async () => {
+    const chain = new FakeChain();
+    chain.hubLimits = { ...chain.hubLimits, paused: true };
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const res = await postOffer(server, so);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("the hub is paused: no new channels");
+  });
+
+  it("Task 2 (spec §13): rejects posting when the chain is unavailable (503), not silently through", async () => {
+    const chain = new FakeChain();
+    chain.limitsError = new Error("rpc down");
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const res = await postOffer(server, so);
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("chain unavailable");
+  });
+
+  it("Task 2 (spec §13): rejects accepting while the hub is paused (409)", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const posted = await postOffer(server, so);
+    const id = posted.body.offerId as Hex;
+    chain.hubLimits = { ...chain.hubLimits, paused: true };
+    const { sa } = await makeAcceptance(id);
+    const res = await acceptOffer(server, id, sa);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("the hub is paused: no new channels");
+  });
+
+  it("Task 2 (spec §13): rejects accepting once it would push committedEscrow over the cap (409)", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain); // deposit 1_000_000n, fee 5_000n -> reserves 2_010_000n
+    const posted = await postOffer(server, so);
+    const id = posted.body.offerId as Hex;
+    chain.hubLimits = { ...chain.hubLimits, maxCommittedEscrow: 2_000_000n };
+    const { sa } = await makeAcceptance(id);
+    const res = await acceptOffer(server, id, sa);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("the hub's escrow cap is reached");
+  });
+
+  it("Task 2 (spec §13): rejects accepting when the chain is unavailable (503), never as an accept", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const posted = await postOffer(server, so);
+    const id = posted.body.offerId as Hex;
+    chain.limitsError = new Error("rpc down");
+    const { sa } = await makeAcceptance(id);
+    const res = await acceptOffer(server, id, sa);
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("chain unavailable");
+  });
+
   it("rejects a duplicate offer id (409)", async () => {
     const chain = new FakeChain();
     server = await startServer(testConfig(), { chain });

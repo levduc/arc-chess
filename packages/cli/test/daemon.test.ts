@@ -4,7 +4,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
 import { DaemonError, type ArenaDaemon } from "../src/index.js";
-import { increaseTime, now, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
@@ -75,6 +75,9 @@ describe("ArenaDaemon core", () => {
   it("I1: a persistently failing deposit tops up the session key's gas at most once", async () => {
     const pair = await startPair({ pollMs: 50 });
     cleanup = pair.cleanup;
+    // Raise the hub's per-player cap (spec §13) above this deposit, so the revert this test drives comes from
+    // alice's insufficient USDC balance, not from the launch-limit check createOffer now applies up front.
+    await setLimits(pair.env.hub, 100_000_000n, 10n ** 12n);
     // A deposit far beyond alice's minted balance: hub.deposit() will keep reverting on every tick.
     const { offerId } = await pair.alice.daemon.createOffer({ deposit: 50_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await pair.bob.daemon.acceptOffer(offerId);

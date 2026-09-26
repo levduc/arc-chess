@@ -2,18 +2,29 @@ import { createPublicClient, defineChain, http, type Address, type PublicClient 
 import { HubClient, type HubEvent } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 
+export type Limits = {
+  maxDepositPerPlayer: bigint;
+  maxCommittedEscrow: bigint;
+  committedEscrow: bigint;
+  paused: boolean;
+};
+
 export interface ChainReader {
   now(): Promise<bigint>;
   feeConfig(): Promise<{ feePerPlayer: bigint; feeRecipient: Address }>;
   timeoutBounds(): Promise<{ min: bigint; max: bigint }>;
   head(): Promise<bigint>;
   hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]>;
+  /** The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause
+   *  flag. `RpcChainReader` caches this for `LIMITS_CACHE_MS`. */
+  limits(): Promise<Limits>;
 }
 
 const NOW_CACHE_MS = 1000;
+const LIMITS_CACHE_MS = 5000;
 
 /** The subset of HubClient that RpcChainReader calls; lets tests inject a stub without a real viem client. */
-export type HubLike = Pick<HubClient, "feeConfig" | "timeoutBounds" | "blockNumber" | "hubEvents">;
+export type HubLike = Pick<HubClient, "feeConfig" | "timeoutBounds" | "blockNumber" | "hubEvents" | "limits">;
 
 /** Reads the chain via viem/HubClient. No accounts, no signing — the server is untrusted plumbing (no keys, no
  *  funds). */
@@ -22,6 +33,7 @@ export class RpcChainReader implements ChainReader {
   private readonly hub: HubLike;
   private cachedNow: { value: bigint; at: number } | undefined;
   private timeoutBoundsPromise: Promise<{ min: bigint; max: bigint }> | undefined;
+  private cachedLimits: { value: Limits; at: number } | undefined;
 
   constructor(cfg: Pick<ServerConfig, "rpcUrl" | "chainId" | "hub">, hub?: HubLike) {
     const chain = defineChain({
@@ -60,6 +72,17 @@ export class RpcChainReader implements ChainReader {
 
   head(): Promise<bigint> {
     return this.hub.blockNumber();
+  }
+
+  /** Cached for `LIMITS_CACHE_MS` (spec §13): the lobby calls this on every post/accept, and the launch limits
+   *  change rarely, so there is no reason to hit the RPC on every request. A rejection (e.g. RPC down) is not
+   *  cached -- the caller sees it and the lobby turns it into a 503, never a silent stale read. */
+  async limits(): Promise<Limits> {
+    const t = Date.now();
+    if (this.cachedLimits && t - this.cachedLimits.at < LIMITS_CACHE_MS) return this.cachedLimits.value;
+    const value = await this.hub.limits();
+    this.cachedLimits = { value, at: t };
+    return value;
   }
 
   hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {

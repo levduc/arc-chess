@@ -70,6 +70,10 @@ export type ChannelHandle = {
   progressKey: string | null;
   /** M-c: set while an autoPlay (relay- or tick-driven) runs, so the two never both try to resign the same mate. */
   autoPlaying: boolean;
+  /** Task 2 (spec §13): chain time until which `watch()` skips `fund()` for this channel, set after a funding
+   *  revert caused by the hub's launch limits (Paused/DepositTooLarge/EscrowCapReached) -- so the watchtower
+   *  backs off instead of retrying the same revert on every tick. Null once funding succeeds. */
+  fundBlockedUntil: bigint | null;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -98,6 +102,14 @@ export const DISPUTE_RESCAN_BLOCKS = 32n;
  *  offer this long past its expiry can no longer produce a fundable match. Distinct from, and must stay well
  *  under, the SDK's `MAX_FUNDING_WINDOW` (86400n): the hub's own hard cap on `fundingDeadline`. */
 export const MAX_FUNDING_WINDOW = 7200n;
+
+/** Task 2 (spec §13): once `fund()` reverts for one of these reasons, `watch()` backs off funding this channel
+ *  for at least this many seconds of chain time, instead of retrying the same revert on every tick. */
+export const FUND_BACKOFF_SECONDS = 30n;
+
+/** The hub error names that mean "this deposit cannot go through right now because of a launch limit" (spec §13),
+ *  as opposed to a bug or an unrelated chain error. */
+const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
 
 export class ArenaDaemon {
   readonly client: PublicClient;
@@ -198,6 +210,22 @@ export class ArenaDaemon {
 
   // ------------------------------------------------------------------ lobby
 
+  /**
+   * Task 2 (spec §13): refuses a deposit the hub would refuse right now -- paused (checked first, mirroring
+   * `ChannelHub.deposit`'s own check order) or over `maxDepositPerPlayer` -- before any funds move or any
+   * signature is produced. Shared by `createOffer` and `acceptOffer`.
+   */
+  private async checkDepositAllowed(deposit: bigint): Promise<void> {
+    const limits = await this.hub.limits();
+    if (limits.paused) throw new DaemonError(409, "the hub is paused: no new channels");
+    if (deposit > limits.maxDepositPerPlayer) {
+      throw new DaemonError(
+        400,
+        `deposit exceeds the hub's per-player cap of ${limits.maxDepositPerPlayer} base units`,
+      );
+    }
+  }
+
   async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
     // I4: refuse offers the hub would never let anyone fund (ChannelHub rejects these params on deposit), so a
     // matched channel can never sit unfundable while its deposit reverts on every tick.
@@ -207,6 +235,7 @@ export class ArenaDaemon {
     if (o.challengeTimeout < bounds.min || o.challengeTimeout > bounds.max) {
       throw new DaemonError(400, `challengeTimeout must be between ${bounds.min} and ${bounds.max} seconds`);
     }
+    await this.checkDepositAllowed(o.deposit);
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
     // (the chain's block timestamp), not wall-clock Date.now() — a test (or a real deployment) that has moved
@@ -275,6 +304,8 @@ export class ArenaDaemon {
       if (so.offer.player.toLowerCase() === this.wallet.address.toLowerCase()) {
         throw new DaemonError(400, "cannot accept your own offer");
       }
+      // Task 2 (spec §13): before generating a session key or signing anything.
+      await this.checkDepositAllowed(so.offer.deposit);
       const sessionKey = generatePrivateKey();
       const acceptance = {
         offerId,
@@ -366,6 +397,17 @@ export class ArenaDaemon {
         this.log(`ignoring match for offer ${offerId}: ${problem}`);
         return release();
       }
+      // Task 2 (spec §13): a match the hub would now refuse to fund (paused, or the offer's deposit is now over
+      // the per-player cap) can never open -- ignore it rather than create an unfundable channel record.
+      try {
+        await this.checkDepositAllowed(m.params.deposit);
+      } catch (err) {
+        // Only a limit refusal is "ignored" here; any other failure (e.g. an RPC blip in hub.limits()) falls
+        // through to the outer catch below, which logs it as a match-handling failure, not a hub refusal.
+        if (!(err instanceof DaemonError)) throw err;
+        this.log(`ignoring match for offer ${offerId}: ${err.message}`);
+        return release();
+      }
       const id = computeChannelId(this.domain.chainId, this.domain.hub, m.params);
       if (this.live.has(id)) return release();
       if (this.stopped) return release();
@@ -427,7 +469,19 @@ export class ArenaDaemon {
       new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
     );
     const signer = privateKeyToAccount(record.sessionKey);
-    const l: ChannelHandle = { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false };
+    const l: ChannelHandle = {
+      record,
+      session,
+      sessionSender,
+      processedEvents: 0,
+      chain: null,
+      lastError: null,
+      passes: 0,
+      lastProgressAt: null,
+      progressKey: null,
+      autoPlaying: false,
+      fundBlockedUntil: null,
+    };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
     // handled uniformly by onJoined() for the first join and for every later reconnect.
@@ -503,7 +557,22 @@ export class ArenaDaemon {
       }
     }
     if (this.stopped) return;
-    await this.hub.deposit(this.wallet, p);
+    try {
+      await this.hub.deposit(this.wallet, p);
+    } catch (err) {
+      // Task 2 (spec §13): a revert caused by a launch limit is not a bug -- it can resolve itself (the owner
+      // raises a cap or unpauses) or never resolve (reclaim after the deadline). Either way, retrying it on every
+      // tick is a hot loop against the RPC/chain for no benefit, so back off instead of rethrowing.
+      if (err instanceof HubRevertError && err.errorName && LIMIT_REVERTS.has(err.errorName)) {
+        l.lastError = `funding: ${err.errorName}`;
+        const chainNow = (await this.client.getBlock()).timestamp;
+        l.fundBlockedUntil = chainNow + FUND_BACKOFF_SECONDS;
+        return;
+      }
+      throw err;
+    }
+    l.fundBlockedUntil = null;
+    if (l.lastError?.startsWith("funding:")) l.lastError = null;
   }
 
   // ------------------------------------------------------------------ relay
@@ -712,8 +781,13 @@ export class ArenaDaemon {
 
     // 1. Funding in order (spec §5), or reclaim after the deadline if this player already funded.
     if (now <= p.fundingDeadline) {
-      if (info.phase === "None" && me === 0) await this.fund(l);
-      else if (info.phase === "Funding" && !info.funded[me] && (me === 0 || info.funded[0])) await this.fund(l);
+      const wantsToFund =
+        (info.phase === "None" && me === 0) ||
+        (info.phase === "Funding" && !info.funded[me] && (me === 0 || info.funded[0]));
+      // Task 2 (spec §13): a prior funding revert caused by a launch limit backs off for FUND_BACKOFF_SECONDS of
+      // chain time -- skip fund() entirely rather than repeat the same revert on every tick.
+      const fundBlocked = l.fundBlockedUntil !== null && now < l.fundBlockedUntil;
+      if (wantsToFund && !fundBlocked) await this.fund(l);
     } else if (info.phase === "Funding" && info.funded[me]) {
       if (this.stopped) return;
       // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.

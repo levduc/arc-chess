@@ -1,6 +1,6 @@
 import type { Address } from "viem";
 import type { HubEvent } from "@arena/sdk";
-import type { ChainReader } from "../../src/chain.js";
+import type { ChainReader, Limits } from "../../src/chain.js";
 import { DEFAULT_LIMITS, type ServerConfig } from "../../src/config.js";
 
 export class FakeChain implements ChainReader {
@@ -8,11 +8,19 @@ export class FakeChain implements ChainReader {
   block = 100n;
   fee = { feePerPlayer: 5_000n, feeRecipient: "0x00000000000000000000000000000000000000fe" as Address };
   events: HubEvent[] = [];
+  // Task 2 (spec §13): generous defaults so tests that don't care about launch limits are unaffected.
+  hubLimits: Limits = { maxDepositPerPlayer: 10_000_000n, maxCommittedEscrow: 10n ** 12n, committedEscrow: 0n, paused: false };
+  /** Set to make `limits()` reject, simulating an RPC failure. */
+  limitsError: Error | null = null;
   async now() { return this.time; }
   async feeConfig() { return this.fee; }
   async timeoutBounds() { return { min: 60n, max: 86_400n }; }
   async head() { return this.block; }
   async hubEvents(from: bigint, to: bigint) { return this.events.filter((e) => e.blockNumber >= from && e.blockNumber <= to); }
+  async limits() {
+    if (this.limitsError) throw this.limitsError;
+    return this.hubLimits;
+  }
 }
 
 export function testConfig(over: Partial<ServerConfig> = {}): ServerConfig {

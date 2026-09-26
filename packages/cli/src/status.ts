@@ -114,6 +114,13 @@ export function buildStatus(input: StatusInput): ChannelStatus {
         ? "done: the funding window closed without this channel opening; nothing is left to do"
         : "wait: the channel is being funded",
     );
+    // Task 2 (spec §13): names the cause when funding is blocked by the hub's pause, rather than leaving the
+    // agent to guess why a channel is not progressing.
+    if (!record.finalized && input.lastError?.startsWith("funding: Paused")) {
+      suggestedActions.push(
+        "wait: the hub is paused; funding resumes automatically when it is unpaused (or reclaim after the funding deadline)",
+      );
+    }
   } else if (phase === "Finalized") suggestedActions.push("done: the channel is settled");
   else if (phase === "Reclaimed") suggestedActions.push("done: the channel was never funded and deposits were returned");
   else if (closing) {

@@ -14,7 +14,7 @@ import {
   type SignedAcceptance,
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
-import { increaseTime, now } from "../../sdk/test/helpers/chain.js";
+import { increaseTime, now, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
 import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -193,6 +193,135 @@ describe("I4: never-fundable offers and never-funded channels", () => {
     const passes = bob.daemon.handle(id).passes;
     await bob.daemon.tick();
     expect(bob.daemon.handle(id).passes).toBe(passes);
+  });
+});
+
+describe("Task 2: off-chain mirrors of the hub's launch limits (spec §13)", () => {
+  it("createOffer rejects a deposit over the hub's per-player cap before posting anything", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    await setLimits(pair.env.hub, 500_000n, 10n ** 12n);
+    const err = await pair.alice.daemon
+      .createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).code).toBe(400);
+    expect((err as DaemonError).message).toBe("deposit exceeds the hub's per-player cap of 500000 base units");
+    expect(await pair.alice.client.lobby.listOffers()).toEqual([]); // nothing was posted
+  });
+
+  it("acceptOffer rejects an over-cap offer without creating a record or signing anything", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await setLimits(pair.env.hub, 500_000n, 10n ** 12n);
+    const err = await bob.daemon.acceptOffer(offerId).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).code).toBe(400);
+    expect((err as DaemonError).message).toBe("deposit exceeds the hub's per-player cap of 500000 base units");
+    expect(new RecordStore(bob.home).offer(offerId)).toBeNull();
+    expect(bob.daemon.channelIds()).toEqual([]);
+  });
+
+  it("createOffer rejects while the hub is paused, with a clear cause", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    await setPaused(pair.env.hub, true);
+    const err = await pair.alice.daemon
+      .createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).code).toBe(409);
+    expect((err as DaemonError).message).toBe("the hub is paused: no new channels");
+  });
+
+  it("acceptOffer rejects while the hub is paused", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await setPaused(pair.env.hub, true);
+    const err = await bob.daemon.acceptOffer(offerId).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).code).toBe(409);
+    expect((err as DaemonError).message).toBe("the hub is paused: no new channels");
+  });
+
+  it("onMatch ignores a match the hub would now reject (paused after the match was posted) and logs it", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const so = (await alice.client.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId)!;
+    const sessionKey = generatePrivateKey();
+    internals(bob.daemon).records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter" });
+    const terms = { rules: pair.env.rules, feeRecipient: pair.env.host, feePerPlayer: 5_000n, fundingWindow: 3600n };
+    const acceptance = { offerId, player: bob.address, signer: privateKeyToAccount(sessionKey).address, nonce: randomNonce() };
+    await setPaused(pair.env.hub, true);
+    await internals(bob.daemon).onMatch({ offerId, params: buildParams(so.offer, acceptance, terms, await now()) });
+    expect(bob.daemon.channelIds()).toEqual([]);
+  });
+
+  it(
+    "a funding revert while paused sets a clear lastError and backs off for 30s; funding completes once unpaused",
+    async () => {
+      const pair = await startPair();
+      cleanups.push(pair.cleanup);
+      const { alice, bob } = pair;
+      const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await bob.daemon.acceptOffer(offerId);
+      const id = await waitFor(async () => {
+        const [a, b] = [alice.daemon.channelIds(), bob.daemon.channelIds()];
+        return a.length === 1 && b.length === 1 && a[0] === b[0] ? a[0] : null;
+      }, 20_000, "match");
+
+      await setPaused(pair.env.hub, true);
+      await waitFor(async () => {
+        await alice.daemon.idle();
+        await alice.daemon.tick();
+        return /^funding: Paused$/.test(alice.daemon.handle(id).lastError ?? "");
+      }, 5_000, "paused funding error");
+      expect(alice.daemon.handle(id).fundBlockedUntil).not.toBeNull();
+      expect((await alice.daemon.hub.channelInfo(id)).funded[0]).toBe(false);
+
+      // Unpausing alone must not trigger an immediate retry: the back-off (>= 30s of chain time) still applies,
+      // so the watchtower does not hot-loop a revert it already saw.
+      await setPaused(pair.env.hub, false);
+      await alice.daemon.idle();
+      await alice.daemon.tick();
+      expect((await alice.daemon.hub.channelInfo(id)).funded[0]).toBe(false);
+
+      await increaseTime(31);
+      await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).funded[0], 20_000, "alice funded once the back-off expires");
+      await bob.daemon.idle();
+      await bob.daemon.tick();
+      await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
+      expect(alice.daemon.handle(id).lastError).toBeNull();
+      expect(alice.daemon.handle(id).fundBlockedUntil).toBeNull();
+    },
+  );
+
+  it("status suggests waiting for the hub's pause when a channel is funding-blocked by it", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(async () => {
+      const [a, b] = [alice.daemon.channelIds(), bob.daemon.channelIds()];
+      return a.length === 1 && b.length === 1 && a[0] === b[0] ? a[0] : null;
+    }, 20_000, "match");
+    await setPaused(pair.env.hub, true);
+    await waitFor(async () => {
+      await alice.daemon.idle();
+      await alice.daemon.tick();
+      return /^funding: Paused$/.test(alice.daemon.handle(id).lastError ?? "");
+    }, 5_000, "paused funding error");
+    const st = await alice.daemon.status(id);
+    expect(st.suggestedActions).toContainEqual(
+      "wait: the hub is paused; funding resumes automatically when it is unpaused (or reclaim after the funding deadline)",
+    );
   });
 });
 
