@@ -135,6 +135,15 @@ export class HubClient {
     return this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "owed", args: [addr] });
   }
 
+  /** The hub's current fee config for new channels (spec §4.6). */
+  async feeConfig(): Promise<{ feePerPlayer: bigint; feeRecipient: Address }> {
+    const [feePerPlayer, feeRecipient] = await Promise.all([
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "feePerPlayer" }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "feeRecipient" }),
+    ]);
+    return { feePerPlayer, feeRecipient };
+  }
+
   /** Challenged/Responded events for a channel in chain order, with the signed state each one carries. */
   async disputeEvents(id: Hex, fromBlock: bigint = 0n): Promise<DisputeEvent[]> {
     // One head for both queries, so a block mined between them cannot appear in one list but not the other.
