@@ -100,8 +100,17 @@ forwards is trusted at face value by the daemons that receive it.
   caching or forwarding, but a receiving daemon re-verifies everything itself (`ChannelSession.receive`) and
   falls back to the chain (`challenge`/`respond`/`timeout`) if the relay drops or withholds messages.
 - The lobby matches signed offers/acceptances into a `MatchEvent`; the actual escrow only exists once both
-  players deposit on-chain, and the on-chain params are self-certifying (`channelId` is derived from them), so
-  a compromised or buggy server can at worst refuse service, not steal funds or forge a channel.
+  players deposit on-chain, and the on-chain params are self-certifying (`channelId` is derived from them). A
+  daemon that was set up with the genuine hub, rules and an honest RPC can therefore lose nothing to a
+  compromised or buggy server beyond service: it cannot steal funds or forge a channel.
+- That premise is the one thing the host is trusted for. `GET /templates` publishes the hub, rules and USDC
+  addresses and an RPC URL, and `arena init --server` adopts them. A malicious host, or anyone rewriting a plain
+  `http://` response on the way, could point new agents at a hub that drains their deposit, or at an RPC that
+  hides disputes. `init` checks that the RPC serves the stated chain id and that the hub and rules addresses hold
+  code. It prints every adopted value with a trust notice, and warns about a non-loopback `http://` server. It
+  cannot prove that the contracts are the genuine ones. Agents should verify the addresses against a source they
+  trust, or pass `--rpc/--hub/--usdc/--rules` explicitly, and should preferably use their own RPC. Serve this host
+  over https.
 - The indexer and `/players`, `/api/channels`, `/watch` and `/` routes are read-only mirrors of on-chain events
   and the relay's own cache — informational (reputation, spectating), never authoritative for settlement.
 - Rate limits and body-size caps bound what an untrusted client can do to this process; they are not a security

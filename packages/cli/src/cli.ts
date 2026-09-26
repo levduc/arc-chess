@@ -12,7 +12,7 @@ export type CliIo = {
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--max-fee N] [--session-gas-wei N] [--poll-ms N] [--log-chunk-blocks N]
-       (missing chain settings are filled from the server's /templates)
+       (missing chain settings are filled from the server's /templates and checked over the RPC)
   daemon [start]
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
@@ -23,6 +23,51 @@ const USAGE = `usage: arena <command> [options]
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 class UsageError extends Error {}
+
+/** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors. */
+async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]): Promise<unknown> {
+  let res: Response;
+  try {
+    res = await io.fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+  } catch (err) {
+    throw new Error(`RPC ${url} is unreachable (${method}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!res.ok) throw new Error(`RPC ${url} answered ${method} with status ${res.status}`);
+  const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
+  if (body.error) throw new Error(`RPC ${url} refused ${method}: ${body.error.message ?? "unknown error"}`);
+  return body.result;
+}
+
+/** I8: checks, over the RPC the daemon will use, that the server-supplied chain settings are at least real: the
+ *  RPC serves `chainId`, and the hub and rules addresses hold contracts. It cannot prove they are the genuine
+ *  arena contracts -- the printed trust line says so. */
+async function verifyChain(io: CliIo, rpcUrl: string, chainId: number, contracts: Record<string, Address>): Promise<void> {
+  const reported = await rpcCall(io, rpcUrl, "eth_chainId", []);
+  if (typeof reported !== "string" || Number(BigInt(reported)) !== chainId) {
+    throw new Error(`RPC ${rpcUrl} serves chain ${String(reported)}, not chain ${chainId}`);
+  }
+  for (const [name, address] of Object.entries(contracts)) {
+    const code = await rpcCall(io, rpcUrl, "eth_getCode", [address, "latest"]);
+    if (typeof code !== "string" || code === "0x" || code === "") {
+      throw new Error(`${name} ${address} has no contract code on chain ${chainId} (via ${rpcUrl})`);
+    }
+  }
+}
+
+/** True for a URL whose host is this machine, where plain http cannot be intercepted on the way. */
+function isLoopbackUrl(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  return host === "localhost" || host === "[::1]" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
 
 function parse(argv: string[]): { positional: string[]; flags: Map<string, string | true> } {
   const positional: string[] = [];
@@ -108,12 +153,25 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (!ADDRESS_RE.test(v)) throw new UsageError(`--${name} must be an address (0x + 40 hex characters)`);
         return v as Address;
       };
+      const hub = asAddress("hub", hubRaw);
+      const usdc = asAddress("usdc", usdcRaw);
+      const rules = asAddress("rules", rulesRaw);
+      const fromServer = !haveAllExplicit;
+      if (fromServer) {
+        if (/^http:\/\//i.test(server) && !isLoopbackUrl(server)) {
+          io.err(
+            `warning: ${server} is plain http: anyone on the path can rewrite the contract addresses and RPC it ` +
+              "hands you. Use https, or pass --rpc/--hub/--usdc/--rules explicitly.",
+          );
+        }
+        await verifyChain(io, rpcUrl, chainId, { hub, rules });
+      }
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,
-        hub: asAddress("hub", hubRaw),
-        usdc: asAddress("usdc", usdcRaw),
-        rules: asAddress("rules", rulesRaw),
+        hub,
+        usdc,
+        rules,
         serverUrl: server,
         port: Number(flag("port") ?? "7070"),
         maxFeePerPlayer: BigInt(flag("max-fee") ?? "10000"),
@@ -123,7 +181,22 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
       const { privateKeyToAccount } = await import("viem/accounts");
-      io.out(JSON.stringify({ home, wallet: privateKeyToAccount(walletKey).address, port: cfg.port }, null, 2));
+      const summary: Record<string, unknown> = {
+        home,
+        wallet: privateKeyToAccount(walletKey).address,
+        port: cfg.port,
+        rpcUrl,
+        chainId,
+        hub,
+        usdc,
+        rules,
+      };
+      if (fromServer) {
+        summary.trust =
+          `these contract addresses and the RPC come from ${server}; verify them against a source you trust, ` +
+          "or pass --rpc/--hub/--usdc/--rules explicitly";
+      }
+      io.out(JSON.stringify(summary, null, 2));
       return 0;
     }
 

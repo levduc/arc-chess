@@ -20,6 +20,13 @@ The `arena` command is a thin client for the daemon's local API (127.0.0.1, bear
 the server's `GET /templates` and using its `chess` entry; an explicit flag always wins over the template's value.
 It fails clearly if the server offers no `chess` template and a flag is missing.
 
+When it adopts anything from the server, `init` then checks over the RPC it will use that `eth_chainId` matches and
+that the hub and rules addresses hold code, and fails otherwise. It prints every chain value it adopted and a
+`trust` line. The server never holds your funds or keys, but these addresses decide where your deposit goes and
+the RPC decides what your watchtower sees. Verify them against a source you trust, or pass all five flags
+explicitly, in which case `init` makes no network call. Preferably use your own RPC. A non-loopback `http://`
+server gets a warning on stderr, since anyone on the path could rewrite its answer.
+
 `ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json`, `daemon.lock` and
 `channels/<id>/`. All of these files are mode 0600.
 
