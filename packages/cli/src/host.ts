@@ -24,6 +24,9 @@ export type HostOptions = {
   maxBackoffMs?: number;
   /** How long a connection must stay up past `hello` before the reconnect backoff resets (default 30 s). */
   stableAfterMs?: number;
+  /** With no frame at all from the server for this long (it pings every 25 s), the connection is treated as dead
+   *  and replaced (default 70 s). */
+  idleTimeoutMs?: number;
 };
 
 export type HostConnection = {
@@ -40,7 +43,8 @@ type ServerFrame =
   | { type: "match"; event: unknown }
   | { type: "joined"; channelId: Hex }
   | { type: "relay"; message: unknown }
-  | { type: "error"; error: string; channelId?: Hex };
+  | { type: "error"; error: string; channelId?: Hex }
+  | { type: "ping" };
 
 type ClientFrame =
   | { type: "subscribe"; offerIds: Hex[] }
@@ -54,6 +58,7 @@ const JOIN_TIMEOUT_MS = 10_000;
 const DEFAULT_MIN_BACKOFF_MS = 250;
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
 const DEFAULT_STABLE_AFTER_MS = 30_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 70_000;
 // re-joins after a reconnect go out at most 50 per second, well inside the server's per-connection frame budget
 const REJOIN_INTERVAL_MS = 20;
 
@@ -109,6 +114,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   const minBackoffMs = opts.minBackoffMs ?? DEFAULT_MIN_BACKOFF_MS;
   const maxBackoffMs = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
   const stableAfterMs = opts.stableAfterMs ?? DEFAULT_STABLE_AFTER_MS;
+  const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   const httpBase = serverUrl.replace(/\/$/, "");
   const wsUrl = serverUrl.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
 
@@ -118,6 +124,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   let attempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let stableTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
   const watched = new Set<Hex>();
   const joins = new Map<Hex, JoinEntry>();
@@ -233,6 +240,8 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
         }
         return;
       }
+      case "ping":
+        return; // only there to reset the idle watchdog, which every frame does
       case "error": {
         const msg = typeof frame.error === "string" ? frame.error : "unknown error";
         const channelId = typeof frame.channelId === "string" ? (frame.channelId as Hex) : undefined;
@@ -268,11 +277,36 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     reconnectTimer = setTimeout(() => connect(), delay);
   }
 
+  /** Forgets `socket` and reconnects at once: the close handshake on a half-open connection may never finish, so
+   *  its eventual `close` event is ignored rather than waited for. */
+  function abandon(socket: WebSocket): void {
+    if (ws !== socket) return;
+    log(`host: no frame from the server for ${idleTimeoutMs} ms, reconnecting`);
+    ws = null;
+    clearTimeout(stableTimer);
+    nonce = null;
+    joinedOnSocket.clear();
+    try {
+      socket.close();
+    } catch {
+      // already closing
+    }
+    scheduleReconnect();
+  }
+
+  function armWatchdog(socket: WebSocket): void {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => abandon(socket), idleTimeoutMs);
+  }
+
   function connect(): void {
     if (closed) return;
     const socket = new WebSocket(wsUrl);
     ws = socket;
+    armWatchdog(socket);
     socket.addEventListener("message", (e: MessageEvent) => {
+      if (ws !== socket) return; // abandoned
+      armWatchdog(socket);
       let parsed: unknown;
       try {
         parsed = decodeWire(String(e.data));
@@ -283,6 +317,8 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       onFrame(parsed);
     });
     socket.addEventListener("close", () => {
+      if (ws !== socket) return; // abandoned: already replaced
+      clearTimeout(idleTimer);
       clearTimeout(stableTimer);
       nonce = null;
       joinedOnSocket.clear();
@@ -412,6 +448,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       closed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       clearTimeout(stableTimer);
+      clearTimeout(idleTimer);
       // Reject any join() calls still waiting on a `joined`/`error` frame that will now never arrive; each
       // waiter's own reject closure clears its timeout, so no timer is left running past close().
       for (const channelId of [...joinWaiters.keys()]) settleJoinWaiters(channelId, new Error("host closed"));

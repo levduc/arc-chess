@@ -19,7 +19,8 @@ export type Metrics = {
   indexerLag: bigint | null;
 };
 
-export type ServerDeps = { chain?: ChainReader; log?: (line: string) => void };
+/** `wsPingMs` overrides the app-level `/ws` ping interval (25 s), for tests. */
+export type ServerDeps = { chain?: ChainReader; log?: (line: string) => void; wsPingMs?: number };
 
 export type ArenaServer = {
   url: string;
@@ -347,7 +348,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   // backstops against a slow/stalled client holding a connection open indefinitely (headers, then the whole request)
   httpServer.requestTimeout = 15_000;
   httpServer.headersTimeout = 10_000;
-  const wsHandle = attachWs(httpServer, { lobby, relay, cfg, metrics, log });
+  const wsHandle = attachWs(httpServer, { lobby, relay, cfg, metrics, log, pingMs: deps.wsPingMs });
 
   const pruneInterval = setInterval(() => {
     chain

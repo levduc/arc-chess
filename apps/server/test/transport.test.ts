@@ -22,6 +22,7 @@ import { DEFAULT_LIMITS } from "../src/config.js";
 import { startServer, type ArenaServer } from "../src/server.js";
 import { FakeChain, testConfig } from "./helpers/fakeChain.js";
 import { makeChannelFixture, rawStateAt, signStateAs } from "./helpers/channel.js";
+import { wsConnect } from "./helpers/wsClient.js";
 
 let server: ArenaServer | undefined;
 afterEach(async () => {
@@ -414,6 +415,57 @@ describe("host transports (connectHost) against a real server", () => {
       host.close();
       await expect(joinPromise).rejects.toThrow(/host closed/);
     } finally {
+      wss.close();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
+  it("the server sends an app-level ping frame on its interval (M7)", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain(), wsPingMs: 50 });
+    const c = await wsConnect(server.url);
+    try {
+      expect(await c.next((f) => f.type === "ping", 2_000)).toEqual({ type: "ping" });
+    } finally {
+      c.ws.close();
+    }
+  });
+
+  it("a silent connection is dropped and replaced after idleTimeoutMs; pings keep a live one (M7)", async () => {
+    let connections = 0;
+    let pinging = false;
+    const httpServer = http.createServer();
+    const wss = new WebSocketServer({ server: httpServer });
+    wss.on("connection", (ws) => {
+      connections++;
+      ws.send(toWire({ type: "hello", nonce: `0x${"00".repeat(32)}` }));
+      if (!pinging) return; // half-open from the client's point of view: nothing ever arrives again
+      const t = setInterval(() => ws.send(toWire({ type: "ping" })), 50);
+      ws.on("close", () => clearInterval(t));
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}`;
+    const logs: string[] = [];
+    const opts = { minBackoffMs: 20, maxBackoffMs: 50, idleTimeoutMs: 200, log: (l: string) => logs.push(l) };
+    const silent = connectHost(url, opts);
+    try {
+      await waitFor(() => connections >= 2, 3_000); // the watchdog gave up on the first and reconnected
+      expect(logs.some((l) => l.includes("no frame from the server"))).toBe(true);
+    } finally {
+      silent.close();
+    }
+
+    pinging = true;
+    connections = 0;
+    logs.length = 0;
+    const live = connectHost(url, opts);
+    try {
+      await waitFor(() => live.connected());
+      await new Promise((r) => setTimeout(r, 700)); // several idle timeouts' worth of pings
+      expect(connections).toBe(1);
+      expect(live.connected()).toBe(true);
+      expect(logs).toEqual([]); // pings are neither "malformed" nor an "unknown frame type"
+    } finally {
+      live.close();
       wss.close();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     }

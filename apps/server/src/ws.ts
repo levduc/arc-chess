@@ -15,7 +15,8 @@ export type ServerFrame =
   | { type: "match"; event: MatchEvent }
   | { type: "joined"; channelId: Hex }
   | { type: "relay"; message: RelayMessage }
-  | { type: "error"; error: string; channelId?: Hex };
+  | { type: "error"; error: string; channelId?: Hex }
+  | { type: "ping" };
 
 // client -> server
 export type ClientFrame =
@@ -27,6 +28,9 @@ export type ClientFrame =
 
 const OFFER_ID_RE = /^0x[0-9a-f]{64}$/i;
 const HEARTBEAT_MS = 30_000;
+// An app-level frame the client can see (protocol pings are invisible to a WHATWG WebSocket): a client that hears
+// nothing for well over this long treats the connection as dead, e.g. half-open after a laptop sleep.
+const DEFAULT_APP_PING_MS = 25_000;
 const RATE_LIMIT_KEY = "f";
 
 type ConnState = {
@@ -44,7 +48,14 @@ type ConnState = {
 
 export function attachWs(
   httpServer: http.Server,
-  deps: { lobby: Lobby; relay: Relay | null; cfg: ServerConfig; metrics: Metrics; log: (l: string) => void },
+  deps: {
+    lobby: Lobby;
+    relay: Relay | null;
+    cfg: ServerConfig;
+    metrics: Metrics;
+    log: (l: string) => void;
+    pingMs?: number;
+  },
 ): { close(): Promise<void>; dropAll(): void; count(): number } {
   const { lobby, relay, cfg, metrics, log } = deps;
   const wss = new WebSocketServer({ noServer: true, maxPayload: cfg.limits.maxFrameBytes });
@@ -246,9 +257,15 @@ export function attachWs(
   }, HEARTBEAT_MS);
   heartbeat.unref();
 
+  const appPing = setInterval(() => {
+    for (const ws of states.keys()) send(ws, { type: "ping" });
+  }, deps.pingMs ?? DEFAULT_APP_PING_MS);
+  appPing.unref();
+
   return {
     async close(): Promise<void> {
       clearInterval(heartbeat);
+      clearInterval(appPing);
       unsubscribe();
       for (const ws of states.keys()) ws.terminate();
       states.clear();
