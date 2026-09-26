@@ -22,3 +22,13 @@ fs_permissions = [
 runs = 64
 depth = 50
 fail_on_revert = false
+
+# Deeper invariant/fuzz sweep, run explicitly via `pnpm test:contracts:deep` (not part of the default
+# `pnpm test:contracts` loop, which must stay fast).
+[profile.deep.invariant]
+runs = 1000
+depth = 200
+fail_on_revert = false
+
+[profile.deep.fuzz]
+runs = 20000
