@@ -416,7 +416,7 @@ accept-draw / next-game / close buttons.
 | Session key leak | Loss bounded to that channel's deposit and gas allowance; payouts only to participant wallets; keys per channel, file-mode 0600 |
 | Malicious host / relay | Host holds nothing; relay only forwards signed data; alternative relay possible |
 | Malicious rules contract | Off-chain allowlist in registry; daemons refuse unlisted rules by default |
-| Admin abuse | Owner can only set future fees within `MAX_FEE_PER_PLAYER`; hub non-upgradeable |
+| Admin abuse | Owner can only set future fees within `MAX_FEE_PER_PLAYER`, the launch caps, and a deposit-only pause (§13); hub non-upgradeable; exits never pausable |
 | Replay across chains/channels | EIP-712 domain + channelId (chainId, hub, salt) |
 
 ## 10. Build order
@@ -574,3 +574,35 @@ accept-draw / next-game / close buttons.
     - With `--rpc/--chain-id/--hub/--usdc/--rules` all given, it makes no network call.
     - This refines §9's "host holds nothing". The host still holds no funds or keys, but agents must verify the
       published addresses, or pass them explicitly, and should preferably use their own RPC.
+
+## 13. Guarded mainnet launch (decided 2026-09-26)
+
+The owner chose to launch directly on Arc mainnet, with no Arc Testnet phase and no external audit first. The §11 audit
+and legal gates are accepted risks. They are not preconditions. To keep a contract defect's damage bounded, the hub gets
+on-chain launch limits, and the §8 test campaign is extended (Plan 4.5) before the web board (Plan 5).
+
+1. **Per-channel deposit cap.**
+   - `maxDepositPerPlayer` is set by the owner and checked when a channel is created. A first `deposit` whose
+     `params.deposit` exceeds it reverts with `DepositTooLarge`.
+   - The cap can be raised or lowered at any time. A change affects only channels created afterwards.
+2. **Total commitment cap.**
+   - The hub tracks `committedEscrow`. When a channel is created it adds `2 · (deposit + feePerPlayer)`, reserving
+     both sides at once, so the second deposit is never blocked by the cap.
+   - It subtracts the same amount when the channel finalizes or is reclaimed.
+   - Creating a channel that would push `committedEscrow` above the owner-set `maxCommittedEscrow` reverts with
+     `EscrowCapReached`.
+   - Lowering the cap below the current commitment only stops new channels.
+3. **Pause.**
+   - `setPaused(bool)` (owner) blocks every `deposit`: new channels and second-side funding alike.
+   - It never blocks `reclaim`, `closeCooperative`, `challenge`, `respond`, `timeout` or `claim`. Every open channel
+     can always settle, and a half-funded channel is refunded by `reclaim` after its funding deadline.
+4. **Admin surface.** The owner (a multisig on mainnet) can change only fees, the two caps and the pause flag. None of
+   these touch deposits or existing channels, and the hub stays non-upgradeable. §9 "Admin abuse" is extended
+   accordingly. The worst an owner can do is refuse new business.
+5. **Off-chain mirrors.**
+   - `HubClient` reads the limits.
+   - Daemons refuse to create or accept an offer the hub would reject.
+   - The host lobby refuses such offers.
+   - `/templates` publishes the current limits and the pause flag.
+6. **Launch values.** The launch values are deployment parameters, not constants. Suggested starting points:
+   `maxDepositPerPlayer` = 10 USDC and `maxCommittedEscrow` = 1,000 USDC, raised as operating history accumulates.
