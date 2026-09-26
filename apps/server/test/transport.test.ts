@@ -1,0 +1,247 @@
+import { randomBytes } from "node:crypto";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterEach, describe, expect, it } from "vitest";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import type { Hex } from "viem";
+import { WebSocketServer } from "ws";
+import { connectHost } from "@arena/cli";
+import {
+  offerId as computeOfferId,
+  signAcceptance,
+  signOffer,
+  toWire,
+  type Acceptance,
+  type MatchEvent,
+  type Offer,
+  type RelayMessage,
+  type SignedAcceptance,
+  type SignedOffer,
+} from "@arena/sdk";
+import { startServer, type ArenaServer } from "../src/server.js";
+import { FakeChain, testConfig } from "./helpers/fakeChain.js";
+import { makeChannelFixture, rawStateAt, signStateAs } from "./helpers/channel.js";
+
+let server: ArenaServer | undefined;
+afterEach(async () => {
+  await server?.close();
+  server = undefined;
+});
+
+/** Polls `fn` until it returns truthy, or throws after `ms`. */
+async function waitFor(fn: () => boolean, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  for (;;) {
+    if (fn()) return;
+    if (Date.now() > end) throw new Error("timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+function randomNonce(): Hex {
+  return `0x${randomBytes(32).toString("hex")}` as Hex;
+}
+
+async function makeOffer(over: Partial<Offer> = {}): Promise<{ offer: Offer; so: SignedOffer; signerKey: Hex }> {
+  const signerKey = generatePrivateKey();
+  const offer: Offer = {
+    template: "chess",
+    player: privateKeyToAccount(generatePrivateKey()).address,
+    signer: privateKeyToAccount(signerKey).address,
+    deposit: 1_000_000n,
+    stakePerGame: 100_000n,
+    challengeTimeout: 600n,
+    expiresAt: 1_003_600n, // FakeChain starts at time = 1_000_000n; well within offerMaxLifetime (86_400n)
+    nonce: randomNonce(),
+    ...over,
+  };
+  const so: SignedOffer = { offer, sig: await signOffer(signerKey, offer) };
+  return { offer, so, signerKey };
+}
+
+async function makeAcceptance(offerId: Hex): Promise<SignedAcceptance> {
+  const signerKey = generatePrivateKey();
+  const acceptance: Acceptance = {
+    offerId,
+    player: privateKeyToAccount(generatePrivateKey()).address,
+    signer: privateKeyToAccount(signerKey).address,
+    nonce: randomNonce(),
+  };
+  return { acceptance, sig: await signAcceptance(signerKey, acceptance) };
+}
+
+describe("host transports (connectHost) against a real server", () => {
+  it("postOffer/listOffers/accept round-trip; accept emits the match locally and to the watching offerer", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const hostA = connectHost(server.url); // the offerer, watching its own offer
+    const hostB = connectHost(server.url); // the accepter
+    try {
+      await waitFor(() => hostA.connected() && hostB.connected());
+      const { offer, so } = await makeOffer();
+      const id = await hostA.lobby.postOffer(so); // postOffer also calls watch([id])
+      expect(id).toBe(computeOfferId(offer));
+
+      const listed = await hostB.lobby.listOffers();
+      expect(listed).toContainEqual(so);
+
+      const remoteMatches: MatchEvent[] = [];
+      hostA.lobby.onMatch((m) => remoteMatches.push(m));
+      const localMatches: MatchEvent[] = [];
+      hostB.lobby.onMatch((m) => localMatches.push(m));
+
+      const sa = await makeAcceptance(id);
+      await hostB.lobby.accept(sa);
+
+      // The accepter's own onMatch fires locally (setTimeout 0) *and*, since accept() also calls watch([id]),
+      // is very likely replayed a second time once that subscribe reaches the server -- both are specified
+      // behavior, so this only asserts that the local emission happened, not an exact count.
+      await waitFor(() => localMatches.length >= 1); // emitted locally, without waiting on a server round trip
+      expect(localMatches[0].offerId).toBe(id);
+      await waitFor(() => remoteMatches.length === 1); // pushed over /ws to the watching offerer, exactly once
+      expect(remoteMatches[0].offerId).toBe(id);
+    } finally {
+      hostA.close();
+      hostB.close();
+    }
+  });
+
+  it("watch() replays a match made while the offerer was not connected", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const hostA = connectHost(server.url);
+    await waitFor(() => hostA.connected());
+    const { so } = await makeOffer();
+    const id = await hostA.lobby.postOffer(so);
+    hostA.close(); // the offerer goes offline
+
+    const hostB = connectHost(server.url);
+    await waitFor(() => hostB.connected());
+    await hostB.lobby.accept(await makeAcceptance(id));
+    hostB.close();
+
+    const hostA2 = connectHost(server.url); // the offerer reconnects, fresh
+    try {
+      await waitFor(() => hostA2.connected());
+      const matches: MatchEvent[] = [];
+      hostA2.lobby.onMatch((m) => matches.push(m));
+      hostA2.lobby.watch([id]);
+      await waitFor(() => matches.length === 1);
+      expect(matches[0].offerId).toBe(id);
+    } finally {
+      hostA2.close();
+    }
+  });
+
+  it("relay: join with a signer (never a key), send, receive; onJoined fires on join", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg);
+    const hostA = connectHost(server.url);
+    const hostB = connectHost(server.url);
+    try {
+      await waitFor(() => hostA.connected() && hostB.connected());
+      const joinedA: Hex[] = [];
+      hostA.relay.onJoined((id) => joinedA.push(id));
+      const joinedB: Hex[] = [];
+      hostB.relay.onJoined((id) => joinedB.push(id));
+
+      // `privateKeyToAccount` returns a RelaySigner ({address, signMessage}); the raw key never crosses into
+      // host.ts, which only ever calls signer.signMessage(...) (I5).
+      await hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA));
+      await hostB.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kB));
+      await waitFor(() => joinedA.includes(fx.id) && joinedB.includes(fx.id));
+
+      const received: RelayMessage[] = [];
+      hostB.relay.onMessage((m) => received.push(m));
+      const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
+      await hostA.relay.send({ type: "state", channelId: fx.id, signed: s1 });
+      await waitFor(() => received.length === 1);
+      expect(received[0]).toEqual({ type: "state", channelId: fx.id, signed: s1 });
+    } finally {
+      hostA.close();
+      hostB.close();
+    }
+  });
+
+  it("reconnects after the server drops connections and re-joins + re-subscribes; onJoined fires again", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg);
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100 });
+    const hostB = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100 });
+    try {
+      await waitFor(() => hostA.connected() && hostB.connected());
+      let joinedACount = 0;
+      hostA.relay.onJoined(() => joinedACount++);
+      let joinedBCount = 0;
+      hostB.relay.onJoined(() => joinedBCount++);
+
+      await hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA));
+      await hostB.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kB));
+      await waitFor(() => joinedACount === 1 && joinedBCount === 1);
+
+      const received: RelayMessage[] = [];
+      hostB.relay.onMessage((m) => received.push(m));
+
+      server.dropConnections();
+      await waitFor(() => joinedACount === 2 && joinedBCount === 2, 10_000);
+      await waitFor(() => hostA.connected() && hostB.connected(), 10_000);
+
+      const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
+      await hostA.relay.send({ type: "state", channelId: fx.id, signed: s1 });
+      await waitFor(() => received.length === 1, 10_000);
+      expect(received[0]).toEqual({ type: "state", channelId: fx.id, signed: s1 });
+    } finally {
+      hostA.close();
+      hostB.close();
+    }
+  });
+
+  it("send() rejects while disconnected", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg);
+    const hostA = connectHost(server.url);
+    try {
+      await waitFor(() => hostA.connected());
+      const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
+      // never joined on this connection -- send must refuse rather than silently drop
+      await expect(hostA.relay.send({ type: "state", channelId: fx.id, signed: s1 })).rejects.toThrow(
+        /relay not connected/,
+      );
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("drops malformed server frames without crashing (log called)", async () => {
+    // A tiny stand-in server (not `startServer`) that sends a well-formed `hello` and then a frame that fails to
+    // parse as a RelayMessage -- exercising the CLI transport's own frame validation, not the real server's.
+    const httpServer = http.createServer();
+    const wss = new WebSocketServer({ server: httpServer });
+    wss.on("connection", (ws) => {
+      ws.send(toWire({ type: "hello", nonce: `0x${"00".repeat(32)}` }));
+      ws.send(toWire({ type: "relay", message: { type: "state" } })); // missing channelId/signed
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const port = (httpServer.address() as AddressInfo).port;
+
+    const logs: string[] = [];
+    const host = connectHost(`http://127.0.0.1:${port}`, { log: (l) => logs.push(l) });
+    try {
+      await waitFor(() => logs.some((l) => l.includes("malformed")));
+    } finally {
+      host.close();
+      wss.close();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
+  it("close() stops reconnecting", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const host = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 50 });
+    await waitFor(() => host.connected());
+    host.close();
+    await new Promise((r) => setTimeout(r, 300)); // several backoff intervals: long enough to see a reconnect
+    expect(host.connected()).toBe(false);
+  });
+});

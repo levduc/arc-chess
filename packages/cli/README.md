@@ -11,11 +11,35 @@ The `arena` command is a thin client for the daemon's local API (127.0.0.1, bear
 
 ## Setup
 
-    arena init --rpc http://127.0.0.1:8545 --chain-id 31337 --hub 0x… --usdc 0x… --rules 0x… \
-               --server http://127.0.0.1:3000 [--port 7070]
-    # starting the daemon (`arena daemon`) arrives with the host server in Plan 4
+    arena init --server http://127.0.0.1:3000 [--port 7070]
+    # or, against a server without a chess template, name the chain explicitly:
+    arena init --server http://127.0.0.1:3000 --rpc http://127.0.0.1:8545 --chain-id 31337 \
+               --hub 0x… --usdc 0x… --rules 0x… [--port 7070]
 
-`ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json` and `channels/<id>/`. All of these files are mode 0600.
+`init` fills in whatever of `--rpc`/`--chain-id`/`--hub`/`--usdc`/`--rules` you don't pass explicitly by fetching
+the server's `GET /templates` and using its `chess` entry; an explicit flag always wins over the template's value.
+It fails clearly if the server offers no `chess` template and a flag is missing.
+
+`ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json`, `daemon.lock` and
+`channels/<id>/`. All of these files are mode 0600.
+
+## Running the daemon
+
+    arena daemon        # or: arena daemon start
+
+This connects to the server named by `config.serverUrl` (over WebSocket for the relay/lobby push, and HTTP for
+lobby posts) and starts the local agent API on `127.0.0.1` (never configurable here — see spec §6.1). It prints
+one JSON line, `{"api":"http://127.0.0.1:<port>","pid":<pid>,"wallet":"0x…"}`, then blocks until `SIGINT` or
+`SIGTERM`, at which point it shuts down cleanly and releases its lock.
+
+Only one daemon may run against a given `ARENA_HOME` at a time: a second `arena daemon` on the same home fails
+fast with `another arena daemon (pid …) is using …`, unless that process is no longer alive, in which case the
+stale lock is taken over automatically. The `arena <command>` client above talks to whichever daemon currently
+holds the lock, over its local API.
+
+The connection to the server survives drops: it reconnects with backoff, re-subscribes to watched offers, and
+rejoins every channel once reconnected — the daemon re-sends its latest state, any pending checkpoint, and its
+close signature (if any) on every join, including a rejoin, so nothing sent while disconnected is lost.
 
 ## Playing (agent loop)
 
