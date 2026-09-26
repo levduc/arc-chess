@@ -1,0 +1,217 @@
+import { randomBytes } from "node:crypto";
+import type http from "node:http";
+import type { Address, Hex } from "viem";
+import { WebSocket as WsWebSocket, WebSocketServer } from "ws";
+import { decodeWire, toWire, type MatchEvent, type Params, type PlayerIndex, type RelayMessage } from "@arena/sdk";
+import type { ServerConfig } from "./config.js";
+import type { Lobby } from "./lobby.js";
+import { RateLimiter } from "./limits.js";
+import type { Metrics } from "./server.js";
+
+// server -> client
+export type ServerFrame =
+  | { type: "hello"; nonce: Hex }
+  | { type: "match"; event: MatchEvent }
+  | { type: "joined"; channelId: Hex }
+  | { type: "relay"; message: RelayMessage }
+  | { type: "error"; error: string; channelId?: Hex };
+
+// client -> server
+export type ClientFrame =
+  | { type: "subscribe"; offerIds: Hex[] }
+  | { type: "join"; channelId: Hex; params: Params; signer: Address; sig: Hex }
+  | { type: "relay"; message: RelayMessage };
+
+/** Task 5 fills this in; while `null` here, `join`/`relay` frames just get an error. */
+export type Relay = unknown;
+
+const OFFER_ID_RE = /^0x[0-9a-f]{64}$/;
+const HEARTBEAT_MS = 30_000;
+const RATE_LIMIT_KEY = "f";
+
+type ConnState = {
+  nonce: Hex;
+  watched: Set<Hex>;
+  joined: Map<Hex, PlayerIndex>;
+  limiter: RateLimiter;
+  alive: boolean;
+};
+
+export function attachWs(
+  httpServer: http.Server,
+  deps: { lobby: Lobby; relay: Relay | null; cfg: ServerConfig; metrics: Metrics; log: (l: string) => void },
+): { close(): Promise<void>; dropAll(): void; count(): number } {
+  const { lobby, relay, cfg, metrics, log } = deps;
+  const wss = new WebSocketServer({ noServer: true, maxPayload: cfg.limits.maxFrameBytes });
+  const states = new Map<WsWebSocket, ConnState>();
+  const perIp = new Map<string, number>();
+
+  function ipCount(ip: string): number {
+    return perIp.get(ip) ?? 0;
+  }
+  function incIp(ip: string): void {
+    perIp.set(ip, ipCount(ip) + 1);
+  }
+  function decIp(ip: string): void {
+    const n = ipCount(ip) - 1;
+    if (n <= 0) perIp.delete(ip);
+    else perIp.set(ip, n);
+  }
+
+  function send(ws: WsWebSocket, frame: ServerFrame): void {
+    if (ws.readyState === WsWebSocket.OPEN) ws.send(toWire(frame));
+  }
+
+  function handleSubscribe(ws: WsWebSocket, state: ConnState, offerIds: unknown): void {
+    if (!Array.isArray(offerIds) || !offerIds.every((x) => typeof x === "string")) {
+      send(ws, { type: "error", error: "malformed frame: offerIds must be a list of strings" });
+      return;
+    }
+    for (const raw of offerIds) {
+      if (!OFFER_ID_RE.test(raw)) {
+        send(ws, { type: "error", error: "malformed frame: bad offer id" });
+        return; // none of this frame's ids get added
+      }
+    }
+    for (const raw of offerIds as string[]) {
+      const id = raw as Hex;
+      if (state.watched.has(id)) continue;
+      if (state.watched.size >= cfg.limits.maxWatchedOffers) {
+        send(ws, { type: "error", error: "too many watched offers" });
+        break;
+      }
+      state.watched.add(id);
+      const m = lobby.matchFor(id);
+      if (m) send(ws, { type: "match", event: m }); // replay: this connection missed the push
+    }
+  }
+
+  function handleFrame(ws: WsWebSocket, state: ConnState, raw: unknown): void {
+    if (typeof raw !== "object" || raw === null || typeof (raw as { type?: unknown }).type !== "string") {
+      send(ws, { type: "error", error: "malformed frame" });
+      return;
+    }
+    const frame = raw as { type: string; [k: string]: unknown };
+    if (frame.type === "subscribe") {
+      handleSubscribe(ws, state, frame.offerIds);
+      return;
+    }
+    if (frame.type === "join" || frame.type === "relay") {
+      // `relay` is always null in this task (Task 5 plugs it in and delegates join/relay frames to it here).
+      if (relay === null) send(ws, { type: "error", error: "relay unavailable" });
+      return;
+    }
+    send(ws, { type: "error", error: "malformed frame" });
+  }
+
+  httpServer.on("upgrade", (req, rawSocket, head) => {
+    const socket = rawSocket as import("node:net").Socket;
+    const url = new URL(req.url ?? "/", "http://internal");
+    if (url.pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+    const ip = socket.remoteAddress ?? "?";
+    if (ipCount(ip) >= cfg.limits.wsPerIp) {
+      socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    incIp(ip);
+    let decremented = false;
+    socket.once("close", () => {
+      if (!decremented) {
+        decremented = true;
+        decIp(ip);
+      }
+    });
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  });
+
+  wss.on("connection", (ws: WsWebSocket) => {
+    const nonce = `0x${randomBytes(32).toString("hex")}` as Hex;
+    const state: ConnState = {
+      nonce,
+      watched: new Set(),
+      joined: new Map(),
+      limiter: new RateLimiter(cfg.limits.wsFrameBurst, cfg.limits.wsFramePerSec),
+      alive: true,
+    };
+    states.set(ws, state);
+    metrics.wsConnections = states.size;
+    send(ws, { type: "hello", nonce });
+
+    ws.on("pong", () => {
+      state.alive = true;
+    });
+
+    ws.on("message", (data) => {
+      if (ws.readyState !== WsWebSocket.OPEN) return;
+      if (!state.limiter.take(RATE_LIMIT_KEY)) {
+        ws.close(1008, "rate limited");
+        return;
+      }
+      let frame: unknown;
+      try {
+        frame = decodeWire(String(data));
+      } catch {
+        send(ws, { type: "error", error: "malformed frame" });
+        return;
+      }
+      try {
+        handleFrame(ws, state, frame);
+      } catch (err) {
+        log(
+          JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "ws frame failed", error: String(err) }),
+        );
+        send(ws, { type: "error", error: "internal" });
+      }
+    });
+
+    ws.on("close", () => {
+      states.delete(ws);
+      metrics.wsConnections = states.size;
+    });
+
+    ws.on("error", () => {
+      // 'close' still follows; state cleanup happens there.
+    });
+  });
+
+  const unsubscribe = lobby.onMatch((event) => {
+    for (const [ws, state] of states) {
+      if (state.watched.has(event.offerId)) send(ws, { type: "match", event });
+    }
+  });
+
+  const heartbeat = setInterval(() => {
+    for (const [ws, state] of states) {
+      if (!state.alive) {
+        ws.terminate();
+        continue;
+      }
+      state.alive = false;
+      ws.ping();
+    }
+  }, HEARTBEAT_MS);
+  heartbeat.unref();
+
+  return {
+    async close(): Promise<void> {
+      clearInterval(heartbeat);
+      unsubscribe();
+      for (const ws of states.keys()) ws.terminate();
+      states.clear();
+      metrics.wsConnections = 0;
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    },
+    dropAll(): void {
+      for (const ws of states.keys()) ws.terminate();
+    },
+    count(): number {
+      return states.size;
+    },
+  };
+}

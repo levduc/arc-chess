@@ -1,10 +1,13 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import { decodeWire, toWire, WireFormatError } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 import { RpcChainReader, type ChainReader } from "./chain.js";
 import { RateLimiter } from "./limits.js";
 import { chessSkillMd, indexHtml, llmsTxt, skillMd } from "./docs.js";
+import { Lobby, LobbyError } from "./lobby.js";
 import { SqliteRepo, type Repo } from "./repo.js";
+import { attachWs } from "./ws.js";
 
 export type Metrics = {
   wsConnections: number;
@@ -20,7 +23,7 @@ export type ArenaServer = {
   port: number;
   config: ServerConfig;
   repo: Repo;
-  dropConnections(): void; // closes every WebSocket (tests: simulate a relay outage); Task 4 fills this in
+  dropConnections(): void; // closes every WebSocket (tests: simulate a relay outage)
   close(): Promise<void>;
 };
 
@@ -34,13 +37,64 @@ type Ctx = {
 };
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
-  const text = JSON.stringify(body);
+  const text = toWire(body);
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(text);
 }
 
 function decStr(n: bigint): string {
   return n.toString();
+}
+
+/** Thrown by `readBody` once the request exceeds the cap; the route handler turns it into a 413. */
+class BodyTooLargeError extends Error {}
+
+const MAX_BODY_BYTES = 64 * 1024;
+
+/** Reads the whole request body as text, refusing (413) anything over `maxBytes` -- by content-length up front,
+ *  and by actual bytes received in case content-length is missing or lied about. */
+function readBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      req.resume();
+      reject(new BodyTooLargeError());
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        // drain and discard rather than destroy(): the socket must stay alive long enough for the 413 to go out
+        req.removeAllListeners("data");
+        req.resume();
+        reject(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+/** Runs a lobby route body, mapping its failure modes to the ruled-on HTTP status. Anything else propagates to
+ *  `handle`'s catch-all (500). */
+async function withLobbyErrors(res: http.ServerResponse, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      sendJson(res, 413, { error: "body too large" });
+    } else if (err instanceof WireFormatError) {
+      sendJson(res, 400, { error: err.message });
+    } else if (err instanceof LobbyError) {
+      sendJson(res, err.status, { error: err.message });
+    } else {
+      throw err;
+    }
+  }
 }
 
 function templateEntry(cfg: ServerConfig, url: string) {
@@ -90,7 +144,7 @@ const MARKDOWN_ROUTES = ["/skill.md", "/llms.txt", "/templates/chess/skill.md"] 
 
 export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Promise<ArenaServer> {
   const repo = new SqliteRepo(cfg.dbPath);
-  // not read by this task's routes yet; Tasks 4-6 (indexer, lobby, relay) consume it from this same closure
+  // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
   const log = deps.log ?? ((line: string) => console.log(line));
 
@@ -98,6 +152,8 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
 
   const postLimiter = new RateLimiter(cfg.limits.httpPostBurst, cfg.limits.httpPostPerSec);
   const getLimiter = new RateLimiter(cfg.limits.httpGetBurst, cfg.limits.httpGetPerSec);
+
+  const lobby = new Lobby(repo, chain, cfg);
 
   // filled once listen() resolves; route handlers close over this box rather than a value, so they always see it
   const self: { url: string } = { url: "" };
@@ -110,8 +166,33 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     },
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/metrics") return false;
+      const offersOpen = repo.openOffers(await chain.now()).length;
       ctx.res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
-      ctx.res.end(renderMetrics(metrics, 0)); // Task 4 wires the real open-offer count into this call
+      ctx.res.end(renderMetrics(metrics, offersOpen));
+      return true;
+    },
+    async (ctx) => {
+      if (ctx.method !== "POST" || ctx.url.pathname !== "/offers") return false;
+      await withLobbyErrors(ctx.res, async () => {
+        const body = decodeWire(await readBody(ctx.req, MAX_BODY_BYTES));
+        const result = await lobby.post(body);
+        sendJson(ctx.res, 201, result);
+      });
+      return true;
+    },
+    async (ctx) => {
+      if (ctx.method !== "GET" || ctx.url.pathname !== "/offers") return false;
+      sendJson(ctx.res, 200, await lobby.list());
+      return true;
+    },
+    async (ctx) => {
+      const match = /^\/offers\/([^/]+)\/accept$/.exec(ctx.url.pathname);
+      if (ctx.method !== "POST" || !match) return false;
+      await withLobbyErrors(ctx.res, async () => {
+        const body = decodeWire(await readBody(ctx.req, MAX_BODY_BYTES));
+        const event = await lobby.accept(match[1], body);
+        sendJson(ctx.res, 200, event);
+      });
       return true;
     },
     async (ctx) => {
@@ -161,6 +242,17 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   }
 
   const httpServer = http.createServer((req, res) => void handle(req, res));
+  const wsHandle = attachWs(httpServer, { lobby, relay: null, cfg, metrics, log });
+
+  const pruneInterval = setInterval(() => {
+    chain
+      .now()
+      .then((now) => repo.pruneOffers(now))
+      .catch((err: unknown) => {
+        log(JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "prune failed", error: String(err) }));
+      });
+  }, 10 * 60 * 1000);
+  pruneInterval.unref();
 
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
@@ -175,9 +267,11 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     config: cfg,
     repo,
     dropConnections() {
-      // no WebSocket server yet; Task 4 replaces this with one that closes every live connection
+      wsHandle.dropAll();
     },
     async close() {
+      clearInterval(pruneInterval);
+      await wsHandle.close();
       httpServer.closeAllConnections();
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
       repo.close();
