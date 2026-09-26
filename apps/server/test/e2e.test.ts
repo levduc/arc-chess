@@ -49,11 +49,24 @@ let server: ArenaServer | undefined;
 let procs: DaemonProcess[] = [];
 
 afterEach(async () => {
-  for (const p of procs) await p.stop();
+  for (const p of procs) {
+    try {
+      await p.stop();
+    } catch {
+      // one failed stop must not leave the other daemons or the server running
+    }
+  }
   procs = [];
   await server?.close();
   server = undefined;
 });
+
+/** Whether the server's relay cache holds `sender`'s state at `turnNum` for channel `id`. */
+function cachedTurn(id: Hex, sender: 0 | 1, turnNum: bigint): boolean {
+  return server!.repo
+    .cachedRelay(id)
+    .some((e) => e.sender === sender && e.message.type === "state" && e.message.signed.state.turnNum === turnNum);
+}
 
 type Env = Awaited<ReturnType<typeof deployArena>>;
 
@@ -194,6 +207,57 @@ describe("arena end-to-end (two real daemon processes, real host server, Anvil)"
       );
     },
     60_000,
+  );
+
+  it(
+    "receiver offline while the sender auto-resigns and proposes the next game: it catches up with no chain step",
+    async () => {
+      const env = await setupServer();
+      const alice = await makePlayer(env, ANVIL_KEYS[1]);
+      const bob = await makePlayer(env, ANVIL_KEYS[2]);
+      const host = { host: { minBackoffMs: 50, maxBackoffMs: 500 } };
+
+      const { offerId } = await alice.proc.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await bob.proc.daemon.acceptOffer(offerId);
+      const id = await waitFor(() => alice.proc.daemon.channelIds()[0], 20_000, "match");
+      await waitFor(async () => (await alice.proc.daemon.status(id)).phase === "Open", 30_000, "open");
+
+      // Everything up to the mating move is played live.
+      await playLine(alice.proc.daemon, bob.proc.daemon, id, SCHOLARS_MATE.slice(0, -1));
+      // Bob goes offline, so the mate reaches him only through the relay cache once he is back; Alice mates and
+      // then goes offline herself before Bob can answer it.
+      await bob.proc.stop();
+      await alice.proc.daemon.move(id, SCHOLARS_MATE[SCHOLARS_MATE.length - 1], { actor: "agent" });
+      const mate = alice.proc.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => cachedTurn(id, 0, mate), 5_000, "mate cached");
+      await alice.proc.stop();
+
+      // Bob (the sender) comes back and stays connected: his daemon auto-resigns at mate+1 and he immediately
+      // proposes the next game at mate+2, while Alice (the receiver) is offline for both.
+      const bob2 = await startDaemonProcess(bob.home, host);
+      procs.push(bob2);
+      await waitFor(async () => (await bob2.daemon.status(id)).gameStatus === "white_won", 20_000, "bob auto-resigns");
+      await waitFor(() => cachedTurn(id, 1, mate + 1n), 5_000, "resignation cached");
+      await bob2.daemon.nextGame(id, "agent");
+      await waitFor(() => cachedTurn(id, 1, mate + 2n), 5_000, "checkpoint cached");
+
+      // Alice reconnects: the relay replays the resignation, then the checkpoint, so she sees the proposal.
+      const alice2 = await startDaemonProcess(alice.home, host);
+      procs.push(alice2);
+      await waitFor(
+        async () => (await alice2.daemon.status(id)).attention === "new-game-proposed",
+        20_000,
+        "alice sees the proposal",
+      );
+      expect(alice2.daemon.handle(id).lastError).toBeNull();
+      const info = await alice2.daemon.hub.channelInfo(id);
+      expect(info.phase).toBe("Open");
+      expect(info.hasRegistered).toBe(false); // nobody had to challenge
+
+      await alice2.daemon.nextGame(id, "agent");
+      await waitFor(() => bob2.daemon.handle(id).session.isMyTurn(), 10_000, "game 1 starts with Bob as white");
+    },
+    120_000,
   );
 
   it(

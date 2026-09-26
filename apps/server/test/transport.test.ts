@@ -246,7 +246,11 @@ describe("host transports (connectHost) against a real server", () => {
       await waitFor(() => logs.some((l) => l.includes("refused")));
 
       server.dropConnections();
+      // wait for the client to see the drop first: otherwise `connected()` can still be true of the old socket and
+      // the assertion below would pass without any reconnect having happened
+      await waitFor(() => !hostA.connected());
       await waitFor(() => hostA.connected());
+      expect(logs.some((l) => l.includes("reconnecting in"))).toBe(true);
       await new Promise((r) => setTimeout(r, 200)); // a resend-on-hello, if it happened, would show up by now
       expect(logs.filter((l) => l.includes("not a member")).length).toBe(1); // not repeated on the reconnect
     } finally {
@@ -294,6 +298,7 @@ describe("host transports (connectHost) against a real server", () => {
       await waitFor(() => logs.some((l) => l.includes("will retry")));
 
       server.dropConnections();
+      await waitFor(() => !hostA.connected());
       await waitFor(() => hostA.connected());
       // The fresh connection re-attempts fx1 and fx2 (in that registration order) on its next `hello`; fx1 still
       // wins the connection's one slot first, so fx2 is refused again -- proving fx2's join was resent, not
