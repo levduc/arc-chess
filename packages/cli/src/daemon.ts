@@ -62,6 +62,9 @@ export type ChannelHandle = {
   passes: number;
 };
 
+/** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
+export type DegradedChannel = { channelId: string; degraded: true; error: string };
+
 export type DaemonOptions = {
   home: string;
   config: ArenaConfig;
@@ -81,6 +84,8 @@ export class ArenaDaemon {
   protected readonly domain: ArenaDomain;
   protected readonly records: RecordStore;
   protected readonly live = new Map<Hex, ChannelHandle>();
+  /** I1: channel entries that could not be loaded at start(), by directory name, with the reason. Never watched or picked. */
+  protected readonly degraded = new Map<string, string>();
   protected readonly changes = new EventEmitter();
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
@@ -112,8 +117,28 @@ export class ArenaDaemon {
   async start(): Promise<void> {
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => void this.onMatch(m)));
     this.unsubscribers.push(this.opts.relay.onMessage((m) => void this.onRelay(m)));
-    for (const record of this.records.channels()) {
-      if (!record.finalized) await this.openChannel(record);
+    // I1: every channel entry is loaded in isolation. A corrupt record or session file, or a record that does not
+    // match this hub/chain, is logged and reported as degraded (see channels()) instead of aborting start() —
+    // which would leave every other channel, including ones mid-dispute, unwatched.
+    for (const entry of this.records.scanChannels()) {
+      if (this.stopped) break;
+      if (entry.record === null) {
+        this.markDegraded(entry.channelId, entry.error);
+        continue;
+      }
+      if (entry.record.finalized) continue;
+      try {
+        await this.openChannel(entry.record);
+      } catch (err) {
+        const opened = this.live.get(entry.record.channelId);
+        if (opened) {
+          // The session loaded and the channel is watched; only the relay join/re-send failed.
+          opened.lastError = `relay: ${errorText(err)}`;
+          this.log(`channel ${entry.channelId}: ${opened.lastError}`);
+        } else {
+          this.markDegraded(entry.channelId, errorText(err));
+        }
+      }
     }
     // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see
     // attention right after a restart instead of waiting up to pollMs for the first periodic tick.
@@ -307,6 +332,13 @@ export class ArenaDaemon {
 
   private async openChannel(record: ChannelRecord): Promise<void> {
     if (this.stopped) return;
+    // I1: a record whose params do not hash to its channelId under this hub/chain (e.g. `arena init` re-run
+    // against another deployment) must not be watched under the wrong id — checked before the session store is
+    // touched, so no snapshot for another channel is ever written into this channel's directory.
+    const expected = computeChannelId(this.domain.chainId, this.domain.hub, record.params);
+    if (expected !== record.channelId) {
+      throw new Error(`record ${record.channelId} does not match this hub and chain (its params give ${expected})`);
+    }
     const store = new FileSessionStore(arenaPaths(this.opts.home).channelSession(record.channelId));
     const session = await ChannelSession.open({
       params: record.params,
@@ -603,12 +635,14 @@ export class ArenaDaemon {
     return this.statusOf(l);
   }
 
-  async channels(): Promise<ChannelStatus[]> {
-    const out: ChannelStatus[] = [];
+  /** Every live channel's status, followed by the channels that could not be loaded (I1). */
+  async channels(): Promise<Array<ChannelStatus | DegradedChannel>> {
+    const out: Array<ChannelStatus | DegradedChannel> = [];
     for (const l of this.live.values()) {
       await this.refreshChain(l);
       out.push(this.statusOf(l));
     }
+    for (const [channelId, error] of this.degraded) out.push({ channelId, degraded: true, error });
     return out;
   }
 
@@ -682,6 +716,9 @@ export class ArenaDaemon {
     if (ref) {
       const hits = [...this.live.values()].filter((l) => l.record.channelId.toLowerCase().startsWith(ref.toLowerCase()));
       if (hits.length === 1) return hits[0];
+      // I1: degraded channels are never picked, but naming one explains why instead of "unknown channel".
+      const broken = hits.length === 0 ? [...this.degraded].filter(([id]) => id.toLowerCase().startsWith(ref.toLowerCase())) : [];
+      if (broken.length === 1) throw new DaemonError(409, `channel ${broken[0][0]} could not be loaded: ${broken[0][1]}`);
       throw new DaemonError(hits.length === 0 ? 404 : 400, hits.length === 0 ? `unknown channel ${ref}` : `ambiguous channel ${ref}`);
     }
     if (active.length === 1) return active[0];
@@ -709,6 +746,11 @@ export class ArenaDaemon {
     } catch {
       // M8: a throwing listener must never break the caller (a move, a relay message, a tick).
     }
+  }
+
+  private markDegraded(channelId: string, error: string): void {
+    this.degraded.set(channelId, error);
+    this.log(`channel ${channelId} is degraded and not watched: ${error}`);
   }
 
   protected log(line: string): void {
