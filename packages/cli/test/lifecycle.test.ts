@@ -82,6 +82,23 @@ describe("I3/M12: offer records do not pile up", () => {
     expect(alice.client.unwatched()).toEqual([offerId]);
   });
 
+  it("start() prunes dead offer records before its first watch, so they are never subscribed", async () => {
+    const { alice } = await pair();
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await alice.daemon.stop();
+    await increaseTime(3600 + Number(MAX_FUNDING_WINDOW) + 60);
+
+    const watchCalls: string[][] = [];
+    const realWatch = alice.client.lobby.watch;
+    alice.client.lobby.watch = (ids) => {
+      watchCalls.push([...ids]);
+      realWatch(ids);
+    };
+    await restart(alice);
+    expect(new RecordStore(alice.home).offer(offerId)).toBe(null);
+    expect(watchCalls.flat()).not.toContain(offerId);
+  });
+
   it("an offer the host refuses leaves no record behind", async () => {
     const { alice } = await pair();
     alice.client.lobby.postOffer = async () => {

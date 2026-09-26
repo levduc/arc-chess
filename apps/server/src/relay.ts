@@ -78,7 +78,7 @@ export class Relay {
         return;
       }
       // anyone can mint params and keys for a throwaway channel; only channels matched by this host's lobby or
-      // seen on-chain by its indexer may occupy the cache
+      // seen on-chain by its indexer, and not yet settled, may occupy the cache
       if (!this.repo.knownChannel(expected)) {
         peer.send({ type: "error", error: "unknown channel", channelId: expected });
         return;

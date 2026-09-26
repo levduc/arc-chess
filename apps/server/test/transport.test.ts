@@ -341,8 +341,9 @@ describe("host transports (connectHost) against a real server", () => {
   });
 
   it("re-joins after a reconnect are paced under the server's frame rate limit", async () => {
-    // a burst budget far below the channel count: an unpaced burst of re-joins would be closed with 1008
-    const limits = { ...DEFAULT_LIMITS, wsFrameBurst: 10, wsFramePerSec: 60 };
+    // the default sustained rate with a burst budget far below the channel count: an unpaced burst of re-joins
+    // would be closed with 1008
+    const limits = { ...DEFAULT_LIMITS, wsFrameBurst: 5, wsFramePerSec: DEFAULT_LIMITS.wsFramePerSec };
     const cfg = testConfig({ limits });
     server = await startServer(cfg, { chain: new FakeChain() });
     const fxs = Array.from({ length: 30 }, () => makeChannelFixture(cfg, server!.repo));
@@ -351,7 +352,7 @@ describe("host transports (connectHost) against a real server", () => {
       await waitFor(() => hostA.connected());
       for (const fx of fxs) {
         await hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA));
-        await new Promise((r) => setTimeout(r, 25)); // the test's own joins stay under the limit too
+        await new Promise((r) => setTimeout(r, 100)); // the test's own joins stay under the limit too
       }
       const rejoined = new Set<Hex>();
       hostA.relay.onJoined((id) => rejoined.add(id));
@@ -370,6 +371,31 @@ describe("host transports (connectHost) against a real server", () => {
       }
       expect(drops).toBe(0);
       expect(hostA.connected()).toBe(true);
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("the re-join loop stops at the first capacity refusal; the rest wait for the next hello", async () => {
+    const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fxs = [0, 1, 2].map(() => makeChannelFixture(cfg, server!.repo));
+    const logs: string[] = [];
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
+    try {
+      await waitFor(() => hostA.connected());
+      await hostA.relay.join(fxs[0].id, fxs[0].params, privateKeyToAccount(fxs[0].kA)); // takes the one slot
+      for (const fx of fxs.slice(1)) {
+        await expect(hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA))).rejects.toThrow(/too many/);
+      }
+      server.dropConnections();
+      await waitFor(() => !hostA.connected());
+      logs.length = 0;
+      await waitFor(() => hostA.connected());
+      await waitFor(() => logs.some((l) => l.includes("too many channels")), 5_000); // fxs[1] is refused...
+      await new Promise((r) => setTimeout(r, 500)); // ...and fxs[2] would follow within a pacing interval or two
+      expect(logs.filter((l) => l.includes("too many channels"))).toHaveLength(1);
+      expect(logs.some((l) => l.includes(fxs[2].id))).toBe(false);
     } finally {
       hostA.close();
     }

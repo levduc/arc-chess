@@ -100,7 +100,7 @@ Client → server:
 |---|---|---|
 | `subscribe` | `offerIds: Hex[]` | Watch these offer ids for a `match` push (and an immediate replay if already matched). Unauthenticated: a match event only reveals params that become public on-chain at deposit anyway. |
 | `unsubscribe` | `offerIds: Hex[]` | Stop watching these offer ids, freeing their slots under `maxWatchedOffers`. |
-| `join` | `channelId`, `params: Params`, `signer`, `sig` | Join a channel's relay. `params` is self-certifying: the server recomputes `channelId` from it and rejects a mismatch. The channel must be known to this host, meaning matched by its lobby or indexed on-chain; otherwise the join is refused with `unknown channel`. The CLI retries such a join on its next `hello`, since the host may learn of the channel later. `sig` must be an EIP-191 (`personal_sign`) signature by one of `params.signers` over `keccak256(abi.encode("arena-relay-join", channelId, nonce))`, for this connection's `hello` nonce. |
+| `join` | `channelId`, `params: Params`, `signer`, `sig` | Join a channel's relay. `params` is self-certifying: the server recomputes `channelId` from it and rejects a mismatch. The channel must be known to this host, meaning matched by its lobby or indexed on-chain, and not settled: an indexer row in `Finalized` or `Reclaimed` makes it unknown again. Otherwise the join is refused with `unknown channel`. The CLI retries such a join on its next `hello`, since the host may learn of the channel later. `sig` must be an EIP-191 (`personal_sign`) signature by one of `params.signers` over `keccak256(abi.encode("arena-relay-join", channelId, nonce))`, for this connection's `hello` nonce. |
 | `leave` | `channelId` | Leave a joined channel (the daemon sends it once the channel is settled), freeing its slot under `maxJoinsPerConnection`. |
 | `relay` | `message: RelayMessage` | Forward an already-signed `state` or `close` message to the channel's other joined member(s). It is cached for replay to a later joiner: the 4 highest-turn states per sender, plus that sender's latest close. |
 
@@ -132,7 +132,8 @@ forwards is trusted at face value by the daemons that receive it.
   - the relay caches only channels this host knows about;
   - a settled channel's cache is deleted a day after the indexer sees it `Finalized` or `Reclaimed`, and its
     games count and final state are kept on the channel row;
-  - a matched offer is deleted a day past its funding deadline, unless its channel is still live on-chain.
+  - a matched offer is deleted a day past its funding deadline, unless its channel is still live on-chain. If the
+    channel never reached the chain, its relay cache is deleted with the offer.
 - Rate limits and body-size caps bound what an untrusted client can do to this process; they are not a security
   boundary for the funds, which live entirely in `ChannelHub`.
 

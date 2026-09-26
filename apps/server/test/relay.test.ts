@@ -359,6 +359,30 @@ describe("relay", () => {
     expect(server.repo.cachedRelay(fx.id)).toEqual([]);
   });
 
+  it("refuses a join once the channel's indexer row is settled, even though this host matched it", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    for (const phase of ["Finalized", "Reclaimed"] as const) {
+      const fx = makeChannelFixture(cfg, server.repo); // matched here...
+      server.repo.saveChannelRow({ // ...and since settled on-chain
+        channelId: fx.id, params: fx.params, phase, createdBlock: 1n, challenges: [0, 0], answered: [0, 0],
+        pendingChallenger: null, registered: null, timeoutLoser: null, balances: [1n, 2n],
+      });
+      const c = await wsConnect(server.url);
+      const acct = privateKeyToAccount(fx.kA);
+      c.send({
+        type: "join",
+        channelId: fx.id,
+        params: fx.params,
+        signer: acct.address,
+        sig: await signRelayJoin(acct, fx.id, c.nonce),
+      });
+      const f = await c.next((f) => f.type === "error" || f.type === "joined");
+      expect(f).toEqual({ type: "error", error: "unknown channel", channelId: fx.id });
+      c.ws.close();
+    }
+  });
+
   it("accepts a join for a channel known only through an indexer row", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });

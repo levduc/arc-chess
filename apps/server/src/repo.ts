@@ -45,7 +45,8 @@ export interface Repo {
   /** `channelId` is `channelId(chainId, hub, m.params)`, computed by the caller (the repo has no domain). */
   recordMatch(offerId: Hex, sa: SignedAcceptance, m: MatchEvent, channelId: Hex): boolean;
   pruneOffers(now: bigint): number;
-  /** Whether this host matched the channel in its lobby or has indexed it on-chain -- the relay's join gate. */
+  /** The relay's join gate: whether this host matched the channel in its lobby or has indexed it on-chain, and it
+   *  is not settled (an indexer row in `Finalized`/`Reclaimed` makes it unknown again). */
   knownChannel(channelId: Hex): boolean;
   /** Keeps up to `RELAY_STATE_DEPTH` `state` messages per (channel, sender) -- the highest turns -- plus the latest
    *  `close`. A same-turn state replaces the held one; a lower turn never evicts a higher one. */
@@ -147,16 +148,30 @@ export class SqliteRepo implements Repo {
   /** Brings a database written by an older schema up to date: `CREATE TABLE IF NOT EXISTS` alone never alters an
    *  existing table. Idempotent, and a no-op on a fresh database. */
   private migrate(channelIdOf?: (p: Params) => Hex): void {
+    // one transaction (SQLite DDL is transactional): a crash mid-migration leaves the old schema intact
+    this.db.exec("BEGIN");
+    try {
+      this.migrateSteps(channelIdOf);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  private migrateSteps(channelIdOf?: (p: Params) => Hex): void {
     const oldCache = this.columns("relay_cache");
-    let carried: Array<{ channel_id: string; sender: number; body: string }> = [];
+    let carried: Array<{ channel_id: string; sender: number; kind: string; body: string }> = [];
     if (oldCache.size > 0 && !oldCache.has("turn")) {
       // the primary key gains `turn`, which SQLite cannot alter in place: rebuild the table, keeping its rows
-      carried = this.db.prepare("SELECT channel_id, sender, body FROM relay_cache").all() as typeof carried;
+      carried = this.db.prepare("SELECT channel_id, sender, kind, body FROM relay_cache").all() as typeof carried;
       this.db.exec("DROP TABLE relay_cache");
     }
     this.db.exec(SCHEMA);
+    // the old key held at most one row per (channel, sender, kind), so these can never collide
+    const insert = this.db.prepare("INSERT INTO relay_cache (channel_id, sender, kind, turn, body) VALUES (?, ?, ?, ?, ?)");
     for (const r of carried) {
-      this.cacheRelay(r.channel_id as Hex, r.sender as PlayerIndex, fromWire<RelayMessage>(r.body));
+      insert.run(r.channel_id, r.sender, r.kind, turnKey(fromWire<RelayMessage>(r.body)), r.body);
     }
     const offers = this.columns("offers");
     if (!offers.has("channel_id")) this.db.exec("ALTER TABLE offers ADD COLUMN channel_id TEXT");
@@ -231,28 +246,43 @@ export class SqliteRepo implements Repo {
 
   pruneOffers(now: bigint): number {
     const threshold = padSeconds(now - ONE_DAY_SECONDS);
-    const unmatched = this.db.prepare("DELETE FROM offers WHERE match IS NULL AND expires_at <= ?").run(threshold);
-    // a day past its funding deadline a match can no longer be funded, so it is only worth keeping while it
-    // still identifies a live channel for the relay's join gate (an indexer row that is not settled yet)
-    const matched = this.db
-      .prepare(
-        "DELETE FROM offers WHERE match IS NOT NULL AND funding_deadline < ? AND (" +
-          "NOT EXISTS (SELECT 1 FROM channels c WHERE c.channel_id = offers.channel_id) OR " +
-          "EXISTS (SELECT 1 FROM channels c WHERE c.channel_id = offers.channel_id " +
-          "AND json_extract(c.body, '$.phase') IN ('Finalized', 'Reclaimed')))",
-      )
-      .run(threshold);
-    return Number(unmatched.changes) + Number(matched.changes);
+    this.db.exec("BEGIN");
+    try {
+      const unmatched = this.db.prepare("DELETE FROM offers WHERE match IS NULL AND expires_at <= ?").run(threshold);
+      // A never-funded channel has no indexer row, so nothing else would ever prune its relay cache: drop it
+      // with the match that made it joinable (a settled channel's cache goes through pruneRelayCache instead).
+      this.db
+        .prepare(
+          "DELETE FROM relay_cache WHERE channel_id IN (SELECT channel_id FROM offers WHERE match IS NOT NULL " +
+            "AND funding_deadline < ? AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.channel_id = offers.channel_id))",
+        )
+        .run(threshold);
+      // a day past its funding deadline a match can no longer be funded, so it is only worth keeping while it
+      // still identifies a live channel for the relay's join gate (an indexer row that is not settled yet)
+      const matched = this.db
+        .prepare(
+          "DELETE FROM offers WHERE match IS NOT NULL AND funding_deadline < ? AND (" +
+            "NOT EXISTS (SELECT 1 FROM channels c WHERE c.channel_id = offers.channel_id) OR " +
+            "EXISTS (SELECT 1 FROM channels c WHERE c.channel_id = offers.channel_id " +
+            "AND json_extract(c.body, '$.phase') IN ('Finalized', 'Reclaimed')))",
+        )
+        .run(threshold);
+      this.db.exec("COMMIT");
+      return Number(unmatched.changes) + Number(matched.changes);
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   knownChannel(channelId: Hex): boolean {
     const id = channelId.toLowerCase();
-    const row = this.db
-      .prepare(
-        "SELECT 1 AS k FROM offers WHERE channel_id = ? UNION ALL SELECT 1 AS k FROM channels WHERE channel_id = ? LIMIT 1",
-      )
-      .get(id, id);
-    return row !== undefined;
+    const indexed = this.db
+      .prepare("SELECT json_extract(body, '$.phase') AS phase FROM channels WHERE channel_id = ?")
+      .get(id) as { phase: string } | undefined;
+    // a settled channel is never joinable again, so its pruned cache cannot be refilled
+    if (indexed) return indexed.phase !== "Finalized" && indexed.phase !== "Reclaimed";
+    return this.db.prepare("SELECT 1 AS k FROM offers WHERE channel_id = ? LIMIT 1").get(id) !== undefined;
   }
 
   cacheRelay(channelId: Hex, sender: PlayerIndex, message: RelayMessage): void {

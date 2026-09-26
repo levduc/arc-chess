@@ -107,6 +107,27 @@ describe("arena init --server", () => {
     expect(() => loadConfig(home)).toThrow(); // nothing written
   });
 
+  it("reports a malformed eth_chainId or a non-JSON RPC body as an RPC error", async () => {
+    const cases: Array<[string, () => Response]> = [
+      ["malformed eth_chainId", () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "31337" }))],
+      ["not JSON", () => new Response("<html>502 Bad Gateway</html>")],
+    ];
+    for (const [label, rpcResponse] of cases) {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const fetchStub = (async (url: string) =>
+        url.endsWith("/templates") ? new Response(JSON.stringify(templatesResponse())) : rpcResponse()) as typeof fetch;
+      const err: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+      });
+      expect(code, label).toBe(1);
+      expect(err.join("\n"), label).toMatch(/^error: RPC http:\/\/rpc\.test /m);
+    }
+  });
+
   it("fails when an adopted hub or rules address has no code", async () => {
     for (const missing of ["hub", "rules"] as const) {
       const home = mkdtempSync(join(tmpdir(), "arena-init-"));

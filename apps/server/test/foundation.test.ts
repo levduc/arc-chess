@@ -240,6 +240,35 @@ describe("sqlite repo", () => {
     }
   });
 
+  it("rolls a failed migration back, leaving the old schema intact", () => {
+    const path = join(tmpdir(), `arena-migrate-${randomBytes(8).toString("hex")}.sqlite`);
+    try {
+      const old = new DatabaseSync(path);
+      old.exec(`CREATE TABLE offers (offer_id TEXT PRIMARY KEY, player TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '',
+        expires_at TEXT NOT NULL, body TEXT NOT NULL, acceptance TEXT, match TEXT, created_ms INTEGER NOT NULL);
+        CREATE TABLE relay_cache (channel_id TEXT NOT NULL, sender INTEGER NOT NULL, kind TEXT NOT NULL,
+        body TEXT NOT NULL, PRIMARY KEY (channel_id, sender, kind));`);
+      const channelId = ("0x" + "ab".repeat(32)) as `0x${string}`;
+      const msg = { type: "state" as const, channelId, signed: { state: { turnNum: 7n }, sigA: "0x", sigB: "0x" } };
+      old.prepare("INSERT INTO relay_cache VALUES (?, 0, 'state', ?)").run(channelId, toWire(msg));
+      old
+        .prepare("INSERT INTO offers (offer_id, player, expires_at, body, match, created_ms) VALUES (?, 'p', '0', '{}', ?, 0)")
+        .run("0x" + "01".repeat(32), toWire({ offerId: "0x" + "01".repeat(32), params: { fundingDeadline: 5n } }));
+      old.close();
+
+      // the backfill runs last, after the relay cache was rebuilt and columns were added: all of it must roll back
+      expect(() => new SqliteRepo(path, () => { throw new Error("backfill failed"); })).toThrow(/backfill failed/);
+      const after = new DatabaseSync(path);
+      const cols = (t: string) => (after.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map((c) => c.name);
+      expect(cols("relay_cache")).not.toContain("turn");
+      expect(cols("offers")).not.toContain("channel_id");
+      expect(after.prepare("SELECT COUNT(*) AS n FROM relay_cache").get()).toEqual({ n: 1 });
+      after.close();
+    } finally {
+      for (const suffix of ["", "-wal", "-shm"]) rmSync(`${path}${suffix}`, { force: true });
+    }
+  });
+
   it("prunes matched offers a day past their funding deadline unless their channel is still live", () => {
     const r = new SqliteRepo(":memory:");
     const deadline = 1_000_000n;
@@ -265,13 +294,24 @@ describe("sqlite repo", () => {
     const reclaimed = mk(4);
     r.saveChannelRow(row(reclaimed.channelId, "Reclaimed"));
 
+    // a self-accepted, never-funded channel whose members pushed states: nothing but this prune would drop them
+    const cached = (channelId: `0x${string}`) =>
+      ({ type: "state", channelId, signed: { state: { turnNum: 1n }, sigA: "0x", sigB: "0x" } }) as never;
+    r.cacheRelay(neverFunded.channelId, 0, cached(neverFunded.channelId));
+    r.cacheRelay(neverFunded.channelId, 1, cached(neverFunded.channelId));
+    r.cacheRelay(live.channelId, 0, cached(live.channelId));
+
     expect(r.pruneOffers(deadline + 86_400n)).toBe(0); // exactly a day past: not yet (strictly more than a day)
+    expect(r.cachedRelay(neverFunded.channelId)).toHaveLength(2);
     expect(r.pruneOffers(deadline + 86_401n)).toBe(3);
+    expect(r.cachedRelay(neverFunded.channelId)).toEqual([]); // no orphaned cache left behind
+    expect(r.cachedRelay(live.channelId)).toHaveLength(1); // a live channel's cache is untouched
     expect(r.offer(neverFunded.offerId)).toBe(null);
     expect(r.offer(finalized.offerId)).toBe(null);
     expect(r.offer(reclaimed.offerId)).toBe(null);
     expect(r.offer(live.offerId)).not.toBe(null); // an Open channel keeps its match (and its join gate)
-    expect(r.knownChannel(finalized.channelId)).toBe(true); // still known through its indexer row
+    expect(r.knownChannel(finalized.channelId)).toBe(false); // settled: never joinable again
+    expect(r.knownChannel(live.channelId)).toBe(true);
     r.close();
   });
 
@@ -333,6 +373,10 @@ describe("http foundation", () => {
     expect(ipKey("::ffff:cb00:7109")).toBe("203.0.113.9"); // the same mapped address in hex form
     expect(ipKey("203.0.113.9")).toBe("203.0.113.9");
     expect(ipKey("fe80::1%eth0")).toBe(ipKey("fe80::2"));
+    // proxies may append the client's port
+    expect(ipKey("203.0.113.9:5678")).toBe("203.0.113.9");
+    expect(ipKey("[2001:db8:1:2::1]:443")).toBe(ipKey("2001:db8:1:2::5"));
+    expect(ipKey("[2001:db8:1:2::1]")).toBe(ipKey("2001:db8:1:2::5"));
     const limiter = new RateLimiter(1, 0.001);
     expect(limiter.take(ipKey("2001:db8:1:2::1"))).toBe(true);
     expect(limiter.take(ipKey("2001:db8:1:2::abcd"))).toBe(false); // same /64: same bucket
@@ -348,6 +392,10 @@ describe("http foundation", () => {
     expect(await get("198.51.100.2, 198.51.100.1")).toBe(429); // only the proxy-appended (right-most) entry counts
     expect(await get("2001:db8:5:6::1")).toBe(200);
     expect(await get("2001:db8:5:6::2")).toBe(429); // same /64
+    expect(await get("198.51.100.3:4000")).toBe(200); // a port on the entry is dropped...
+    expect(await get("198.51.100.3:4001")).toBe(429); // ...so another port of the same client shares its bucket
+    expect(await get("[2001:db8:7:8::1]:443")).toBe(200);
+    expect(await get("2001:db8:7:8::2")).toBe(429);
   });
 
   it("without trustProxy, ignores X-Forwarded-For", async () => {

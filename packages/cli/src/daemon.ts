@@ -160,6 +160,8 @@ export class ArenaDaemon {
         this.markDegraded(entry.channelId, errorText(err));
       }
     }
+    // Records that can no longer produce a fundable match go first, so they are never subscribed at all.
+    if (!this.stopped) await this.pruneOffers();
     // Replays match events for offers this daemon posted/accepted while it was down.
     this.opts.lobby.watch(this.records.offers().map((o) => o.offerId));
     // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see

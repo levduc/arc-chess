@@ -505,9 +505,12 @@ accept-draw / next-game / close buttons.
     - A relay `join` carries the channel's `Params` (self-certifying: the server recomputes `channelId`) and a
       session-key EIP-191 (`personal_sign`) signature over `keccak256(abi.encode("arena-relay-join", channelId,
       nonce))`.
-    - The server accepts a join only for a channel it knows: one its lobby matched (the match records the
-      `channelId`), or one its indexer has seen on-chain. Any other join is refused with `unknown channel`. Why:
-      otherwise anyone could mint throwaway channels and fill the host's disk through the relay cache. The CLI
+    - The server accepts a join only for a channel it knows that is not settled: one its lobby matched (the
+      match records the `channelId`), or one its indexer has seen on-chain. A channel whose indexer row is
+      `Finalized` or `Reclaimed` counts as unknown, so its pruned cache cannot be refilled; daemons leave a
+      channel when they mark it settled and never need the relay after that. Any other join is refused with
+      `unknown channel`. Why: otherwise anyone could mint throwaway channels and fill the host's disk through the
+      relay cache. The CLI
       treats this refusal as transient and retries the join on the next `hello`, because the host can learn of
       the channel later, for example once its indexer sees `ChannelCreated`. A retry costs one frame per
       reconnect.
@@ -538,7 +541,8 @@ accept-draw / next-game / close buttons.
       games count derived from it on the channel row. It deletes the channel's relay cache a day later. After
       that, reputation and `/api/channels` read the stored values.
     - The server deletes a matched offer a day past its funding deadline if its channel never reached the chain
-      or is settled.
+      or is settled. For a channel that never reached the chain, it also deletes the relay cache in the same
+      transaction, because no indexer row will ever schedule that cache for pruning.
 18. **Dispute scan cursor.** Daemons scan `Challenged`/`Responded` events forward from a persisted per-channel
     cursor, in chunks of `logChunkBlocks` (default 1000). They never advance past an event that failed to
     ingest, and a `getLogs` failure does not stop the rest of the watchtower pass. Every scan also re-reads the
@@ -550,7 +554,10 @@ accept-draw / next-game / close buttons.
 19. **Host connection lifecycle (CLI).**
     - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
       or the local API. A failed join is recorded as the channel's `lastError`.
-    - After a reconnect, re-joins go out at 50 per second or fewer, and only for channels that are not settled.
+    - After a reconnect, re-joins go out at 10 per second or fewer, and only for channels that are not settled.
+      That is half the server's default sustained frame rate of 20 per second, because every confirmed join
+      makes the daemon re-send frames of its own. The loop stops at the first "too many channels on this
+      connection" refusal, and the remaining joins wait for the next `hello`.
     - The reconnect backoff resets only after a connection has stayed up for 30 s past `hello`. A server that
       accepts the connection and drops it at once therefore sees a growing delay.
 20. **Per-IP limits.** The server keys every per-IP limit (the HTTP token buckets, `wsPerIp` and

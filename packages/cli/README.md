@@ -48,8 +48,9 @@ The connection to the server survives drops. The client:
 
 - reconnects with a backoff that resets only after a connection has stayed up for 30 s;
 - treats a connection that has sent no frame for 70 s as dead, since the server pings every 25 s;
-- on each reconnect, re-subscribes to watched offers and re-joins every unsettled channel, paced at 50 joins per
-  second or fewer.
+- on each reconnect, re-subscribes to watched offers and re-joins every unsettled channel, paced at 10 joins per
+  second or fewer. It stops for that connection at the first "too many channels on this connection" refusal and
+  sends the rest on the next reconnect.
 
 On every confirmed join, the daemon re-sends its latest own state, any pending checkpoint and its Close signature.
 The server's relay keeps each sender's 4 highest-turn states and latest close, and replays them in turn order to a

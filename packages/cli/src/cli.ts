@@ -37,7 +37,13 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
     throw new Error(`RPC ${url} is unreachable (${method}): ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!res.ok) throw new Error(`RPC ${url} answered ${method} with status ${res.status}`);
-  const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
+  let body: { result?: unknown; error?: { message?: string } };
+  try {
+    body = (await res.json()) as typeof body;
+  } catch {
+    throw new Error(`RPC ${url} answered ${method} with a body that is not JSON`);
+  }
+  if (body === null || typeof body !== "object") throw new Error(`RPC ${url} answered ${method} with a malformed body`);
   if (body.error) throw new Error(`RPC ${url} refused ${method}: ${body.error.message ?? "unknown error"}`);
   return body.result;
 }
@@ -47,7 +53,10 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
  *  arena contracts -- the printed trust line says so. */
 async function verifyChain(io: CliIo, rpcUrl: string, chainId: number, contracts: Record<string, Address>): Promise<void> {
   const reported = await rpcCall(io, rpcUrl, "eth_chainId", []);
-  if (typeof reported !== "string" || Number(BigInt(reported)) !== chainId) {
+  if (typeof reported !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(reported)) {
+    throw new Error(`RPC ${rpcUrl} returned a malformed eth_chainId: ${JSON.stringify(reported)?.slice(0, 80)}`);
+  }
+  if (BigInt(reported) !== BigInt(chainId)) {
     throw new Error(`RPC ${rpcUrl} serves chain ${String(reported)}, not chain ${chainId}`);
   }
   for (const [name, address] of Object.entries(contracts)) {

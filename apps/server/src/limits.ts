@@ -72,10 +72,14 @@ function ipv6Groups(ip: string): number[] {
   return [...h, ...Array<string>(fill).fill("0"), ...t].map((g) => parseInt(g, 16));
 }
 
-/** `ipKey` of `raw`, or `null` when it is not an IP address. */
+/** `ipKey` of `raw`, or `null` when it is not an IP address. Accepts a proxy's `a.b.c.d:port` and `[v6]:port`
+ *  forms, dropping the port. */
 function ipKeyOf(raw: string): string | null {
   let ip = raw.trim();
-  if (ip.startsWith("[") && ip.endsWith("]")) ip = ip.slice(1, -1);
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(ip);
+  if (bracketed) ip = bracketed[1];
+  const v4WithPort = /^(\d+\.\d+\.\d+\.\d+):\d+$/.exec(ip);
+  if (v4WithPort) ip = v4WithPort[1];
   const zone = ip.indexOf("%");
   if (zone >= 0) ip = ip.slice(0, zone);
   if (isIPv4(ip)) return ip;

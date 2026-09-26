@@ -59,8 +59,10 @@ const DEFAULT_MIN_BACKOFF_MS = 250;
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
 const DEFAULT_STABLE_AFTER_MS = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 70_000;
-// re-joins after a reconnect go out at most 50 per second, well inside the server's per-connection frame budget
-const REJOIN_INTERVAL_MS = 20;
+// Re-joins after a reconnect go out at most 10 per second: half the server's default sustained frame rate (20/s),
+// since each confirmed join makes the daemon re-send its own state, proposal and Close on the same connection.
+const REJOIN_INTERVAL_MS = 100;
+const CAPACITY_REFUSAL_PREFIX = "too many channels on this connection";
 
 /**
  * Error-frame message prefixes (relay.ts's `join`) that mean a join is refused for good: the same channelId,
@@ -125,6 +127,9 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let stableTimer: ReturnType<typeof setTimeout> | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The socket whose re-join loop must stop: the server refused a join there for lack of channel slots, so the
+   *  rest would be refused too. They stay registered and go out on the next `hello`. */
+  let rejoinFullOn: WebSocket | null = null;
 
   const watched = new Set<Hex>();
   const joins = new Map<Hex, JoinEntry>();
@@ -169,10 +174,10 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
 
   /** Re-sends every registered join on the connection that just said `hello`, paced (`REJOIN_INTERVAL_MS`) so a
    *  daemon with many channels never bursts past the server's frame limit. Stops as soon as that connection is
-   *  gone; the next `hello` starts over. */
+   *  gone, or has refused a join for lack of channel slots; the next `hello` starts over. */
   async function rejoinAll(socket: WebSocket, n: Hex): Promise<void> {
     for (const [channelId, entry] of [...joins]) {
-      if (closed || ws !== socket || nonce !== n) return;
+      if (closed || ws !== socket || nonce !== n || rejoinFullOn === socket) return;
       if (joins.get(channelId) !== entry) continue; // left (or re-registered) while this loop was running
       try {
         await sendJoin(channelId, entry);
@@ -256,6 +261,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
             joins.delete(channelId);
             log(`host: join to ${channelId} refused permanently, not retrying: ${msg}`);
           } else {
+            if (msg.startsWith(CAPACITY_REFUSAL_PREFIX)) rejoinFullOn = ws;
             log(`host: join to ${channelId} refused, will retry on the next hello: ${msg}`);
           }
         } else {
