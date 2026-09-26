@@ -86,6 +86,19 @@ describe("I1: one bad channel entry never disables the watchtower", () => {
   });
 });
 
+describe("I1: a corrupt session file", () => {
+  it("degrades only that channel: start() resolves and reports it", async () => {
+    const { alice, id } = await matched();
+    await alice.daemon.stop();
+    writeFileSync(arenaPaths(alice.home).channelSession(id), "{ not json");
+    const restarted = new ArenaDaemon({ home: alice.home, config: loadConfig(alice.home), walletKey: alice.walletKey, lobby: alice.client.lobby, relay: alice.client.relay });
+    cleanups.push(() => restarted.stop());
+    await expect(restarted.start()).resolves.toBeUndefined();
+    expect(restarted.channelIds()).toEqual([]);
+    expect(await restarted.channels()).toEqual([{ channelId: id, degraded: true, error: expect.any(String) }]);
+  });
+});
+
 describe("I2: stalled and withheld states escalate instead of looping", () => {
   it("P1 regression: an opponent Close signature on a non-terminal state is refused and wait() does not hot-loop", async () => {
     const { alice, bob, id, env } = await matched();
