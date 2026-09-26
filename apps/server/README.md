@@ -44,7 +44,8 @@ Example `server.json` for a local Anvil deployment (`anvil --port 8545` plus a `
 
 Every field but `rpcUrl`, `chainId`, `hub`, `usdc` and `rules` is optional and defaults as shown (see
 `src/config.ts`'s `parseServerConfig`). `dbPath` defaults to `:memory:` — set a real file path to keep matches,
-the relay's replay cache (§12 items 16–17) and indexed channel history across restarts. `publicUrl` overrides the
+the relay's replay cache (§12 items 16–17) and indexed channel history across restarts; the server logs a warning
+at startup when it runs in memory. A database written by an older version is migrated in place on open. `publicUrl` overrides the
 `listen()`-derived URL this process advertises to clients (behind a reverse proxy); `publicRpcUrl` is what gets
 handed to agents in `/templates` when it differs from the RPC endpoint this process itself uses. Amounts
 (`fundingWindow`, `offerMaxLifetime`, `defaults.*`) accept either a JSON number or a decimal string, since some
@@ -57,7 +58,7 @@ values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 | GET | `/healthz` | Liveness check: `{ok: true}`. |
 | GET | `/metrics` | Prometheus text exposition (see Metrics below). |
 | GET | `/players/:address` | Reputation/activity stats for one address: `channels`, `open`, `finalized`, `reclaimed`, `games`, `challengesInitiated`, `challengesAnswered`, `timeoutsLost`. |
-| GET | `/api/channels/:id` | A channel's indexed phase/params plus its latest relay-cached state (fen, balances, status), as JSON. |
+| GET | `/api/channels/:id` | A channel's indexed phase/params plus its latest relay-cached state (fen, balances, status), as JSON. Once a settled channel's relay cache is pruned, `latest` is the state the indexer recorded at settlement. |
 | GET | `/watch/:channelId` | An HTML spectator page for one channel. |
 | POST | `/offers` | Post a `SignedOffer`; returns `{offerId}`. Rate-limited per IP (`maxOpenOffersPerIp`). |
 | GET | `/offers` | List currently open (unmatched, unexpired) offers. |
@@ -67,8 +68,17 @@ values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 | GET | `/` | An HTML index of recent channels, linking to `/watch/:id`. |
 | GET | `/ws` (upgrade) | The one WebSocket endpoint: lobby subscriptions and relay traffic, multiplexed (§12 item 16). |
 
-Every response is JSON (`toWire`/`decodeWire`): bigints serialize as decimal strings, not JSON numbers. Every
-route runs behind a per-IP token-bucket limiter (`httpGetBurst`/`httpGetPerSec` for GET, `httpPostBurst`/
+Response formats differ by audience:
+
+- The protocol routes (`POST /offers`, `GET /offers`, `POST /offers/:offerId/accept`) and every `/ws` frame use the
+  SDK's wire JSON (`toWire`/`decodeWire`). There a bigint is the object `{"$bigint":"<decimal>"}`, so that protocol
+  values round-trip exactly. Error bodies are `{"error": "…"}`.
+- The human-facing JSON routes (`/templates`, `/players/:address`, `/api/channels/:id`, `/healthz`) are plain
+  JSON, with bigints as decimal strings.
+- `/metrics` is Prometheus text. `/skill.md`, `/llms.txt` and `/templates/chess/skill.md` are Markdown. `/`
+  and `/watch/:id` are HTML.
+
+Every route runs behind a per-IP token-bucket limiter (`httpGetBurst`/`httpGetPerSec` for GET, `httpPostBurst`/
 `httpPostPerSec` for POST); over the limit gets a `429`. POST bodies over 64 KiB get a `413`.
 
 ## The `/ws` frame protocol
@@ -79,17 +89,20 @@ Server → client:
 |---|---|---|
 | `hello` | `nonce` | Sent once, right after connecting. Every later `join` on this connection must sign over this nonce. |
 | `match` | `event: MatchEvent` | An offer this connection is watching (`subscribe`) got matched — pushed live, and replayed immediately on `subscribe` if the match already happened (so an offerer who reconnects after being matched still funds). |
-| `joined` | `channelId` | A `join` succeeded; the relay will now forward and cache this connection's messages for that channel, and it replays the other member's cached `state`/`close` messages right after. |
+| `joined` | `channelId` | A `join` succeeded; the relay will now forward and cache this connection's messages for that channel, and it replays the other member's cached messages right after: its states in ascending `turnNum` order, then its close. |
 | `relay` | `message: RelayMessage` | A signed `state` or `close` message forwarded from the channel's other member (live, or replayed on join). |
 | `error` | `error`, `channelId?` | A frame was refused or malformed. `channelId` is present when the error can be attributed to one channel. |
+| `ping` | — | Sent every 25 s. It carries nothing and exists so the client can tell a live connection from a dead one: the CLI replaces a connection that has sent no frame for 70 s. |
 
 Client → server:
 
 | Frame | Fields | Purpose |
 |---|---|---|
 | `subscribe` | `offerIds: Hex[]` | Watch these offer ids for a `match` push (and an immediate replay if already matched). Unauthenticated: a match event only reveals params that become public on-chain at deposit anyway. |
-| `join` | `channelId`, `params: Params`, `signer`, `sig` | Join a channel's relay: `params` is self-certifying (the server recomputes `channelId` from it and rejects a mismatch), and `sig` must be a session-key signature over `keccak256(abi.encode("arena-relay-join", channelId, nonce))` for this connection's `hello` nonce. |
-| `relay` | `message: RelayMessage` | Forward an already-signed `state` or `close` message to the channel's other joined member(s); cached (latest per sender) for replay to a later joiner. |
+| `unsubscribe` | `offerIds: Hex[]` | Stop watching these offer ids, freeing their slots under `maxWatchedOffers`. |
+| `join` | `channelId`, `params: Params`, `signer`, `sig` | Join a channel's relay. `params` is self-certifying: the server recomputes `channelId` from it and rejects a mismatch. The channel must be known to this host, meaning matched by its lobby or indexed on-chain; otherwise the join is refused with `unknown channel`. `sig` must be an EIP-191 (`personal_sign`) signature by one of `params.signers` over `keccak256(abi.encode("arena-relay-join", channelId, nonce))`, for this connection's `hello` nonce. |
+| `leave` | `channelId` | Leave a joined channel (the daemon sends it once the channel is settled), freeing its slot under `maxJoinsPerConnection`. |
+| `relay` | `message: RelayMessage` | Forward an already-signed `state` or `close` message to the channel's other joined member(s). It is cached for replay to a later joiner: the 4 highest-turn states per sender, plus that sender's latest close. |
 
 ## Trust model
 
@@ -112,7 +125,14 @@ forwards is trusted at face value by the daemons that receive it.
   trust, or pass `--rpc/--hub/--usdc/--rules` explicitly, and should preferably use their own RPC. Serve this host
   over https.
 - The indexer and `/players`, `/api/channels`, `/watch` and `/` routes are read-only mirrors of on-chain events
-  and the relay's own cache — informational (reputation, spectating), never authoritative for settlement.
+  and the relay's own cache — informational (reputation, spectating), never authoritative for settlement. The
+  indexer re-reads the trailing 32 blocks on every poll, so an event that a lagging RPC left out once is still
+  picked up.
+- Storage stays bounded:
+  - the relay caches only channels this host knows about;
+  - a settled channel's cache is deleted a day after the indexer sees it `Finalized` or `Reclaimed`, and its
+    games count and final state are kept on the channel row;
+  - a matched offer is deleted a day past its funding deadline, unless its channel is still live on-chain.
 - Rate limits and body-size caps bound what an untrusted client can do to this process; they are not a security
   boundary for the funds, which live entirely in `ChannelHub`.
 

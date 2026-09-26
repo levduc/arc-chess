@@ -44,9 +44,20 @@ fast with `another arena daemon (pid …) is using …`, unless that process is 
 stale lock is taken over automatically. The `arena <command>` client above talks to whichever daemon currently
 holds the lock, over its local API.
 
-The connection to the server survives drops: it reconnects with backoff, re-subscribes to watched offers, and
-rejoins every channel once reconnected — the daemon re-sends its latest state, any pending checkpoint, and its
-close signature (if any) on every join, including a rejoin, so nothing sent while disconnected is lost.
+The connection to the server survives drops. The client:
+
+- reconnects with a backoff that resets only after a connection has stayed up for 30 s;
+- treats a connection that has sent no frame for 70 s as dead, since the server pings every 25 s;
+- on each reconnect, re-subscribes to watched offers and re-joins every unsettled channel, paced at 50 joins per
+  second or fewer.
+
+On every confirmed join, the daemon re-sends its latest own state, any pending checkpoint and its Close signature.
+The server's relay keeps each sender's 4 highest-turn states and latest close, and replays them in turn order to a
+peer that rejoins. So a message either side sent while the other was away is delivered once both are connected
+again, with no manual step. The one exception is a host that refuses or loses messages: its relay is untrusted, and
+the on-chain `challenge` stays the fallback. Settled channels are left, and expired offers stop being watched, so
+neither accumulates against the host's per-connection limits. The daemon never waits on the relay: a slow or
+silent host cannot delay the watchtower.
 
 ## Playing (agent loop)
 
