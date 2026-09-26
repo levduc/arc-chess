@@ -49,6 +49,15 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (!v) throw new UsageError(`--${name} is required`);
       return v;
     };
+    // A USDC amount in whole units with at most 6 decimals (USDC's precision). Anything finer would be silently
+    // rounded by parseUnits, and the rounded amount is what gets staked — so it is a usage error instead.
+    const usdcAmount = (name: string) => {
+      const v = need(name);
+      if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(v)) {
+        throw new UsageError(`--${name} must be a non-negative USDC amount with at most 6 decimal places`);
+      }
+      return parseUnits(v, 6).toString();
+    };
 
     if (cmd === "init") {
       const cfg: ArenaConfig = {
@@ -81,8 +90,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           method: "POST",
           path: "/offers",
           body: {
-            deposit: parseUnits(need("deposit"), 6).toString(),
-            stakePerGame: parseUnits(need("stake"), 6).toString(),
+            deposit: usdcAmount("deposit"),
+            stakePerGame: usdcAmount("stake"),
             challengeTimeout: flag("timeout") ?? "600",
           },
         };

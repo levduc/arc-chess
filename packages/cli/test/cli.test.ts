@@ -65,4 +65,17 @@ describe("arena CLI", () => {
     expect(await runCli(["frobnicate"], t.io)).toBe(2);
     expect(await runCli(["move"], t.io)).toBe(2);
   });
+
+  it("rejects USDC amounts with more than 6 decimals, negative or malformed ones as usage errors", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const t = io(home);
+    for (const [deposit, stake] of [["1.0000001", "0.1"], ["1", "0.1234567"], ["-1", "0.1"], ["1", "-0.1"], ["1e6", "0.1"], ["1.", "0.1"], [".5", "0.1"], ["abc", "0.1"]]) {
+      expect(await runCli(["offer", "--deposit", deposit, "--stake", stake], t.io)).toBe(2);
+    }
+    expect(t.calls).toHaveLength(0); // nothing reached the daemon
+    expect(t.err.join("\n")).toMatch(/at most 6 decimal places/);
+    expect(await runCli(["offer", "--deposit", "1.123456", "--stake", "0"], t.io)).toBe(0);
+    expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toMatchObject({ deposit: "1123456", stakePerGame: "0" });
+  });
 });
