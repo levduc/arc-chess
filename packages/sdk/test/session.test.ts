@@ -88,6 +88,26 @@ async function newGame(a: ChannelSession, b: ChannelSession) {
   expect(await a.receive(full)).toBe("checkpoint-complete");
 }
 
+/** `setup()`, renamed to the alice/bob pair the M5 tests use; `bobStore` lets a test assert on save counts. */
+async function openPair() {
+  const { a: alice, b: bob, cfgB } = await setup();
+  return { alice, bob, bobStore: cfgB.store as MemoryStore };
+}
+
+/**
+ * M5: a second session signing with Alice's own key, over a copy of her store's snapshot taken before her first
+ * move -- e.g. a stale client instance, or a compromised key signing behind the real session's back. It produces
+ * an alternate (conflicting) state for the same turn Alice's real session later signs.
+ */
+async function openPairWithFork() {
+  const { a: alice, b: bob, cfgA } = await setup();
+  const aliceKeyedFork = ChannelSession.restore(
+    { ...cfgA, store: new MemoryStore() },
+    structuredClone(alice.snapshot()),
+  );
+  return { alice, bob, aliceKeyedFork };
+}
+
 describe("ChannelSession", () => {
   it("alternates turns and rejects moving out of turn or illegally", async () => {
     const { a, b } = await setup();
@@ -201,7 +221,8 @@ describe("ChannelSession", () => {
     expect(tx).toEqual(b.closeTransaction());
     expect(await recoverCloseSigner(tx!.state, tx!.sigA, domain)).toBe(params.signers[0]);
     expect(await recoverCloseSigner(tx!.state, tx!.sigB, domain)).toBe(params.signers[1]);
-    await expect(a.receive(a.latest)).rejects.toThrow(/closing/);
+    // M5: an exact duplicate of latest is a no-op even while closing -- classifyRepeat runs before the closing check.
+    expect(await a.receive(a.latest)).toBe("duplicate");
   });
 
   it("refuses to close while its own new-game proposal is outstanding", async () => {
@@ -246,7 +267,8 @@ describe("ChannelSession", () => {
     const { a, b } = await setup();
     const other = await setup();
     await expect(b.receive(await other.a.move("e2e4"))).rejects.toThrow(/wrong channel/);
-    await expect(a.receive({ ...a.latest })).rejects.toThrow();
+    // M5: an exact duplicate of latest (here, the opening state) is a no-op, not an error.
+    expect(await a.receive({ ...a.latest })).toBe("duplicate");
     expect(encodeMove(0, 0, 0, KIND.NONE)).toBe(0);
   });
 
@@ -530,8 +552,8 @@ describe("ChannelSession", () => {
     expect(proof.prev.sigB).toBe(e4.sigB);
     expect(proof.latest).toEqual(e5);
     expect(await b.receive(e5)).toBe("move");
-    // The late countersignature is now stale and harmless.
-    await expect(a.receive(full)).rejects.toThrow(/unexpected turn/);
+    // M5: the late countersignature is now stale and harmless -- a no-op, not an error.
+    expect(await a.receive(full)).toBe("stale");
   });
 
   it("R9: refuses a move on the pending checkpoint that is wrongly signed, illegal or does not chain", async () => {
@@ -630,13 +652,12 @@ describe("ChannelSession", () => {
   it("T5: two concurrent receive() calls of the same valid move apply it exactly once", async () => {
     const { a, b } = await setup();
     const e4 = await a.move("e2e4");
+    // The mutex serializes the two calls in call order, so the first genuinely applies the move; by the time the
+    // second one runs, `latest` already is that move, and M5's classifyRepeat reports the resend as a duplicate
+    // no-op rather than an "unexpected turn" error.
     const results = await Promise.allSettled([b.receive(e4), b.receive(structuredClone(e4))]);
-    const fulfilled = results.filter((r) => r.status === "fulfilled") as PromiseFulfilledResult<string>[];
-    const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
-    expect(fulfilled.map((r) => r.value)).toEqual(["move"]);
-    expect(rejected).toHaveLength(1);
-    expect(rejected[0].reason).toBeInstanceOf(ArenaProtocolError);
-    expect(String(rejected[0].reason.message)).toMatch(/unexpected turn/);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect((results as PromiseFulfilledResult<string>[]).map((r) => r.value)).toEqual(["move", "duplicate"]);
     expect(b.latest.state.turnNum).toBe(1n);
     expect(b.latest).toEqual(e4);
   });
@@ -851,5 +872,73 @@ describe("ChannelSession", () => {
     expect(() => ChannelSession.restore(cfgA, null as unknown as SessionSnapshot)).toThrow(ArenaProtocolError);
     expect(() => ChannelSession.restore(cfgA, 5 as unknown as SessionSnapshot)).toThrow(ArenaProtocolError);
     expect(() => ChannelSession.restore(cfgA, "nope" as unknown as SessionSnapshot)).toThrow(ArenaProtocolError);
+  });
+
+  // --- M5: re-sent messages (a relay reconnect re-sends both daemons' latest) -------------------------------
+
+  describe("re-sent messages (M5)", () => {
+    it("an exact duplicate of latest is a no-op", async () => {
+      const { alice, bob, bobStore } = await openPair();
+      const m1 = await alice.move("e4");
+      expect(await bob.receive(m1)).toBe("move");
+      const before = bob.snapshot();
+      const saves = bobStore.snapshots.length;
+      expect(await bob.receive(m1)).toBe("duplicate");
+      expect(bob.snapshot()).toEqual(before);
+      expect(bobStore.snapshots.length).toBe(saves); // classifyRepeat returns before store.save
+    });
+
+    it("an older state is stale and ignored", async () => {
+      const { alice, bob, bobStore } = await openPair();
+      const m1 = await alice.move("e4");
+      await bob.receive(m1);
+      const m2 = await bob.move("e5");
+      await alice.receive(m2);
+      const m3 = await alice.move("Nf3");
+      await bob.receive(m3);
+      const saves = bobStore.snapshots.length;
+      expect(await bob.receive(m1)).toBe("stale");
+      expect(bobStore.snapshots.length).toBe(saves); // classifyRepeat returns before store.save
+    });
+
+    it("a different state for the latest turn is still an error", async () => {
+      const { alice, bob, aliceKeyedFork } = await openPairWithFork();
+      const m1 = await alice.move("e4");
+      await bob.receive(m1);
+      const conflicting = await aliceKeyedFork.move("d4");
+      await expect(bob.receive(conflicting)).rejects.toThrow(/conflicting state for turn 1/);
+    });
+
+    it("a re-sent new-game proposal the player already holds is a duplicate", async () => {
+      const { alice, bob, bobStore } = await openPair();
+      await finishGame(alice, bob);
+      const proposal = await alice.proposeNewGame();
+      expect(await bob.receive(proposal)).toBe("checkpoint-proposed");
+      const saves = bobStore.snapshots.length;
+      expect(await bob.receive(proposal)).toBe("duplicate");
+      expect(bobStore.snapshots.length).toBe(saves); // classifyRepeat returns before store.save
+    });
+
+    it("a duplicate is still a no-op after this player signed Close", async () => {
+      const { alice, bob, bobStore } = await openPair();
+      await finishGame(alice, bob); // terminal state, reached via resign; bob holds it as `latest`
+      const resignState = bob.latest;
+      await bob.signClose();
+      const saves = bobStore.snapshots.length;
+      expect(await bob.receive(resignState)).toBe("duplicate");
+      expect(bobStore.snapshots.length).toBe(saves); // classifyRepeat returns before store.save
+    });
+
+    it("receiveClose of a signature this player already holds is a no-op", async () => {
+      const { alice, bob, bobStore } = await openPair();
+      await finishGame(alice, bob);
+      const ca = await alice.signClose();
+      await bob.receiveClose(ca);
+      const before = bob.snapshot();
+      const saves = bobStore.snapshots.length;
+      await expect(bob.receiveClose(ca)).resolves.toBeUndefined();
+      expect(bob.snapshot()).toEqual(before);
+      expect(bobStore.snapshots.length).toBe(saves); // early return, not a re-verify + re-save
+    });
   });
 });

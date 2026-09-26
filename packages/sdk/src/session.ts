@@ -284,10 +284,17 @@ export class ChannelSession {
     });
   }
 
-  /** Validates and records an opponent message (a move, or a NEW_GAME proposal/countersignature). */
-  receive(msg: SignedState): Promise<"move" | "checkpoint-proposed" | "checkpoint-complete" | "checkpoint-repaired"> {
+  /**
+   * Validates and records an opponent message (a move, or a NEW_GAME proposal/countersignature). "duplicate" and
+   * "stale" (M5) mean a relay re-send this player already accounted for; neither changes anything.
+   */
+  receive(
+    msg: SignedState,
+  ): Promise<"move" | "checkpoint-proposed" | "checkpoint-complete" | "checkpoint-repaired" | "duplicate" | "stale"> {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
+      const repeat = await this.asProtocolError(async () => this.classifyRepeat(draft, msg));
+      if (repeat === "duplicate" || repeat === "stale") return repeat;
       if (draft.closeState !== null) throw new ArenaProtocolError(CLOSING_MESSAGE);
       // classifyIncoming only reads `draft` except when it adopts a move on this player's own pending checkpoint
       // (R4): there it also signs with `draft` (equivocation guard + lastSignedTurn), same as every other write
@@ -396,6 +403,36 @@ export class ChannelSession {
   }
 
   /**
+   * M5: a message this player already holds, or one older than its latest, arrives again after a relay reconnect
+   * (both daemons re-send their latest). Neither changes anything, so neither is an error. A *different* state at
+   * the latest turn still is (equivocation evidence). Returns null for everything else, which then takes the
+   * normal path, including the late-countersignature repair of `prev`, which must win over "stale".
+   */
+  private classifyRepeat(data: SessionSnapshot, msg: SignedState): "duplicate" | "stale" | null {
+    let s: State;
+    try {
+      s = this.canonicalState(structuredClone(msg).state);
+    } catch {
+      return null;
+    }
+    if (s.channelId !== this.id) return null;
+    const prev = data.prev;
+    if (prev && isCheckpoint(prev.state) && !this.endorsed(prev) && s.turnNum === prev.state.turnNum) return null;
+    const latest = data.latest.state;
+    const h = hashState(s, this.domain);
+    if (s.turnNum < latest.turnNum) return "stale";
+    if (s.turnNum === latest.turnNum) {
+      if (h === hashState(latest, this.domain)) return "duplicate";
+      throw new ArenaProtocolError(`conflicting state for turn ${s.turnNum}`);
+    }
+    const incoming = data.incomingCheckpoint;
+    if (incoming && s.turnNum === incoming.state.turnNum && h === hashState(incoming.state, this.domain)) {
+      return "duplicate";
+    }
+    return null;
+  }
+
+  /**
    * Signs Close for the latest state, and only when that state is terminal (spec §12 R8). Closing on the opening
    * or on a checkpoint is never safe: the opponent can keep the Close signature, challenge the same state (which
    * the hub supports without this player's help), and let `timeout` forfeit the frozen closer's stake. On a
@@ -437,6 +474,18 @@ export class ChannelSession {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
       const target = (draft.closeState ?? draft.latest).state;
+      // M5: an opponent Close signature this player already recorded, re-sent after a relay reconnect, is a
+      // no-op -- not re-verified, not re-saved.
+      if (
+        typeof cs === "object" &&
+        cs !== null &&
+        cs.by === this.opponent &&
+        draft.closeSigs[this.opponent] !== NO_SIG &&
+        draft.closeSigs[this.opponent] === cs.sig &&
+        draft.closeSigTargets[this.opponent] === cs.stateHash
+      ) {
+        return;
+      }
       const sig = await this.asProtocolError(async () => {
         const clonedCs = structuredClone(cs);
         if (clonedCs.by !== this.opponent) throw new ArenaProtocolError("close signature is not from the opponent");

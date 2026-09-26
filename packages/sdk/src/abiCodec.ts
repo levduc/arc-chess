@@ -83,6 +83,11 @@ export function decodeSignedState(data: Hex): SignedState {
   return { state: { ...ss.state }, sigA: ss.sigA, sigB: ss.sigB };
 }
 
+export function decodeParams(data: Hex): Params {
+  const [p] = decodeAbiParameters([{ type: "tuple", components: PARAMS }], data);
+  return { ...p, participants: [p.participants[0], p.participants[1]], signers: [p.signers[0], p.signers[1]] };
+}
+
 export function encodeProof(proof: Proof): Hex {
   return encodeAbiParameters([{ type: "tuple", components: PROOF }], [proof]);
 }

@@ -153,17 +153,48 @@ export type RelayMessage =
 
 export type MatchEvent = { offerId: Hex; params: Params };
 
-/** Lobby side of the host (Plan 4 implements it over HTTP/WebSocket). */
+export type RelaySigner = { readonly address: Address; signMessage(args: { message: { raw: Hex } }): Promise<Hex> };
+
+/** What a session key signs to join a channel on the relay: bound to the channel and to this connection's nonce. */
+export function relayJoinDigest(channelId: Hex, nonce: Hex): Hex {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "string" }, { type: "bytes32" }, { type: "bytes32" }],
+      ["arena-relay-join", channelId, nonce],
+    ),
+  );
+}
+
+export function signRelayJoin(signer: RelaySigner, channelId: Hex, nonce: Hex): Promise<Hex> {
+  return signer.signMessage({ message: { raw: relayJoinDigest(channelId, nonce) } });
+}
+
+export async function verifyRelayJoin(channelId: Hex, nonce: Hex, signer: Address, sig: Hex): Promise<boolean> {
+  try {
+    const who = await recoverMessageAddress({ message: { raw: relayJoinDigest(channelId, nonce) }, signature: sig });
+    return who.toLowerCase() === signer.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/** Lobby side of the host. Plan 4 implements it in packages/cli/src/host.ts. */
 export interface LobbyClient {
   postOffer(so: SignedOffer): Promise<Hex>;
   listOffers(): Promise<SignedOffer[]>;
   accept(sa: SignedAcceptance): Promise<void>;
   onMatch(handler: (m: MatchEvent) => void): () => void;
+  /** Ask the host to deliver match events for these offers, including ones matched while this client was away. */
+  watch(offerIds: Hex[]): void;
 }
 
-/** Relay side of the host: forwards signed messages between a channel's two session keys. */
+/** Relay side of the host: forwards signed messages between a channel's two session keys. Plan 4 implements it in
+ *  packages/cli/src/host.ts. */
 export interface RelayClient {
-  join(channelId: Hex, sessionKey: Hex): Promise<void>;
+  /** Joins the channel as `signer` (one of params.signers). The private key never reaches the transport (I5). */
+  join(channelId: Hex, params: Params, signer: RelaySigner): Promise<void>;
   send(msg: RelayMessage): Promise<void>;
   onMessage(handler: (msg: RelayMessage) => void): () => void;
+  /** Fires every time the host confirms membership of a channel: after the first join and after each reconnect. */
+  onJoined(handler: (channelId: Hex) => void): () => void;
 }

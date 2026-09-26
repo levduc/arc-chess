@@ -9,9 +9,9 @@ import {
   type TransactionReceipt,
 } from "viem";
 import { channelHubAbi, mockUsdcAbi } from "./abi.js";
-import { decodeSignedState, encodeParams, encodeProof, encodeSignedState } from "./abiCodec.js";
+import { decodeParams, decodeSignedState, encodeParams, encodeProof, encodeSignedState } from "./abiCodec.js";
 import type { TxSender } from "./tx.js";
-import type { CloseTransaction, Params, Proof, SignedState, State } from "./types.js";
+import type { CloseTransaction, Params, PlayerIndex, Proof, SignedState, State } from "./types.js";
 
 export const PHASE = ["None", "Funding", "Open", "Challenged", "Finalized", "Reclaimed"] as const;
 export type Phase = (typeof PHASE)[number];
@@ -36,6 +36,32 @@ export type DisputeEvent = {
   challenger?: number;
   deadline?: bigint;
 };
+
+/** One hub event, for any channel, decoded from `getContractEvents` with `eventName` omitted (hubEvents). */
+export type HubEvent = { blockNumber: bigint; logIndex: number; channelId: Hex } & (
+  | { kind: "ChannelCreated"; params: Params }
+  | { kind: "Deposited"; player: PlayerIndex; amount: bigint }
+  | { kind: "Opened" }
+  | { kind: "Challenged"; challenger: PlayerIndex; turnNum: bigint; deadline: bigint; signed: SignedState }
+  | { kind: "Responded"; turnNum: bigint; signed: SignedState }
+  | { kind: "Finalized"; balanceA: bigint; balanceB: bigint; fee: bigint }
+  | { kind: "Reclaimed" }
+);
+
+/** Splits [fromBlock, toBlock] (inclusive) into consecutive chunks of at most `size` blocks each. */
+export function chunkRanges(
+  fromBlock: bigint,
+  toBlock: bigint,
+  size: bigint,
+): Array<{ fromBlock: bigint; toBlock: bigint }> {
+  if (size <= 0n) throw new RangeError("chunkRanges: size must be positive");
+  const chunks: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+  for (let from = fromBlock; from <= toBlock; from += size) {
+    const to = from + size - 1n;
+    chunks.push({ fromBlock: from, toBlock: to < toBlock ? to : toBlock });
+  }
+  return chunks;
+}
 
 /** A hub call that would revert; `errorName` is the decoded custom error (e.g. "BadSignature") when known. */
 export class HubRevertError extends Error {
@@ -153,14 +179,31 @@ export class HubClient {
     return { min: BigInt(min), max: BigInt(max) };
   }
 
-  /** Challenged/Responded events for a channel in chain order, with the signed state each one carries. */
-  async disputeEvents(id: Hex, fromBlock: bigint = 0n): Promise<DisputeEvent[]> {
-    // One head for both queries, so a block mined between them cannot appear in one list but not the other.
-    // cacheTime 0: viem otherwise serves a cached head for up to a polling interval and would hide fresh events.
-    const toBlock = await this.client.getBlockNumber({ cacheTime: 0 });
+  /**
+   * Challenged/Responded events for a channel in chain order, with the signed state each one carries. `toBlock`
+   * omitted means the current head (cacheTime 0: viem otherwise serves a cached head for up to a polling interval
+   * and would hide fresh events) -- one head for both queries, so a block mined between them cannot appear in one
+   * list but not the other.
+   */
+  async disputeEvents(id: Hex, fromBlock: bigint = 0n, toBlock?: bigint): Promise<DisputeEvent[]> {
+    const to = toBlock ?? (await this.client.getBlockNumber({ cacheTime: 0 }));
     const [challenged, responded] = await Promise.all([
-      this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName: "Challenged", args: { channelId: id }, fromBlock, toBlock }),
-      this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName: "Responded", args: { channelId: id }, fromBlock, toBlock }),
+      this.client.getContractEvents({
+        address: this.hub,
+        abi: channelHubAbi,
+        eventName: "Challenged",
+        args: { channelId: id },
+        fromBlock,
+        toBlock: to,
+      }),
+      this.client.getContractEvents({
+        address: this.hub,
+        abi: channelHubAbi,
+        eventName: "Responded",
+        args: { channelId: id },
+        fromBlock,
+        toBlock: to,
+      }),
     ]);
     const events: DisputeEvent[] = [
       ...challenged.map((l) => ({
@@ -182,6 +225,80 @@ export class HubClient {
         signed: decodeSignedState(l.args.signedState as Hex),
       })),
     ];
+    return events.sort((x, y) =>
+      x.blockNumber === y.blockNumber ? x.logIndex - y.logIndex : x.blockNumber < y.blockNumber ? -1 : 1,
+    );
+  }
+
+  /** The current head; cacheTime 0 so a caller polling for new events never sees a stale cached block. */
+  blockNumber(): Promise<bigint> {
+    return this.client.getBlockNumber({ cacheTime: 0 });
+  }
+
+  /**
+   * Every hub event for every channel in `[fromBlock, toBlock]`, chain order -- for a watchtower scanning the
+   * whole hub rather than one channel at a time, since it may not know every channel to poll for ahead of time.
+   * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, EIP712DomainChanged, OZ Ownership*) are
+   * skipped.
+   */
+  async hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
+    const logs = await this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, fromBlock, toBlock });
+    const events: HubEvent[] = [];
+    for (const log of logs) {
+      const args = log.args as Record<string, unknown>;
+      if (typeof args.channelId !== "string") continue;
+      const channelId = args.channelId as Hex;
+      const base = { blockNumber: log.blockNumber, logIndex: log.logIndex, channelId };
+      switch (log.eventName) {
+        case "ChannelCreated":
+          events.push({ ...base, kind: "ChannelCreated", params: decodeParams(args.params as Hex) });
+          break;
+        case "Deposited":
+          events.push({
+            ...base,
+            kind: "Deposited",
+            player: Number(args.player) as PlayerIndex,
+            amount: args.amount as bigint,
+          });
+          break;
+        case "Opened":
+          events.push({ ...base, kind: "Opened" });
+          break;
+        case "Challenged":
+          events.push({
+            ...base,
+            kind: "Challenged",
+            challenger: Number(args.challenger) as PlayerIndex,
+            turnNum: args.turnNum as bigint,
+            deadline: args.deadline as bigint,
+            signed: decodeSignedState(args.signedState as Hex),
+          });
+          break;
+        case "Responded":
+          events.push({
+            ...base,
+            kind: "Responded",
+            turnNum: args.turnNum as bigint,
+            signed: decodeSignedState(args.signedState as Hex),
+          });
+          break;
+        case "Finalized":
+          events.push({
+            ...base,
+            kind: "Finalized",
+            balanceA: args.balanceA as bigint,
+            balanceB: args.balanceB as bigint,
+            fee: args.fee as bigint,
+          });
+          break;
+        case "Reclaimed":
+          events.push({ ...base, kind: "Reclaimed" });
+          break;
+        default:
+          // Unknown event carrying a channelId-named arg; ignore defensively rather than guess its shape.
+          break;
+      }
+    }
     return events.sort((x, y) =>
       x.blockNumber === y.blockNumber ? x.logIndex - y.logIndex : x.blockNumber < y.blockNumber ? -1 : 1,
     );

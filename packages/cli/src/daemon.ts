@@ -386,7 +386,7 @@ export class ArenaDaemon {
     if (this.stopped || this.live.has(record.channelId)) return;
     const sessionSender = new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain);
     this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false });
-    await this.opts.relay.join(record.channelId, record.sessionKey);
+    await this.opts.relay.join(record.channelId, record.params, privateKeyToAccount(record.sessionKey));
     // Crash recovery (Review Focus 5): re-send our latest own state so a message lost at the crash is delivered.
     const latest = session.latest;
     const mine = record.me === 0 ? latest.sigA : latest.sigB;

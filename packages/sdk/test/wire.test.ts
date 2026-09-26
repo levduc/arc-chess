@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { keccak256, toHex, type Address } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
+  SerialTxSender,
   buildParams,
   checkMatchParams,
   fromWire,
@@ -101,5 +102,29 @@ describe("wire", () => {
   it("rejects malformed $bigint payloads", () => {
     expect(() => fromWire('{"a":{"$bigint":"12a"}}')).toThrow("invalid $bigint");
     expect(() => fromWire(`{"a":{"$bigint":"${"1".repeat(81)}"}}`)).toThrow("invalid $bigint");
+  });
+});
+
+describe("SerialTxSender", () => {
+  it("never runs two sends at once and keeps going after a failure", async () => {
+    let active = 0;
+    let peak = 0;
+    let n = 0;
+    const inner = {
+      address: "0x0000000000000000000000000000000000000001" as const,
+      send: async () => {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((r) => setTimeout(r, 5));
+        active--;
+        if (++n === 2) throw new Error("boom");
+        return `0x${n.toString(16).padStart(64, "0")}` as const;
+      },
+    };
+    const s = new SerialTxSender(inner);
+    const results = await Promise.allSettled([1, 2, 3].map(() => s.send({ to: inner.address, data: "0x" })));
+    expect(peak).toBe(1);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected", "fulfilled"]);
+    expect(s.address).toBe(inner.address);
   });
 });
