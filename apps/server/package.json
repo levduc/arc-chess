@@ -1,0 +1,17 @@
+{
+  "name": "@arena/server",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/server.ts" },
+  "bin": { "arena-server": "./bin/arena-server.mjs" },
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "vitest run", "typecheck": "tsc --noEmit", "start": "node bin/arena-server.mjs" },
+  "dependencies": { "@arena/sdk": "workspace:*", "tsx": "4.23.15", "viem": "2.56.8", "ws": "8.21.3" },
+  "devDependencies": {
+    "@arena/cli": "workspace:*",
+    "@types/node": "25.9.8",
+    "@types/ws": "8.18.1",
+    "typescript": "6.0.3",
+    "vitest": "5.0.1"
+  }
+}
