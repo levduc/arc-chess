@@ -78,6 +78,8 @@ describe("wire", () => {
       feeRecipient: TERMS.feeRecipient,
       minFeePerPlayer: 5_000n,
       maxFeePerPlayer: 10_000n,
+      now: 1_000n,
+      maxFundingWindow: 7_200n,
     };
     expect(checkMatchParams(p, { ...base, me: 0, player: ALICE, signer: offer.signer })).toBeNull();
     expect(checkMatchParams(p, { ...base, me: 1, player: BOB, signer: acc.signer })).toBeNull();
@@ -85,5 +87,19 @@ describe("wire", () => {
     expect(checkMatchParams({ ...p, rules: BOB }, { ...base, me: 0, player: ALICE, signer: offer.signer })).toMatch(/rules/);
     expect(checkMatchParams({ ...p, feePerPlayer: 20_000n }, { ...base, me: 0, player: ALICE, signer: offer.signer })).toMatch(/fee/);
     expect(checkMatchParams({ ...p, deposit: 1n }, { ...base, me: 0, player: ALICE, signer: offer.signer })).toMatch(/amount/);
+    expect(checkMatchParams({ ...p, fundingDeadline: 1_000n }, { ...base, me: 0, player: ALICE, signer: offer.signer })).toMatch(
+      /funding deadline/,
+    );
+    expect(
+      checkMatchParams({ ...p, fundingDeadline: 1_000n + 7_201n }, { ...base, me: 0, player: ALICE, signer: offer.signer }),
+    ).toMatch(/funding deadline/);
+    expect(
+      checkMatchParams({ ...p, fundingDeadline: 8_200n }, { ...base, me: 0, player: ALICE, signer: offer.signer }),
+    ).toBeNull();
+  });
+
+  it("rejects malformed $bigint payloads", () => {
+    expect(() => fromWire('{"a":{"$bigint":"12a"}}')).toThrow("invalid $bigint");
+    expect(() => fromWire(`{"a":{"$bigint":"${"1".repeat(81)}"}}`)).toThrow("invalid $bigint");
   });
 });

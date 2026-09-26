@@ -10,9 +10,12 @@ export function toWire(value: unknown): string {
   return JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? { $bigint: v.toString() } : v));
 }
 
+const BIGINT_RE = /^-?[0-9]+$/;
+
 export function fromWire<T>(text: string): T {
   return JSON.parse(text, (_k, v) => {
     if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.$bigint === "string") {
+      if (v.$bigint.length > 80 || !BIGINT_RE.test(v.$bigint)) throw new Error("invalid $bigint");
       return BigInt(v.$bigint);
     }
     return v;
@@ -121,6 +124,8 @@ export type MatchExpectation = {
   feeRecipient: Address;
   minFeePerPlayer: bigint;
   maxFeePerPlayer: bigint;
+  now: bigint;
+  maxFundingWindow: bigint;
 };
 
 const same = (x: string, y: string) => x.toLowerCase() === y.toLowerCase();
@@ -134,6 +139,7 @@ export function checkMatchParams(p: Params, e: MatchExpectation): string | null 
   if (p.deposit !== e.deposit || p.stakePerGame !== e.stakePerGame || p.challengeTimeout !== e.challengeTimeout) {
     return "amounts differ from the agreed offer";
   }
+  if (p.fundingDeadline <= e.now || p.fundingDeadline > e.now + e.maxFundingWindow) return "unexpected funding deadline";
   if (!same(p.feeRecipient, e.feeRecipient)) return "unexpected fee recipient";
   if (p.feePerPlayer < e.minFeePerPlayer || p.feePerPlayer > e.maxFeePerPlayer) return "unexpected fee";
   return null;
