@@ -97,6 +97,39 @@ describe("Indexer.poll and Indexer.apply", () => {
     repo.close();
   });
 
+  it("re-reads the trailing 32 blocks: an event a lagging RPC hid is found on the next poll, once (M4)", async () => {
+    const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks: 10, startBlock: 0n } });
+    const repo = new SqliteRepo(":memory:");
+    const chain = new FakeChain();
+    const fx = makeChannelFixture(cfg);
+    const created: HubEvent = { blockNumber: 95n, logIndex: 0, channelId: fx.id, kind: "ChannelCreated", params: fx.params };
+    const challenged: HubEvent = {
+      blockNumber: 96n, logIndex: 0, channelId: fx.id, kind: "Challenged", challenger: 0, turnNum: 1n, deadline: 1_000n,
+      signed: { state: rawStateAt(fx, 1n), sigA: "0x", sigB: "0x" },
+    };
+    chain.events = [created, challenged];
+    chain.block = 100n;
+    let hide = true;
+    const real = chain.hubEvents.bind(chain);
+    chain.hubEvents = async (from: bigint, to: bigint) => (await real(from, to)).filter((e) => !(hide && e.blockNumber >= 95n));
+    const indexer = new Indexer(repo, chain, cfg, noopLog);
+
+    await indexer.poll();
+    expect(repo.cursor()).toBe(100n);
+    expect(repo.channelRow(fx.id)).toBe(null); // missed: the RPC's log index lagged its reported head
+
+    hide = false;
+    chain.block = 101n;
+    await indexer.poll();
+    expect(repo.cursor()).toBe(101n); // the rescan never moved the cursor back
+    expect(repo.channelRow(fx.id)?.challenges).toEqual([1, 0]);
+
+    chain.block = 102n;
+    await indexer.poll(); // the same blocks are re-read again: nothing is applied twice
+    expect(repo.channelRow(fx.id)?.challenges).toEqual([1, 0]);
+    repo.close();
+  });
+
   it("counts challenges, answers and a timeout loss", () => {
     const cfg = testConfig();
     const repo = new SqliteRepo(":memory:");

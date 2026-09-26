@@ -22,6 +22,11 @@ export type PlayerStats = {
 // into an unbounded amount of RPC work; the next poll (on the same interval) picks up where this one left off.
 const MAX_CHUNKS_PER_POLL = 50;
 
+/** Every poll re-reads this many blocks behind the cursor, as the daemons' dispute scan does: a lagging or
+ *  load-balanced RPC can report a head its `getLogs` index has not caught up with yet. `apply` is idempotent
+ *  (`lastEvent`), so re-reading is harmless. */
+export const INDEXER_RESCAN_BLOCKS = 32n;
+
 /** Games played in a channel whose latest state is `s`: every finished game before `gameIndex`, plus the current
  *  one once it has a move. */
 export function gamesOf(s: State): number {
@@ -57,7 +62,8 @@ export class Indexer {
   ) {}
 
   /** One catch-up pass: reads the chain head, then works through at most `MAX_CHUNKS_PER_POLL` chunks of
-   *  `cfg.indexer.chunkBlocks` blocks each, applying every event in a chunk before advancing the cursor past it.
+   *  `cfg.indexer.chunkBlocks` blocks each, starting `INDEXER_RESCAN_BLOCKS` behind the cursor, applying every
+   *  event in a chunk before advancing the cursor past it.
    *  Never throws -- any failure (head, or a chunk's `hubEvents`) is logged and the cursor is left exactly where
    *  the last successfully-committed chunk left it, so the next poll retries from there. */
   async poll(): Promise<void> {
@@ -65,7 +71,9 @@ export class Indexer {
       this.repo.pruneRelayCache(Date.now());
       const head = await this.chain.head();
       const cursor = this.repo.cursor() ?? this.cfg.indexer.startBlock - 1n;
-      const ranges = chunkRanges(cursor + 1n, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL);
+      const rescan = cursor + 1n - INDEXER_RESCAN_BLOCKS;
+      const from = rescan > this.cfg.indexer.startBlock ? rescan : this.cfg.indexer.startBlock;
+      const ranges = chunkRanges(from, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL);
       for (const r of ranges) {
         let events: HubEvent[];
         try {
@@ -75,7 +83,7 @@ export class Indexer {
           return;
         }
         for (const e of events) this.apply(e);
-        this.repo.setCursor(r.toBlock);
+        if (r.toBlock > cursor) this.repo.setCursor(r.toBlock); // a rescanned chunk never moves the cursor back
       }
     } catch (err) {
       this.log(`indexer: ${err instanceof Error ? err.message : String(err)}`);
