@@ -62,6 +62,7 @@ export const PERMANENT_JOIN_REFUSAL_PREFIXES = [
   "params do not match",
   "not a member of this channel",
   "bad join signature",
+  "unknown channel",
 ] as const;
 
 type JoinEntry = { params: Params; signer: RelaySigner };

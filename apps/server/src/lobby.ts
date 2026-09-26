@@ -1,6 +1,7 @@
 import type { Hex } from "viem";
 import {
   buildParams,
+  channelId as computeChannelId,
   offerId as computeOfferId,
   parseSignedAcceptance,
   parseSignedOffer,
@@ -120,7 +121,8 @@ export class Lobby {
     const params = buildParams(offer, sa.acceptance, terms, now);
     const event: MatchEvent = { offerId: id, params };
 
-    if (!this.repo.recordMatch(id, sa, event)) {
+    const channel = computeChannelId(this.cfg.chainId, this.cfg.hub, params);
+    if (!this.repo.recordMatch(id, sa, event, channel)) {
       // lost the race to another acceptance: re-read and apply the idempotency/conflict rule
       const fresh = this.repo.offer(id);
       if (fresh?.match) return this.resolveAlreadyMatched(fresh, sa);

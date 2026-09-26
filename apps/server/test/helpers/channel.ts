@@ -4,6 +4,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { channelId, initialState, signState } from "@arena/sdk";
 import type { ArenaDomain, Params, SignedState, State } from "@arena/sdk";
 import type { ServerConfig } from "../../src/config.js";
+import type { Repo } from "../../src/repo.js";
 
 /** A channel with fresh random participants and two fresh session keys (`kA` signs for `signers[0]`, `kB` for
  *  `signers[1]`), plus its `channelId` and the EIP-712 `domain` states over it are signed with. Shared by relay
@@ -16,7 +17,9 @@ export type ChannelFixture = {
   kB: Hex;
 };
 
-export function makeChannelFixture(cfg: ServerConfig): ChannelFixture {
+/** With `repo`, the channel is also registered as known to that host (see `registerChannel`), so the relay accepts
+ *  joins for it; without, it is a self-minted channel the relay refuses as "unknown channel". */
+export function makeChannelFixture(cfg: ServerConfig, repo?: Repo): ChannelFixture {
   const kA = generatePrivateKey();
   const kB = generatePrivateKey();
   const params: Params = {
@@ -36,7 +39,32 @@ export function makeChannelFixture(cfg: ServerConfig): ChannelFixture {
   };
   const id = channelId(cfg.chainId, cfg.hub, params);
   const domain: ArenaDomain = { chainId: cfg.chainId, hub: cfg.hub };
-  return { params, id, domain, kA, kB };
+  const fx = { params, id, domain, kA, kB };
+  if (repo) registerChannel(repo, fx);
+  return fx;
+}
+
+/** Records a lobby match for `fx`'s params in `repo`, as `Lobby.accept` would, so `repo.knownChannel(fx.id)` holds.
+ *  The offer and acceptance signatures are placeholders: nothing downstream of the repo re-verifies them. */
+export function registerChannel(repo: Repo, fx: ChannelFixture): void {
+  const offerId = keccak256(toHex(`fixture-offer-${fx.id}`));
+  const [player, taker] = fx.params.participants;
+  const [signer, takerSigner] = fx.params.signers;
+  repo.insertOffer(
+    offerId,
+    {
+      offer: {
+        template: "chess", player, signer, deposit: fx.params.deposit, stakePerGame: fx.params.stakePerGame,
+        challengeTimeout: fx.params.challengeTimeout, expiresAt: fx.params.fundingDeadline, nonce: fx.params.salt,
+      },
+      sig: "0x",
+    },
+    "fixture",
+  );
+  const acceptance = { offerId, player: taker, signer: takerSigner, nonce: fx.params.salt };
+  if (!repo.recordMatch(offerId, { acceptance, sig: "0x" }, { offerId, params: fx.params }, fx.id)) {
+    throw new Error("registerChannel: fixture offer was already matched");
+  }
 }
 
 /** A `State` at `turnNum`, otherwise the channel's opening state -- the relay does not check game rules, only the

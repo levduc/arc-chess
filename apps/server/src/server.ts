@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Address, Hex } from "viem";
-import { decodeWire, fenOf, statusOf, toWire, WireFormatError } from "@arena/sdk";
+import { channelId, decodeWire, fenOf, statusOf, toWire, WireFormatError } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 import { RpcChainReader, type ChainReader } from "./chain.js";
 import { chessSkillMd, indexHtml, llmsTxt, skillMd, watchHtml } from "./docs.js";
@@ -174,10 +174,19 @@ function canonicalChannelId(raw: string): Hex | null {
 }
 
 export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Promise<ArenaServer> {
-  const repo = new SqliteRepo(cfg.dbPath);
+  const repo = new SqliteRepo(cfg.dbPath, (p) => channelId(cfg.chainId, cfg.hub, p));
   // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
   const log = deps.log ?? ((line: string) => console.log(line));
+  if (cfg.dbPath === ":memory:") {
+    log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "warn",
+        msg: "dbPath is :memory: -- matches, the relay cache and indexed channels are lost on restart",
+      }),
+    );
+  }
 
   const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
 
@@ -186,7 +195,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
 
   const lobby = new Lobby(repo, chain, cfg);
   const relay = new Relay(repo, cfg, metrics, log);
-  const indexer = new Indexer(repo, chain, cfg, log);
+  const indexer = new Indexer(repo, chain, cfg, log, relay);
   indexer.start();
 
   // filled once listen() resolves; route handlers close over this box rather than a value, so they always see it
@@ -227,7 +236,8 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
         return true;
       }
       const row = repo.channelRow(id);
-      const latestSigned = relay.latestState(id);
+      // once a settled channel's relay cache is pruned, the state the indexer recorded at settlement stands in
+      const latestSigned = relay.latestState(id) ?? row?.finalState ?? null;
       if (!row && !latestSigned) {
         sendJson(ctx.res, 404, { error: "not found" });
         return true;

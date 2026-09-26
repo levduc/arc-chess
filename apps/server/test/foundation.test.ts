@@ -1,5 +1,10 @@
+import { randomBytes } from "node:crypto";
 import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
+import { toWire } from "@arena/sdk";
 import { DEFAULT_LIMITS, parseServerConfig, type ServerConfig } from "../src/config.js";
 import { RpcChainReader, type HubLike } from "../src/chain.js";
 import { RateLimiter } from "../src/limits.js";
@@ -140,9 +145,12 @@ describe("sqlite repo", () => {
       acceptance: { offerId, player: so.offer.signer, signer: so.offer.signer, nonce: so.offer.nonce },
       sig: "0x" as `0x${string}`,
     };
-    const m = { offerId, params: { salt: "0x" } as never };
-    expect(r.recordMatch(offerId, sa, m)).toBe(true);
-    expect(r.recordMatch(offerId, sa, m)).toBe(false); // already matched: atomic, only one winner
+    const m = { offerId, params: { salt: "0x", fundingDeadline: 1_003_600n } as never };
+    const matchedChannel = ("0x" + "ee".repeat(32)) as `0x${string}`;
+    expect(r.knownChannel(matchedChannel)).toBe(false);
+    expect(r.recordMatch(offerId, sa, m, matchedChannel)).toBe(true);
+    expect(r.recordMatch(offerId, sa, m, matchedChannel)).toBe(false); // already matched: atomic, only one winner
+    expect(r.knownChannel(matchedChannel)).toBe(true); // matched by this host's lobby: the relay may join it
     expect(r.offer(offerId)?.acceptance).toEqual(sa);
     expect(r.offer(offerId)?.match).toEqual(m);
 
@@ -157,20 +165,108 @@ describe("sqlite repo", () => {
     r.close();
   });
 
-  it("caches relay messages keyed by (channelId, sender, type), last write wins", () => {
+  it("caches up to 4 states per (channelId, sender), highest turns kept, plus the latest close", () => {
     const r = new SqliteRepo(":memory:");
     const channelId = ("0x" + "cc".repeat(32)) as `0x${string}`;
-    const signed1 = { state: { turnNum: 1n }, sigA: "0x", sigB: "0x" } as never;
-    const signed2 = { state: { turnNum: 2n }, sigA: "0x", sigB: "0x" } as never;
-    const state1 = { type: "state" as const, channelId, signed: signed1 };
-    const state2 = { type: "state" as const, channelId, signed: signed2 };
-    r.cacheRelay(channelId, 0, state1);
-    r.cacheRelay(channelId, 0, state2); // same (channelId, sender, type): overwrites
-    r.cacheRelay(channelId, 1, state1); // different sender: separate entry
-    const cached = r.cachedRelay(channelId);
-    expect(cached).toHaveLength(2);
-    const bySender0 = cached.find((c) => c.sender === 0);
-    expect(bySender0?.message).toEqual(state2);
+    type Loose = { type: "state"; channelId: `0x${string}`; signed: { state: { turnNum: bigint }; sigA: string; sigB: string } };
+    const state = (turnNum: bigint, tag = "") =>
+      ({ type: "state", channelId, signed: { state: { turnNum }, sigA: `0x${tag}`, sigB: "0x" } }) as Loose as never;
+    const turnOf = (m: unknown) => (m as Loose).signed.state.turnNum;
+    const turns = (sender: 0 | 1) =>
+      r
+        .cachedRelay(channelId)
+        .filter((c) => c.sender === sender && c.message.type === "state")
+        .map((c) => turnOf(c.message));
+
+    r.cacheRelay(channelId, 0, state(2n));
+    r.cacheRelay(channelId, 0, state(1n)); // lower, but there is room: kept
+    r.cacheRelay(channelId, 1, state(1n)); // different sender: its own entries
+    expect(turns(0)).toEqual([1n, 2n]); // ascending turn order
+    expect(turns(1)).toEqual([1n]);
+
+    r.cacheRelay(channelId, 0, state(2n, "aa")); // same turn: replaces the held one
+    expect(turns(0)).toEqual([1n, 2n]);
+    const heldTwo = r.cachedRelay(channelId).find((c) => c.sender === 0 && c.message.type === "state" && turnOf(c.message) === 2n);
+    expect(heldTwo?.message).toEqual(state(2n, "aa"));
+
+    for (const t of [3n, 4n, 5n]) r.cacheRelay(channelId, 0, state(t)); // a fifth state evicts the lowest (1)
+    expect(turns(0)).toEqual([2n, 3n, 4n, 5n]);
+    r.cacheRelay(channelId, 0, state(1n)); // full, and lower than everything held: dropped, evicts nothing
+    expect(turns(0)).toEqual([2n, 3n, 4n, 5n]);
+    r.cacheRelay(channelId, 0, state(2n, "bb")); // equal to the lowest held: a same-turn replacement, not a drop
+    expect(turns(0)).toEqual([2n, 3n, 4n, 5n]);
+
+    const close1 = { type: "close" as const, channelId, close: { stateHash: channelId, by: 0 as const, sig: "0x01" as const } };
+    const close2 = { ...close1, close: { ...close1.close, sig: "0x02" as const } };
+    r.cacheRelay(channelId, 0, close1);
+    r.cacheRelay(channelId, 0, close2); // only the latest close per sender
+    const closes = r.cachedRelay(channelId).filter((c) => c.message.type === "close");
+    expect(closes).toEqual([{ sender: 0, message: close2 }]);
+    expect(turns(1)).toEqual([1n]); // untouched by sender 0's traffic
+    r.close();
+  });
+
+  it("migrates a relay cache and offers table written by the previous schema", () => {
+    const path = join(tmpdir(), `arena-migrate-${randomBytes(8).toString("hex")}.sqlite`);
+    try {
+      const old = new DatabaseSync(path);
+      old.exec(`CREATE TABLE offers (offer_id TEXT PRIMARY KEY, player TEXT NOT NULL, ip TEXT NOT NULL DEFAULT '',
+        expires_at TEXT NOT NULL, body TEXT NOT NULL, acceptance TEXT, match TEXT, created_ms INTEGER NOT NULL);
+        CREATE TABLE relay_cache (channel_id TEXT NOT NULL, sender INTEGER NOT NULL, kind TEXT NOT NULL,
+        body TEXT NOT NULL, PRIMARY KEY (channel_id, sender, kind));
+        CREATE TABLE channels (channel_id TEXT PRIMARY KEY, a TEXT NOT NULL, b TEXT NOT NULL,
+        created_block TEXT NOT NULL, body TEXT NOT NULL);`);
+      const channelId = ("0x" + "ab".repeat(32)) as `0x${string}`;
+      const msg = { type: "state" as const, channelId, signed: { state: { turnNum: 7n }, sigA: "0x", sigB: "0x" } };
+      old.prepare("INSERT INTO relay_cache VALUES (?, 0, 'state', ?)").run(channelId, toWire(msg));
+      const params = { salt: "0x", fundingDeadline: 5n };
+      old
+        .prepare("INSERT INTO offers (offer_id, player, expires_at, body, match, created_ms) VALUES (?, 'p', '0', '{}', ?, 0)")
+        .run("0x" + "01".repeat(32), toWire({ offerId: "0x" + "01".repeat(32), params }));
+      old.close();
+
+      const matched = ("0x" + "cd".repeat(32)) as `0x${string}`;
+      const r = new SqliteRepo(path, () => matched);
+      expect(r.cachedRelay(channelId)).toEqual([{ sender: 0, message: msg }]); // carried over, not dropped
+      expect(r.knownChannel(matched)).toBe(true); // channel_id backfilled from the stored match
+      r.close();
+    } finally {
+      for (const suffix of ["", "-wal", "-shm"]) rmSync(`${path}${suffix}`, { force: true });
+    }
+  });
+
+  it("prunes matched offers a day past their funding deadline unless their channel is still live", () => {
+    const r = new SqliteRepo(":memory:");
+    const deadline = 1_000_000n;
+    const mk = (n: number) => {
+      const offerId = ("0x" + n.toString(16).padStart(2, "0").repeat(32)) as `0x${string}`;
+      const channelId = ("0x" + (n + 16).toString(16).padStart(2, "0").repeat(32)) as `0x${string}`;
+      const so = { offer: { player: "0x" + "00".repeat(20), expiresAt: 1n }, sig: "0x" } as never;
+      r.insertOffer(offerId, so, "1.2.3.4");
+      const sa = { acceptance: { offerId }, sig: "0x" } as never;
+      r.recordMatch(offerId, sa, { offerId, params: { fundingDeadline: deadline } as never }, channelId);
+      return { offerId, channelId };
+    };
+    const row = (channelId: `0x${string}`, phase: "Open" | "Finalized" | "Reclaimed") => ({
+      channelId, params: { participants: ["0x" + "01".repeat(20), "0x" + "02".repeat(20)] } as never, phase,
+      createdBlock: 1n, challenges: [0, 0] as [number, number], answered: [0, 0] as [number, number],
+      pendingChallenger: null, registered: null, timeoutLoser: null, balances: null,
+    });
+    const neverFunded = mk(1); // no indexer row: the channel never reached the chain
+    const live = mk(2);
+    r.saveChannelRow(row(live.channelId, "Open"));
+    const finalized = mk(3);
+    r.saveChannelRow(row(finalized.channelId, "Finalized"));
+    const reclaimed = mk(4);
+    r.saveChannelRow(row(reclaimed.channelId, "Reclaimed"));
+
+    expect(r.pruneOffers(deadline + 86_400n)).toBe(0); // exactly a day past: not yet (strictly more than a day)
+    expect(r.pruneOffers(deadline + 86_401n)).toBe(3);
+    expect(r.offer(neverFunded.offerId)).toBe(null);
+    expect(r.offer(finalized.offerId)).toBe(null);
+    expect(r.offer(reclaimed.offerId)).toBe(null);
+    expect(r.offer(live.offerId)).not.toBe(null); // an Open channel keeps its match (and its join gate)
+    expect(r.knownChannel(finalized.channelId)).toBe(true); // still known through its indexer row
     r.close();
   });
 

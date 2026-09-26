@@ -1,6 +1,6 @@
 import type { Address } from "viem";
 import { chunkRanges, isGameOver, mover } from "@arena/sdk";
-import type { HubEvent, PlayerIndex } from "@arena/sdk";
+import type { HubEvent, PlayerIndex, SignedState, State } from "@arena/sdk";
 import type { ChainReader } from "./chain.js";
 import type { ServerConfig } from "./config.js";
 import type { Relay } from "./relay.js";
@@ -21,6 +21,12 @@ export type PlayerStats = {
 // A catch-up pass never chews through more than this many chunks, so a very stale cursor doesn't turn one poll
 // into an unbounded amount of RPC work; the next poll (on the same interval) picks up where this one left off.
 const MAX_CHUNKS_PER_POLL = 50;
+
+/** Games played in a channel whose latest state is `s`: every finished game before `gameIndex`, plus the current
+ *  one once it has a move. */
+export function gamesOf(s: State): number {
+  return s.gameIndex + (s.turnNum > 0n ? 1 : 0);
+}
 
 function eventKey(e: HubEvent): { block: bigint; logIndex: number } {
   return { block: e.blockNumber, logIndex: e.logIndex };
@@ -47,6 +53,7 @@ export class Indexer {
     private readonly chain: ChainReader,
     private readonly cfg: ServerConfig,
     private readonly log: (l: string) => void,
+    private readonly relay?: Pick<Relay, "latestState">,
   ) {}
 
   /** One catch-up pass: reads the chain head, then works through at most `MAX_CHUNKS_PER_POLL` chunks of
@@ -55,6 +62,7 @@ export class Indexer {
    *  the last successfully-committed chunk left it, so the next poll retries from there. */
   async poll(): Promise<void> {
     try {
+      this.repo.pruneRelayCache(Date.now());
       const head = await this.chain.head();
       const cursor = this.repo.cursor() ?? this.cfg.indexer.startBlock - 1n;
       const ranges = chunkRanges(cursor + 1n, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL);
@@ -138,13 +146,24 @@ export class Indexer {
         if (next.pendingChallenger !== null && next.registered && !isGameOver(next.registered.state)) {
           next.timeoutLoser = mover(next.registered.state);
         }
+        this.recordSettlement(next);
         break;
       }
       case "Reclaimed":
         next.phase = "Reclaimed";
+        this.recordSettlement(next);
         break;
     }
     this.repo.saveChannelRow(next);
+  }
+
+  /** Copies what reputation and `/api/channels` read from the relay cache into the row, so they outlive the
+   *  cache, which `Repo.pruneRelayCache` drops a day after `finalizedAt`. */
+  private recordSettlement(row: ChannelRow): void {
+    const latest: SignedState | null = this.relay?.latestState(row.channelId) ?? null;
+    row.finalState = latest;
+    row.games = latest ? gamesOf(latest.state) : 0;
+    row.finalizedAt = Date.now();
   }
 
   /** `head - cursor` (0 if no chunk has ever committed, per `startBlock`) -- for `/metrics`. */
@@ -179,8 +198,9 @@ export class Indexer {
 }
 
 /** Aggregates `address`'s reputation across every channel row it appears in. `games` for a channel comes from
- *  `relay.latestState` (the same verified cache the relay itself serves), not the row: the indexer only sees
- *  on-chain phase transitions, not off-chain moves. */
+ *  `relay.latestState` (the same verified cache the relay itself serves): the indexer only sees on-chain phase
+ *  transitions, not off-chain moves. A settled channel whose cache has been pruned falls back to the count the
+ *  indexer recorded at settlement. */
 export function playerStats(repo: Repo, relay: Relay, address: Address): PlayerStats {
   const addr = address.toLowerCase();
   const rows = repo.channelRowsFor(address);
@@ -202,7 +222,8 @@ export function playerStats(repo: Repo, relay: Relay, address: Address): PlayerS
     if (row.timeoutLoser === idx) timeoutsLost += 1;
 
     const latest = relay.latestState(row.channelId);
-    if (latest) games += latest.state.gameIndex + (latest.state.turnNum > 0n ? 1 : 0);
+    if (latest) games += gamesOf(latest.state);
+    else if (row.games !== undefined) games += row.games;
   }
 
   return {

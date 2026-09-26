@@ -28,9 +28,10 @@ function knownChannelId(v: unknown): Hex | undefined {
   return typeof v === "string" && HEX32_RE.test(v) ? (v.toLowerCase() as Hex) : undefined;
 }
 
-/** Untrusted plumbing between a channel's two session keys: nonce-authenticated joins, forwarding of messages the
- *  sender has already signed, and a last-message-per-sender cache that lets a rejoining member catch up. The relay
- *  does not enforce game rules or channel state machine transitions -- daemons re-verify everything they receive. */
+/** Untrusted plumbing between a channel's two session keys: nonce-authenticated joins (only for channels this host
+ *  knows), forwarding of messages the sender has already signed, and a per-sender cache of recent states plus the
+ *  latest close that lets a rejoining member catch up. The relay does not enforce game rules or channel state
+ *  machine transitions -- daemons re-verify everything they receive. */
 export class Relay {
   private readonly channels = new Map<Hex, ChannelState>();
   private readonly domain: ArenaDomain;
@@ -56,7 +57,8 @@ export class Relay {
   }
 
   /** Joins `peer` to the channel named by `frame`, or sends an `error` frame naming why not. On success, sends
-   *  `joined` followed by a replay of the channel's cached messages from the *other* member (state, then close). */
+   *  `joined` followed by a replay of the channel's cached messages from the *other* member: its states in
+   *  ascending `turnNum` order, then its close. */
   async join(
     peer: RelayPeer,
     frame: { channelId: unknown; params: unknown; signer: unknown; sig: unknown },
@@ -73,6 +75,12 @@ export class Relay {
       const expected = channelId(this.cfg.chainId, this.cfg.hub, params);
       if (claimed !== expected) {
         peer.send({ type: "error", error: "params do not match channel", channelId: claimed });
+        return;
+      }
+      // anyone can mint params and keys for a throwaway channel; only channels matched by this host's lobby or
+      // seen on-chain by its indexer may occupy the cache
+      if (!this.repo.knownChannel(expected)) {
+        peer.send({ type: "error", error: "unknown channel", channelId: expected });
         return;
       }
       const signer = frame.signer;
@@ -114,7 +122,8 @@ export class Relay {
       peer.send({ type: "joined", channelId: expected });
 
       const cached = this.repo.cachedRelay(expected).filter((e) => e.sender !== idx);
-      const states = cached.filter((e) => e.message.type === "state");
+      const turnOf = (e: (typeof cached)[number]) => (e.message.type === "state" ? e.message.signed.state.turnNum : 0n);
+      const states = cached.filter((e) => e.message.type === "state").sort((x, y) => (turnOf(x) < turnOf(y) ? -1 : 1));
       const closes = cached.filter((e) => e.message.type === "close");
       for (const entry of [...states, ...closes]) peer.send({ type: "relay", message: entry.message });
     } catch (err) {

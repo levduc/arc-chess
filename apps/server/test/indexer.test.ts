@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
@@ -351,6 +351,41 @@ describe("HTTP routes", () => {
     expect((await fetch(`${server.url}/api/channels/${unknown}`)).status).toBe(404);
     // not hex32 at all
     expect((await fetch(`${server.url}/api/channels/not-a-channel`)).status).toBe(400);
+  });
+
+  it("a settled channel keeps its games count and final state after its relay cache is pruned (I6)", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const fx = makeChannelFixture(server.config, server.repo);
+    const last = { ...initialState(fx.id, fx.params), gameIndex: 2, turnNum: 9n };
+    const signed = { state: last, sigA: "0x" as Hex, sigB: "0x" as Hex };
+    server.repo.cacheRelay(fx.id, 0, { type: "state", channelId: fx.id, signed });
+
+    server.indexer.apply({ blockNumber: 1n, logIndex: 0, channelId: fx.id, kind: "ChannelCreated", params: fx.params });
+    server.indexer.apply({ blockNumber: 2n, logIndex: 0, channelId: fx.id, kind: "Opened" });
+    server.indexer.apply({
+      blockNumber: 3n, logIndex: 0, channelId: fx.id, kind: "Finalized", balanceA: 1n, balanceB: 2n, fee: 0n,
+    });
+    const row = server.repo.channelRow(fx.id);
+    expect(row?.games).toBe(3); // gameIndex 2 + the current game, which has moves
+    expect(row?.finalState).toEqual(signed);
+
+    // a day later, the next poll prunes the cache; not before
+    await server.indexer.poll();
+    expect(server.repo.cachedRelay(fx.id)).toHaveLength(1);
+    const dayLater = Date.now() + 86_400_000 + 1_000;
+    const spy = vi.spyOn(Date, "now").mockReturnValue(dayLater);
+    try {
+      await server.indexer.poll();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(server.repo.cachedRelay(fx.id)).toEqual([]);
+
+    const stats = (await (await fetch(`${server.url}/players/${fx.params.participants[0]}`)).json()) as any;
+    expect(stats.games).toBe(3);
+    const channel = (await (await fetch(`${server.url}/api/channels/${fx.id}`)).json()) as any;
+    expect(channel.phase).toBe("Finalized");
+    expect(channel.latest).toMatchObject({ turnNum: "9", gameIndex: 2, fen: fenOf(last) });
   });
 
   it("GET /watch/:id serves HTML that polls /api/channels/:id and escapes the id", async () => {

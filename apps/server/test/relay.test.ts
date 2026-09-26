@@ -54,7 +54,7 @@ describe("relay", () => {
   it("forwards a signed state from A to B and not back to A", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const a = await joinAs(server.url, fx, fx.kA);
     const b = await joinAs(server.url, fx, fx.kB);
 
@@ -69,7 +69,7 @@ describe("relay", () => {
   it("delivers a state and a following close in send order, though state verification awaits", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const a = await joinAs(server.url, fx, fx.kA);
     const b = await joinAs(server.url, fx, fx.kB);
 
@@ -89,7 +89,7 @@ describe("relay", () => {
   it("forwards a relay frame sent immediately after join, without waiting for `joined`", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const b = await joinAs(server.url, fx, fx.kB);
     const c = await wsConnect(server.url);
     const acct = privateKeyToAccount(fx.kA);
@@ -114,7 +114,7 @@ describe("relay", () => {
   it("refuses a join whose params do not hash to channelId", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const c = await wsConnect(server.url);
     const acct = privateKeyToAccount(fx.kA);
     const wrongId = `0x${"ab".repeat(32)}` as Hex;
@@ -134,7 +134,7 @@ describe("relay", () => {
   it("refuses a join by a key that is not one of the channel's signers", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const outsider = generatePrivateKey();
     const c = await wsConnect(server.url);
     const acct = privateKeyToAccount(outsider);
@@ -153,7 +153,7 @@ describe("relay", () => {
   it("refuses a join signed over another connection's nonce (replay)", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const c1 = await wsConnect(server.url);
     const c2 = await wsConnect(server.url);
     const acct = privateKeyToAccount(fx.kA);
@@ -167,8 +167,8 @@ describe("relay", () => {
   it("refuses a second join over the connection's channel limit", async () => {
     const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx1 = makeChannelFixture(cfg);
-    const fx2 = makeChannelFixture(cfg); // a different channel
+    const fx1 = makeChannelFixture(cfg, server.repo);
+    const fx2 = makeChannelFixture(cfg, server.repo); // a different channel
     const a = await joinAs(server.url, fx1, fx1.kA);
 
     const acct2 = privateKeyToAccount(fx2.kA);
@@ -187,7 +187,7 @@ describe("relay", () => {
   it("refuses relay messages for channels the connection has not joined", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const c = await wsConnect(server.url); // never joins
     const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
     c.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } });
@@ -199,7 +199,7 @@ describe("relay", () => {
   it("refuses a state whose sender signature is missing or wrong and does not forward it", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const a = await joinAs(server.url, fx, fx.kA); // idx 0
     const b = await joinAs(server.url, fx, fx.kB);
 
@@ -220,7 +220,7 @@ describe("relay", () => {
   it("refuses a close message whose `by` is not the sender's index", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const a = await joinAs(server.url, fx, fx.kA); // idx 0
     const b = await joinAs(server.url, fx, fx.kB);
 
@@ -233,7 +233,7 @@ describe("relay", () => {
   it("replays the peer's cached latest state and close to a (re)joining member", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
     const close = closeMsg(fx, 0);
 
@@ -253,7 +253,7 @@ describe("relay", () => {
   it("does not replay a member's own messages back to it", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
 
     const a = await joinAs(server.url, fx, fx.kA);
@@ -264,22 +264,72 @@ describe("relay", () => {
     await expect(a2.next((f) => f.type === "relay", 200)).rejects.toThrow();
   });
 
-  it("keeps only the latest state per sender (a newer state replaces the cache)", async () => {
+  it("replays a sender's terminal state and its following new-game checkpoint, in turn order (I1)", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
+    const b = await joinAs(server.url, fx, fx.kB); // Bob: player 1; Alice is not joined
+    // Bob resigns at turn n, then proposes the next game at n+1, before Alice ever rejoins: both must survive.
+    const terminal = await signStateAs(fx, rawStateAt(fx, 7n), 1);
+    const checkpoint = await signStateAs(fx, rawStateAt(fx, 8n), 1);
+    b.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: terminal } });
+    b.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: checkpoint } });
+    await b.next(() => false, 200).catch(() => undefined); // let both land
+
     const a = await joinAs(server.url, fx, fx.kA);
+    const first = await a.next((f) => f.type === "relay");
+    expect(first.message.signed).toEqual(terminal);
+    const second = await a.next((f) => f.type === "relay");
+    expect(second.message.signed).toEqual(checkpoint);
+    await expect(a.next((f) => f.type === "relay", 200)).rejects.toThrow(); // nothing else cached
+  });
+
+  it("replays states in ascending turn order even when a lower turn was re-sent last", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg, server.repo);
+    const a = await joinAs(server.url, fx, fx.kA);
+    const s3 = await signStateAs(fx, rawStateAt(fx, 3n), 0);
     const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
-    const s2 = await signStateAs(fx, rawStateAt(fx, 2n), 0);
-    a.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } });
-    await a.next(() => false, 200).catch(() => undefined);
-    a.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s2 } });
+    a.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s3 } });
+    a.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } }); // a late re-send
     await a.next(() => false, 200).catch(() => undefined);
 
     const b = await joinAs(server.url, fx, fx.kB);
-    const got = await b.next((f) => f.type === "relay");
-    expect(got.message.signed).toEqual(s2);
-    await expect(b.next((f) => f.type === "relay", 200)).rejects.toThrow(); // only one cached entry per sender
+    expect((await b.next((f) => f.type === "relay")).message.signed).toEqual(s1);
+    expect((await b.next((f) => f.type === "relay")).message.signed).toEqual(s3);
+  });
+
+  it("refuses a join for a self-minted channel this host never matched or indexed", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg); // params hash to the id and the key is a signer, but nobody matched it here
+    const c = await wsConnect(server.url);
+    const acct = privateKeyToAccount(fx.kA);
+    c.send({
+      type: "join",
+      channelId: fx.id,
+      params: fx.params,
+      signer: acct.address,
+      sig: await signRelayJoin(acct, fx.id, c.nonce),
+    });
+    const f = await c.next((f) => f.type === "error" || f.type === "joined");
+    expect(f.type).toBe("error");
+    expect(f.error).toBe("unknown channel");
+    expect(f.channelId).toBe(fx.id);
+    expect(server.repo.cachedRelay(fx.id)).toEqual([]);
+  });
+
+  it("accepts a join for a channel known only through an indexer row", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg); // matched on another host's lobby, but seen on-chain by this indexer
+    server.repo.saveChannelRow({
+      channelId: fx.id, params: fx.params, phase: "Open", createdBlock: 1n, challenges: [0, 0], answered: [0, 0],
+      pendingChallenger: null, registered: null, timeoutLoser: null, balances: null,
+    });
+    const a = await joinAs(server.url, fx, fx.kA);
+    expect(a.frames).toEqual([]); // `joined` consumed by joinAs; no error left behind
   });
 
   it("survives a server restart with a file database: cache is replayed after restart", async () => {
@@ -287,7 +337,7 @@ describe("relay", () => {
     try {
       const cfg = testConfig({ dbPath });
       server = await startServer(cfg, { chain: new FakeChain() });
-      const fx = makeChannelFixture(cfg);
+      const fx = makeChannelFixture(cfg, server.repo);
       const a = await joinAs(server.url, fx, fx.kA);
       const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
       a.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } });
@@ -310,7 +360,7 @@ describe("relay", () => {
   it("drops frames above maxFrameBytes without affecting other members", async () => {
     const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxFrameBytes: 1024 } });
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const a = await joinAs(server.url, fx, fx.kA);
     const b = await joinAs(server.url, fx, fx.kB);
 
@@ -329,7 +379,7 @@ describe("relay", () => {
   it("re-confirms and replays a duplicate join, without double-counting maxJoinsPerConnection", async () => {
     const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const a = await joinAs(server.url, fx, fx.kA);
     const b = await joinAs(server.url, fx, fx.kB);
 
@@ -359,7 +409,7 @@ describe("relay", () => {
     const repo = new SqliteRepo(":memory:");
     const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
     const relay = new Relay(repo, cfg, metrics, () => {});
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, repo);
     const peerA = fakePeer();
     const peerB = fakePeer();
     const acctA = privateKeyToAccount(fx.kA);
@@ -395,7 +445,7 @@ describe("relay", () => {
     const cfg = testConfig();
     const repo = new SqliteRepo(":memory:");
     const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, repo);
     const acctA = privateKeyToAccount(fx.kA);
     const acctB = privateKeyToAccount(fx.kB);
 
@@ -433,7 +483,7 @@ describe("relay", () => {
     const repo = new SqliteRepo(":memory:");
     const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
     const relay = new Relay(repo, cfg, metrics, () => {});
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, repo);
     const peerA = fakePeer();
     const peerB = fakePeer();
     const acctA = privateKeyToAccount(fx.kA);
@@ -466,7 +516,7 @@ describe("relay", () => {
     const repo = new SqliteRepo(":memory:");
     const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
     const relay = new Relay(repo, cfg, metrics, () => {});
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, repo);
     const peerA = fakePeer();
     const acctA = privateKeyToAccount(fx.kA);
     const sig = await signRelayJoin(acctA, fx.id, peerA.nonce); // computed before the race, like a real join

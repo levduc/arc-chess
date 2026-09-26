@@ -135,7 +135,7 @@ describe("host transports (connectHost) against a real server", () => {
   it("relay: join with a signer (never a key), send, receive; onJoined fires on join", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const hostA = connectHost(server.url);
     const hostB = connectHost(server.url);
     try {
@@ -166,7 +166,7 @@ describe("host transports (connectHost) against a real server", () => {
   it("reconnects after the server drops connections and re-joins + re-subscribes; onJoined fires again", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100 });
     const hostB = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100 });
     try {
@@ -212,7 +212,7 @@ describe("host transports (connectHost) against a real server", () => {
   it("send() rejects once the socket has actually disconnected", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const hostA = connectHost(server.url);
     try {
       await waitFor(() => hostA.connected());
@@ -233,7 +233,7 @@ describe("host transports (connectHost) against a real server", () => {
   it("a join refused by the server is not retried on every future hello", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg);
+    const fx = makeChannelFixture(cfg, server.repo);
     const outsider = generatePrivateKey(); // not one of fx.params.signers
     const logs: string[] = [];
     const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
@@ -253,14 +253,35 @@ describe("host transports (connectHost) against a real server", () => {
     }
   });
 
+  it("an unknown-channel refusal is permanent: the channel is not re-joined on the next hello", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg); // self-minted: never matched or indexed by this host
+    const logs: string[] = [];
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
+    try {
+      await waitFor(() => hostA.connected());
+      await expect(hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA))).rejects.toThrow(/unknown channel/);
+      await waitFor(() => logs.some((l) => l.includes("refused permanently")));
+
+      server.dropConnections();
+      await waitFor(() => !hostA.connected());
+      await waitFor(() => hostA.connected());
+      await new Promise((r) => setTimeout(r, 200)); // a resend-on-hello, if it happened, would show up by now
+      expect(logs.filter((l) => l.includes("unknown channel")).length).toBe(1);
+    } finally {
+      hostA.close();
+    }
+  });
+
   it("a transient join refusal (too many channels on this connection) is retried after a reconnect", async () => {
     // A per-connection capacity error names no permanent property of the join itself (a fresh connection with
     // fewer other channels already joined could accept the very same join) -- unlike "not a member of this
     // channel" above, it must stay registered and be retried on the next `hello`, not dropped.
     const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx1 = makeChannelFixture(cfg);
-    const fx2 = makeChannelFixture(cfg);
+    const fx1 = makeChannelFixture(cfg, server.repo);
+    const fx2 = makeChannelFixture(cfg, server.repo);
     const logs: string[] = [];
     const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
     try {
