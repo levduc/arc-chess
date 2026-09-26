@@ -37,7 +37,8 @@ Example `server.json` for a local Anvil deployment (`anvil --port 8545` plus a `
   "cliCommand": "arena",
   "audit": "unaudited (development build)",
   "indexer": { "pollMs": 2000, "chunkBlocks": 1000, "startBlock": 0 },
-  "limits": {}
+  "limits": {},
+  "trustProxy": false
 }
 ```
 
@@ -107,6 +108,18 @@ forwards is trusted at face value by the daemons that receive it.
   boundary for the funds, which live entirely in `ChannelHub`.
 
 ## Limits (`ServerConfig.limits`, all overridable under `"limits"` in `server.json`)
+
+Every "per IP" limit below is keyed on the client address:
+
+- An IPv4 address counts as itself. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counts as that IPv4 address.
+- An IPv6 address counts by its /64 prefix. One subscriber usually holds a whole /64, so keying on the full address
+  would let one client rotate through addresses and dodge every cap.
+- By default the address is the TCP peer of the socket. **Behind a reverse proxy or TLS terminator you must set
+  `"trustProxy": true`.** Otherwise every client shares the proxy's address and one bucket: at the defaults, the
+  whole deployment gets 16 WebSocket connections, 5 open offers and one POST per second. With `trustProxy` the
+  client address is the right-most `X-Forwarded-For` entry, which the proxy appends. The entries to its left come
+  from the client and are ignored. The same rule applies to HTTP requests and to the `/ws` upgrade.
+- Never set `trustProxy` on a server that is reachable directly: any client could then pick its own key.
 
 | Field | Default | Applies to |
 |---|---|---|

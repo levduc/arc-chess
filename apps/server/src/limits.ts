@@ -1,3 +1,6 @@
+import type http from "node:http";
+import { isIPv4, isIPv6 } from "node:net";
+
 type Bucket = { tokens: number; last: number };
 
 // drop a key's bucket once it has sat fully refilled this long, to bound memory
@@ -52,4 +55,59 @@ export class RateLimiter {
       if (idleMs - refillMs > IDLE_FULL_MS) this.buckets.delete(key);
     }
   }
+}
+
+/** The eight 16-bit groups of a valid IPv6 address (`::` expanded, an embedded dotted IPv4 tail converted). */
+function ipv6Groups(ip: string): number[] {
+  let s = ip;
+  const v4 = /(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+  if (v4) {
+    const [a, b, c, d] = v4[1].split(".").map(Number);
+    s = `${s.slice(0, -v4[1].length)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = s.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail === undefined ? [] : tail ? tail.split(":") : [];
+  const fill = tail === undefined ? 0 : 8 - h.length - t.length;
+  return [...h, ...Array<string>(fill).fill("0"), ...t].map((g) => parseInt(g, 16));
+}
+
+/** `ipKey` of `raw`, or `null` when it is not an IP address. */
+function ipKeyOf(raw: string): string | null {
+  let ip = raw.trim();
+  if (ip.startsWith("[") && ip.endsWith("]")) ip = ip.slice(1, -1);
+  const zone = ip.indexOf("%");
+  if (zone >= 0) ip = ip.slice(0, zone);
+  if (isIPv4(ip)) return ip;
+  if (!isIPv6(ip)) return null;
+  const g = ipv6Groups(ip);
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
+    return [g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff].join(".");
+  }
+  return `${g.slice(0, 4).map((x) => x.toString(16)).join(":")}::/64`;
+}
+
+/** The key per-IP limits count against: an IPv4 address as is (IPv4-mapped IPv6 unwrapped to it), an IPv6 address
+ *  by its /64 -- one subscriber's allocation, which is free to rotate through -- and anything else verbatim. */
+export function ipKey(raw: string): string {
+  return ipKeyOf(raw) ?? raw;
+}
+
+/** The client key for `req`: the socket's peer address, or -- only with `trustProxy`, when a reverse proxy in front
+ *  of this server appends the address it saw -- the right-most `X-Forwarded-For` entry. Entries to its left were
+ *  written by the client and prove nothing. */
+export function clientKey(req: http.IncomingMessage, trustProxy: boolean): string {
+  const socketIp = req.socket.remoteAddress ?? "?";
+  if (trustProxy) {
+    const raw = req.headers["x-forwarded-for"];
+    const joined = Array.isArray(raw) ? raw.join(",") : (raw ?? "");
+    const last = joined
+      .split(",")
+      .map((e) => e.trim())
+      .filter((e) => e !== "")
+      .at(-1);
+    const proxied = last === undefined ? null : ipKeyOf(last);
+    if (proxied !== null) return proxied;
+  }
+  return ipKey(socketIp);
 }

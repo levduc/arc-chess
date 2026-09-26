@@ -5,7 +5,7 @@ import { WebSocket as WsWebSocket, WebSocketServer } from "ws";
 import { decodeWire, toWire, type MatchEvent, type Params, type RelayMessage } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 import type { Lobby } from "./lobby.js";
-import { RateLimiter } from "./limits.js";
+import { clientKey, RateLimiter } from "./limits.js";
 import type { Relay, RelayPeer } from "./relay.js";
 import type { Metrics } from "./server.js";
 
@@ -161,7 +161,7 @@ export function attachWs(
       socket.destroy();
       return;
     }
-    const ip = socket.remoteAddress ?? "?";
+    const ip = clientKey(req, cfg.trustProxy);
     if (ipCount(ip) >= cfg.limits.wsPerIp) {
       socket.end("HTTP/1.1 429 Too Many Requests\r\n\r\n");
       return;

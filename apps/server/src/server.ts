@@ -6,7 +6,7 @@ import type { ServerConfig } from "./config.js";
 import { RpcChainReader, type ChainReader } from "./chain.js";
 import { chessSkillMd, indexHtml, llmsTxt, skillMd, watchHtml } from "./docs.js";
 import { Indexer, playerStats } from "./indexer.js";
-import { RateLimiter } from "./limits.js";
+import { clientKey, RateLimiter } from "./limits.js";
 import { Lobby, LobbyError } from "./lobby.js";
 import { Relay } from "./relay.js";
 import { SqliteRepo, type Repo } from "./repo.js";
@@ -325,7 +325,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     try {
       const method = req.method ?? "GET";
-      const ip = req.socket.remoteAddress ?? "?";
+      const ip = clientKey(req, cfg.trustProxy);
       const limiter = method === "POST" ? postLimiter : getLimiter;
       if (!limiter.take(ip)) {
         sendJson(res, 429, { error: "rate limited" });

@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { toWire } from "@arena/sdk";
 import { DEFAULT_LIMITS, parseServerConfig, type ServerConfig } from "../src/config.js";
 import { RpcChainReader, type HubLike } from "../src/chain.js";
-import { RateLimiter } from "../src/limits.js";
+import { WebSocket as WsClient } from "ws";
+import { ipKey, RateLimiter } from "../src/limits.js";
 import { SqliteRepo } from "../src/repo.js";
 import { startServer, type ArenaServer } from "../src/server.js";
 import { FakeChain, testConfig } from "./helpers/fakeChain.js";
@@ -22,6 +23,10 @@ describe("config", () => {
     expect(c.fundingWindow).toBe(3600n);
     expect(c.defaults.deposit).toBe(1_000_000n);
     expect(c.limits).toEqual(DEFAULT_LIMITS);
+    expect(c.trustProxy).toBe(false);
+    const base = { rpcUrl: "http://x", chainId: 1, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20) };
+    expect(parseServerConfig({ ...base, trustProxy: true }).trustProxy).toBe(true);
+    expect(() => parseServerConfig({ ...base, trustProxy: "yes" })).toThrow(/trustProxy/);
   });
   it("names the bad field", () => {
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "nope" })).toThrow(/hub/);
@@ -320,6 +325,58 @@ describe("http foundation", () => {
     for (let i = 0; i < 3; i++) codes.push((await fetch(`${server.url}/templates`)).status);
     expect(codes).toEqual([200, 200, 429]);
   });
+  it("keys IPv6 clients by their /64 and unwraps IPv4-mapped addresses (I7)", () => {
+    expect(ipKey("2001:db8:1:2::1")).toBe(ipKey("2001:db8:1:2:ffff:ffff:ffff:5"));
+    expect(ipKey("2001:0db8:0001:0002:0000:0000:0000:0001")).toBe(ipKey("2001:db8:1:2::1"));
+    expect(ipKey("2001:db8:1:2::1")).not.toBe(ipKey("2001:db8:1:3::1"));
+    expect(ipKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
+    expect(ipKey("::ffff:cb00:7109")).toBe("203.0.113.9"); // the same mapped address in hex form
+    expect(ipKey("203.0.113.9")).toBe("203.0.113.9");
+    expect(ipKey("fe80::1%eth0")).toBe(ipKey("fe80::2"));
+    const limiter = new RateLimiter(1, 0.001);
+    expect(limiter.take(ipKey("2001:db8:1:2::1"))).toBe(true);
+    expect(limiter.take(ipKey("2001:db8:1:2::abcd"))).toBe(false); // same /64: same bucket
+    expect(limiter.take(ipKey("2001:db8:1:3::1"))).toBe(true);
+  });
+
+  it("with trustProxy, keys HTTP limits on the right-most X-Forwarded-For entry", async () => {
+    const limits = { ...DEFAULT_LIMITS, httpGetBurst: 1, httpGetPerSec: 0.001 };
+    server = await startServer({ ...testConfig(), limits, trustProxy: true }, { chain: new FakeChain() });
+    const get = (xff: string) => fetch(`${server!.url}/healthz`, { headers: { "x-forwarded-for": xff } }).then((r) => r.status);
+    expect(await get("198.51.100.1")).toBe(200);
+    expect(await get("198.51.100.2")).toBe(200); // a different client behind the proxy: its own bucket
+    expect(await get("198.51.100.2, 198.51.100.1")).toBe(429); // only the proxy-appended (right-most) entry counts
+    expect(await get("2001:db8:5:6::1")).toBe(200);
+    expect(await get("2001:db8:5:6::2")).toBe(429); // same /64
+  });
+
+  it("without trustProxy, ignores X-Forwarded-For", async () => {
+    const limits = { ...DEFAULT_LIMITS, httpGetBurst: 1, httpGetPerSec: 0.001 };
+    server = await startServer({ ...testConfig(), limits }, { chain: new FakeChain() });
+    const get = (xff: string) => fetch(`${server!.url}/healthz`, { headers: { "x-forwarded-for": xff } }).then((r) => r.status);
+    expect(await get("198.51.100.1")).toBe(200);
+    expect(await get("198.51.100.2")).toBe(429); // the socket peer is what counts
+  });
+
+  it("applies trustProxy to the WebSocket upgrade's per-IP connection cap", async () => {
+    const open = (url: string, xff: string) =>
+      new Promise<"open" | "refused">((resolve) => {
+        const ws = new WsClient(`${url.replace(/^http/, "ws")}/ws`, { headers: { "x-forwarded-for": xff } });
+        ws.on("open", () => resolve("open"));
+        ws.on("error", () => resolve("refused"));
+      });
+    const limits = { ...DEFAULT_LIMITS, wsPerIp: 1 };
+    server = await startServer({ ...testConfig(), limits, trustProxy: true }, { chain: new FakeChain() });
+    expect(await open(server.url, "198.51.100.1")).toBe("open");
+    expect(await open(server.url, "198.51.100.2")).toBe("open");
+    expect(await open(server.url, "198.51.100.1")).toBe("refused");
+    await server.close();
+
+    server = await startServer({ ...testConfig(), limits }, { chain: new FakeChain() });
+    expect(await open(server.url, "198.51.100.1")).toBe("open");
+    expect(await open(server.url, "198.51.100.2")).toBe("refused"); // header ignored: both are 127.0.0.1
+  });
+
   it("exposes Prometheus metrics", async () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const text = await (await fetch(`${server.url}/metrics`)).text();

@@ -28,6 +28,9 @@ export type ServerConfig = {
   audit: string;
   indexer: { pollMs: number; chunkBlocks: number; startBlock: bigint };
   limits: Limits;
+  /** Behind a reverse proxy: key per-IP limits on the right-most `X-Forwarded-For` entry, not the socket peer
+   *  (which is then the proxy itself). Never enable it on a directly exposed server: clients could spoof it. */
+  trustProxy: boolean;
 };
 
 // the daemons refuse funding deadlines further out than 7200s (maxFundingWindow); see hub.ts checkMatchParams
@@ -80,6 +83,13 @@ function num(obj: Record<string, unknown>, field: string, fallback?: number): nu
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
   fail(field, "must be a number");
+}
+
+function bool(obj: Record<string, unknown>, field: string, fallback: boolean): boolean {
+  const v = obj[field];
+  if (v === undefined) return fallback;
+  if (typeof v !== "boolean") fail(field, "must be true or false");
+  return v;
 }
 
 function bigint(obj: Record<string, unknown>, field: string, fallback: bigint): bigint {
@@ -158,9 +168,10 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   };
 
   const limits = parseLimits(obj);
+  const trustProxy = bool(obj, "trustProxy", false);
 
   return {
     host, port, publicUrl, rpcUrl, publicRpcUrl, chainId, hub, usdc, rules, dbPath,
-    fundingWindow, offerMaxLifetime, defaults, cliCommand, audit, indexer, limits,
+    fundingWindow, offerMaxLifetime, defaults, cliCommand, audit, indexer, limits, trustProxy,
   };
 }
