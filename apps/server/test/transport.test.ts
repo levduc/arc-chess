@@ -182,9 +182,21 @@ describe("host transports (connectHost) against a real server", () => {
       const received: RelayMessage[] = [];
       hostB.relay.onMessage((m) => received.push(m));
 
+      // hostA also watches an offer before the drop. The match for it is made over HTTP (unaffected by the ws
+      // drop) *while hostA is disconnected*, so the only way hostA can learn of it is the re-subscribe its
+      // reconnect sends on the next `hello` -- this is what proves re-subscribe coverage, not just re-join.
+      const { so } = await makeOffer();
+      const offerId = await hostA.lobby.postOffer(so);
+      const matches: MatchEvent[] = [];
+      hostA.lobby.onMatch((m) => matches.push(m));
+
       server.dropConnections();
+      await hostB.lobby.accept(await makeAcceptance(offerId));
+
       await waitFor(() => joinedACount === 2 && joinedBCount === 2, 10_000);
       await waitFor(() => hostA.connected() && hostB.connected(), 10_000);
+      await waitFor(() => matches.length >= 1, 10_000); // replayed via the re-subscribe on reconnect
+      expect(matches[0].offerId).toBe(offerId);
 
       const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
       await hostA.relay.send({ type: "state", channelId: fx.id, signed: s1 });
@@ -196,18 +208,81 @@ describe("host transports (connectHost) against a real server", () => {
     }
   });
 
-  it("send() rejects while disconnected", async () => {
+  it("send() rejects once the socket has actually disconnected", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
     const fx = makeChannelFixture(cfg);
     const hostA = connectHost(server.url);
     try {
       await waitFor(() => hostA.connected());
+      await hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA));
+
+      server.dropConnections();
+      await waitFor(() => !hostA.connected());
+
       const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
-      // never joined on this connection -- send must refuse rather than silently drop
       await expect(hostA.relay.send({ type: "state", channelId: fx.id, signed: s1 })).rejects.toThrow(
         /relay not connected/,
       );
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("a join refused by the server is not retried on every future hello", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg);
+    const outsider = generatePrivateKey(); // not one of fx.params.signers
+    const logs: string[] = [];
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
+    try {
+      await waitFor(() => hostA.connected());
+      await expect(hostA.relay.join(fx.id, fx.params, privateKeyToAccount(outsider))).rejects.toThrow(
+        /not a member/,
+      );
+      await waitFor(() => logs.some((l) => l.includes("refused")));
+
+      server.dropConnections();
+      await waitFor(() => hostA.connected());
+      await new Promise((r) => setTimeout(r, 200)); // a resend-on-hello, if it happened, would show up by now
+      expect(logs.filter((l) => l.includes("not a member")).length).toBe(1); // not repeated on the reconnect
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("close() rejects a pending join() wait instead of leaving it hanging for the full timeout", async () => {
+    // A tiny stand-in server that sends `hello` and then never answers a `join` -- so the only thing that can
+    // ever settle the pending join() promise is close() itself, not a (would-be 10s) timeout.
+    const httpServer = http.createServer();
+    const wss = new WebSocketServer({ server: httpServer });
+    wss.on("connection", (ws) => {
+      ws.send(toWire({ type: "hello", nonce: `0x${"00".repeat(32)}` }));
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const port = (httpServer.address() as AddressInfo).port;
+    const fx = makeChannelFixture(testConfig());
+    const host = connectHost(`http://127.0.0.1:${port}`);
+    try {
+      await waitFor(() => host.connected());
+      const joinPromise = host.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA));
+      await new Promise((r) => setTimeout(r, 50)); // let the join frame go out and the wait start
+      host.close();
+      await expect(joinPromise).rejects.toThrow(/host closed/);
+    } finally {
+      wss.close();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
+  it("the lobby surfaces the server's error message on a rejected request", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const hostA = connectHost(server.url);
+    try {
+      await waitFor(() => hostA.connected());
+      const { so } = await makeOffer({ stakePerGame: 0n }); // rejected by the lobby (400)
+      await expect(hostA.lobby.postOffer(so)).rejects.toThrow(/stakePerGame must be greater than 0/);
     } finally {
       hostA.close();
     }

@@ -68,9 +68,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const server = need("server");
       const explicitFields = ["rpc", "chain-id", "hub", "usdc", "rules"];
       const haveAllExplicit = explicitFields.every((name) => flag(name) !== undefined);
-      let template: { rpcUrl?: string; chainId?: number; hub?: string; usdc?: string; rules?: string } = {};
+      let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string } = {};
       if (!haveAllExplicit) {
-        const res = await io.fetch(`${server.replace(/\/$/, "")}/templates`);
+        const templatesUrl = `${server.replace(/\/$/, "")}/templates`;
+        const res = await io.fetch(templatesUrl);
+        if (!res.ok) throw new Error(`fetching ${templatesUrl} failed with status ${res.status}`);
         const list = (await res.json()) as unknown;
         const chess = Array.isArray(list)
           ? (list as Array<Record<string, unknown>>).find((t) => t.id === "chess")
@@ -78,19 +80,27 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (!chess) throw new Error(`server ${server} offers no chess template`);
         template = {
           rpcUrl: typeof chess.rpcUrl === "string" ? chess.rpcUrl : undefined,
-          chainId: typeof chess.chainId === "number" ? chess.chainId : Number(chess.chainId),
+          // Left as a string here (not coerced to a number) so a missing/non-numeric template chainId falls
+          // through to the same "--chain-id is required" / NaN-rejecting checks below as a missing flag, instead
+          // of silently becoming the string "undefined" or "NaN".
+          chainId: chess.chainId === undefined || chess.chainId === null ? undefined : String(chess.chainId),
           hub: typeof chess.hub === "string" ? chess.hub : undefined,
           usdc: typeof chess.usdc === "string" ? chess.usdc : undefined,
           rules: typeof chess.rules === "string" ? chess.rules : undefined,
         };
       }
       const rpcUrl = flag("rpc") ?? template.rpcUrl;
-      const chainIdRaw = flag("chain-id") ?? (template.chainId !== undefined ? String(template.chainId) : undefined);
+      const chainIdRaw = flag("chain-id") ?? template.chainId;
       const hubRaw = flag("hub") ?? template.hub;
       const usdcRaw = flag("usdc") ?? template.usdc;
       const rulesRaw = flag("rules") ?? template.rules;
       if (!rpcUrl) throw new UsageError("--rpc is required (the server offered no template value)");
+      if (!/^https?:\/\//i.test(rpcUrl)) throw new UsageError("--rpc must be an http:// or https:// URL");
       if (!chainIdRaw) throw new UsageError("--chain-id is required (the server offered no template value)");
+      const chainId = Number(chainIdRaw);
+      if (!Number.isInteger(chainId) || chainId <= 0) {
+        throw new UsageError("--chain-id must be a positive integer (the server's template value was not)");
+      }
       if (!hubRaw) throw new UsageError("--hub is required (the server offered no template value)");
       if (!usdcRaw) throw new UsageError("--usdc is required (the server offered no template value)");
       if (!rulesRaw) throw new UsageError("--rules is required (the server offered no template value)");
@@ -100,7 +110,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       };
       const cfg: ArenaConfig = {
         rpcUrl,
-        chainId: Number(chainIdRaw),
+        chainId,
         hub: asAddress("hub", hubRaw),
         usdc: asAddress("usdc", usdcRaw),
         rules: asAddress("rules", rulesRaw),
@@ -123,6 +133,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       io.out(JSON.stringify({ api: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address }));
       await new Promise<void>((resolve) => {
         const stop = () => {
+          // Only one of SIGINT/SIGTERM fires; `process.once` alone would leave the other one's listener
+          // registered forever. Remove both here, whichever one triggered the shutdown.
+          process.removeListener("SIGINT", stop);
+          process.removeListener("SIGTERM", stop);
           proc.stop().then(resolve, resolve);
         };
         process.once("SIGINT", stop);

@@ -63,6 +63,20 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Turns a non-OK HTTP response body into an error message: the server's `{error}` field when the body decodes
+ *  that way, otherwise the status plus a bounded snippet of the raw body, so a non-JSON error page or a proxy's
+ *  own error text is still visible instead of being swallowed. */
+function errorFromBody(text: string, status: number): string {
+  try {
+    const decoded = decodeWire(text) as { error?: unknown } | null;
+    if (decoded && typeof decoded === "object" && typeof decoded.error === "string") return decoded.error;
+  } catch {
+    // not decodable as wire JSON -- fall through to a status-plus-snippet message
+  }
+  const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+  return snippet ? `request failed with status ${status}: ${snippet}` : `request failed with status ${status}`;
+}
+
 /**
  * The CLI's two host transports (Plan 4 §7): an HTTP lobby client and a reconnecting WebSocket relay client, both
  * built over one persistent connection to `serverUrl`. Never sees a private key -- only a `RelaySigner` (I5).
@@ -108,9 +122,17 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     for (const w of waiters) (err ? w.reject(err) : w.resolve());
   }
 
+  /** Signs and sends a join frame -- but only if the connection is still the one we started signing on: signing
+   *  is async (it calls out to the signer), and the socket can close/reconnect (a new socket, a new nonce) while
+   *  it's in flight. Sending a join signed over a stale nonce, on a socket that's no longer current, would be
+   *  silently refused or misattributed by the server -- so on any change, this is a no-op and the join is left
+   *  registered in `joins` to be (re-)sent on the next `hello` instead. */
   async function sendJoin(channelId: Hex, entry: JoinEntry): Promise<void> {
-    if (!nonce) return;
-    const sig = await signRelayJoin(entry.signer, channelId, nonce);
+    const socketAtStart = ws;
+    const nonceAtStart = nonce;
+    if (!nonceAtStart || !socketAtStart) return;
+    const sig = await signRelayJoin(entry.signer, channelId, nonceAtStart);
+    if (ws !== socketAtStart || nonce !== nonceAtStart) return; // the connection moved on while we were signing
     sendFrame({ type: "join", channelId, params: entry.params, signer: entry.signer.address, sig });
   }
 
@@ -172,8 +194,18 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       }
       case "error": {
         const msg = typeof frame.error === "string" ? frame.error : "unknown error";
-        log(`host: server error: ${msg}`);
-        if (typeof frame.channelId === "string") settleJoinWaiters(frame.channelId as Hex, new Error(msg));
+        const channelId = typeof frame.channelId === "string" ? (frame.channelId as Hex) : undefined;
+        // Not yet confirmed joined on this socket, but registered for (re-)join: this error is almost certainly
+        // the server refusing that join, not a later forward failure on an already-joined channel -- drop it
+        // from the re-join set so it isn't retried on every future `hello`. A channel that *is* joined keeps its
+        // entry: an unrelated forward error (bad signature, wrong sender, ...) must not deregister a good join.
+        if (channelId && joins.has(channelId) && !joinedOnSocket.has(channelId)) {
+          joins.delete(channelId);
+          log(`host: join to ${channelId} refused, not retrying: ${msg}`);
+        } else {
+          log(`host: server error: ${msg}`);
+        }
+        if (channelId) settleJoinWaiters(channelId, new Error(msg));
         return;
       }
       default:
@@ -217,16 +249,19 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   const lobby: LobbyClient = {
     async postOffer(so: SignedOffer): Promise<Hex> {
       const res = await fetchFn(`${httpBase}/offers`, { method: "POST", body: toWire(so) });
-      const body = decodeWire(await res.text()) as { offerId?: Hex; error?: string };
-      if (res.status !== 201) throw new Error(body.error ?? `postOffer failed with status ${res.status}`);
+      const text = await res.text();
+      if (!res.ok) throw new Error(errorFromBody(text, res.status));
+      const body = decodeWire(text) as { offerId?: Hex };
       const id = body.offerId as Hex;
       lobby.watch([id]);
       return id;
     },
     async listOffers(): Promise<SignedOffer[]> {
       const res = await fetchFn(`${httpBase}/offers`);
-      const decoded = decodeWire(await res.text());
-      if (!Array.isArray(decoded)) return [];
+      const text = await res.text();
+      if (!res.ok) throw new Error(errorFromBody(text, res.status));
+      const decoded = decodeWire(text);
+      if (!Array.isArray(decoded)) throw new Error("listOffers: server response was not an array");
       const out: SignedOffer[] = [];
       for (const entry of decoded) {
         try {
@@ -242,11 +277,9 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
         method: "POST",
         body: toWire(sa),
       });
-      const decoded = decodeWire(await res.text());
-      if (res.status !== 200) {
-        throw new Error((decoded as { error?: string }).error ?? `accept failed with status ${res.status}`);
-      }
-      const event = parseMatchEvent(decoded);
+      const text = await res.text();
+      if (!res.ok) throw new Error(errorFromBody(text, res.status));
+      const event = parseMatchEvent(decodeWire(text));
       setTimeout(() => {
         for (const h of matchHandlers) safeCall(h, [event], "onMatch");
       }, 0);
@@ -317,6 +350,9 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     close(): void {
       closed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      // Reject any join() calls still waiting on a `joined`/`error` frame that will now never arrive; each
+      // waiter's own reject closure clears its timeout, so no timer is left running past close().
+      for (const channelId of [...joinWaiters.keys()]) settleJoinWaiters(channelId, new Error("host closed"));
       ws?.close();
     },
   };

@@ -50,22 +50,33 @@ export async function startDaemonProcess(
       stop: async () => {
         if (stopped) return;
         stopped = true;
-        serverRef.closeAllConnections();
-        await new Promise<void>((resolve) => serverRef.close(() => resolve()));
-        await daemonRef.stop();
-        hostRef.close();
-        lock.release();
+        // `host.close()` and `lock.release()` must run even if closing the api server or stopping the daemon
+        // throws -- otherwise a failed shutdown step would leave the reconnect loop running and/or the home
+        // permanently locked.
+        try {
+          serverRef.closeAllConnections();
+          await new Promise<void>((resolve) => serverRef.close(() => resolve()));
+          await daemonRef.stop();
+        } finally {
+          hostRef.close();
+          lock.release();
+        }
       },
     };
   } catch (err) {
-    // Reverse of the start order: server, then daemon, then host, then the lock.
-    if (server) {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => (server as Server).close(() => resolve()));
+    // Reverse of the start order: server, then daemon, then host, then the lock. `host.close()` and
+    // `lock.release()` are in their own `finally` so they always run, even if closing the server or stopping the
+    // daemon throws partway through this cleanup.
+    try {
+      if (server) {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => (server as Server).close(() => resolve()));
+      }
+      if (daemon) await daemon.stop();
+    } finally {
+      if (host) host.close();
+      lock.release();
     }
-    if (daemon) await daemon.stop();
-    if (host) host.close();
-    lock.release();
     throw err;
   }
 }
