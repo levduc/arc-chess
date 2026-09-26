@@ -94,6 +94,10 @@ const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\
  */
 export const DISPUTE_RESCAN_BLOCKS = 32n;
 
+/** The furthest out a funding deadline may be set from match time (`checkMatchParams`' `maxFundingWindow`): an
+ *  offer this long past its expiry can no longer produce a fundable match. */
+export const MAX_FUNDING_WINDOW = 7200n;
+
 export class ArenaDaemon {
   readonly client: PublicClient;
   readonly hub: HubClient;
@@ -224,7 +228,13 @@ export class ArenaDaemon {
     };
     const id = computeOfferId(offer);
     this.records.saveOffer({ offerId: id, offer, sessionKey, role: "offerer" });
-    await this.opts.lobby.postOffer({ offer, sig: await signOffer(sessionKey, offer) });
+    try {
+      await this.opts.lobby.postOffer({ offer, sig: await signOffer(sessionKey, offer) });
+    } catch (err) {
+      // M12: an offer the host refused can never be matched; a record left behind would be watched forever
+      this.records.removeOffer(id);
+      throw err;
+    }
     this.opts.lobby.watch([id]);
     return { offerId: id };
   }
@@ -350,7 +360,7 @@ export class ArenaDaemon {
         minFeePerPlayer: fee.feePerPlayer,
         maxFeePerPlayer,
         now,
-        maxFundingWindow: 7200n,
+        maxFundingWindow: MAX_FUNDING_WINDOW,
       });
       if (problem) {
         this.log(`ignoring match for offer ${offerId}: ${problem}`);
@@ -641,6 +651,7 @@ export class ArenaDaemon {
     if (this.stopped || this.ticking) return;
     this.ticking = true;
     try {
+      await this.pruneOffers();
       for (const l of this.live.values()) {
         if (this.stopped) break;
         if (l.record.finalized) continue;
@@ -655,6 +666,33 @@ export class ArenaDaemon {
       this.ticking = false;
       if (!this.stopped) this.notify();
     }
+  }
+
+  /**
+   * I3: drops offer records that can no longer produce a fundable match (`expiresAt + MAX_FUNDING_WINDOW` is past)
+   * and stops watching them, so expired offers never pile up against the host's per-connection watch limit.
+   */
+  private async pruneOffers(): Promise<void> {
+    try {
+      const recs = this.records.offers();
+      if (recs.length === 0) return;
+      const now = (await this.client.getBlock()).timestamp;
+      const dead = recs.filter((r) => r.offer.expiresAt + MAX_FUNDING_WINDOW < now && !this.claiming.has(r.offerId));
+      if (dead.length === 0) return;
+      for (const r of dead) this.records.removeOffer(r.offerId);
+      this.opts.lobby.unwatch(dead.map((r) => r.offerId));
+    } catch (err) {
+      this.log(`offer pruning failed: ${errorText(err)}`);
+    }
+  }
+
+  /** Marks a channel settled or retired, persists it, and leaves its relay channel: nothing is sent on it again,
+   *  and its slot on the host connection is freed (I2). Idempotent. */
+  private markFinalized(l: ChannelHandle): void {
+    if (l.record.finalized) return;
+    l.record = { ...l.record, finalized: true };
+    this.records.saveChannel(l.record);
+    this.opts.relay.leave(l.record.channelId);
   }
 
   /** One watchtower pass for one channel (spec §6.3). Runs regardless of the controller. */
@@ -676,8 +714,7 @@ export class ArenaDaemon {
       // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
       // ChannelHub.sol) — mark it here, synchronously with our own confirmed tx, instead of only via the
       // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
-      l.record = { ...l.record, finalized: true };
-      this.records.saveChannel(l.record);
+      this.markFinalized(l);
     } else if (info.phase === "None" || (info.phase === "Funding" && !info.funded[me])) {
       // I4: the funding window closed and none of our money is in the channel (nobody funded, or only the
       // opponent did — theirs is theirs to reclaim). The channel can never open: retire it (abandoned), so it
@@ -688,8 +725,7 @@ export class ArenaDaemon {
       const fresh = await this.hub.channelInfo(id);
       if (!(fresh.phase === "None" || (fresh.phase === "Funding" && !fresh.funded[me]))) return;
       this.log(`channel ${id}: funding window closed without our deposit; retiring it`);
-      l.record = { ...l.record, finalized: true };
-      this.records.saveChannel(l.record);
+      this.markFinalized(l);
       await this.refreshChain(l);
       return;
     }
@@ -729,18 +765,14 @@ export class ArenaDaemon {
         // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:
         // `timeout()` itself only resolves one RPC round trip after Anvil mines the tx and flips the on-chain
         // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
-        l.record = { ...l.record, finalized: true };
-        this.records.saveChannel(l.record);
+        this.markFinalized(l);
       }
     }
 
     // 4. Settled channels are done.
     if (this.stopped) return;
     const after = await this.hub.channelInfo(id);
-    if (after.phase === "Finalized" || after.phase === "Reclaimed") {
-      l.record = { ...l.record, finalized: true };
-      this.records.saveChannel(l.record);
-    }
+    if (after.phase === "Finalized" || after.phase === "Reclaimed") this.markFinalized(l);
     await this.refreshChain(l);
   }
 

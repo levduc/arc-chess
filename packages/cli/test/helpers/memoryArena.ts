@@ -15,6 +15,8 @@ import {
 
 type Member = {
   rooms: Set<Hex>;
+  watched: Set<Hex>;
+  unwatched: Hex[];
   handlers: Set<(m: RelayMessage) => void>;
   joinedHandlers: Set<(id: Hex) => void>;
   connected: boolean;
@@ -28,8 +30,25 @@ export class MemoryArena {
 
   constructor(private readonly terms: () => Promise<MatchTerms & { now: bigint }>) {}
 
-  client(): { lobby: LobbyClient; relay: RelayClient; disconnect(): void; reconnect(): void } {
-    const member: Member = { rooms: new Set(), handlers: new Set(), joinedHandlers: new Set(), connected: true };
+  client(): {
+    lobby: LobbyClient;
+    relay: RelayClient;
+    disconnect(): void;
+    reconnect(): void;
+    /** Channels this client is currently joined to (left channels are gone). */
+    rooms(): Hex[];
+    /** Offer ids this client currently watches, and every id it has unwatched, in order. */
+    watched(): Hex[];
+    unwatched(): Hex[];
+  } {
+    const member: Member = {
+      rooms: new Set(),
+      watched: new Set(),
+      unwatched: [],
+      handlers: new Set(),
+      joinedHandlers: new Set(),
+      connected: true,
+    };
     this.members.add(member);
     const lobby: LobbyClient = {
       postOffer: async (so) => {
@@ -55,7 +74,15 @@ export class MemoryArena {
         this.matchHandlers.add(h);
         return () => this.matchHandlers.delete(h);
       },
-      watch: () => undefined,
+      watch: (ids) => {
+        for (const id of ids) member.watched.add(id);
+      },
+      unwatch: (ids) => {
+        for (const id of ids) {
+          member.watched.delete(id);
+          member.unwatched.push(id);
+        }
+      },
     };
     const relay: RelayClient = {
       join: async (channelId) => {
@@ -82,6 +109,9 @@ export class MemoryArena {
         member.joinedHandlers.add(h);
         return () => member.joinedHandlers.delete(h);
       },
+      leave: (channelId) => {
+        member.rooms.delete(channelId);
+      },
     };
     return {
       lobby,
@@ -98,6 +128,9 @@ export class MemoryArena {
           }, 0);
         }
       },
+      rooms: () => [...member.rooms],
+      watched: () => [...member.watched],
+      unwatched: () => [...member.unwatched],
     };
   }
 }

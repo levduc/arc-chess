@@ -22,6 +22,8 @@ export type HostOptions = {
   log?: (line: string) => void;
   minBackoffMs?: number;
   maxBackoffMs?: number;
+  /** How long a connection must stay up past `hello` before the reconnect backoff resets (default 30 s). */
+  stableAfterMs?: number;
 };
 
 export type HostConnection = {
@@ -42,13 +44,18 @@ type ServerFrame =
 
 type ClientFrame =
   | { type: "subscribe"; offerIds: Hex[] }
+  | { type: "unsubscribe"; offerIds: Hex[] }
   | { type: "join"; channelId: Hex; params: Params; signer: Address; sig: Hex }
+  | { type: "leave"; channelId: Hex }
   | { type: "relay"; message: RelayMessage };
 
 const SUBSCRIBE_CHUNK = 64;
 const JOIN_TIMEOUT_MS = 10_000;
 const DEFAULT_MIN_BACKOFF_MS = 250;
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
+const DEFAULT_STABLE_AFTER_MS = 30_000;
+// re-joins after a reconnect go out at most 50 per second, well inside the server's per-connection frame budget
+const REJOIN_INTERVAL_MS = 20;
 
 /**
  * Error-frame message prefixes (relay.ts's `join`) that mean a join is refused for good: the same channelId,
@@ -101,6 +108,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   const log = opts.log ?? (() => undefined);
   const minBackoffMs = opts.minBackoffMs ?? DEFAULT_MIN_BACKOFF_MS;
   const maxBackoffMs = opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+  const stableAfterMs = opts.stableAfterMs ?? DEFAULT_STABLE_AFTER_MS;
   const httpBase = serverUrl.replace(/\/$/, "");
   const wsUrl = serverUrl.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
 
@@ -109,6 +117,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   let closed = false;
   let attempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let stableTimer: ReturnType<typeof setTimeout> | undefined;
 
   const watched = new Set<Hex>();
   const joins = new Map<Hex, JoinEntry>();
@@ -151,16 +160,33 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     sendFrame({ type: "join", channelId, params: entry.params, signer: entry.signer.address, sig });
   }
 
+  /** Re-sends every registered join on the connection that just said `hello`, paced (`REJOIN_INTERVAL_MS`) so a
+   *  daemon with many channels never bursts past the server's frame limit. Stops as soon as that connection is
+   *  gone; the next `hello` starts over. */
+  async function rejoinAll(socket: WebSocket, n: Hex): Promise<void> {
+    for (const [channelId, entry] of [...joins]) {
+      if (closed || ws !== socket || nonce !== n) return;
+      if (joins.get(channelId) !== entry) continue; // left (or re-registered) while this loop was running
+      try {
+        await sendJoin(channelId, entry);
+      } catch (err) {
+        log(`host: resend of join ${channelId} failed: ${errorText(err)}`);
+      }
+      await new Promise((r) => setTimeout(r, REJOIN_INTERVAL_MS));
+    }
+  }
+
   function onHello(n: Hex): void {
     nonce = n;
-    attempt = 0;
     joinedOnSocket.clear();
+    // Only a connection that stays up resets the backoff: a server that accepts and then drops us right away
+    // (rate limit, overload) must keep seeing a growing delay, not a reconnect at minimum backoff forever.
+    clearTimeout(stableTimer);
+    stableTimer = setTimeout(() => {
+      attempt = 0;
+    }, stableAfterMs);
     for (const ids of chunk([...watched], SUBSCRIBE_CHUNK)) sendFrame({ type: "subscribe", offerIds: ids });
-    for (const [channelId, entry] of joins) {
-      sendJoin(channelId, entry).catch((err: unknown) => {
-        log(`host: resend of join ${channelId} failed: ${errorText(err)}`);
-      });
-    }
+    if (ws) void rejoinAll(ws, n);
   }
 
   function onFrame(raw: unknown): void {
@@ -238,6 +264,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     if (closed) return;
     const delay = Math.min(maxBackoffMs, minBackoffMs * 2 ** attempt) + Math.random() * minBackoffMs;
     attempt++;
+    log(`host: reconnecting in ${Math.round(delay)} ms`);
     reconnectTimer = setTimeout(() => connect(), delay);
   }
 
@@ -256,6 +283,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       onFrame(parsed);
     });
     socket.addEventListener("close", () => {
+      clearTimeout(stableTimer);
       nonce = null;
       joinedOnSocket.clear();
       scheduleReconnect();
@@ -314,6 +342,12 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       for (const id of offerIds) watched.add(id);
       if (nonce) for (const ids of chunk(offerIds, SUBSCRIBE_CHUNK)) sendFrame({ type: "subscribe", offerIds: ids });
     },
+    unwatch(offerIds: Hex[]): void {
+      const dropped = offerIds.filter((id) => watched.delete(id));
+      if (nonce && dropped.length > 0) {
+        for (const ids of chunk(dropped, SUBSCRIBE_CHUNK)) sendFrame({ type: "unsubscribe", offerIds: ids });
+      }
+    },
   };
 
   const relay: RelayClient = {
@@ -360,6 +394,12 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       joinedHandlers.add(handler);
       return () => joinedHandlers.delete(handler);
     },
+    leave(channelId: Hex): void {
+      const registered = joins.delete(channelId);
+      joinedOnSocket.delete(channelId);
+      settleJoinWaiters(channelId, new Error(`left ${channelId}`));
+      if (registered && nonce) sendFrame({ type: "leave", channelId });
+    },
   };
 
   return {
@@ -371,6 +411,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     close(): void {
       closed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      clearTimeout(stableTimer);
       // Reject any join() calls still waiting on a `joined`/`error` frame that will now never arrive; each
       // waiter's own reject closure clears its timeout, so no timer is left running past close().
       for (const channelId of [...joinWaiters.keys()]) settleJoinWaiters(channelId, new Error("host closed"));

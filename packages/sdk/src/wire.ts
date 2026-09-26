@@ -186,6 +186,8 @@ export interface LobbyClient {
   onMatch(handler: (m: MatchEvent) => void): () => void;
   /** Ask the host to deliver match events for these offers, including ones matched while this client was away. */
   watch(offerIds: Hex[]): void;
+  /** Stop watching these offers (expired or settled), freeing their slots on the host connection. */
+  unwatch(offerIds: Hex[]): void;
 }
 
 /** Relay side of the host: forwards signed messages between a channel's two session keys. Plan 4 implements it in
@@ -197,4 +199,7 @@ export interface RelayClient {
   onMessage(handler: (msg: RelayMessage) => void): () => void;
   /** Fires every time the host confirms membership of a channel: after the first join and after each reconnect. */
   onJoined(handler: (channelId: Hex) => void): () => void;
+  /** Leaves the channel for good (it is settled): it is no longer re-joined on reconnect, and the host frees its
+   *  per-connection slot. */
+  leave(channelId: Hex): void;
 }

@@ -213,6 +213,21 @@ export class Relay {
     }
   }
 
+  /** Removes `peer` from one channel at its request (a `leave` frame: the channel is settled on its side), freeing
+   *  that slot under `maxJoinsPerConnection`. Leaving a channel it never joined is a silent no-op. */
+  leaveChannel(peer: RelayPeer, rawId: unknown): void {
+    const id = knownChannelId(rawId);
+    if (!id) {
+      peer.send({ type: "error", error: "malformed leave frame" });
+      return;
+    }
+    if (!peer.joined.delete(id)) return;
+    const channel = this.channels.get(id);
+    if (!channel) return;
+    channel.members.delete(peer);
+    if (channel.members.size === 0) this.channels.delete(id);
+  }
+
   /** The number of channels this process currently holds state for -- i.e. with at least one connected member.
    *  Test-only introspection for the leak fix above. */
   channelCount(): number {

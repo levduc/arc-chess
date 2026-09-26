@@ -303,6 +303,98 @@ describe("host transports (connectHost) against a real server", () => {
     }
   });
 
+  it("leave() frees the channel's slot: a second channel joins over the one-channel limit", async () => {
+    const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx1 = makeChannelFixture(cfg, server.repo);
+    const fx2 = makeChannelFixture(cfg, server.repo);
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100 });
+    try {
+      await waitFor(() => hostA.connected());
+      await hostA.relay.join(fx1.id, fx1.params, privateKeyToAccount(fx1.kA));
+      hostA.relay.leave(fx1.id);
+      await hostA.relay.join(fx2.id, fx2.params, privateKeyToAccount(fx2.kA)); // resolves only on `joined`
+
+      // after a reconnect only fx2 is re-joined: fx1 was left for good
+      const rejoined: Hex[] = [];
+      hostA.relay.onJoined((id) => rejoined.push(id));
+      server.dropConnections();
+      await waitFor(() => !hostA.connected());
+      await waitFor(() => rejoined.includes(fx2.id), 5_000);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(rejoined).toEqual([fx2.id]);
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("re-joins after a reconnect are paced under the server's frame rate limit", async () => {
+    // a burst budget far below the channel count: an unpaced burst of re-joins would be closed with 1008
+    const limits = { ...DEFAULT_LIMITS, wsFrameBurst: 10, wsFramePerSec: 60 };
+    const cfg = testConfig({ limits });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fxs = Array.from({ length: 30 }, () => makeChannelFixture(cfg, server!.repo));
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100 });
+    try {
+      await waitFor(() => hostA.connected());
+      for (const fx of fxs) {
+        await hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA));
+        await new Promise((r) => setTimeout(r, 25)); // the test's own joins stay under the limit too
+      }
+      const rejoined = new Set<Hex>();
+      hostA.relay.onJoined((id) => rejoined.add(id));
+      let drops = 0;
+      server.dropConnections();
+      await waitFor(() => !hostA.connected());
+      const watch = setInterval(() => {
+        if (!hostA.connected()) drops++;
+      }, 5);
+      try {
+        await waitFor(() => hostA.connected());
+        drops = 0; // only disconnects after the reconnect count
+        await waitFor(() => rejoined.size === fxs.length, 10_000);
+      } finally {
+        clearInterval(watch);
+      }
+      expect(drops).toBe(0);
+      expect(hostA.connected()).toBe(true);
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("an immediate close after hello does not reset the reconnect backoff (M8)", async () => {
+    const httpServer = http.createServer();
+    const wss = new WebSocketServer({ server: httpServer });
+    wss.on("connection", (ws) => {
+      ws.send(toWire({ type: "hello", nonce: `0x${"00".repeat(32)}` }));
+      ws.close(1008, "rate limited"); // accepted, greeted, then dropped at once
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const port = (httpServer.address() as AddressInfo).port;
+    const delays: number[] = [];
+    const min = 20;
+    const host = connectHost(`http://127.0.0.1:${port}`, {
+      minBackoffMs: min,
+      maxBackoffMs: 10_000,
+      log: (l) => {
+        const m = /reconnecting in (\d+) ms/.exec(l);
+        if (m) delays.push(Number(m[1]));
+      },
+    });
+    try {
+      await waitFor(() => delays.length >= 3, 5_000);
+      // attempt k waits min * 2^k plus up to `min` of jitter, so each band is disjoint from the one before
+      expect(delays[1]).toBeGreaterThan(delays[0]);
+      expect(delays[1]).toBeGreaterThanOrEqual(2 * min);
+      expect(delays[2]).toBeGreaterThanOrEqual(4 * min);
+    } finally {
+      host.close();
+      wss.close();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
   it("close() rejects a pending join() wait instead of leaving it hanging for the full timeout", async () => {
     // A tiny stand-in server that sends `hello` and then never answers a `join` -- so the only thing that can
     // ever settle the pending join() promise is close() itself, not a (would-be 10s) timeout.

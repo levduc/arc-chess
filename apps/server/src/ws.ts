@@ -20,7 +20,9 @@ export type ServerFrame =
 // client -> server
 export type ClientFrame =
   | { type: "subscribe"; offerIds: Hex[] }
+  | { type: "unsubscribe"; offerIds: Hex[] }
   | { type: "join"; channelId: Hex; params: Params; signer: Address; sig: Hex }
+  | { type: "leave"; channelId: Hex }
   | { type: "relay"; message: RelayMessage };
 
 const OFFER_ID_RE = /^0x[0-9a-f]{64}$/i;
@@ -73,19 +75,26 @@ export function attachWs(
     send(ws, { type: "error", error: "internal" });
   }
 
-  function handleSubscribe(ws: WsWebSocket, state: ConnState, offerIds: unknown): void {
+  /** The frame's offer ids, lower-cased, or `null` (after sending an `error`) if any of them is malformed. */
+  function offerIdsOf(ws: WsWebSocket, offerIds: unknown): Hex[] | null {
     if (!Array.isArray(offerIds) || !offerIds.every((x) => typeof x === "string")) {
       send(ws, { type: "error", error: "malformed frame: offerIds must be a list of strings" });
-      return;
+      return null;
     }
     for (const raw of offerIds) {
       if (!OFFER_ID_RE.test(raw)) {
         send(ws, { type: "error", error: "malformed frame: bad offer id" });
-        return; // none of this frame's ids get added
+        return null; // none of this frame's ids are taken
       }
     }
-    for (const raw of offerIds as string[]) {
-      const id = raw.toLowerCase() as Hex; // ids are accepted case-insensitively and normalized to canonical lower-case
+    return (offerIds as string[]).map((raw) => raw.toLowerCase() as Hex);
+  }
+
+  function handleSubscribe(ws: WsWebSocket, state: ConnState, offerIds: unknown): void {
+    const ids = offerIdsOf(ws, offerIds);
+    if (!ids) return;
+    // ids are accepted case-insensitively and normalized to canonical lower-case (offerIdsOf)
+    for (const id of ids) {
       if (state.watched.has(id)) continue;
       if (state.watched.size >= cfg.limits.maxWatchedOffers) {
         send(ws, { type: "error", error: "too many watched offers" });
@@ -95,6 +104,12 @@ export function attachWs(
       const m = lobby.matchFor(id);
       if (m) send(ws, { type: "match", event: m }); // replay: this connection missed the push
     }
+  }
+
+  function handleUnsubscribe(ws: WsWebSocket, state: ConnState, offerIds: unknown): void {
+    const ids = offerIdsOf(ws, offerIds);
+    if (!ids) return;
+    for (const id of ids) state.watched.delete(id);
   }
 
   async function handleFrame(ws: WsWebSocket, state: ConnState, raw: unknown): Promise<void> {
@@ -107,6 +122,10 @@ export function attachWs(
       handleSubscribe(ws, state, frame.offerIds);
       return;
     }
+    if (frame.type === "unsubscribe") {
+      handleUnsubscribe(ws, state, frame.offerIds);
+      return;
+    }
     if (frame.type === "join") {
       if (relay === null) {
         send(ws, { type: "error", error: "relay unavailable" });
@@ -114,6 +133,14 @@ export function attachWs(
       }
       type JoinFrame = { channelId: unknown; params: unknown; signer: unknown; sig: unknown };
       await relay.join(state.peer, frame as unknown as JoinFrame);
+      return;
+    }
+    if (frame.type === "leave") {
+      if (relay === null) {
+        send(ws, { type: "error", error: "relay unavailable" });
+        return;
+      }
+      relay.leaveChannel(state.peer, frame.channelId);
       return;
     }
     if (frame.type === "relay") {

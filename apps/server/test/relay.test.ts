@@ -184,6 +184,45 @@ describe("relay", () => {
     expect(f.error).toMatch(/too many channels on this connection/);
   });
 
+  it("a leave frame frees the connection's slot and stops forwarding to it (I2)", async () => {
+    const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx1 = makeChannelFixture(cfg, server.repo);
+    const fx2 = makeChannelFixture(cfg, server.repo);
+    const a = await joinAs(server.url, fx1, fx1.kA);
+    const b = await joinAs(server.url, fx1, fx1.kB);
+
+    a.send({ type: "leave", channelId: fx1.id });
+    const acct2 = privateKeyToAccount(fx2.kA);
+    a.send({
+      type: "join",
+      channelId: fx2.id,
+      params: fx2.params,
+      signer: acct2.address,
+      sig: await signRelayJoin(acct2, fx2.id, a.nonce),
+    });
+    const f = await a.next((f) => f.type === "error" || f.type === "joined");
+    expect(f).toEqual({ type: "joined", channelId: fx2.id }); // the one slot is free again
+
+    const s1 = await signStateAs(fx1, rawStateAt(fx1, 1n), 1);
+    b.send({ type: "relay", message: { type: "state", channelId: fx1.id, signed: s1 } });
+    await expect(a.next((f) => f.type === "relay", 300)).rejects.toThrow(); // A left fx1
+  });
+
+  it("an unsubscribe frame frees watched-offer slots", async () => {
+    const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxWatchedOffers: 1 } });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const c = await wsConnect(server.url);
+    const first = `0x${"01".repeat(32)}`;
+    const second = `0x${"02".repeat(32)}`;
+    c.send({ type: "subscribe", offerIds: [first] });
+    c.send({ type: "subscribe", offerIds: [second] });
+    expect((await c.next((f) => f.type === "error")).error).toBe("too many watched offers");
+    c.send({ type: "unsubscribe", offerIds: [first.toUpperCase().replace("0X", "0x")] });
+    c.send({ type: "subscribe", offerIds: [second] });
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(); // accepted this time
+  });
+
   it("refuses relay messages for channels the connection has not joined", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
