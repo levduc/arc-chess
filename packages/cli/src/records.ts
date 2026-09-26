@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import type { Hex } from "viem";
-import type { Offer, Params, PlayerIndex } from "@arena/sdk";
+import type { Offer, Params, PlayerIndex, SignedAcceptance } from "@arena/sdk";
 import { arenaPaths, isCanonicalId } from "./config.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 
@@ -21,7 +21,14 @@ export type ChannelRecord = {
 /** One entry of `channels/`: its record, or why it could not be read. */
 export type ChannelEntry = { channelId: string; record: ChannelRecord } | { channelId: string; record: null; error: string };
 
-export type OfferRecord = { offerId: Hex; offer: Offer; sessionKey: Hex; role: "offerer" | "accepter" };
+export type OfferRecord = {
+  offerId: Hex;
+  offer: Offer;
+  sessionKey: Hex;
+  role: "offerer" | "accepter";
+  /** M-d: the accepter's signed acceptance, stored before it is sent, so a retry re-sends it instead of re-keying. */
+  acceptance?: SignedAcceptance;
+};
 
 export class RecordStore {
   private readonly paths;

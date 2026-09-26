@@ -219,7 +219,25 @@ export class ArenaDaemon {
     }));
   }
 
-  async acceptOffer(offerId: Hex): Promise<void> {
+  async acceptOffer(offerIdInput: Hex): Promise<void> {
+    const offerId = (typeof offerIdInput === "string" ? offerIdInput.toLowerCase() : "") as Hex;
+    if (!isCanonicalId(offerId)) throw new DaemonError(400, "offerId must be 0x followed by 64 hex characters");
+    // M-d: accepting is idempotent — an existing acceptance is never replaced by one under a new session key
+    // (the host may already have matched the first one; a new key would make this daemon reject that match).
+    const channel = this.channelForOffer(offerId);
+    if (channel) throw new DaemonError(409, `offer ${offerId} was already accepted (channel ${channel})`);
+    const existing = this.records.offer(offerId);
+    if (existing) {
+      if (existing.role !== "accepter") throw new DaemonError(400, "cannot accept your own offer");
+      if (!existing.acceptance) throw new DaemonError(409, `offer ${offerId} was already accepted`);
+      // A retry re-sends the stored acceptance: same session key, same signature.
+      try {
+        await this.opts.lobby.accept(existing.acceptance);
+      } catch (err) {
+        throw new DaemonError(409, `offer ${offerId} was already accepted; the host did not take it again: ${errorText(err)}`);
+      }
+      return;
+    }
     const so = (await this.opts.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
     if (!so) throw new DaemonError(404, `offer ${offerId} not found`);
     if (so.offer.player.toLowerCase() === this.wallet.address.toLowerCase()) {
@@ -232,8 +250,10 @@ export class ArenaDaemon {
       signer: privateKeyToAccount(sessionKey).address,
       nonce: `0x${randomBytes(32).toString("hex")}` as Hex,
     };
-    this.records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter" });
-    await this.opts.lobby.accept({ acceptance, sig: await signAcceptance(sessionKey, acceptance) });
+    const signed = { acceptance, sig: await signAcceptance(sessionKey, acceptance) };
+    // Crash ordering: the record (with the signed acceptance) is on disk before the acceptance leaves.
+    this.records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter", acceptance: signed });
+    await this.opts.lobby.accept(signed);
   }
 
   private async onMatch(m: MatchEvent): Promise<void> {

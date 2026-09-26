@@ -4,7 +4,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import type { Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { ChannelSession, buildParams, hashState, offerId as computeOfferId, signClose, type MatchEvent } from "@arena/sdk";
+import {
+  ChannelSession,
+  buildParams,
+  hashState,
+  offerId as computeOfferId,
+  signClose,
+  type MatchEvent,
+  type SignedAcceptance,
+} from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
 import { increaseTime, now } from "../../sdk/test/helpers/chain.js";
 import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
@@ -204,5 +212,41 @@ describe("minor fixes", () => {
     await waitFor(async () => (await alice.daemon.status(id)).gameStatus === "white_won", 10_000, "auto-resign reaches alice");
     expect(restarted.handle(id).session.isMyTurn()).toBe(false);
     expect((await restarted.status(id)).gameStatus).toBe("white_won");
+  });
+
+  it("M-d: acceptOffer is idempotent — a retry re-sends the same signed acceptance and never generates a new key", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    // Bob's first attempt is lost in transit (the host never sees it); later attempts go through.
+    const lobby = bob.client.lobby;
+    const original = lobby.accept.bind(lobby);
+    const sent: SignedAcceptance[] = [];
+    let attempts = 0;
+    lobby.accept = async (sa) => {
+      attempts++;
+      sent.push(structuredClone(sa));
+      if (attempts === 1) throw new Error("network down");
+      return original(sa);
+    };
+    await expect(bob.daemon.acceptOffer(offerId)).rejects.toThrow(/network down/);
+    const keyAfterFirst = new RecordStore(bob.home).offer(offerId)!.sessionKey;
+    await bob.daemon.acceptOffer(offerId.toUpperCase().replace("0X", "0x") as Hex); // any hex case is the same offer
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]); // same acceptance, same signature
+    const id = await waitFor(async () => {
+      const [a, b] = [alice.daemon.channelIds(), bob.daemon.channelIds()];
+      return a.length === 1 && b.length === 1 && a[0] === b[0] ? a[0] : null;
+    }, 20_000, "match");
+    expect(bob.daemon.handle(id).record.sessionKey).toBe(keyAfterFirst);
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "funding");
+    // Once matched, accepting again is refused outright.
+    const again = await bob.daemon.acceptOffer(offerId).catch((e: unknown) => e);
+    expect(again).toBeInstanceOf(DaemonError);
+    expect((again as DaemonError).code).toBe(409);
+    expect((again as DaemonError).message).toMatch(/already accepted/);
+    expect(sent).toHaveLength(2);
+    await expect(bob.daemon.acceptOffer("./0x1234" as Hex)).rejects.toThrow(/offerId must be/);
   });
 });
