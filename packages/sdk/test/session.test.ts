@@ -380,6 +380,21 @@ describe("ChannelSession", () => {
     expect(fresh.latest).toEqual(full);
   });
 
+  it("I2: refuses an opponent Close signature on a state that is not a finished game", async () => {
+    const { a, b, keys } = await setup();
+    await b.receive(await a.move("e2e4")); // game in progress; b (black) is on move
+    const s = a.latest.state;
+    const early: CloseSignature = { stateHash: hashState(s, domain), by: 1, sig: await signClose(keys[1], s, domain) };
+    await expect(a.receiveClose(early)).rejects.toThrow(ArenaProtocolError);
+    await expect(a.receiveClose(early)).rejects.toThrow("close signature for a state that is not a finished game");
+    expect(a.snapshot().closeSigs).toEqual(["0x", "0x"]); // nothing recorded
+    // The same opponent signature on a finished game is still accepted.
+    await a.receive(await b.resign());
+    const done = a.latest.state;
+    await a.receiveClose({ stateHash: hashState(done, domain), by: 1, sig: await signClose(keys[1], done, domain) });
+    expect(a.snapshot().closeSigs[1]).not.toBe("0x");
+  });
+
   it("Minor 5: clears a stale opponent Close signature once latest moves past it", async () => {
     const { a, b, keys } = await setup();
     await finishGame(a, b); // G1 terminal for both

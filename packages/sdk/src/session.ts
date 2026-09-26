@@ -439,6 +439,12 @@ export class ChannelSession {
         if (clonedCs.stateHash !== hashState(target, this.domain)) {
           throw new ArenaProtocolError("close signature is for a different state");
         }
+        // I2: this player can only close on a finished game (see signClose), so recording an opponent's Close
+        // signature on anything else only produces a close request that can never be honoured — and, in the
+        // daemon, a `close-requested` attention that wakes the agent forever. Refuse it outright.
+        if (!isGameOver(target)) {
+          throw new ArenaProtocolError("close signature for a state that is not a finished game");
+        }
         let signer: string;
         try {
           signer = await recoverCloseSigner(target, cloneSig, this.domain);
