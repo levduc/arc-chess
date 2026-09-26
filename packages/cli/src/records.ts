@@ -16,6 +16,8 @@ export type ChannelRecord = {
   controller: Controller;
   note: string;
   finalized: boolean;
+  /** I3: last block whose dispute events have all been ingested; absent = none scanned yet. */
+  scannedBlock?: bigint;
 };
 
 /** One entry of `channels/`: its record, or why it could not be read. */

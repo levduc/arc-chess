@@ -262,4 +262,39 @@ describe("minor fixes", () => {
     expect(sent).toHaveLength(2);
     await expect(bob.daemon.acceptOffer("./0x1234" as Hex)).rejects.toThrow(/offerId must be/);
   });
+
+  it("concurrent acceptOffer calls for one offer create exactly one acceptance (M-carry)", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const results = await Promise.allSettled([pair.bob.daemon.acceptOffer(offerId), pair.bob.daemon.acceptOffer(offerId)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(rejected.reason)).toMatch(/already being accepted|already accepted/);
+  });
+
+  it("scans dispute events in chunks from a persisted cursor and survives a getLogs failure (I3)", async () => {
+    const pair = await startPair({ bobConfig: { logChunkBlocks: 2 } });
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "open");
+    bob.client.disconnect(); // Bob never sees e4 over the relay; only through the Challenged event
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await alice.daemon.challenge(id, "agent");
+    // A getLogs failure must not stop the rest of the watchtower pass.
+    const hub = bob.daemon.hub;
+    const real = hub.disputeEvents.bind(hub);
+    let failures = 1;
+    hub.disputeEvents = (...a: Parameters<typeof real>) => (failures-- > 0 ? Promise.reject(new Error("range too large")) : real(...a));
+    await bob.daemon.idle();
+    await bob.daemon.tick();
+    expect(bob.daemon.handle(id).lastError).toMatch(/^events:/);
+    await waitFor(async () => { await bob.daemon.idle(); await bob.daemon.tick(); return bob.daemon.handle(id).session.isMyTurn(); }, 20_000, "ingested e4 from chain");
+    const rec = bob.daemon.handle(id).record;
+    expect(rec.scannedBlock).toBeDefined();
+    expect(rec.scannedBlock! >= rec.createdBlock).toBe(true);
+  });
 });

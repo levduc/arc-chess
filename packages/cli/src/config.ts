@@ -17,7 +17,12 @@ export type ArenaConfig = {
   maxFeePerPlayer: bigint;
   sessionGasWei: bigint;
   pollMs: number;
+  /** I3: max block span per `getLogs` call when scanning dispute events (real RPCs cap the range). */
+  logChunkBlocks?: number;
 };
+
+/** I3: default `logChunkBlocks` when a config omits it. */
+export const DEFAULT_LOG_CHUNK_BLOCKS = 1000;
 
 export function defaultHome(env: NodeJS.ProcessEnv): string {
   return env.ARENA_HOME ?? join(homedir(), ".arena");
