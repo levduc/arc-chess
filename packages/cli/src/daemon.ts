@@ -86,6 +86,14 @@ export type DaemonOptions = {
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
 
+/**
+ * I3: on every scan, re-read this many blocks behind the persisted cursor, not just forward from it. A
+ * load-balanced RPC's `blockNumber()` can outrun its own `getLogs` index (or, on a real chain, a shallow reorg
+ * can drop and re-mine a block), so trusting a single pass at a reported head can permanently skip an event
+ * that was there all along. `ingestOnChain` is idempotent for a state it already holds, so re-reading is safe.
+ */
+export const DISPUTE_RESCAN_BLOCKS = 32n;
+
 export class ArenaDaemon {
   readonly client: PublicClient;
   readonly hub: HubClient;
@@ -145,7 +153,8 @@ export class ArenaDaemon {
       } catch (err) {
         const opened = this.live.get(entry.record.channelId);
         if (opened) {
-          // The session loaded and the channel is watched; only the relay join/re-send failed.
+          // The session loaded and the channel is watched; only the relay join failed (the re-send itself now
+          // happens later, asynchronously, from onJoined — it never runs as part of this catch).
           opened.lastError = `relay: ${errorText(err)}`;
           this.log(`channel ${entry.channelId}: ${opened.lastError}`);
         } else {
@@ -445,6 +454,9 @@ export class ArenaDaemon {
           target !== ZERO_HASH ? target : hashState((snap.closeState ?? snap.latest).state, this.domain);
         await this.opts.relay.send({ type: "close", channelId: id, close: { stateHash, by: me, sig: closeSig } });
       }
+      // A join failure recorded here earlier (e.g. the first join at start(), or a previous reconnect) no
+      // longer applies once a re-send round trips successfully.
+      if (l.lastError?.startsWith("relay:")) l.lastError = null;
     } catch (err) {
       l.lastError = `relay: ${errorText(err)}`;
     }
@@ -736,16 +748,23 @@ export class ArenaDaemon {
    * I3: scans dispute events forward from the persisted cursor (`record.scannedBlock`, or `createdBlock - 1n`
    * for a channel never scanned before) in chunks of at most `logChunkBlocks` blocks — real RPCs cap the range
    * a single `getLogs` call may cover. Ingests events in order and never advances the cursor past one that
-   * failed to ingest (R9/4): it is retried, unskipped, on the next pass.
+   * failed to ingest (R9/4): it is retried, unskipped, on the next pass. Every scan also re-reads the trailing
+   * `DISPUTE_RESCAN_BLOCKS` blocks behind the cursor (never before `createdBlock`), so a `getLogs` result that
+   * silently omitted an event on an earlier pass — a load-balanced RPC whose head outran its own log index, or
+   * a shallow reorg — still gets a later chance; `ingestOnChain` ignores a state it already holds, so the
+   * overlap is harmless.
    */
   private async scanDisputes(l: ChannelHandle): Promise<void> {
     const id = l.record.channelId;
     const size = BigInt(this.opts.config.logChunkBlocks ?? DEFAULT_LOG_CHUNK_BLOCKS);
-    let cursor = l.record.scannedBlock ?? l.record.createdBlock - 1n;
+    const scanned = l.record.scannedBlock ?? l.record.createdBlock - 1n;
+    const rescanFrom = scanned + 1n - DISPUTE_RESCAN_BLOCKS;
+    const start = rescanFrom > l.record.createdBlock ? rescanFrom : l.record.createdBlock;
+    let cursor = scanned; // only moves forward as chunks succeed; a scan with nothing new leaves it unchanged
     try {
       const head = await this.hub.blockNumber();
       // At most 50 chunks per tick, so a long-dormant channel catches up over a few ticks without starving the others.
-      for (const r of chunkRanges(cursor + 1n, head, size).slice(0, 50)) {
+      for (const r of chunkRanges(start, head, size).slice(0, 50)) {
         if (this.stopped) break;
         const events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
         for (const e of events) {
@@ -759,8 +778,11 @@ export class ArenaDaemon {
           }
         }
         cursor = r.toBlock;
-        this.saveCursor(l, cursor);
       }
+      // Saved once for the whole pass (not per chunk): every ingest above already succeeded (or the loop
+      // returned early on the first failure), so this is the real, fully-ingested scanned head.
+      this.saveCursor(l, cursor);
+      if (l.lastError?.startsWith("events:") || l.lastError?.startsWith("ingest:")) l.lastError = null;
     } catch (err) {
       l.lastError = `events: ${errorText(err)}`;
     }

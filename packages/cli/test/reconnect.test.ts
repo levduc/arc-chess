@@ -30,9 +30,39 @@ describe("relay reconnect", () => {
     await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
     await bob.daemon.move(id, "e5", { actor: "agent" });
     await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn");
-    alice.client.reconnect(); // Alice re-sends e4 (stale for Bob)
-    bob.client.reconnect();   // Bob re-sends e5 (duplicate for Alice)
+    // Alice's latest here is Bob's e5 (she never signed it herself: mine === "0x" for that state), so her
+    // reconnect's onJoined has nothing of hers to re-send. Bob's latest is his own e5 (he signed it), so his
+    // reconnect re-sends it -- a duplicate for Alice, who already has it.
+    alice.client.reconnect();
+    bob.client.reconnect();
     await new Promise((r) => setTimeout(r, 300));
+    expect(alice.daemon.handle(id).lastError).toBeNull();
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+  });
+
+  it("a re-sent state that is genuinely stale for the receiver is ignored without setting lastError", async () => {
+    const { alice, bob, id } = await openChannel();
+    await alice.daemon.move(id, "e4", { actor: "agent" }); // turn 1, delivered live (both connected)
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+
+    bob.client.disconnect();
+    await bob.daemon.move(id, "e5", { actor: "agent" }); // turn 2 signed locally; Bob's own send fails
+    expect(alice.daemon.handle(id).session.latest.state.turnNum).toBe(1n); // never delivered directly
+    bob.client.reconnect(); // onJoined resends Bob's turn 2 -- fresh ("move") for Alice, not stale
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn");
+
+    // This time disconnect Bob as the *receiver*, before Alice moves: her send succeeds (she stays connected
+    // the whole time — no lastError on her side), but Bob, offline, is silently skipped by it, so his own
+    // latest stays at turn 2 while Alice moves on to turn 3.
+    bob.client.disconnect();
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    expect(bob.daemon.handle(id).session.latest.state.turnNum).toBe(2n); // Bob never learned about turn 3
+
+    // Bob reconnects: onJoined resends his still-turn-2 own-signed state. Alice is now at turn 3, so this
+    // lands as a genuine "stale" receive for her (turnNum 2 < her latest 3) -- not a "duplicate".
+    bob.client.reconnect();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(alice.daemon.handle(id).session.latest.state.turnNum).toBe(3n); // the stale resend never regressed her
     expect(alice.daemon.handle(id).lastError).toBeNull();
     expect(bob.daemon.handle(id).lastError).toBeNull();
   });
