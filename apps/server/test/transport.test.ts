@@ -258,22 +258,28 @@ describe("host transports (connectHost) against a real server", () => {
     }
   });
 
-  it("an unknown-channel refusal is permanent: the channel is not re-joined on the next hello", async () => {
+  it("an unknown-channel refusal is transient: the join is retried and succeeds once the host knows the channel", async () => {
     const cfg = testConfig();
     server = await startServer(cfg, { chain: new FakeChain() });
-    const fx = makeChannelFixture(cfg); // self-minted: never matched or indexed by this host
+    const fx = makeChannelFixture(cfg); // not yet matched or indexed by this host
     const logs: string[] = [];
     const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
     try {
       await waitFor(() => hostA.connected());
       await expect(hostA.relay.join(fx.id, fx.params, privateKeyToAccount(fx.kA))).rejects.toThrow(/unknown channel/);
-      await waitFor(() => logs.some((l) => l.includes("refused permanently")));
+      await waitFor(() => logs.some((l) => l.includes("will retry on the next hello")));
+      expect(logs.some((l) => l.includes("refused permanently"))).toBe(false);
 
+      // the host learns of the channel afterwards (as when its indexer catches up on ChannelCreated)
+      server.repo.saveChannelRow({
+        channelId: fx.id, params: fx.params, phase: "Funding", createdBlock: 1n, challenges: [0, 0], answered: [0, 0],
+        pendingChallenger: null, registered: null, timeoutLoser: null, balances: null,
+      });
+      const joined: Hex[] = [];
+      hostA.relay.onJoined((id) => joined.push(id));
       server.dropConnections();
       await waitFor(() => !hostA.connected());
-      await waitFor(() => hostA.connected());
-      await new Promise((r) => setTimeout(r, 200)); // a resend-on-hello, if it happened, would show up by now
-      expect(logs.filter((l) => l.includes("unknown channel")).length).toBe(1);
+      await waitFor(() => joined.includes(fx.id), 5_000); // re-sent on the next hello, and accepted this time
     } finally {
       hostA.close();
     }

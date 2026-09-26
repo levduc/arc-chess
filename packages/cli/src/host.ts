@@ -67,14 +67,14 @@ const REJOIN_INTERVAL_MS = 20;
  * params and signer would be refused again by any server holding this same on-chain state, so it must not stay
  * registered for retry. Every other join refusal -- a per-connection capacity limit ("too many channels on this
  * connection"), a server-side hiccup ("internal", "relay unavailable"), a client-side timeout with no error
- * frame at all, or any other message this ruling did not name (e.g. "malformed join frame") -- leaves the
+ * frame at all, "unknown channel" (the host may learn of the channel later, e.g. once its indexer sees it
+ * created on-chain), or any other message this ruling did not name (e.g. "malformed join frame") -- leaves the
  * channel registered and it is retried on the next `hello` instead.
  */
 export const PERMANENT_JOIN_REFUSAL_PREFIXES = [
   "params do not match",
   "not a member of this channel",
   "bad join signature",
-  "unknown channel",
 ] as const;
 
 type JoinEntry = { params: Params; signer: RelaySigner };

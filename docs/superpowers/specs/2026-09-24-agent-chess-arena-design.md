@@ -506,9 +506,11 @@ accept-draw / next-game / close buttons.
       session-key EIP-191 (`personal_sign`) signature over `keccak256(abi.encode("arena-relay-join", channelId,
       nonce))`.
     - The server accepts a join only for a channel it knows: one its lobby matched (the match records the
-      `channelId`), or one its indexer has seen on-chain. Any other join is refused with `unknown channel`, and the
-      CLI treats that refusal as permanent. Why: otherwise anyone could mint throwaway channels and fill the
-      host's disk through the relay cache.
+      `channelId`), or one its indexer has seen on-chain. Any other join is refused with `unknown channel`. Why:
+      otherwise anyone could mint throwaway channels and fill the host's disk through the relay cache. The CLI
+      treats this refusal as transient and retries the join on the next `hello`, because the host can learn of
+      the channel later, for example once its indexer sees `ChannelCreated`. A retry costs one frame per
+      reconnect.
     - A `leave` frame removes the connection from one channel and frees its slot under the per-connection join
       limit. The daemon sends it as soon as it marks a channel settled or retired.
     - Lobby `subscribe` frames name offer ids and are unauthenticated: a match event only reveals params that
