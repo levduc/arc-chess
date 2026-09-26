@@ -430,6 +430,7 @@ export class ArenaDaemon {
     // handled uniformly by onJoined() for the first join and for every later reconnect.
     // I4: not awaited -- a slow or silent host must never hold up start() and with it the watchtower.
     this.opts.relay.join(record.channelId, record.params, signer).catch((err: unknown) => {
+      if (l.record.finalized) return; // leave() rejected a join still in flight: nothing to report on a settled channel
       l.lastError = `relay: ${errorText(err)}`;
       this.log(`channel ${record.channelId}: ${l.lastError}`);
     });
