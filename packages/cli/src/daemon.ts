@@ -178,6 +178,14 @@ export class ArenaDaemon {
   // ------------------------------------------------------------------ lobby
 
   async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
+    // I4: refuse offers the hub would never let anyone fund (ChannelHub rejects these params on deposit), so a
+    // matched channel can never sit unfundable while its deposit reverts on every tick.
+    if (o.stakePerGame <= 0n) throw new DaemonError(400, "stakePerGame must be greater than 0");
+    if (o.deposit < o.stakePerGame) throw new DaemonError(400, "deposit must be at least stakePerGame");
+    const bounds = await this.hub.timeoutBounds();
+    if (o.challengeTimeout < bounds.min || o.challengeTimeout > bounds.max) {
+      throw new DaemonError(400, `challengeTimeout must be between ${bounds.min} and ${bounds.max} seconds`);
+    }
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
     // (the chain's block timestamp), not wall-clock Date.now() — a test (or a real deployment) that has moved
@@ -573,6 +581,20 @@ export class ArenaDaemon {
       // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
       l.record = { ...l.record, finalized: true };
       this.records.saveChannel(l.record);
+    } else if (info.phase === "None" || (info.phase === "Funding" && !info.funded[me])) {
+      // I4: the funding window closed and none of our money is in the channel (nobody funded, or only the
+      // opponent did — theirs is theirs to reclaim). The channel can never open: retire it (abandoned), so it
+      // stops being polled and leaves pick()'s active set. `info` was read before `now`, so confirm on a fresh
+      // read taken after the deadline (no deposit can land after it) that ours really is not in — a retired
+      // channel is never reclaimed by this daemon.
+      if (this.stopped) return;
+      const fresh = await this.hub.channelInfo(id);
+      if (!(fresh.phase === "None" || (fresh.phase === "Funding" && !fresh.funded[me]))) return;
+      this.log(`channel ${id}: funding window closed without our deposit; retiring it`);
+      l.record = { ...l.record, finalized: true };
+      this.records.saveChannel(l.record);
+      await this.refreshChain(l);
+      return;
     }
 
     // 2. Adopt on-chain states from dispute events, in order. Stop at the first ingest failure (R9/4) and

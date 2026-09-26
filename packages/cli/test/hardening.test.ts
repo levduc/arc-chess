@@ -1,10 +1,18 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { hashState, signClose } from "@arena/sdk";
-import { increaseTime } from "../../sdk/test/helpers/chain.js";
-import { ArenaDaemon, RecordStore, loadConfig, type ChannelRecord } from "../src/index.js";
+import { randomBytes } from "node:crypto";
+import type { Hex } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { buildParams, hashState, offerId as computeOfferId, signClose, type MatchEvent } from "@arena/sdk";
+import { increaseTime, now } from "../../sdk/test/helpers/chain.js";
+import { ArenaDaemon, DaemonError, RecordStore, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
+
+/** Test-only escape hatch: onMatch/records are private/protected, but these tests craft host events. */
+type Internals = { onMatch(m: MatchEvent): Promise<void>; records: { saveOffer(r: unknown): void } };
+const internals = (d: ArenaDaemon): Internals => d as unknown as Internals;
+const randomNonce = (): Hex => `0x${randomBytes(32).toString("hex")}`;
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -107,5 +115,61 @@ describe("I2: stalled and withheld states escalate instead of looping", () => {
     const after = await alice.daemon.status(id);
     expect(after.phase).toBe("Challenged");
     expect(after.attention).toBeNull();
+  });
+});
+
+describe("I4: never-fundable offers and never-funded channels", () => {
+  it("createOffer rejects offers the hub could never fund with 400", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const d = pair.alice.daemon;
+    const bad = [
+      { deposit: 1_000_000n, stakePerGame: 0n, challengeTimeout: 600n, why: /stakePerGame must be greater than 0/ },
+      { deposit: 99_999n, stakePerGame: 100_000n, challengeTimeout: 600n, why: /deposit must be at least stakePerGame/ },
+      { deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 59n, why: /challengeTimeout must be between 60 and 604800/ },
+      { deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 604_801n, why: /challengeTimeout must be between 60 and 604800/ },
+    ];
+    for (const { why, ...o } of bad) {
+      const err = await d.createOffer(o).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DaemonError);
+      expect((err as DaemonError).code).toBe(400);
+      expect((err as DaemonError).message).toMatch(why);
+    }
+    expect(await pair.alice.client.lobby.listOffers()).toEqual([]); // nothing was posted
+    // The bounds themselves are fine, and so is deposit == stake.
+    await expect(d.createOffer({ deposit: 100_000n, stakePerGame: 100_000n, challengeTimeout: 60n })).resolves.toHaveProperty("offerId");
+    await expect(d.createOffer({ deposit: 100_000n, stakePerGame: 100_000n, challengeTimeout: 604_800n })).resolves.toHaveProperty("offerId");
+  });
+
+  it("retires a matched channel whose funding window passes with nobody funded (phase None)", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const so = (await alice.client.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId)!;
+    // Bob holds an acceptance and receives a match that Alice never hears about, so the offerer never funds.
+    const sessionKey = generatePrivateKey();
+    internals(bob.daemon).records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter" });
+    const terms = { rules: pair.env.rules, feeRecipient: pair.env.host, feePerPlayer: 5_000n, fundingWindow: 3600n };
+    const acceptance = { offerId, player: bob.address, signer: privateKeyToAccount(sessionKey).address, nonce: randomNonce() };
+    await internals(bob.daemon).onMatch({ offerId, params: buildParams(so.offer, acceptance, terms, await now()) });
+    const [id] = bob.daemon.channelIds();
+    expect(id).toBeDefined();
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("None");
+    expect(bob.daemon.handle(id).record.finalized).toBe(false);
+    expect((await bob.daemon.status()).channelId).toBe(id); // still the one active channel
+
+    await increaseTime(3601);
+    await waitFor(() => bob.daemon.handle(id).record.finalized, 10_000, "retired");
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("None");
+    expect(new RecordStore(bob.home).channel(id)!.finalized).toBe(true); // persisted
+    // It has left the active set, and is no longer polled.
+    await expect(bob.daemon.status()).rejects.toThrow(/no active channel/);
+    const st = await bob.daemon.status(id);
+    expect(st.suggestedActions[0]).toMatch(/^done: the funding window closed/);
+    await bob.daemon.idle();
+    const passes = bob.daemon.handle(id).passes;
+    await bob.daemon.tick();
+    expect(bob.daemon.handle(id).passes).toBe(passes);
   });
 });

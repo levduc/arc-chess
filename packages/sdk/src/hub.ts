@@ -144,6 +144,15 @@ export class HubClient {
     return { feePerPlayer, feeRecipient };
   }
 
+  /** The hub's accepted `challengeTimeout` range in seconds (`MIN_TIMEOUT`..`MAX_TIMEOUT`, inclusive). */
+  async timeoutBounds(): Promise<{ min: bigint; max: bigint }> {
+    const [min, max] = await Promise.all([
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "MIN_TIMEOUT" }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "MAX_TIMEOUT" }),
+    ]);
+    return { min: BigInt(min), max: BigInt(max) };
+  }
+
   /** Challenged/Responded events for a channel in chain order, with the signed state each one carries. */
   async disputeEvents(id: Hex, fromBlock: bigint = 0n): Promise<DisputeEvent[]> {
     // One head for both queries, so a block mined between them cannot appear in one list but not the other.
