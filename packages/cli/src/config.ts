@@ -23,6 +23,20 @@ export function defaultHome(env: NodeJS.ProcessEnv): string {
   return env.ARENA_HOME ?? join(homedir(), ".arena");
 }
 
+/** True for a canonical 32-byte id as used on disk: `0x` + exactly 64 lowercase hex characters. */
+export function isCanonicalId(id: unknown): id is Hex {
+  return typeof id === "string" && /^0x[0-9a-f]{64}$/.test(id);
+}
+
+/**
+ * C1 (defense in depth): channel and offer ids become path components, so anything that is not a canonical id
+ * (`./0x…`, `../wallet`, upper-case hex, …) is refused here instead of being resolved to some file by `join`.
+ */
+function canonical(id: Hex): Hex {
+  if (!isCanonicalId(id)) throw new Error(`not a canonical id (0x + 64 lowercase hex): ${JSON.stringify(String(id)).slice(0, 80)}`);
+  return id;
+}
+
 export function arenaPaths(home: string) {
   return {
     home,
@@ -31,9 +45,9 @@ export function arenaPaths(home: string) {
     token: join(home, "token.json"),
     channels: join(home, "channels"),
     offers: join(home, "offers"),
-    channelRecord: (id: Hex) => join(home, "channels", id, "record.json"),
-    channelSession: (id: Hex) => join(home, "channels", id, "session.json"),
-    offerRecord: (id: Hex) => join(home, "offers", `${id}.json`),
+    channelRecord: (id: Hex) => join(home, "channels", canonical(id), "record.json"),
+    channelSession: (id: Hex) => join(home, "channels", canonical(id), "session.json"),
+    offerRecord: (id: Hex) => join(home, "offers", `${canonical(id)}.json`),
   };
 }
 

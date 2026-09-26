@@ -108,4 +108,16 @@ describe("files", () => {
     rs.removeOffer(rec.offerId);
     expect(rs.offer(rec.offerId)).toBeNull();
   });
+
+  it("C1: arenaPaths refuses channel and offer ids that are not 0x + 64 lowercase hex", () => {
+    const paths = arenaPaths(home());
+    const id = `0x${"ab".repeat(32)}` as const;
+    expect(paths.offerRecord(id)).toMatch(/offers\/0x(ab){32}\.json$/);
+    expect(paths.channelRecord(id)).toMatch(/channels\/0x(ab){32}\/record\.json$/);
+    for (const bad of [`./${id}`, `.//${id}`, `0x${"AB".repeat(32)}`, `0x${"ab".repeat(31)}`, `${id}00`, "../wallet", ""]) {
+      expect(() => paths.offerRecord(bad as never)).toThrow(/canonical/);
+      expect(() => paths.channelRecord(bad as never)).toThrow(/canonical/);
+      expect(() => paths.channelSession(bad as never)).toThrow(/canonical/);
+    }
+  });
 });

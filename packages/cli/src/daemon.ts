@@ -24,7 +24,7 @@ import {
   type RelayMessage,
   type SignedState,
 } from "@arena/sdk";
-import { arenaPaths, type ArenaConfig } from "./config.js";
+import { arenaPaths, isCanonicalId, type ArenaConfig } from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
@@ -199,22 +199,42 @@ export class ArenaDaemon {
 
   private async onMatch(m: MatchEvent): Promise<void> {
     if (this.stopped) return;
+    // C1: `m.offerId` comes from the host and serves both as the claim key below and as a file name. Accept only
+    // the canonical form, so an alias (`./0x…`, `.//0x…`, upper-case hex, …) can neither slip past the claim nor
+    // resolve, via path joining, to the same offer file as the canonical id.
+    const offerId = m.offerId;
+    if (!isCanonicalId(offerId)) {
+      this.log(`ignoring match: malformed offerId ${JSON.stringify(String(offerId)).slice(0, 80)}`);
+      return;
+    }
     // I3: claim the offerId synchronously, before any await, so a second match event for the same offer
     // (concurrent or back-to-back) bails here instead of racing this call to open a second channel.
-    if (this.claiming.has(m.offerId)) return;
-    const rec = this.records.offer(m.offerId);
-    if (!rec) return;
-    this.claiming.add(m.offerId);
+    if (this.claiming.has(offerId)) return;
+    this.claiming.add(offerId);
     // I3: released on every path that does not end in removeOffer() below (i.e. every rejection or error),
     // so a later, corrected match event for the same offer can still be considered.
     let claimed = true;
     const release = () => {
       if (claimed) {
-        this.claiming.delete(m.offerId);
+        this.claiming.delete(offerId);
         claimed = false;
       }
     };
     try {
+      const rec = this.records.offer(offerId);
+      if (!rec) return release();
+      // C1: the stored offer must be the one this id names (a record filed under the wrong name is never used).
+      if (computeOfferId(rec.offer) !== offerId) {
+        this.log(`ignoring match for offer ${offerId}: the stored offer does not hash to this id`);
+        return release();
+      }
+      // C1: one offer funds at most one channel. Also covers a crash (or fs failure) between saveChannel and
+      // removeOffer below, which would otherwise leave the offer record behind for a second match.
+      const existing = this.channelForOffer(offerId);
+      if (existing) {
+        this.log(`ignoring match for offer ${offerId}: channel ${existing} already exists for it`);
+        return release();
+      }
       // I2: never trust the host's participant/signer ordering in m.params — derive `me` from which role this
       // player took when it created or accepted the offer, so a host that swaps indices is caught below by
       // checkMatchParams (params[me] no longer names this player's wallet/signer) rather than trusted.
@@ -225,7 +245,7 @@ export class ArenaDaemon {
       const now = (await this.client.getBlock()).timestamp;
       // M4: an offer the host matched after it expired must never be funded.
       if (now >= rec.offer.expiresAt) {
-        this.log(`ignoring match for offer ${m.offerId}: offer has expired`);
+        this.log(`ignoring match for offer ${offerId}: offer has expired`);
         return release();
       }
       // M3: fee equality — accept only the hub's current fee, and only if it is within this player's ceiling.
@@ -245,7 +265,7 @@ export class ArenaDaemon {
         maxFundingWindow: 7200n,
       });
       if (problem) {
-        this.log(`ignoring match for offer ${m.offerId}: ${problem}`);
+        this.log(`ignoring match for offer ${offerId}: ${problem}`);
         return release();
       }
       const id = computeChannelId(this.domain.chainId, this.domain.hub, m.params);
@@ -256,15 +276,16 @@ export class ArenaDaemon {
         params: m.params,
         me,
         sessionKey: rec.sessionKey,
-        offerId: m.offerId,
+        offerId,
         createdBlock: await this.client.getBlockNumber(),
         controller: "agent",
         note: "",
         finalized: false,
       };
       this.records.saveChannel(record);
-      this.records.removeOffer(m.offerId);
-      // The offer record is gone: a duplicate match event now bails at `!rec` above, so the claim can be released.
+      this.records.removeOffer(offerId);
+      // The offer record is gone and a channel record carries this offerId: a duplicate match event now bails at
+      // `!rec` or `channelForOffer` above, so the claim can be released.
       release();
       if (this.stopped) return;
       await this.openChannel(record);
@@ -274,6 +295,14 @@ export class ArenaDaemon {
       release();
       this.log(`match handling failed: ${errorText(err)}`);
     }
+  }
+
+  /** C1: the id of a channel (live, or recorded on disk) that was opened for `offerId`, if any. */
+  private channelForOffer(offerId: Hex): Hex | null {
+    const same = (r: ChannelRecord) => typeof r.offerId === "string" && r.offerId.toLowerCase() === offerId;
+    for (const l of this.live.values()) if (same(l.record)) return l.record.channelId;
+    for (const e of this.records.scanChannels()) if (e.record && same(e.record)) return e.record.channelId;
+    return null;
   }
 
   private async openChannel(record: ChannelRecord): Promise<void> {

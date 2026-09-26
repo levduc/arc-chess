@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import type { Hex } from "viem";
 import type { Offer, Params, PlayerIndex } from "@arena/sdk";
-import { arenaPaths } from "./config.js";
+import { arenaPaths, isCanonicalId } from "./config.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 
 export type Controller = "agent" | "human";
@@ -17,6 +17,9 @@ export type ChannelRecord = {
   note: string;
   finalized: boolean;
 };
+
+/** One entry of `channels/`: its record, or why it could not be read. */
+export type ChannelEntry = { channelId: string; record: ChannelRecord } | { channelId: string; record: null; error: string };
 
 export type OfferRecord = { offerId: Hex; offer: Offer; sessionKey: Hex; role: "offerer" | "accepter" };
 
@@ -35,11 +38,28 @@ export class RecordStore {
     return readJson<ChannelRecord>(this.paths.channelRecord(id));
   }
 
-  channels(): ChannelRecord[] {
+  /**
+   * Every entry under `channels/`, each read in isolation (I1): a corrupt or foreign entry — unparsable
+   * `record.json`, a non-canonical directory name, a record naming another channel — is returned with its
+   * error instead of aborting the scan, so one bad file can never hide the other channels.
+   */
+  scanChannels(): ChannelEntry[] {
     if (!existsSync(this.paths.channels)) return [];
-    return readdirSync(this.paths.channels)
-      .map((id) => this.channel(id as Hex))
-      .filter((r): r is ChannelRecord => r !== null);
+    return readdirSync(this.paths.channels).map((name): ChannelEntry => {
+      try {
+        const r = this.channel(name as Hex);
+        if (r === null) throw new Error("record.json is missing");
+        if (typeof r !== "object" || r.channelId !== name) throw new Error("record.json does not describe this channel");
+        return { channelId: name, record: r };
+      } catch (err) {
+        return { channelId: name, record: null, error: err instanceof Error ? err.message.split("\n")[0] : String(err) };
+      }
+    });
+  }
+
+  /** The readable channel records (unreadable entries are skipped; see `scanChannels`). */
+  channels(): ChannelRecord[] {
+    return this.scanChannels().flatMap((e) => (e.record ? [e.record] : []));
   }
 
   saveOffer(r: OfferRecord): void {
@@ -50,12 +70,19 @@ export class RecordStore {
     return readJson<OfferRecord>(this.paths.offerRecord(id));
   }
 
+  /** The readable offer records; files that are not a canonical `<offerId>.json` or do not parse are skipped. */
   offers(): OfferRecord[] {
     if (!existsSync(this.paths.offers)) return [];
     return readdirSync(this.paths.offers)
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => this.offer(f.slice(0, -".json".length) as Hex))
-      .filter((r): r is OfferRecord => r !== null);
+      .filter((f) => f.endsWith(".json") && isCanonicalId(f.slice(0, -".json".length)))
+      .flatMap((f) => {
+        try {
+          const r = this.offer(f.slice(0, -".json".length) as Hex);
+          return r ? [r] : [];
+        } catch {
+          return [];
+        }
+      });
   }
 
   removeOffer(id: Hex): void {
