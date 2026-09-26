@@ -154,6 +154,20 @@ contract ChannelHubLimitsTest is HubFixture {
         assertEq(hub.committedEscrow(), 0);
     }
 
+    /// A channel's fee recipient is the one snapshotted into its params at creation, not the hub's current
+    /// recipient: a setFee recipient change between creation and settlement must not redirect the fee
+    /// (mutation-review F7).
+    function test_finalize_paysFeeToChannelsOwnRecipient_notCurrent() public {
+        Params memory p = _params(); // snapshots feeRecipient
+        bytes32 id = _open(p);
+        address newRecipient = makeAddr("newFeeRecipient");
+        vm.prank(owner);
+        hub.setFee(FEE, newRecipient);
+        _close(_resignedGame(p, id));
+        assertEq(usdc.balanceOf(feeRecipient), 2 * FEE);
+        assertEq(usdc.balanceOf(newRecipient), 0);
+    }
+
     function test_committedEscrow_honoursFeeSnapshot_acrossReclaim() public {
         Params memory p = _params(); // snapshots FEE
         vm.prank(alice);

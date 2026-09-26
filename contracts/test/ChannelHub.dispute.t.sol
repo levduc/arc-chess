@@ -179,6 +179,22 @@ contract ChannelHubDisputeTest is HubFixture {
         hub.respond(proof);
     }
 
+    /// respond's deadline check is `>=`: it must revert DeadlinePassed both exactly at the deadline and
+    /// after it, never just strictly after (mutation-review F12).
+    function test_respond_revertsDeadlinePassed_atAndAfterDeadline() public {
+        _challengeS1();
+        uint64 deadline = hub.channelInfo(id).deadline;
+        bytes memory proof = _moveProof(s1, "", "", s2, "", _sign(bobKey, s2));
+
+        vm.warp(deadline);
+        vm.expectRevert(ChannelHub.DeadlinePassed.selector);
+        hub.respond(proof);
+
+        vm.warp(deadline + 1);
+        vm.expectRevert(ChannelHub.DeadlinePassed.selector);
+        hub.respond(proof);
+    }
+
     function test_timeout_onTerminalState_settlesAsIs() public {
         State memory t = _play(s1, p, _kind(B.KIND_RESIGN)); // bob resigned but refuses to co-sign close
         bytes memory proof = _moveProof(s1, _sign(aliceKey, s1), "", t, "", _sign(bobKey, t));

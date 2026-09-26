@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# Mutation test for ChannelHub.sol (Plan 4.5 Task 3, fix round 1).
+# Mutation test for ChannelHub.sol (Plan 4.5 Task 3, fix round 2).
 #
 # Applies each of the 18 one-line mutants from the reviewer's mutation pass (task-3-review.md) — the 6
 # already known to be caught plus the 12 that survived the original suite — to a throwaway copy of the
-# whole contracts/ tree, runs the invariant + unit suite against each mutant, and asserts every one of
-# them is killed (i.e. the suite fails). The real repo is never touched: everything happens in a fresh
-# temp directory, removed on exit via a trap.
+# whole contracts/ tree, runs the FULL test suite (every *.t.sol file, not just the invariant one) against
+# each mutant, and asserts every one of them is killed (i.e. the suite fails). Running the full suite
+# matters: nearly every one of these 18 mutants already has a deterministic, non-fuzzed directed unit test
+# elsewhere in the suite (e.g. ChannelHub.limits.t.sol's test_pause_*StillWorks tests for F1/F2/C1/C2,
+# ChannelHub.dispute.t.sol's test_deadlineBoundary for F3/F11) — the invariant fuzz suite alone is a much
+# weaker, seed-dependent net for exactly these guard-check mutants (see task-3-report.md fix round 2). The
+# real repo is never touched: everything happens in a fresh temp directory, removed on exit via a trap.
 #
 # Usage: scripts/tools/mutants.sh
 # Env:   MUTATION_PROFILE (default: mutation) - the foundry.toml profile used for the per-mutant test run.
+#        MUTATION_SEED (default: 0x1) - fuzz seed pinned for reproducibility across repeated runs.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROFILE="${MUTATION_PROFILE:-mutation}"
+SEED="${MUTATION_SEED:-0x1}"
 TMP="$(mktemp -d)"
 
 cleanup() {
@@ -133,7 +139,7 @@ for id in "${MUTANT_IDS[@]}"; do
 
   TEST_LOG="$TMP/test_${id}.log"
   if (cd "$TMP/contracts" && FOUNDRY_PROFILE="$PROFILE" PATH="$HOME/.foundry/bin:$PATH" \
-      forge test --match-path test/ChannelHub.invariant.t.sol) > "$TEST_LOG" 2>&1; then
+      forge test --fuzz-seed "$SEED") > "$TEST_LOG" 2>&1; then
     RESULT[$id]="SURVIVED"
     FAIL=1
   else
@@ -152,7 +158,7 @@ for id in "${MUTANT_IDS[@]}"; do
   printf "%-6s %-9s %s\n" "$id" "${RESULT[$id]}" "${DESC[$id]}"
 done
 echo
-echo "Profile: $PROFILE"
+echo "Profile: $PROFILE, seed: $SEED, scope: full test suite"
 
 SURVIVORS=()
 for id in "${MUTANT_IDS[@]}"; do
