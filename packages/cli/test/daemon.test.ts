@@ -187,10 +187,21 @@ describe("watchtower", () => {
     const stale = alice.daemon.handle(id).session.challengeProof(); // turn 1
     await bob.daemon.move(undefined, "e5", { actor: "agent" });
     await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn");
-    // A misbehaving Alice registers the stale state; Bob's watchtower must answer with turn 2.
+    const bobSessionAddr = bob.daemon.handle(id).sessionSender.address;
+    // R9/3a: stop Alice's own daemon first, so only Bob's watchtower is left running to answer the
+    // challenge below — Alice's own self-correcting respond (from her own up-to-date session) cannot be
+    // the one resolving it.
+    await alice.daemon.stop();
+    // A misbehaving Alice registers the stale state (sent directly, bypassing her stopped daemon); Bob's
+    // watchtower must answer with turn 2.
     await alice.daemon.hub.challenge(alice.daemon.handle(id).sessionSender, stale);
     await waitFor(async () => (await bob.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "respond");
     expect((await bob.daemon.hub.registeredState(id)).turnNum).toBe(2n);
+    const responded = (await bob.daemon.hub.disputeEvents(id)).find((e) => e.kind === "Responded");
+    expect(responded).toBeDefined();
+    // Confirm it was Bob's session key that sent the Responded transaction (spec §3.1 / R9-I1).
+    const tx = await bob.daemon.client.getTransaction({ hash: responded!.transactionHash });
+    expect(tx.from.toLowerCase()).toBe(bobSessionAddr.toLowerCase());
   });
 
   it("times out a silent opponent and never times out itself", async () => {
@@ -216,11 +227,87 @@ describe("watchtower", () => {
     await alice.daemon.challenge(undefined, "agent"); // Bob must move
     await alice.daemon.stop(); // only Bob's watchtower runs from here
     await increaseTime(601);
+    // R9/3b: an explicit tick() is a no-op if the periodic timer's own tick is already in flight; wait for
+    // idle() first and check the per-channel pass counter actually moved, so each tick() below is known to
+    // have run a full watch() pass past the deadline rather than being silently swallowed.
+    await bob.daemon.idle();
+    let before = bob.daemon.handle(id).passes;
     await bob.daemon.tick();
+    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    await bob.daemon.idle();
+    before = bob.daemon.handle(id).passes;
     await bob.daemon.tick();
+    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
     // Bob is on move in the registered state and past the deadline: calling timeout would forfeit Bob's stake.
     expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
     expect((await bob.daemon.status(id)).challenge?.mustMove).toBe(true);
+  });
+
+  it("does not time out when our own local state lags behind a registered state we are on move in", async () => {
+    const { alice, bob, id } = await matched();
+    // Simulate a session that cannot repair itself from on-chain dispute events (e.g. a store/verification
+    // failure while behind), so Bob's local `latest` stays stuck at turn 0 no matter how many ticks run.
+    const session = bob.daemon.handle(id).session;
+    session.ingestOnChain = () => Promise.reject(new Error("simulated ingest failure"));
+    bob.client.disconnect(); // Bob also never receives Alice's move over the relay
+    await alice.daemon.move(undefined, "e4", { actor: "agent" }); // turn 1; Bob (black) is on move there
+    await alice.daemon.challenge(undefined, "agent"); // registers turn 1 on-chain
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Challenged", 20_000, "challenge");
+    await increaseTime(601);
+    await bob.daemon.idle();
+    let before = bob.daemon.handle(id).passes;
+    await bob.daemon.tick();
+    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    await bob.daemon.idle();
+    before = bob.daemon.handle(id).passes;
+    await bob.daemon.tick();
+    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    // Bob's local view never caught up (ingest keeps failing), but the registered state has him on move:
+    // his watchtower must never call timeout on itself, even though it is well past the deadline.
+    expect(session.isMyTurn()).toBe(false); // still stuck at turn 0, not bob's local turn
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+    // R9/4: the always-failing event was never marked processed, so it is retried (and never skipped).
+    expect(bob.daemon.handle(id).processedEvents).toBe(0);
+    expect(bob.daemon.handle(id).lastError).toMatch(/^ingest:/);
+  });
+
+  it("calls timeout in its favour once a stale challenge can no longer be answered past the deadline (I2)", async () => {
+    // Both periodic timers are parked (pollMs far beyond the test's lifetime), so every phase transition
+    // below — including funding — is driven by an explicit tick(); nothing can race ahead and auto-respond
+    // to the misbehaving challenge before we choose to, which is what this regression needs to be airtight.
+    const pair = await startPair({ pollMs: 3_600_000 });
+    cleanup = pair.cleanup;
+    const { alice, bob, env } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await alice.daemon.idle(); // let the match event's own fire-and-forget tick (if any) finish first
+    await alice.daemon.tick(); // alice (offerer) deposits
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).funded[0], 20_000, "alice funded");
+    await bob.daemon.idle();
+    await bob.daemon.tick(); // bob (accepter) deposits now that funded[0] is true
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
+
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    const stale = bob.daemon.handle(id).session.challengeProof(); // turn 1: Bob (black) is on move there
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn"); // both now at turn 2
+
+    // A misbehaving Bob registers his own stale (turn 1) state on-chain. Alice now holds a newer state
+    // (turn 2 > registered's 1), but with both periodic timers parked nothing answers it until the
+    // explicit tick() below — so the deadline passes for certain before anyone gets a chance to respond.
+    await bob.daemon.hub.challenge(bob.daemon.handle(id).sessionSender, stale);
+    await increaseTime(601);
+    await alice.daemon.idle();
+    const before = alice.daemon.handle(id).passes;
+    await alice.daemon.tick();
+    expect(alice.daemon.handle(id).passes).toBeGreaterThan(before);
+    // Past the deadline, respond() would revert (DeadlinePassed): Alice's watchtower must fall back to
+    // timeout(), which succeeds because Bob (the opponent) was on move in the registered (stale) state.
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Finalized");
+    expect(await usdcBalance(env.usdc, alice.address)).toBe(START - 5_000n + 100_000n);
+    expect(alice.daemon.handle(id).record.finalized).toBe(true);
   });
 
   it("reclaims a deposit when the counterparty never funds", async () => {

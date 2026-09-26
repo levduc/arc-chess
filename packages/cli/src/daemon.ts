@@ -58,6 +58,8 @@ export type ChannelHandle = {
   processedEvents: number;
   chain: ChainView | null;
   lastError: string | null;
+  /** R9/3b: counts every `watch()` attempt for this channel — lets tests confirm an explicit `tick()` actually ran a pass (as opposed to being swallowed by the concurrent-tick guard) instead of just assuming it. */
+  passes: number;
 };
 
 export type DaemonOptions = {
@@ -126,6 +128,11 @@ export class ArenaDaemon {
     this.unsubscribers = [];
     while (this.ticking) await new Promise((r) => setTimeout(r, 10));
     this.changes.removeAllListeners();
+  }
+
+  /** R9/3b: resolves once no tick is currently in flight — call before an explicit `tick()` in a test that needs it deterministic, so that call isn't a no-op against the periodic timer's own concurrent tick. */
+  async idle(): Promise<void> {
+    while (this.ticking) await new Promise((r) => setTimeout(r, 5));
   }
 
   channelIds(): Hex[] {
@@ -278,7 +285,7 @@ export class ArenaDaemon {
     // stop()) could have used to already open this same channel, or to stop the daemon.
     if (this.stopped || this.live.has(record.channelId)) return;
     const sessionSender = new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain);
-    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null });
+    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0 });
     await this.opts.relay.join(record.channelId, record.sessionKey);
     // Crash recovery (Review Focus 5): re-send our latest own state so a message lost at the crash is delivered.
     const latest = session.latest;
@@ -431,7 +438,9 @@ export class ArenaDaemon {
 
   async reclaim(ref: string | undefined): Promise<void> {
     const l = this.pick(ref);
-    await this.guard(() => this.hub.reclaim(this.wallet, l.record.channelId));
+    // R9/I1: dispute operations go through the session key (spec §3.1), so they keep working after the
+    // Circle session backing the wallet key has expired.
+    await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId));
     this.notify();
   }
 
@@ -451,6 +460,7 @@ export class ArenaDaemon {
       for (const l of this.live.values()) {
         if (this.stopped) break;
         if (l.record.finalized) continue;
+        l.passes++;
         try {
           await this.watch(l);
         } catch (err) {
@@ -477,7 +487,8 @@ export class ArenaDaemon {
       else if (info.phase === "Funding" && !info.funded[me] && (me === 0 || info.funded[0])) await this.fund(l);
     } else if (info.phase === "Funding" && info.funded[me]) {
       if (this.stopped) return;
-      await this.hub.reclaim(this.wallet, id);
+      // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
+      await this.hub.reclaim(l.sessionSender, id);
       // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
       // ChannelHub.sol) — mark it here, synchronously with our own confirmed tx, instead of only via the
       // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
@@ -485,34 +496,42 @@ export class ArenaDaemon {
       this.records.saveChannel(l.record);
     }
 
-    // 2. Adopt on-chain states from dispute events, in order. Errors are recorded but never stop the pass.
+    // 2. Adopt on-chain states from dispute events, in order. Stop at the first ingest failure (R9/4) and
+    // retry it next tick — advancing past a failed event would permanently skip it, since events are never
+    // revisited once `processedEvents` passes them.
     if (this.stopped) return;
     const events = await this.hub.disputeEvents(id, l.record.createdBlock);
-    for (const ev of events.slice(l.processedEvents)) {
+    let processed = l.processedEvents;
+    for (; processed < events.length; processed++) {
       try {
-        await l.session.ingestOnChain(ev.signed);
+        await l.session.ingestOnChain(events[processed].signed);
       } catch (err) {
         l.lastError = `ingest: ${errorText(err)}`;
+        break;
       }
     }
-    l.processedEvents = events.length;
+    l.processedEvents = processed;
 
     // 3. Disputes (spec §6.3).
     if (this.stopped) return;
     if (info.phase === "Challenged") {
       const registered = await this.hub.registeredState(id);
       const latest = l.session.latest.state;
-      if (latest.turnNum > registered.turnNum) {
-        // Stale challenge: we hold a newer supported state, so answer it with our proof.
+      if (now < info.deadline && latest.turnNum > registered.turnNum) {
+        // Stale challenge, and there is still time to answer it: we hold a newer supported state.
         await this.respondIfChallenged(l);
       } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
         // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
         // otherwise leave it for the controller (status shows mustMove).
         await this.autoPlay(l);
       } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
-        // Never call timeout while we are on move in the registered state — that would forfeit our own stake.
+        // R9/I2: past the deadline, a newer state we hold is no longer answerable (respond would revert
+        // DeadlinePassed), so this is the fallback once the respond branch above is no longer available.
+        // Never call timeout while we are on move in the registered state — that would forfeit our own
+        // stake — so this only fires when the opponent is on move there, or the registered game is over.
         if (this.stopped) return;
-        await this.hub.timeout(this.wallet, id);
+        // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
+        await this.hub.timeout(l.sessionSender, id);
         // Bug fix (Task 6 review): timeout() always finalizes in the same transaction (see ChannelHub.sol) —
         // mark it here, synchronously with our own confirmed tx, so a caller reading `record.finalized` right
         // after observing the phase change on-chain (e.g. via its own direct RPC poll) never loses that race.
