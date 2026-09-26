@@ -6,6 +6,7 @@ import { RpcChainReader, type ChainReader } from "./chain.js";
 import { RateLimiter } from "./limits.js";
 import { chessSkillMd, indexHtml, llmsTxt, skillMd } from "./docs.js";
 import { Lobby, LobbyError } from "./lobby.js";
+import { Relay } from "./relay.js";
 import { SqliteRepo, type Repo } from "./repo.js";
 import { attachWs } from "./ws.js";
 
@@ -173,6 +174,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   const getLimiter = new RateLimiter(cfg.limits.httpGetBurst, cfg.limits.httpGetPerSec);
 
   const lobby = new Lobby(repo, chain, cfg);
+  const relay = new Relay(repo, cfg, metrics, log);
 
   // filled once listen() resolves; route handlers close over this box rather than a value, so they always see it
   const self: { url: string } = { url: "" };
@@ -264,7 +266,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   // backstops against a slow/stalled client holding a connection open indefinitely (headers, then the whole request)
   httpServer.requestTimeout = 15_000;
   httpServer.headersTimeout = 10_000;
-  const wsHandle = attachWs(httpServer, { lobby, relay: null, cfg, metrics, log });
+  const wsHandle = attachWs(httpServer, { lobby, relay, cfg, metrics, log });
 
   const pruneInterval = setInterval(() => {
     chain

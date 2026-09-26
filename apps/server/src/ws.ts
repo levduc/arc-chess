@@ -2,10 +2,11 @@ import { randomBytes } from "node:crypto";
 import type http from "node:http";
 import type { Address, Hex } from "viem";
 import { WebSocket as WsWebSocket, WebSocketServer } from "ws";
-import { decodeWire, toWire, type MatchEvent, type Params, type PlayerIndex, type RelayMessage } from "@arena/sdk";
+import { decodeWire, toWire, type MatchEvent, type Params, type RelayMessage } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 import type { Lobby } from "./lobby.js";
 import { RateLimiter } from "./limits.js";
+import type { Relay, RelayPeer } from "./relay.js";
 import type { Metrics } from "./server.js";
 
 // server -> client
@@ -22,9 +23,6 @@ export type ClientFrame =
   | { type: "join"; channelId: Hex; params: Params; signer: Address; sig: Hex }
   | { type: "relay"; message: RelayMessage };
 
-/** Task 5 fills this in; while `null` here, `join`/`relay` frames just get an error. */
-export type Relay = unknown;
-
 const OFFER_ID_RE = /^0x[0-9a-f]{64}$/i;
 const HEARTBEAT_MS = 30_000;
 const RATE_LIMIT_KEY = "f";
@@ -32,7 +30,7 @@ const RATE_LIMIT_KEY = "f";
 type ConnState = {
   nonce: Hex;
   watched: Set<Hex>;
-  joined: Map<Hex, PlayerIndex>;
+  peer: RelayPeer;
   limiter: RateLimiter;
   alive: boolean;
 };
@@ -60,6 +58,13 @@ export function attachWs(
 
   function send(ws: WsWebSocket, frame: ServerFrame): void {
     if (ws.readyState === WsWebSocket.OPEN) ws.send(toWire(frame));
+  }
+
+  /** Logs an unexpected rejection from `relay.join`/`relay.forward` (both normally resolve, sending their own
+   *  `error` frame on refusal) and tells the client something went wrong. */
+  function onRelayRejection(ws: WsWebSocket, msg: string, err: unknown): void {
+    log(JSON.stringify({ ts: new Date().toISOString(), level: "error", msg, error: String(err) }));
+    send(ws, { type: "error", error: "internal" });
   }
 
   function handleSubscribe(ws: WsWebSocket, state: ConnState, offerIds: unknown): void {
@@ -96,9 +101,25 @@ export function attachWs(
       handleSubscribe(ws, state, frame.offerIds);
       return;
     }
-    if (frame.type === "join" || frame.type === "relay") {
-      // `relay` is always null in this task (Task 5 plugs it in and delegates join/relay frames to it here).
-      if (relay === null) send(ws, { type: "error", error: "relay unavailable" });
+    if (frame.type === "join") {
+      if (relay === null) {
+        send(ws, { type: "error", error: "relay unavailable" });
+        return;
+      }
+      type JoinFrame = { channelId: unknown; params: unknown; signer: unknown; sig: unknown };
+      relay
+        .join(state.peer, frame as unknown as JoinFrame)
+        .catch((err: unknown) => onRelayRejection(ws, "relay join failed", err));
+      return;
+    }
+    if (frame.type === "relay") {
+      if (relay === null) {
+        send(ws, { type: "error", error: "relay unavailable" });
+        return;
+      }
+      relay
+        .forward(state.peer, frame.message)
+        .catch((err: unknown) => onRelayRejection(ws, "relay forward failed", err));
       return;
     }
     send(ws, { type: "error", error: "malformed frame" });
@@ -131,10 +152,11 @@ export function attachWs(
 
   wss.on("connection", (ws: WsWebSocket) => {
     const nonce = `0x${randomBytes(32).toString("hex")}` as Hex;
+    const peer: RelayPeer = { send: (frame) => send(ws, frame), joined: new Map(), nonce };
     const state: ConnState = {
       nonce,
       watched: new Set(),
-      joined: new Map(),
+      peer,
       limiter: new RateLimiter(cfg.limits.wsFrameBurst, cfg.limits.wsFramePerSec),
       alive: true,
     };
@@ -170,6 +192,7 @@ export function attachWs(
     });
 
     ws.on("close", () => {
+      relay?.leave(state.peer);
       states.delete(ws);
       metrics.wsConnections = states.size;
     });
