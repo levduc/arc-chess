@@ -47,7 +47,7 @@ export type ChainView = {
   now: bigint;
 };
 
-type Live = {
+export type ChannelHandle = {
   record: ChannelRecord;
   session: ChannelSession;
   sessionSender: LocalKeyTxSender;
@@ -74,12 +74,16 @@ export class ArenaDaemon {
   protected readonly chain: Chain;
   protected readonly domain: ArenaDomain;
   protected readonly records: RecordStore;
-  protected readonly live = new Map<Hex, Live>();
+  protected readonly live = new Map<Hex, ChannelHandle>();
   protected readonly changes = new EventEmitter();
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
   private ticking = false;
   private approved = false;
+  /** M1: set by stop(); every handler checks this before any side effect (open/join/fund) it hasn't started yet. */
+  private stopped = false;
+  /** I3: offerIds currently being turned into a channel — guards against two match events racing the same offer. */
+  private readonly claiming = new Set<Hex>();
 
   constructor(protected readonly opts: DaemonOptions) {
     const c = opts.config;
@@ -109,10 +113,12 @@ export class ArenaDaemon {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
     while (this.ticking) await new Promise((r) => setTimeout(r, 10));
+    this.changes.removeAllListeners();
   }
 
   channelIds(): Hex[] {
@@ -120,7 +126,7 @@ export class ArenaDaemon {
   }
 
   /** Direct access to a channel's session and senders — for tests and tooling, not for the agent API. */
-  handle(id: Hex): Live {
+  handle(id: Hex): ChannelHandle {
     const l = this.live.get(id);
     if (!l) throw new DaemonError(404, `unknown channel ${id}`);
     return l;
@@ -173,14 +179,38 @@ export class ArenaDaemon {
   }
 
   private async onMatch(m: MatchEvent): Promise<void> {
+    if (this.stopped) return;
+    // I3: claim the offerId synchronously, before any await, so a second match event for the same offer
+    // (concurrent or back-to-back) bails here instead of racing this call to open a second channel.
+    if (this.claiming.has(m.offerId)) return;
+    const rec = this.records.offer(m.offerId);
+    if (!rec) return;
+    this.claiming.add(m.offerId);
+    // I3: released on every path that does not end in removeOffer() below (i.e. every rejection or error),
+    // so a later, corrected match event for the same offer can still be considered.
+    let claimed = true;
+    const release = () => {
+      if (claimed) {
+        this.claiming.delete(m.offerId);
+        claimed = false;
+      }
+    };
     try {
-      const rec = this.records.offer(m.offerId);
-      if (!rec) return;
+      // I2: never trust the host's participant/signer ordering in m.params — derive `me` from which role this
+      // player took when it created or accepted the offer, so a host that swaps indices is caught below by
+      // checkMatchParams (params[me] no longer names this player's wallet/signer) rather than trusted.
+      const me = rec.role === "offerer" ? 0 : 1;
       const signer = privateKeyToAccount(rec.sessionKey).address;
-      const me = m.params.signers.findIndex((s) => s.toLowerCase() === signer.toLowerCase());
-      if (me !== 0 && me !== 1) return;
       const fee = await this.hub.feeConfig();
+      if (this.stopped) return release();
       const now = (await this.client.getBlock()).timestamp;
+      // M4: an offer the host matched after it expired must never be funded.
+      if (now >= rec.offer.expiresAt) {
+        this.log(`ignoring match for offer ${m.offerId}: offer has expired`);
+        return release();
+      }
+      // M3: fee equality — accept only the hub's current fee, and only if it is within this player's ceiling.
+      const maxFeePerPlayer = fee.feePerPlayer < this.opts.config.maxFeePerPlayer ? fee.feePerPlayer : this.opts.config.maxFeePerPlayer;
       const problem = checkMatchParams(m.params, {
         me,
         player: this.wallet.address,
@@ -191,16 +221,17 @@ export class ArenaDaemon {
         challengeTimeout: rec.offer.challengeTimeout,
         feeRecipient: fee.feeRecipient,
         minFeePerPlayer: fee.feePerPlayer,
-        maxFeePerPlayer: this.opts.config.maxFeePerPlayer,
+        maxFeePerPlayer,
         now,
         maxFundingWindow: 7200n,
       });
       if (problem) {
         this.log(`ignoring match for offer ${m.offerId}: ${problem}`);
-        return;
+        return release();
       }
       const id = computeChannelId(this.domain.chainId, this.domain.hub, m.params);
-      if (this.live.has(id)) return;
+      if (this.live.has(id)) return release();
+      if (this.stopped) return release();
       const record: ChannelRecord = {
         channelId: id,
         params: m.params,
@@ -214,15 +245,20 @@ export class ArenaDaemon {
       };
       this.records.saveChannel(record);
       this.records.removeOffer(m.offerId);
+      // The offer record is gone: a duplicate match event now bails at `!rec` above, so the claim can be released.
+      release();
+      if (this.stopped) return;
       await this.openChannel(record);
       this.notify();
       void this.tick();
     } catch (err) {
+      release();
       this.log(`match handling failed: ${errorText(err)}`);
     }
   }
 
   private async openChannel(record: ChannelRecord): Promise<void> {
+    if (this.stopped) return;
     const store = new FileSessionStore(arenaPaths(this.opts.home).channelSession(record.channelId));
     const session = await ChannelSession.open({
       params: record.params,
@@ -231,6 +267,9 @@ export class ArenaDaemon {
       domain: this.domain,
       store,
     });
+    // I3/M1: re-check immediately before mutating `live` — the await above is a window another call (or a
+    // stop()) could have used to already open this same channel, or to stop the daemon.
+    if (this.stopped || this.live.has(record.channelId)) return;
     const sessionSender = new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain);
     this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null });
     await this.opts.relay.join(record.channelId, record.sessionKey);
@@ -243,30 +282,46 @@ export class ArenaDaemon {
   }
 
   /** Approve once, give the session key gas for disputes, then deposit (spec §3.1, §5). */
-  protected async fund(l: Live): Promise<void> {
+  protected async fund(l: ChannelHandle): Promise<void> {
+    if (this.stopped) return;
     const p = l.record.params;
     if (!this.approved) {
       await this.hub.approve(this.wallet, this.opts.config.usdc, maxUint256);
       this.approved = true;
     }
+    if (this.stopped) return;
     if (this.opts.config.sessionGasWei > 0n) {
-      const hash = await this.wallet.send({ to: l.sessionSender.address, data: "0x", value: this.opts.config.sessionGasWei });
-      await this.client.waitForTransactionReceipt({ hash });
+      // I1: top up only the shortfall, and only while the session key is actually below the target — otherwise
+      // a deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever.
+      const balance = await this.client.getBalance({ address: l.sessionSender.address });
+      if (balance < this.opts.config.sessionGasWei) {
+        if (this.stopped) return;
+        const hash = await this.wallet.send({
+          to: l.sessionSender.address,
+          data: "0x",
+          value: this.opts.config.sessionGasWei - balance,
+        });
+        await this.client.waitForTransactionReceipt({ hash });
+      }
     }
+    if (this.stopped) return;
     await this.hub.deposit(this.wallet, p);
   }
 
   // ------------------------------------------------------------------ relay
 
   private async onRelay(msg: RelayMessage): Promise<void> {
+    if (this.stopped) return;
     const l = this.live.get(msg.channelId);
     if (!l) return;
     try {
       if (msg.type === "state") {
         await l.session.receive(msg.signed);
+        if (this.stopped) return;
         await this.autoPlay(l);
       } else {
         await l.session.receiveClose(msg.close);
+        if (this.stopped) return;
         await this.trySubmitClose(l);
       }
       l.lastError = null;
@@ -274,18 +329,19 @@ export class ArenaDaemon {
       l.lastError = errorText(err);
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }
+    if (this.stopped) return;
     this.notify();
   }
 
   /** Spec §6.3: sign RESIGN when checkmated and CLAIM_STALEMATE when stalemated, regardless of controller. */
-  protected async autoPlay(l: Live): Promise<void> {
+  protected async autoPlay(l: ChannelHandle): Promise<void> {
     if (!l.session.isMyTurn()) return;
     const o = outcome(l.session.latest.state);
     if (o === "checkmate") await this.sendState(l, await l.session.resign());
     else if (o === "stalemate") await this.sendState(l, await l.session.claimStalemate());
   }
 
-  protected async sendState(l: Live, signed: SignedState): Promise<void> {
+  protected async sendState(l: ChannelHandle, signed: SignedState): Promise<void> {
     await this.opts.relay.send({ type: "state", channelId: l.record.channelId, signed }).catch((err) => {
       l.lastError = `relay: ${errorText(err)}`;
     });
@@ -293,7 +349,7 @@ export class ArenaDaemon {
   }
 
   /** If a challenge is pending and we now hold a newer supported state, answer it on-chain from the session key. */
-  protected async respondIfChallenged(l: Live): Promise<void> {
+  protected async respondIfChallenged(l: ChannelHandle): Promise<void> {
     const id = l.record.channelId;
     const info = await this.hub.channelInfo(id);
     if (info.phase !== "Challenged") return;
@@ -306,7 +362,7 @@ export class ArenaDaemon {
     }
   }
 
-  private async trySubmitClose(l: Live): Promise<void> {
+  private async trySubmitClose(l: ChannelHandle): Promise<void> {
     const tx = l.session.closeTransaction();
     if (!tx) return;
     const info = await this.hub.channelInfo(l.record.channelId);
@@ -382,10 +438,11 @@ export class ArenaDaemon {
   // ------------------------------------------------------------------ watchtower (Task 6)
 
   async tick(): Promise<void> {
-    if (this.ticking) return;
+    if (this.stopped || this.ticking) return;
     this.ticking = true;
     try {
       for (const l of this.live.values()) {
+        if (this.stopped) break;
         if (l.record.finalized) continue;
         try {
           await this.watch(l);
@@ -395,12 +452,12 @@ export class ArenaDaemon {
       }
     } finally {
       this.ticking = false;
-      this.notify();
+      if (!this.stopped) this.notify();
     }
   }
 
   /** One watchtower pass for one channel. Task 4 funds only; Task 6 adds disputes. */
-  protected async watch(l: Live): Promise<void> {
+  protected async watch(l: ChannelHandle): Promise<void> {
     const id = l.record.channelId;
     const p = l.record.params;
     const info = await this.hub.channelInfo(id);
@@ -423,7 +480,7 @@ export class ArenaDaemon {
 
   // ------------------------------------------------------------------ helpers
 
-  protected pick(ref: string | undefined): Live {
+  protected pick(ref: string | undefined): ChannelHandle {
     const active = [...this.live.values()].filter((l) => !l.record.finalized);
     if (ref) {
       const hits = [...this.live.values()].filter((l) => l.record.channelId.toLowerCase().startsWith(ref.toLowerCase()));
@@ -434,7 +491,7 @@ export class ArenaDaemon {
     throw new DaemonError(400, active.length === 0 ? "no active channel" : "several channels are active: pass --channel");
   }
 
-  protected requireController(l: Live, actor: Actor): void {
+  protected requireController(l: ChannelHandle, actor: Actor): void {
     if (actor !== l.record.controller) {
       throw new DaemonError(409, `the ${l.record.controller} is in control of this channel (use "arena handoff")`);
     }
@@ -450,7 +507,11 @@ export class ArenaDaemon {
   }
 
   protected notify(): void {
-    this.changes.emit("change");
+    try {
+      this.changes.emit("change");
+    } catch {
+      // M8: a throwing listener must never break the caller (a move, a relay message, a tick).
+    }
   }
 
   protected log(line: string): void {
