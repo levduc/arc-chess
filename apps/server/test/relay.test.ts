@@ -42,7 +42,7 @@ function randomNonce(): Hex {
 
 function fakePeer(): RelayPeer & { frames: unknown[] } {
   const frames: unknown[] = [];
-  return { send: (f) => frames.push(f), joined: new Map(), nonce: randomNonce(), frames };
+  return { send: (f) => frames.push(f), joined: new Map(), nonce: randomNonce(), closed: false, frames };
 }
 
 /** A `close` relay message for `fx`'s channel, attributed to player `by`; the relay never checks `sig`. */
@@ -64,6 +64,51 @@ describe("relay", () => {
     const gotB = await b.next((f) => f.type === "relay");
     expect(gotB.message).toEqual({ type: "state", channelId: fx.id, signed: s1 });
     await expect(a.next((f) => f.type === "relay", 200)).rejects.toThrow();
+  });
+
+  it("delivers a state and a following close in send order, though state verification awaits", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg);
+    const a = await joinAs(server.url, fx, fx.kA);
+    const b = await joinAs(server.url, fx, fx.kB);
+
+    const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
+    const close = closeMsg(fx, 0);
+    // sent back to back, with no wait in between: `forward`'s state branch awaits signature recovery but its
+    // close branch doesn't, so without per-connection serialization the close would overtake the state.
+    a.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } });
+    a.send({ type: "relay", message: close });
+
+    const first = await b.next((f) => f.type === "relay");
+    expect(first.message).toEqual({ type: "state", channelId: fx.id, signed: s1 });
+    const second = await b.next((f) => f.type === "relay");
+    expect(second.message).toEqual(close);
+  });
+
+  it("forwards a relay frame sent immediately after join, without waiting for `joined`", async () => {
+    const cfg = testConfig();
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx = makeChannelFixture(cfg);
+    const b = await joinAs(server.url, fx, fx.kB);
+    const c = await wsConnect(server.url);
+    const acct = privateKeyToAccount(fx.kA);
+    const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 0);
+
+    // join and relay sent back to back, without waiting for `joined`: without serialization, the relay frame's
+    // (synchronous, once parsed) handling could run before the join's (async, awaits `verifyRelayJoin`) does,
+    // and get refused as "not joined to this channel".
+    c.send({
+      type: "join",
+      channelId: fx.id,
+      params: fx.params,
+      signer: acct.address,
+      sig: await signRelayJoin(acct, fx.id, c.nonce),
+    });
+    c.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } });
+
+    const got = await b.next((f) => f.type === "relay");
+    expect(got.message.signed).toEqual(s1);
   });
 
   it("refuses a join whose params do not hash to channelId", async () => {
@@ -117,6 +162,26 @@ describe("relay", () => {
     const f = await c2.next((f) => f.type === "error" || f.type === "joined");
     expect(f.type).toBe("error");
     expect(f.error).toMatch(/bad join signature/);
+  });
+
+  it("refuses a second join over the connection's channel limit", async () => {
+    const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx1 = makeChannelFixture(cfg);
+    const fx2 = makeChannelFixture(cfg); // a different channel
+    const a = await joinAs(server.url, fx1, fx1.kA);
+
+    const acct2 = privateKeyToAccount(fx2.kA);
+    a.send({
+      type: "join",
+      channelId: fx2.id,
+      params: fx2.params,
+      signer: acct2.address,
+      sig: await signRelayJoin(acct2, fx2.id, a.nonce),
+    });
+    const f = await a.next((f) => f.type === "error" || f.type === "joined");
+    expect(f.type).toBe("error");
+    expect(f.error).toMatch(/too many channels on this connection/);
   });
 
   it("refuses relay messages for channels the connection has not joined", async () => {
@@ -266,6 +331,12 @@ describe("relay", () => {
     server = await startServer(cfg, { chain: new FakeChain() });
     const fx = makeChannelFixture(cfg);
     const a = await joinAs(server.url, fx, fx.kA);
+    const b = await joinAs(server.url, fx, fx.kB);
+
+    // something cached for A to replay: B's last message, not A's own
+    const s1 = await signStateAs(fx, rawStateAt(fx, 1n), 1);
+    b.send({ type: "relay", message: { type: "state", channelId: fx.id, signed: s1 } });
+    await a.next((f) => f.type === "relay"); // A gets it live, once
 
     const acct = privateKeyToAccount(fx.kA);
     a.send({
@@ -278,6 +349,9 @@ describe("relay", () => {
     const f = await a.next((f) => f.type === "joined" || f.type === "error");
     expect(f.type).toBe("joined");
     expect(f.channelId).toBe(fx.id);
+    // the duplicate join must not just re-confirm -- it replays the cache again too, at the limit of 1
+    const replayed = await a.next((f) => f.type === "relay");
+    expect(replayed.message.signed).toEqual(s1);
   });
 
   it("latestState returns the highest-turn validly signed cached state", async () => {
@@ -351,6 +425,62 @@ describe("relay", () => {
     await relay2.forward(peerA2, { type: "state", channelId: fx.id, signed: low });
 
     expect(relay2.latestState(fx.id)).toEqual(high); // not clobbered by the lower-turn re-send
+    repo.close();
+  });
+
+  it("channel map shrinks to 0 once both members have disconnected", async () => {
+    const cfg = testConfig();
+    const repo = new SqliteRepo(":memory:");
+    const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
+    const relay = new Relay(repo, cfg, metrics, () => {});
+    const fx = makeChannelFixture(cfg);
+    const peerA = fakePeer();
+    const peerB = fakePeer();
+    const acctA = privateKeyToAccount(fx.kA);
+    const acctB = privateKeyToAccount(fx.kB);
+
+    await relay.join(peerA, {
+      channelId: fx.id,
+      params: fx.params,
+      signer: acctA.address,
+      sig: await signRelayJoin(acctA, fx.id, peerA.nonce),
+    });
+    await relay.join(peerB, {
+      channelId: fx.id,
+      params: fx.params,
+      signer: acctB.address,
+      sig: await signRelayJoin(acctB, fx.id, peerB.nonce),
+    });
+    expect(relay.channelCount()).toBe(1);
+
+    relay.leave(peerA);
+    expect(relay.channelCount()).toBe(1); // B is still a member
+
+    relay.leave(peerB);
+    expect(relay.channelCount()).toBe(0); // no members left: the channel entry itself is dropped
+    repo.close();
+  });
+
+  it("a join that completes after its socket closed leaves no member behind", async () => {
+    const cfg = testConfig();
+    const repo = new SqliteRepo(":memory:");
+    const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
+    const relay = new Relay(repo, cfg, metrics, () => {});
+    const fx = makeChannelFixture(cfg);
+    const peerA = fakePeer();
+    const acctA = privateKeyToAccount(fx.kA);
+    const sig = await signRelayJoin(acctA, fx.id, peerA.nonce); // computed before the race, like a real join
+
+    const joinPromise = relay.join(peerA, {
+      channelId: fx.id,
+      params: fx.params,
+      signer: acctA.address,
+      sig,
+    });
+    relay.leave(peerA); // the socket closes while `join` is still awaiting signature verification
+    await joinPromise;
+
+    expect(relay.channelCount()).toBe(0); // `join` must not have added the now-dead peer as a member
     repo.close();
   });
 });

@@ -7,9 +7,9 @@ import type { Metrics } from "./server.js";
 import type { ServerFrame } from "./ws.js";
 
 /** What `Relay` needs from a connection: a way to push frames to it, its per-connection join table (shared with
- *  `ws.ts`'s connection state, so a `forward` sees exactly what a `join` set), and the nonce it must sign joins
- *  over. */
-export type RelayPeer = { send(frame: ServerFrame): void; joined: Map<Hex, PlayerIndex>; nonce: Hex };
+ *  `ws.ts`'s connection state, so a `forward` sees exactly what a `join` set), the nonce it must sign joins over,
+ *  and a `closed` flag `leave` sets so a `join` still in flight when the socket closes doesn't add a dead peer. */
+export type RelayPeer = { send(frame: ServerFrame): void; joined: Map<Hex, PlayerIndex>; nonce: Hex; closed: boolean };
 
 type ChannelState = {
   params: Params;
@@ -92,6 +92,9 @@ export class Relay {
         peer.send({ type: "error", error: "bad join signature", channelId: expected });
         return;
       }
+      // the only await in this function: the socket may have closed while we were verifying. Don't add a peer
+      // whose connection is already gone -- it would never be removed from `channel.members` again.
+      if (peer.closed) return;
       const alreadyJoined = peer.joined.has(expected);
       if (!alreadyJoined && peer.joined.size >= this.cfg.limits.maxJoinsPerConnection) {
         peer.send({ type: "error", error: "too many channels on this connection", channelId: expected });
@@ -118,7 +121,7 @@ export class Relay {
       this.log(
         JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "relay join failed", error: String(err) }),
       );
-      peer.send({ type: "error", error: "internal" });
+      peer.send({ type: "error", error: "internal", channelId: knownChannelId(frame.channelId) });
     }
   }
 
@@ -126,12 +129,15 @@ export class Relay {
    *  that channel and the message is validly attributed to `peer`'s player index. Sends an `error` frame, and does
    *  not forward, on any refusal. */
   async forward(peer: RelayPeer, raw: unknown): Promise<void> {
+    // best-effort, independent of whether `raw` parses at all -- lets even a "malformed" or "internal" error
+    // frame carry the channelId the CLI is filtering on, when the raw frame at least named one.
+    const rawId = knownChannelId((raw as { channelId?: unknown } | null | undefined)?.channelId);
     try {
       let message: RelayMessage;
       try {
         message = parseRelayMessage(raw);
       } catch {
-        peer.send({ type: "error", error: "malformed relay message" });
+        peer.send({ type: "error", error: "malformed relay message", channelId: rawId });
         return;
       }
       const id = message.channelId;
@@ -178,14 +184,30 @@ export class Relay {
           error: String(err),
         }),
       );
-      peer.send({ type: "error", error: "internal" });
+      peer.send({ type: "error", error: "internal", channelId: rawId });
     }
   }
 
-  /** Removes `peer` from every channel it was a member of. Called on socket close; `peer.joined` itself is left
-   *  alone since the connection (and the peer) is going away with it. */
+  /** Removes `peer` from every channel *it* joined (via its own join table, not a scan of every channel this
+   *  process knows about -- with many channels and frequent reconnects that scan is an easy self-inflicted DoS).
+   *  Drops a channel entirely once its last member leaves: `latestState` falls back to the repo on a miss, and
+   *  `join` re-seeds a channel's params and verified-latest cache from the repo the next time either side
+   *  reconnects, so nothing is lost. Called on socket close; also marks the peer `closed` so a `join` still in
+   *  flight for it won't add it back. */
   leave(peer: RelayPeer): void {
-    for (const channel of this.channels.values()) channel.members.delete(peer);
+    peer.closed = true;
+    for (const id of peer.joined.keys()) {
+      const channel = this.channels.get(id);
+      if (!channel) continue;
+      channel.members.delete(peer);
+      if (channel.members.size === 0) this.channels.delete(id);
+    }
+  }
+
+  /** The number of channels this process currently holds state for -- i.e. with at least one connected member.
+   *  Test-only introspection for the leak fix above. */
+  channelCount(): number {
+    return this.channels.size;
   }
 
   /** The highest-turn cached `state` message whose sender signature verified, or `null` if the channel has none.

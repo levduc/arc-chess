@@ -33,6 +33,11 @@ type ConnState = {
   peer: RelayPeer;
   limiter: RateLimiter;
   alive: boolean;
+  /** Serializes this connection's frame handling. `ws` can emit several "message" events synchronously from one
+   *  underlying read, and `relay.join`/`relay.forward` await async signature recovery -- without this, a later
+   *  frame's (synchronous) handling can finish before an earlier one's (async) handling does, reordering what the
+   *  other side sees. Every frame is chained onto this so they resolve in the order they arrived. */
+  chain: Promise<void>;
 };
 
 export function attachWs(
@@ -60,10 +65,11 @@ export function attachWs(
     if (ws.readyState === WsWebSocket.OPEN) ws.send(toWire(frame));
   }
 
-  /** Logs an unexpected rejection from `relay.join`/`relay.forward` (both normally resolve, sending their own
-   *  `error` frame on refusal) and tells the client something went wrong. */
-  function onRelayRejection(ws: WsWebSocket, msg: string, err: unknown): void {
-    log(JSON.stringify({ ts: new Date().toISOString(), level: "error", msg, error: String(err) }));
+  /** Logs an unexpected exception/rejection from a frame's handling (`relay.join`/`relay.forward` normally
+   *  resolve on their own, sending their own `error` frame on refusal, so this is a genuine bug or I/O failure)
+   *  and tells the client something went wrong. */
+  function onFrameFailure(ws: WsWebSocket, err: unknown): void {
+    log(JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "ws frame failed", error: String(err) }));
     send(ws, { type: "error", error: "internal" });
   }
 
@@ -91,7 +97,7 @@ export function attachWs(
     }
   }
 
-  function handleFrame(ws: WsWebSocket, state: ConnState, raw: unknown): void {
+  async function handleFrame(ws: WsWebSocket, state: ConnState, raw: unknown): Promise<void> {
     if (typeof raw !== "object" || raw === null || typeof (raw as { type?: unknown }).type !== "string") {
       send(ws, { type: "error", error: "malformed frame" });
       return;
@@ -107,9 +113,7 @@ export function attachWs(
         return;
       }
       type JoinFrame = { channelId: unknown; params: unknown; signer: unknown; sig: unknown };
-      relay
-        .join(state.peer, frame as unknown as JoinFrame)
-        .catch((err: unknown) => onRelayRejection(ws, "relay join failed", err));
+      await relay.join(state.peer, frame as unknown as JoinFrame);
       return;
     }
     if (frame.type === "relay") {
@@ -117,9 +121,7 @@ export function attachWs(
         send(ws, { type: "error", error: "relay unavailable" });
         return;
       }
-      relay
-        .forward(state.peer, frame.message)
-        .catch((err: unknown) => onRelayRejection(ws, "relay forward failed", err));
+      await relay.forward(state.peer, frame.message);
       return;
     }
     send(ws, { type: "error", error: "malformed frame" });
@@ -152,13 +154,14 @@ export function attachWs(
 
   wss.on("connection", (ws: WsWebSocket) => {
     const nonce = `0x${randomBytes(32).toString("hex")}` as Hex;
-    const peer: RelayPeer = { send: (frame) => send(ws, frame), joined: new Map(), nonce };
+    const peer: RelayPeer = { send: (frame) => send(ws, frame), joined: new Map(), nonce, closed: false };
     const state: ConnState = {
       nonce,
       watched: new Set(),
       peer,
       limiter: new RateLimiter(cfg.limits.wsFrameBurst, cfg.limits.wsFramePerSec),
       alive: true,
+      chain: Promise.resolve(),
     };
     states.set(ws, state);
     metrics.wsConnections = states.size;
@@ -181,14 +184,10 @@ export function attachWs(
         send(ws, { type: "error", error: "malformed frame" });
         return;
       }
-      try {
-        handleFrame(ws, state, frame);
-      } catch (err) {
-        log(
-          JSON.stringify({ ts: new Date().toISOString(), level: "error", msg: "ws frame failed", error: String(err) }),
-        );
-        send(ws, { type: "error", error: "internal" });
-      }
+      // chained onto the connection's existing queue, not run immediately: see `ConnState.chain`.
+      state.chain = state.chain.then(() => handleFrame(ws, state, frame)).catch((err: unknown) => {
+        onFrameFailure(ws, err);
+      });
     });
 
     ws.on("close", () => {
