@@ -483,7 +483,14 @@ accept-draw / next-game / close buttons.
     opponent who countersigns but withholds it (or a dropped relay message) leaves the proposer unable to accept
     `C+1`; after a challenge with `{prev: C both-signed, latest: C+1}` the proposer cannot respond and forfeits.
     After acceptance the proposer's next move `C+2` is proven as `{prev: C+1 (opponent-signed), latest: C+2}`,
-    which the hub accepts. Exception: if C+1 is a finished game (a resignation on move 1) and arrives off-chain,
-    the proposer does not adopt it until the countersignature arrives, because C signed by only one player cannot
-    anchor a proof and no further move can repair it; a late countersignature received after adopting a
-    non-terminal C+1 repairs the stored predecessor.
+    which the hub accepts. R4 (Plan 3 fix round 1): on acceptance the proposer also signs `C+1` itself, through
+    the normal equivocation-guarded signing path, whether adopted off-chain (`receive`) or from an on-chain event
+    (`ingestOnChain`). `C+1` is then stored fully signed and is provable on its own (`{hasPrev: false, latest:
+    C+1}`), with no need for `C+2` or for `C`'s countersignature at all. Why: the opponent's signature on `C+1`
+    already endorses `C` (as above), so nothing is lost by the proposer also signing `C+1`; doing so closes a
+    liveness gap the naive version of this rule left open (N1, Plan 2 review; I1, Plan 3 review): if `C+1` is a
+    finished game (a resignation on move 1), the *unsigned* adopted state would leave `prev` a checkpoint only
+    the proposer had signed — a proof the hub rejects, with no further move able to repair it, and no way to
+    unlock funds without the opponent's cooperation, on- or off-chain. A `C` countersignature that later arrives
+    anyway is still accepted and repairs the stored predecessor, but this is now cosmetic, since `C+1`'s
+    provability never depended on it.

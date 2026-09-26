@@ -246,6 +246,52 @@ describe("channel lifecycle on Anvil", () => {
     await play(a, b, ["g1f3"]);
     expect(a.isMyTurn()).toBe(true);
   });
+
+  // --- R4/I1: a terminal move on a withheld checkpoint, registered on-chain (Plan 3 fix round 1) -------------
+
+  it("R4/I1: Bob registers a move-1 resignation on Alice's withheld checkpoint; Alice ingests, proves alone, and is paid out on timeout", async () => {
+    const x = await arena("r4-i1");
+    const { a, b } = await open(x);
+
+    await play(a, b, SCHOLARS_MATE); // game 0: A mates
+    await a.receive(await b.resign()); // A +stake
+
+    const proposal = await a.proposeNewGame(); // A's pending checkpoint C (game 1: B white)
+    await b.receive(proposal);
+    const full = await b.countersignNewGame(); // withheld from A off-chain
+    const resign = await b.resign(); // C+1: B resigns move 1 of game 1 -- never delivered to A off-chain either
+
+    // Reviewer's probe "b": instead of relaying `resign` to Alice, Bob registers {prev: C (both-signed), latest:
+    // C+1 (Bob-signed)} on-chain directly. Before this fix (I1), the only way for Alice to recover from this was
+    // through ingestOnChain's R9 path (iv), which left `prev` a checkpoint only Alice had signed and `latest`
+    // signed only by Bob -- `challengeProof` then threw, and only Bob could unlock the funds. R4 fixes path (iv)
+    // the same way it fixes `receive`'s on-pending branch: Alice also signs the adopted C+1 herself.
+    await x.hub.challenge(x.bob, { hasPrev: true, prev: full, latest: resign });
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Challenged");
+    const ev = (await x.hub.disputeEvents(a.id)).at(-1)!;
+    expect(ev.kind).toBe("Challenged");
+    expect(await a.ingestOnChain(ev.signed)).toBe(true);
+
+    // Alice's own proof of the adopted (terminal) state needs no predecessor and no help from Bob.
+    const proof = a.challengeProof();
+    expect(proof.hasPrev).toBe(false);
+    expect(proof.latest.state).toEqual(resign.state);
+    expect(proof.latest.sigA).not.toBe("0x");
+    expect(proof.latest.sigB).not.toBe("0x");
+
+    // The state Bob registered is already this exact, final, Alice-favouring state: nothing further to dispute.
+    // `respond` would revert (StaleState, same turnNum) and `challenge` would revert (WrongPhase, already
+    // Challenged) if either player tried -- timeout alone settles it as registered.
+    await increaseTime(Number(x.params.challengeTimeout));
+    await x.hub.timeout(x.alice, a.id);
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Finalized");
+
+    const d = x.params.deposit;
+    const f = x.params.feePerPlayer;
+    const bal = a.latest.state; // balances after both games (game 0 mate, game 1 resignation), both won by Alice
+    expect(await usdcBalance(x.env.usdc, x.alice.address)).toBe(START - d - f + bal.balanceA);
+    expect(await usdcBalance(x.env.usdc, x.bob.address)).toBe(START - d - f + bal.balanceB);
+  });
 });
 
 describe("HubClient.disputeEvents", () => {

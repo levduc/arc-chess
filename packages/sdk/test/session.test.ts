@@ -13,6 +13,7 @@ import {
   isGameOver,
   parseMove,
   recoverCloseSigner,
+  recoverStateSigner,
   signClose,
   signState,
   statusOf,
@@ -484,7 +485,7 @@ describe("ChannelSession", () => {
 
   // --- R9: a move that chains from this player's pending checkpoint --------------------------------------
 
-  it("R9: accepts the opponent's move on this player's pending checkpoint when the countersign never arrives", async () => {
+  it("R9/R4: accepts the opponent's move on this player's pending checkpoint, co-signing it itself", async () => {
     const { a, b } = await setup();
     await finishGame(a, b); // game 0 over; game 1 has B as white
     const proposal = await a.proposeNewGame();
@@ -496,14 +497,23 @@ describe("ChannelSession", () => {
     expect(await a.receive(e4)).toBe("move");
     const snap = a.snapshot();
     expect(snap.pendingCheckpoint).toBeNull();
-    expect(snap.prev).toEqual(proposal); // the checkpoint, with A's own signature
-    expect(snap.latest).toEqual({ state: e4.state, sigA: "0x", sigB: e4.sigB }); // canonical, B's signature only
+    expect(snap.prev).toEqual(proposal); // the checkpoint, still only with A's own signature
+    // R4: A also signs the adopted move itself (equivocation-guarded), so `latest` ends up fully signed and
+    // needs no predecessor to be provable — closing the liveness gap the N1 refusal used to guard against.
+    expect(snap.latest.state).toEqual(e4.state);
+    expect(snap.latest.sigA).not.toBe("0x");
+    expect(snap.latest.sigB).toBe(e4.sigB);
     expect(typeof snap.latest.state.meta).toBe("bigint");
+    expect(a.challengeProof().hasPrev).toBe(false);
     expect(a.isMyTurn()).toBe(true);
 
     const e5 = await a.move("e7e5");
     const proof = a.challengeProof();
-    expect(proof).toEqual({ hasPrev: true, prev: { state: e4.state, sigA: "0x", sigB: e4.sigB }, latest: e5 });
+    expect(proof.hasPrev).toBe(true);
+    expect(proof.prev.state).toEqual(e4.state);
+    expect(proof.prev.sigA).not.toBe("0x"); // R4: A's own signature on the now-`prev` state
+    expect(proof.prev.sigB).toBe(e4.sigB);
+    expect(proof.latest).toEqual(e5);
     expect(await b.receive(e5)).toBe("move");
     // The late countersignature is now stale and harmless.
     await expect(a.receive(full)).rejects.toThrow(/unexpected turn/);
@@ -721,36 +731,53 @@ describe("ChannelSession", () => {
     expect(await a.receive(e5)).toBe("move");
   });
 
-  it("does not adopt a finished game on an uncountersigned checkpoint (N1)", async () => {
-    const { a, b } = await setup();
+  // N1 (Plan 2 review) was: refuse to adopt a finished game on an uncountersigned checkpoint, since the adopted
+  // state would leave `prev` a checkpoint only this player had signed — a proof the hub rejects, with no further
+  // move able to repair it. R4 (Plan 3 fix round 1) replaces that refusal: the adopted state is co-signed by this
+  // player too (see `moveOnPending`), so it is fully signed and needs no `prev` to be provable, whether or not it
+  // is terminal — closing the liveness gap for real rather than declining to enter it.
+  it("R4 (was N1): adopts and co-signs the opponent's move-1 resignation on an uncountersigned checkpoint", async () => {
+    const { a, b, keys } = await setup();
     await finishGame(a, b); // A white wins game 0
-    const terminal = a.latest;
     const proposal = await a.proposeNewGame();
     await b.receive(proposal);
     const full = await b.countersignNewGame(); // withheld from A for now
     const resign = await b.resign(); // B is white in game 1 and resigns on move 1
-    await expect(a.receive(resign)).rejects.toThrow(/countersign/);
-    expect(a.latest).toEqual(terminal); // A keeps a provable state
-    expect(a.challengeProof().latest).toEqual(terminal);
-    // Once the countersignature arrives, the resignation is accepted normally.
-    expect(await a.receive(full)).toBe("checkpoint-complete");
     expect(await a.receive(resign)).toBe("move");
+    const proof = a.challengeProof();
+    expect(proof.hasPrev).toBe(false); // fully signed: no predecessor needed
+    expect(proof.latest.state).toEqual(resign.state);
+    expect(proof.latest.sigA).not.toBe("0x");
+    expect(proof.latest.sigB).not.toBe("0x");
+    // The co-signature really does recover to A's own signer, not just a non-empty placeholder.
+    expect((await recoverStateSigner(proof.latest.state, proof.latest.sigA, domain)).toLowerCase()).toBe(
+      privateKeyToAccount(keys[0]).address.toLowerCase(),
+    );
+    // Fully signed and terminal: A can close cooperatively without waiting on B at all.
+    await expect(a.signClose()).resolves.toBeDefined();
+    // Once closing, even a legitimate late countersignature for the (now-moot) checkpoint is refused.
+    await expect(a.receive(full)).rejects.toThrow(/closing/);
   });
 
-  it("repairs prev with a late countersignature after adopting a move on its own checkpoint", async () => {
+  it("repairs prev with a late countersignature after adopting a move on its own checkpoint (harmless post-R4)", async () => {
     const { a, b } = await setup();
     await finishGame(a, b);
     await b.receive(await a.proposeNewGame());
     const full = await b.countersignNewGame(); // withheld
     const e4 = await b.move("e2e4");
-    expect(await a.receive(e4)).toBe("move"); // R9 adoption
-    expect(() => a.challengeProof()).toThrow(/countersign/);
+    expect(await a.receive(e4)).toBe("move"); // R9 adoption; R4: A co-signs e4 itself
+    // R4: the adopted move is already fully signed, so it is provable with no predecessor.
+    const proofBefore = a.challengeProof();
+    expect(proofBefore.hasPrev).toBe(false);
+    expect(proofBefore.latest.state).toEqual(e4.state);
+    expect(proofBefore.latest.sigA).not.toBe("0x");
+    expect(proofBefore.latest.sigB).not.toBe("0x");
+    // `prev` (the checkpoint C) is still only self-signed; a late countersignature still repairs it (harmless).
+    expect(a.snapshot().prev?.sigB).toBe("0x"); // opponent is B
     expect(await a.receive(full)).toBe("checkpoint-repaired");
-    const proof = a.challengeProof();
-    expect(proof.hasPrev).toBe(true);
-    expect(proof.prev.sigA).not.toBe("0x");
-    expect(proof.prev.sigB).not.toBe("0x");
-    expect(proof.latest.state).toEqual(e4.state);
+    expect(a.snapshot().prev?.sigB).not.toBe("0x");
+    // The repair changes nothing about what is provable: the proof is identical before and after.
+    expect(a.challengeProof()).toEqual(proofBefore);
   });
 
   it("opens from a loadable store: create first, restore afterwards", async () => {
@@ -772,5 +799,42 @@ describe("ChannelSession", () => {
     await expect(restored.move("e2e4")).resolves.toBeDefined();
     const bad = { ...a.snapshot(), lastSignedTurn: "1" as unknown as bigint };
     expect(() => ChannelSession.restore(cfgA, bad)).toThrow(ArenaProtocolError);
+  });
+
+  // R5 (Plan 3 fix round 1, I2): normalizeSnapshot must reject nested type confusion, not just missing top-level
+  // fields — a string `turnNum` used to slip through and let `move()` release a signature over `turnNum: "01"`.
+  it("rejects a snapshot with type-confused nested fields (I2)", async () => {
+    const { a, cfgA } = await setup();
+    const good = a.snapshot();
+
+    const stringTurnNum = structuredClone(good);
+    (stringTurnNum.latest.state as unknown as { turnNum: string }).turnNum = "0";
+    expect(() => ChannelSession.restore(cfgA, stringTurnNum)).toThrow(ArenaProtocolError);
+
+    const nonObjectState = structuredClone(good);
+    (nonObjectState.latest as unknown as { state: number }).state = 5;
+    expect(() => ChannelSession.restore(cfgA, nonObjectState)).toThrow(ArenaProtocolError);
+
+    const badCloseSigs = structuredClone(good);
+    (badCloseSigs as unknown as { closeSigs: unknown[] }).closeSigs = [1, 2];
+    expect(() => ChannelSession.restore(cfgA, badCloseSigs)).toThrow(ArenaProtocolError);
+
+    const missingSigB = structuredClone(good);
+    delete (missingSigB.latest as unknown as Partial<SignedState>).sigB;
+    expect(() => ChannelSession.restore(cfgA, missingSigB)).toThrow(ArenaProtocolError);
+
+    const badCloseSigTargets = structuredClone(good);
+    (badCloseSigTargets as unknown as { closeSigTargets: unknown[] }).closeSigTargets = ["not-hex", "0x"];
+    expect(() => ChannelSession.restore(cfgA, badCloseSigTargets)).toThrow(ArenaProtocolError);
+
+    // Sanity: the untouched clone still restores fine.
+    expect(() => ChannelSession.restore(cfgA, good)).not.toThrow();
+  });
+
+  it("rejects a null or non-object snapshot", async () => {
+    const { cfgA } = await setup();
+    expect(() => ChannelSession.restore(cfgA, null as unknown as SessionSnapshot)).toThrow(ArenaProtocolError);
+    expect(() => ChannelSession.restore(cfgA, 5 as unknown as SessionSnapshot)).toThrow(ArenaProtocolError);
+    expect(() => ChannelSession.restore(cfgA, "nope" as unknown as SessionSnapshot)).toThrow(ArenaProtocolError);
   });
 });

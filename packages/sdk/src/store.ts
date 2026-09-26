@@ -31,7 +31,17 @@ export interface SessionStore {
   save(snapshot: SessionSnapshot): Promise<void>;
 }
 
-/** A per-channel store that can also read back the last saved snapshot (file store in the daemon). */
+/**
+ * A per-channel store that can also read back the last saved snapshot (file store in the daemon).
+ *
+ * `load()` returns `null` ONLY when no snapshot has ever been saved for this channel; a store that has one but
+ * cannot read or parse it (corrupt file, I/O error) must throw rather than return `null`, since `ChannelSession
+ * .open()` treats `null` as "create a fresh channel" — silently discarding a real, if unreadable, history.
+ *
+ * Exactly one `ChannelSession` must own a given store (and thus a given channel) at a time: `save()` calls are
+ * not coordinated across instances, so two sessions sharing one store could interleave writes and each observe a
+ * stale snapshot.
+ */
 export interface LoadableSessionStore extends SessionStore {
   load(): Promise<SessionSnapshot | null>;
 }

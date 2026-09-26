@@ -45,24 +45,87 @@ function frozenParams(p: Params): Params {
 }
 const CLOSING_MESSAGE = "channel is closing; no further states are signed or accepted";
 
+/** True for any 0x-hex string, including the empty "0x" used for an absent signature. */
+function isHexString(x: unknown): x is Hex {
+  return typeof x === "string" && /^0x[0-9a-fA-F]*$/.test(x);
+}
+
+/**
+ * Rebuilds a State from untrusted input with every field checked against its exact canonical type — unlike the
+ * instance method `canonicalState` (used for on-chain data that viem has already decoded to the right JS type),
+ * this never coerces: a `turnNum` of `"0"` or `0` is rejected, only an actual `bigint` is accepted. Throws a plain
+ * `Error` (wrapped by the caller) on any mismatch.
+ */
+function strictState(v: unknown): State {
+  if (typeof v !== "object" || v === null) throw new Error("state must be an object");
+  const o = v as Record<string, unknown>;
+  const hex = (x: unknown): Hex => {
+    if (!isHexString(x)) throw new Error("not a 0x-hex string");
+    return x;
+  };
+  const big = (x: unknown): bigint => {
+    if (typeof x !== "bigint") throw new Error("not a bigint");
+    return x;
+  };
+  const int = (x: unknown): number => {
+    if (typeof x !== "number" || !Number.isSafeInteger(x) || x < 0) throw new Error("not a non-negative integer");
+    return x;
+  };
+  return {
+    channelId: hex(o.channelId),
+    turnNum: big(o.turnNum),
+    prevHash: hex(o.prevHash),
+    balanceA: big(o.balanceA),
+    balanceB: big(o.balanceB),
+    gameIndex: int(o.gameIndex),
+    move: int(o.move),
+    board: big(o.board),
+    meta: big(o.meta),
+  };
+}
+
+/** True for a SignedState whose `state` passes `strictState` and whose signatures are 0x-hex strings. */
+function isStrictSignedState(x: unknown): x is SignedState {
+  if (typeof x !== "object" || x === null) return false;
+  const o = x as Record<string, unknown>;
+  if (!isHexString(o.sigA) || !isHexString(o.sigB)) return false;
+  try {
+    strictState(o.state);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** True for `null` or a value that passes `isStrictSignedState` — the shape of every nullable snapshot field. */
+function isNullableSigned(x: unknown): boolean {
+  return x === null || isStrictSignedState(x);
+}
+
+/** True for a two-element array of 0x-hex strings — the shape of `closeSigs`/`closeSigTargets`. */
+function isHexPair(x: unknown): x is [Hex, Hex] {
+  return Array.isArray(x) && x.length === 2 && isHexString(x[0]) && isHexString(x[1]);
+}
+
 /** Validates a snapshot read from storage and fills fields added after it was written. Throws on malformed data. */
 function normalizeSnapshot(raw: SessionSnapshot): SessionSnapshot {
+  if (typeof raw !== "object" || raw === null) throw new ArenaProtocolError("malformed session snapshot");
   const s = structuredClone(raw) as Partial<SessionSnapshot>;
-  const isSigned = (x: unknown): x is SignedState =>
-    typeof x === "object" && x !== null && "state" in x && typeof (x as SignedState).sigA === "string";
   const ok =
-    typeof s.channelId === "string" &&
-    isSigned(s.latest) &&
-    (s.prev === null || isSigned(s.prev)) &&
-    (s.pendingCheckpoint === null || isSigned(s.pendingCheckpoint)) &&
-    (s.incomingCheckpoint === null || isSigned(s.incomingCheckpoint)) &&
+    isHexString(s.channelId) &&
+    isStrictSignedState(s.latest) &&
+    isNullableSigned(s.prev) &&
+    isNullableSigned(s.pendingCheckpoint) &&
+    isNullableSigned(s.incomingCheckpoint) &&
     (s.lastSignedTurn === null || typeof s.lastSignedTurn === "bigint") &&
-    (s.closeState === null || isSigned(s.closeState)) &&
-    Array.isArray(s.closeSigs) &&
-    s.closeSigs.length === 2;
+    (s.closeState === null || isStrictSignedState(s.closeState)) &&
+    isHexPair(s.closeSigs);
   if (!ok) throw new ArenaProtocolError("malformed session snapshot");
-  if (!Array.isArray(s.closeSigTargets) || s.closeSigTargets.length !== 2) {
+  if (s.closeSigTargets === undefined) {
+    // Added after some snapshots were written (see the field's own doc comment); default rather than reject.
     s.closeSigTargets = [ZERO_HASH, ZERO_HASH];
+  } else if (!isHexPair(s.closeSigTargets)) {
+    throw new ArenaProtocolError("malformed session snapshot");
   }
   return s as SessionSnapshot;
 }
@@ -226,7 +289,9 @@ export class ChannelSession {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
       if (draft.closeState !== null) throw new ArenaProtocolError(CLOSING_MESSAGE);
-      // Validation only reads `draft`; every write happens below, after it succeeded, and is persisted first.
+      // classifyIncoming only reads `draft` except when it adopts a move on this player's own pending checkpoint
+      // (R4): there it also signs with `draft` (equivocation guard + lastSignedTurn), same as every other write
+      // below — none of it is visible outside this method until `store.save(draft)` below succeeds and swaps in.
       const v = await this.asProtocolError(() => this.classifyIncoming(draft, msg));
       switch (v.kind) {
         case "on-pending":
@@ -285,18 +350,12 @@ export class ChannelSession {
     }
     const pending = draft.pendingCheckpoint;
     if (pending && s.turnNum === pending.state.turnNum + 1n) {
-      // R9: the opponent's first move on the checkpoint this player proposed. Their signature on a move that
-      // commits to the checkpoint endorses it (spec §4.3 rule 2), even if their countersignature never arrived.
-      const r = await this.moveOnPending(pending, s, sigA, sigB);
+      // R9/R4: the opponent's first move on the checkpoint this player proposed. Their signature on a move that
+      // commits to the checkpoint endorses it (spec §4.3 rule 2), even if their countersignature never arrived;
+      // this player also co-signs the move itself (inside moveOnPending), so it adopts fully signed and needs no
+      // predecessor to be provable — including when it is a terminal state (was the N1 refusal; see its docstring).
+      const r = await this.moveOnPending(draft, pending, s, sigA, sigB);
       if (!r.ok) throw new ArenaProtocolError(r.reason);
-      if (isGameOver(r.signed.state)) {
-        // N1: adopting a finished game here would leave `prev` a checkpoint signed only by this player, which the
-        // hub rejects as a proof and which no further move can repair. Stay at the terminal state (provable)
-        // until the countersignature arrives.
-        throw new ArenaProtocolError(
-          "refusing a finished game on a new-game checkpoint the opponent has not countersigned; waiting for the countersignature",
-        );
-      }
       return { kind: "on-pending", pending, signed: r.signed };
     }
     if (s.turnNum !== latest.turnNum + 1n) {
@@ -424,8 +483,11 @@ export class ChannelSession {
     const prev = this.data.prev;
     if (!prev) throw new ArenaProtocolError("no endorsed predecessor for the latest state");
     if (isCheckpoint(prev.state) && !this.endorsed(prev)) {
+      // Defensive: R4 co-signs every adopted move on this player's own pending checkpoint, so `latest` is fully
+      // signed and this branch is not reachable from that path any more; kept as a guard for any other path that
+      // might still leave `prev` a lone-signed checkpoint. Does not assume a move is possible from here.
       throw new ArenaProtocolError(
-        "the new-game checkpoint before the latest state lacks the opponent's countersignature; make your next move first or wait for the countersignature",
+        "the new-game checkpoint before the latest state lacks the opponent's countersignature; wait for the countersignature before challenging on this predecessor",
       );
     }
     return structuredClone({ hasPrev: true, prev, latest });
@@ -565,10 +627,15 @@ export class ChannelSession {
   /**
    * R9: checks that `s` is the opponent's move on this player's pending NEW_GAME checkpoint — the next turn,
    * committing to the checkpoint's hash, exactly the canonical successor, not itself a checkpoint, and signed by
-   * the checkpoint's mover (who must be the opponent). Returns the canonical state with only the opponent's
-   * signature, never the received object.
+   * the checkpoint's mover (who must be the opponent). R4: once verified, this player ALSO signs the move itself
+   * through the normal equivocation-guarded path (`signInto`, written into `draft`) — the opponent's signature on
+   * a state committing to the checkpoint already endorses the checkpoint (spec §4.3 rule 2), so nothing is lost by
+   * also co-signing the move; doing so makes the adopted state fully signed and provable with no predecessor,
+   * closing the liveness gap where a terminal C+1 left `prev` a checkpoint only this player had signed (N1).
+   * Returns the canonical, fully-signed state, never the received object.
    */
   private async moveOnPending(
+    draft: SessionSnapshot,
     pending: SignedState,
     s: State,
     sigA: Hex,
@@ -592,13 +659,15 @@ export class ChannelSession {
     if (!(await this.signedBy(this.opponent, expected, oppSig))) {
       return { ok: false, reason: "missing or invalid opponent signature" };
     }
-    return { ok: true, signed: this.withOnly(this.opponent, expected, oppSig) };
+    const signed = await this.signInto(draft, expected, this.withOnly(this.opponent, expected, oppSig));
+    return { ok: true, signed };
   }
 
   /**
-   * R9: adopts the opponent's move on the pending checkpoint. `prev` becomes the checkpoint with this player's
-   * signature and `latest` the canonical move with the opponent's, so this player's next move yields the proof
-   * `{prev: move (opponent-signed), latest: next move (self-signed)}` that the hub accepts.
+   * R9/R4: adopts the opponent's move on the pending checkpoint, already co-signed by this player (see
+   * `moveOnPending`). `latest` becomes that fully-signed move — provable on its own, `challengeProof` returns
+   * `hasPrev: false` for it — and `prev` becomes the checkpoint, still carrying only this player's signature; a
+   * countersignature that arrives later repairs it (harmless, since `latest` no longer depends on it).
    */
   private adoptMoveOnPending(draft: SessionSnapshot, pending: SignedState, move: SignedState): void {
     draft.prev = pending;
@@ -713,11 +782,11 @@ export class ChannelSession {
       }
     }
 
-    // (iv) R9: the opponent's move on this player's pending NEW_GAME checkpoint (e.g. registered by a challenge
-    // after their countersignature was withheld or lost).
+    // (iv) R9/R4: the opponent's move on this player's pending NEW_GAME checkpoint (e.g. registered by a challenge
+    // after their countersignature was withheld or lost), co-signed by this player (see moveOnPending).
     const pending = draft.pendingCheckpoint;
     if (pending) {
-      const r = await this.moveOnPending(pending, canonical, sigA, sigB);
+      const r = await this.moveOnPending(draft, pending, canonical, sigA, sigB);
       if (r.ok) return { signed: r.signed, onPending: true };
     }
 
