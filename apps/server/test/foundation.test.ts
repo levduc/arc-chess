@@ -1,5 +1,7 @@
+import { rmSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_LIMITS, parseServerConfig, type ServerConfig } from "../src/config.js";
+import { RpcChainReader, type HubLike } from "../src/chain.js";
 import { RateLimiter } from "../src/limits.js";
 import { SqliteRepo } from "../src/repo.js";
 import { startServer, type ArenaServer } from "../src/server.js";
@@ -19,6 +21,56 @@ describe("config", () => {
   it("names the bad field", () => {
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "nope" })).toThrow(/hub/);
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20), fundingWindow: "9000" })).toThrow(/fundingWindow/); // > 7200
+  });
+  it("rejects a non-positive rate-limit burst or perSec, naming the field", () => {
+    const base = validBase();
+    const bad1 = { ...base, limits: { ...DEFAULT_LIMITS, httpPostBurst: 0 } };
+    const bad2 = { ...base, limits: { ...DEFAULT_LIMITS, httpGetPerSec: -1 } };
+    expect(() => parseServerConfig(bad1)).toThrow(/httpPostBurst/);
+    expect(() => parseServerConfig(bad2)).toThrow(/httpGetPerSec/);
+  });
+  it("rejects a port outside 0..65535", () => {
+    const base = validBase();
+    expect(() => parseServerConfig({ ...base, port: 70_000 })).toThrow(/port/);
+    expect(() => parseServerConfig({ ...base, port: 1.5 })).toThrow(/port/);
+  });
+});
+
+function validBase() {
+  return {
+    rpcUrl: "http://x",
+    chainId: 31337,
+    hub: "0x" + "11".repeat(20),
+    usdc: "0x" + "22".repeat(20),
+    rules: "0x" + "33".repeat(20),
+  };
+}
+
+describe("chain", () => {
+  it("does not cache a rejected timeoutBounds forever", async () => {
+    let calls = 0;
+    const hub: HubLike = {
+      feeConfig() {
+        throw new Error("not used");
+      },
+      timeoutBounds() {
+        calls++;
+        return calls === 1 ? Promise.reject(new Error("rpc down")) : Promise.resolve({ min: 60n, max: 86_400n });
+      },
+      blockNumber() {
+        throw new Error("not used");
+      },
+      hubEvents() {
+        throw new Error("not used");
+      },
+    };
+    const reader = new RpcChainReader(
+      { rpcUrl: "http://127.0.0.1:1", chainId: 31337, hub: "0x" + "11".repeat(20) as `0x${string}` },
+      hub,
+    );
+    await expect(reader.timeoutBounds()).rejects.toThrow("rpc down");
+    await expect(reader.timeoutBounds()).resolves.toEqual({ min: 60n, max: 86_400n });
+    expect(calls).toBe(2);
   });
 });
 
@@ -51,6 +103,7 @@ describe("sqlite repo", () => {
     const r2 = new SqliteRepo(path);
     expect(r2.cursor()).toBe(42n);
     r2.close();
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(`${path}${suffix}`, { force: true });
   });
 
   it("runs the offer lifecycle: insert, match once, prune expired", () => {

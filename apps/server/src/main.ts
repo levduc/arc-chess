@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { parseServerConfig, type ServerConfig } from "./config.js";
+import { parseServerConfig } from "./config.js";
 import { startServer } from "./server.js";
 
 function log(level: "info" | "error", msg: string, fields: Record<string, unknown> = {}): void {
@@ -21,20 +21,24 @@ function parseArgs(argv: string[]): Map<string, string> {
   return args;
 }
 
-function applyOverrides(cfg: ServerConfig, args: Map<string, string>): ServerConfig {
-  const out = { ...cfg };
-  if (args.has("port")) out.port = Number(args.get("port"));
-  if (args.has("db")) out.dbPath = args.get("db")!;
-  if (args.has("public-url")) out.publicUrl = args.get("public-url")!;
-  if (args.has("host")) out.host = args.get("host")!;
-  return out;
+/** Merges `--port`/`--db`/`--public-url`/`--host` into the raw JSON *before* parsing, so a bad override (e.g. a
+ *  non-numeric or out-of-range `--port`) fails through parseServerConfig's own validation with a clear field
+ *  name, instead of silently producing an invalid ServerConfig. */
+function mergeOverrides(raw: unknown, args: Map<string, string>): unknown {
+  const base: Record<string, unknown> =
+    raw !== null && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, unknown>) } : {};
+  if (args.has("port")) base.port = args.get("port");
+  if (args.has("db")) base.dbPath = args.get("db");
+  if (args.has("public-url")) base.publicUrl = args.get("public-url");
+  if (args.has("host")) base.host = args.get("host");
+  return base;
 }
 
 export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
   const configPath = args.get("config");
   const raw = configPath ? JSON.parse(readFileSync(configPath, "utf8")) : {};
-  const cfg = applyOverrides(parseServerConfig(raw), args);
+  const cfg = parseServerConfig(mergeOverrides(raw, args));
 
   const server = await startServer(cfg);
   log("info", "listening", { url: server.url });
@@ -45,8 +49,13 @@ export async function main(argv: string[]): Promise<number> {
     if (closing) return;
     closing = true;
     log("info", "shutting down", { signal });
-    await server.close();
-    process.exit(0);
+    try {
+      await server.close();
+      process.exit(0);
+    } catch (err) {
+      log("error", "shutdown failed", { error: err instanceof Error ? err.message : String(err) });
+      process.exit(1);
+    }
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));

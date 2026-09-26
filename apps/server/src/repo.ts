@@ -89,9 +89,12 @@ export class SqliteRepo implements Repo {
 
   insertOffer(offerId: Hex, so: SignedOffer): boolean {
     const result = this.db
-      .prepare("INSERT OR IGNORE INTO offers (offer_id, player, expires_at, body, created_ms) VALUES (?, ?, ?, ?, ?)")
+      .prepare(
+        "INSERT INTO offers (offer_id, player, expires_at, body, created_ms) VALUES (?, ?, ?, ?, ?) " +
+          "ON CONFLICT(offer_id) DO NOTHING",
+      )
       .run(offerId, so.offer.player.toLowerCase(), padSeconds(so.offer.expiresAt), toWire(so), Date.now());
-    return Number(result.changes) === 1; // 0 changes means offer_id already existed and was ignored
+    return Number(result.changes) === 1; // 0 changes means offer_id already existed and was skipped
   }
 
   offer(offerId: Hex): OfferEntry | null {

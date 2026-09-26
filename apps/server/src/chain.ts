@@ -12,15 +12,18 @@ export interface ChainReader {
 
 const NOW_CACHE_MS = 1000;
 
+/** The subset of HubClient that RpcChainReader calls; lets tests inject a stub without a real viem client. */
+export type HubLike = Pick<HubClient, "feeConfig" | "timeoutBounds" | "blockNumber" | "hubEvents">;
+
 /** Reads the chain via viem/HubClient. No accounts, no signing — the server is untrusted plumbing (no keys, no
  *  funds). */
 export class RpcChainReader implements ChainReader {
   private readonly client: PublicClient;
-  private readonly hub: HubClient;
+  private readonly hub: HubLike;
   private cachedNow: { value: bigint; at: number } | undefined;
   private timeoutBoundsPromise: Promise<{ min: bigint; max: bigint }> | undefined;
 
-  constructor(cfg: Pick<ServerConfig, "rpcUrl" | "chainId" | "hub">) {
+  constructor(cfg: Pick<ServerConfig, "rpcUrl" | "chainId" | "hub">, hub?: HubLike) {
     const chain = defineChain({
       id: cfg.chainId,
       name: `arena-${cfg.chainId}`,
@@ -28,7 +31,7 @@ export class RpcChainReader implements ChainReader {
       rpcUrls: { default: { http: [cfg.rpcUrl] } },
     });
     this.client = createPublicClient({ chain, transport: http(cfg.rpcUrl) });
-    this.hub = new HubClient(cfg.hub, this.client);
+    this.hub = hub ?? new HubClient(cfg.hub, this.client);
   }
 
   async now(): Promise<bigint> {
@@ -44,8 +47,14 @@ export class RpcChainReader implements ChainReader {
   }
 
   timeoutBounds(): Promise<{ min: bigint; max: bigint }> {
-    // immutable on-chain, so memoize forever once fetched
-    if (!this.timeoutBoundsPromise) this.timeoutBoundsPromise = this.hub.timeoutBounds();
+    // immutable on-chain, so memoize forever once fetched -- but a rejection (e.g. RPC down) must not stick
+    // around forever, or every future call fails even after the chain recovers
+    if (!this.timeoutBoundsPromise) {
+      this.timeoutBoundsPromise = this.hub.timeoutBounds().catch((err: unknown) => {
+        this.timeoutBoundsPromise = undefined;
+        throw err;
+      });
+    }
     return this.timeoutBoundsPromise;
   }
 

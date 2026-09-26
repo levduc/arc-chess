@@ -91,6 +91,16 @@ function bigint(obj: Record<string, unknown>, field: string, fallback: bigint): 
   fail(field, "must be a decimal string or an integer number");
 }
 
+// these feed RateLimiter token buckets directly; zero or negative breaks refill math and makes take() nonsensical
+const RATE_LIMIT_FIELDS: Array<keyof Limits> = [
+  "httpPostBurst",
+  "httpPostPerSec",
+  "httpGetBurst",
+  "httpGetPerSec",
+  "wsFrameBurst",
+  "wsFramePerSec",
+];
+
 function parseLimits(obj: Record<string, unknown>): Limits {
   const raw = obj.limits;
   if (raw === undefined) return { ...DEFAULT_LIMITS };
@@ -98,6 +108,9 @@ function parseLimits(obj: Record<string, unknown>): Limits {
   const out = { ...DEFAULT_LIMITS };
   for (const key of Object.keys(DEFAULT_LIMITS) as Array<keyof Limits>) {
     out[key] = num(r, key, DEFAULT_LIMITS[key]);
+  }
+  for (const key of RATE_LIMIT_FIELDS) {
+    if (!(out[key] > 0)) fail(`limits.${key}`, "must be positive");
   }
   return out;
 }
@@ -108,6 +121,7 @@ export function parseServerConfig(raw: unknown): ServerConfig {
 
   const host = str(obj, "host", "127.0.0.1");
   const port = num(obj, "port", 8080);
+  if (!Number.isInteger(port) || port < 0 || port > 65_535) fail("port", "must be an integer between 0 and 65535");
   const publicUrl = str(obj, "publicUrl", "");
   const rpcUrl = str(obj, "rpcUrl");
   const publicRpcUrl = str(obj, "publicRpcUrl", "");
