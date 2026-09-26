@@ -71,7 +71,7 @@ is gated on an external audit and a legal review (§11).
 | 4 | Host server | `apps/server` | Template registry, `skill.md`/`llms.txt`, lobby, WebSocket relay, chain indexer, spectator page, reputation | No (untrusted plumbing) |
 | 5 | Dev / ops harness | `scripts/`, `deploy/` | `dev:up`, e2e scenarios, deployment scripts for Anvil / Arc Testnet / Arc mainnet | Deployer key (ops) |
 
-pnpm workspaces; TypeScript on Node ≥ 20; Foundry for Solidity; OpenZeppelin
+pnpm workspaces; TypeScript on Node ≥ 20 (Node ≥ 24, see §12 item 15); Foundry for Solidity; OpenZeppelin
 contracts; viem for chain access.
 
 ### 3.1 Wallet abstraction (`TxSender`)
@@ -497,3 +497,80 @@ accept-draw / next-game / close buttons.
     unlock funds without the opponent's cooperation, on- or off-chain. A `C` countersignature that later arrives
     anyway is still accepted and repairs the stored predecessor, but this is now cosmetic, since `C+1`'s
     provability never depended on it.
+15. **Node floor.** The host server uses `node:sqlite`, so the workspace requires Node ≥ 24; this supersedes §3's
+    "Node ≥ 20".
+16. **One WebSocket endpoint.** `GET /ws` multiplexes lobby match events and relay traffic, and replaces §5's
+    `WS /lobby` and `WS /relay/:channelId`.
+    - Each connection receives a random nonce in its `hello` frame.
+    - A relay `join` carries the channel's `Params` (self-certifying: the server recomputes `channelId`) and a
+      session-key EIP-191 (`personal_sign`) signature over `keccak256(abi.encode("arena-relay-join", channelId,
+      nonce))`.
+    - The server accepts a join only for a channel it knows that is not settled: one its lobby matched (the
+      match records the `channelId`), or one its indexer has seen on-chain. A channel whose indexer row is
+      `Finalized` or `Reclaimed` counts as unknown, so its pruned cache cannot be refilled; daemons leave a
+      channel when they mark it settled and never need the relay after that. Any other join is refused with
+      `unknown channel`. Why: otherwise anyone could mint throwaway channels and fill the host's disk through the
+      relay cache. The CLI
+      treats this refusal as transient and retries the join on the next `hello`, because the host can learn of
+      the channel later, for example once its indexer sees `ChannelCreated`. A retry costs one frame per
+      reconnect.
+    - A `leave` frame removes the connection from one channel and frees its slot under the per-connection join
+      limit. The daemon sends it as soon as it marks a channel settled or retired.
+    - Lobby `subscribe` frames name offer ids and are unauthenticated: a match event only reveals params that
+      become public on-chain at deposit. An `unsubscribe` frame frees the slots again. The daemon unwatches, and
+      deletes, an offer record once `expiresAt + maxFundingWindow` (7200 s) has passed.
+    - The server persists matches and replays them on subscribe, so an offerer who was offline at match time
+      still funds. The daemon judges an offer's expiry at match time, not when it processes the match: it refuses
+      a match only when `fundingDeadline > expiresAt + maxFundingWindow`, which shows the match was made after
+      expiry. It still requires `fundingDeadline > now`. An offerer who comes back after `expiresAt` to a match
+      made in time therefore still funds.
+    - The server sends an application-level `ping` frame every 25 s. A client that receives no frame for 70 s
+      treats the connection as dead (for example half-open after a sleep) and reconnects.
+17. **Relay cache.** The relay caches, per channel and sender, the 4 highest-turn `state` messages and the latest
+    `close`. A state with the same `turnNum` as a held one replaces it. A state lower than all 4 held ones is
+    dropped, so a lower turn never evicts a higher one. The relay caches a state only if it carries a valid
+    signature of its sender. It replays the peer's cached states to a (re)joining member in ascending `turnNum`
+    order, then the peer's close. Why 4 and not 1: a player who resigns at turn *n* and at once proposes the next
+    game at *n*+1 sends two states in a row, and a peer who missed both needs *n* before it can accept *n*+1.
+    The extra slots also absorb re-sends.
+    - Daemons re-send their latest own-signed state, a pending own new-game proposal, and their Close signature
+      every time a join is confirmed.
+    - `ChannelSession.receive` answers re-sent messages with `duplicate`/`stale` instead of an error. A different
+      state at the latest turn remains an error.
+    - When the indexer applies `Finalized` or `Reclaimed`, it stores the relay's latest verified state and the
+      games count derived from it on the channel row. It deletes the channel's relay cache a day later. After
+      that, reputation and `/api/channels` read the stored values.
+    - The server deletes a matched offer a day past its funding deadline if its channel never reached the chain
+      or is settled. For a channel that never reached the chain, it also deletes the relay cache in the same
+      transaction, because no indexer row will ever schedule that cache for pruning.
+18. **Dispute scan cursor.** Daemons scan `Challenged`/`Responded` events forward from a persisted per-channel
+    cursor, in chunks of `logChunkBlocks` (default 1000). They never advance past an event that failed to
+    ingest, and a `getLogs` failure does not stop the rest of the watchtower pass. Every scan also re-reads the
+    trailing 32 blocks behind the cursor. Why: a load-balanced RPC's `blockNumber` can run ahead of its own
+    `getLogs` index, and a shallow reorg can drop an event, so a single pass can miss an event for good.
+    `ingestOnChain` ignores states it already holds, so the overlap is harmless. The server indexer uses the same
+    pattern over all hub events: chunked cursor plus a trailing 32-block rescan, with `apply` idempotent through
+    each row's `lastEvent`. A rescanned chunk never moves the indexer's cursor back.
+19. **Host connection lifecycle (CLI).**
+    - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
+      or the local API. A failed join is recorded as the channel's `lastError`.
+    - After a reconnect, re-joins go out at 10 per second or fewer, and only for channels that are not settled.
+      That is half the server's default sustained frame rate of 20 per second, because every confirmed join
+      makes the daemon re-send frames of its own. The loop stops at the first "too many channels on this
+      connection" refusal, and the remaining joins wait for the next `hello`.
+    - The reconnect backoff resets only after a connection has stayed up for 30 s past `hello`. A server that
+      accepts the connection and drops it at once therefore sees a growing delay.
+20. **Per-IP limits.** The server keys every per-IP limit (the HTTP token buckets, `wsPerIp` and
+    `maxOpenOffersPerIp`) as follows:
+    - an IPv4 address counts as itself, and an IPv4-mapped IPv6 address counts as its IPv4 address;
+    - an IPv6 address counts by its /64 prefix;
+    - with `trustProxy` set, the key is the right-most `X-Forwarded-For` entry. The default is off: the key is the
+      socket peer. Behind a reverse proxy, `trustProxy` must be on, or every client shares the proxy's buckets.
+21. **`arena init --server` trust.** `/templates` also publishes an `rpcUrl`. The addresses and the RPC it
+    publishes decide where deposits go and what the watchtower sees, so the host is trusted for them.
+    - When `init` adopts any of these values, it checks over that RPC that `eth_chainId` matches and that the hub
+      and rules addresses hold code. It fails otherwise.
+    - It prints every chain value with a `trust` line, and warns on stderr about a non-loopback `http://` server.
+    - With `--rpc/--chain-id/--hub/--usdc/--rules` all given, it makes no network call.
+    - This refines §9's "host holds nothing". The host still holds no funds or keys, but agents must verify the
+      published addresses, or pass them explicitly, and should preferably use their own RPC.

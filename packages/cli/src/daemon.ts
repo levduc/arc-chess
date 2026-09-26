@@ -8,8 +8,12 @@ import {
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
+  SerialTxSender,
+  ZERO_HASH,
   channelId as computeChannelId,
+  chunkRanges,
   checkMatchParams,
+  hashState,
   isGameOver,
   mover,
   offerId as computeOfferId,
@@ -24,7 +28,7 @@ import {
   type RelayMessage,
   type SignedState,
 } from "@arena/sdk";
-import { arenaPaths, isCanonicalId, type ArenaConfig } from "./config.js";
+import { arenaPaths, isCanonicalId, DEFAULT_LOG_CHUNK_BLOCKS, type ArenaConfig } from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
@@ -54,7 +58,7 @@ export type ChainView = {
 export type ChannelHandle = {
   record: ChannelRecord;
   session: ChannelSession;
-  sessionSender: LocalKeyTxSender;
+  sessionSender: SerialTxSender;
   processedEvents: number;
   chain: ChainView | null;
   lastError: string | null;
@@ -82,10 +86,22 @@ export type DaemonOptions = {
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
 
+/**
+ * I3: on every scan, re-read this many blocks behind the persisted cursor, not just forward from it. A
+ * load-balanced RPC's `blockNumber()` can outrun its own `getLogs` index (or, on a real chain, a shallow reorg
+ * can drop and re-mine a block), so trusting a single pass at a reported head can permanently skip an event
+ * that was there all along. `ingestOnChain` is idempotent for a state it already holds, so re-reading is safe.
+ */
+export const DISPUTE_RESCAN_BLOCKS = 32n;
+
+/** The furthest out a funding deadline may be set from match time (`checkMatchParams`' `maxFundingWindow`): an
+ *  offer this long past its expiry can no longer produce a fundable match. */
+export const MAX_FUNDING_WINDOW = 7200n;
+
 export class ArenaDaemon {
   readonly client: PublicClient;
   readonly hub: HubClient;
-  readonly wallet: LocalKeyTxSender;
+  readonly wallet: SerialTxSender;
   protected readonly chain: Chain;
   protected readonly domain: ArenaDomain;
   protected readonly records: RecordStore;
@@ -101,6 +117,8 @@ export class ArenaDaemon {
   private stopped = false;
   /** I3: offerIds currently being turned into a channel — guards against two match events racing the same offer. */
   private readonly claiming = new Set<Hex>();
+  /** Guards against two concurrent acceptOffer calls for the same offerId both going through. */
+  private readonly accepting = new Set<Hex>();
 
   constructor(protected readonly opts: DaemonOptions) {
     const c = opts.config;
@@ -112,7 +130,7 @@ export class ArenaDaemon {
     });
     this.client = createPublicClient({ chain: this.chain, transport: http(c.rpcUrl) });
     this.hub = new HubClient(c.hub, this.client);
-    this.wallet = new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain);
+    this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain));
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
@@ -123,6 +141,7 @@ export class ArenaDaemon {
   async start(): Promise<void> {
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => void this.onMatch(m)));
     this.unsubscribers.push(this.opts.relay.onMessage((m) => void this.onRelay(m)));
+    this.unsubscribers.push(this.opts.relay.onJoined((id) => void this.onJoined(id)));
     // I1: every channel entry is loaded in isolation. A corrupt record or session file, or a record that does not
     // match this hub/chain, is logged and reported as degraded (see channels()) instead of aborting start() —
     // which would leave every other channel, including ones mid-dispute, unwatched.
@@ -136,16 +155,15 @@ export class ArenaDaemon {
       try {
         await this.openChannel(entry.record);
       } catch (err) {
-        const opened = this.live.get(entry.record.channelId);
-        if (opened) {
-          // The session loaded and the channel is watched; only the relay join/re-send failed.
-          opened.lastError = `relay: ${errorText(err)}`;
-          this.log(`channel ${entry.channelId}: ${opened.lastError}`);
-        } else {
-          this.markDegraded(entry.channelId, errorText(err));
-        }
+        // only a session that failed to load gets here: a relay join failure is recorded as the channel's
+        // lastError by openChannel itself, without holding up this loop
+        this.markDegraded(entry.channelId, errorText(err));
       }
     }
+    // Records that can no longer produce a fundable match go first, so they are never subscribed at all.
+    if (!this.stopped) await this.pruneOffers();
+    // Replays match events for offers this daemon posted/accepted while it was down.
+    this.opts.lobby.watch(this.records.offers().map((o) => o.offerId));
     // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see
     // attention right after a restart instead of waiting up to pollMs for the first periodic tick.
     if (!this.stopped) await this.tick();
@@ -206,7 +224,14 @@ export class ArenaDaemon {
     };
     const id = computeOfferId(offer);
     this.records.saveOffer({ offerId: id, offer, sessionKey, role: "offerer" });
-    await this.opts.lobby.postOffer({ offer, sig: await signOffer(sessionKey, offer) });
+    try {
+      await this.opts.lobby.postOffer({ offer, sig: await signOffer(sessionKey, offer) });
+    } catch (err) {
+      // M12: an offer the host refused can never be matched; a record left behind would be watched forever
+      this.records.removeOffer(id);
+      throw err;
+    }
+    this.opts.lobby.watch([id]);
     return { offerId: id };
   }
 
@@ -222,38 +247,48 @@ export class ArenaDaemon {
   async acceptOffer(offerIdInput: Hex): Promise<void> {
     const offerId = (typeof offerIdInput === "string" ? offerIdInput.toLowerCase() : "") as Hex;
     if (!isCanonicalId(offerId)) throw new DaemonError(400, "offerId must be 0x followed by 64 hex characters");
-    // M-d: accepting is idempotent — an existing acceptance is never replaced by one under a new session key
-    // (the host may already have matched the first one; a new key would make this daemon reject that match).
-    const channel = this.channelForOffer(offerId);
-    if (channel) throw new DaemonError(409, `offer ${offerId} was already accepted (channel ${channel})`);
-    const existing = this.records.offer(offerId);
-    if (existing) {
-      if (existing.role !== "accepter") throw new DaemonError(400, "cannot accept your own offer");
-      if (!existing.acceptance) throw new DaemonError(409, `offer ${offerId} was already accepted`);
-      // A retry re-sends the stored acceptance: same session key, same signature.
-      try {
-        await this.opts.lobby.accept(existing.acceptance);
-      } catch (err) {
-        throw new DaemonError(409, `offer ${offerId} was already accepted; the host did not take it again: ${errorText(err)}`);
+    // Guards against two concurrent acceptOffer calls for the same offer both reaching the host (M-carry):
+    // the loser fails fast here instead of racing the winner through listOffers()/sign/accept below.
+    if (this.accepting.has(offerId)) throw new DaemonError(409, `offer ${offerId} is already being accepted`);
+    this.accepting.add(offerId);
+    try {
+      // M-d: accepting is idempotent — an existing acceptance is never replaced by one under a new session key
+      // (the host may already have matched the first one; a new key would make this daemon reject that match).
+      const channel = this.channelForOffer(offerId);
+      if (channel) throw new DaemonError(409, `offer ${offerId} was already accepted (channel ${channel})`);
+      const existing = this.records.offer(offerId);
+      if (existing) {
+        if (existing.role !== "accepter") throw new DaemonError(400, "cannot accept your own offer");
+        if (!existing.acceptance) throw new DaemonError(409, `offer ${offerId} was already accepted`);
+        // A retry re-sends the stored acceptance: same session key, same signature.
+        try {
+          await this.opts.lobby.accept(existing.acceptance);
+        } catch (err) {
+          throw new DaemonError(409, `offer ${offerId} was already accepted; the host did not take it again: ${errorText(err)}`);
+        }
+        this.opts.lobby.watch([offerId]);
+        return;
       }
-      return;
+      const so = (await this.opts.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
+      if (!so) throw new DaemonError(404, `offer ${offerId} not found`);
+      if (so.offer.player.toLowerCase() === this.wallet.address.toLowerCase()) {
+        throw new DaemonError(400, "cannot accept your own offer");
+      }
+      const sessionKey = generatePrivateKey();
+      const acceptance = {
+        offerId,
+        player: this.wallet.address,
+        signer: privateKeyToAccount(sessionKey).address,
+        nonce: `0x${randomBytes(32).toString("hex")}` as Hex,
+      };
+      const signed = { acceptance, sig: await signAcceptance(sessionKey, acceptance) };
+      // Crash ordering: the record (with the signed acceptance) is on disk before the acceptance leaves.
+      this.records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter", acceptance: signed });
+      await this.opts.lobby.accept(signed);
+      this.opts.lobby.watch([offerId]);
+    } finally {
+      this.accepting.delete(offerId);
     }
-    const so = (await this.opts.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
-    if (!so) throw new DaemonError(404, `offer ${offerId} not found`);
-    if (so.offer.player.toLowerCase() === this.wallet.address.toLowerCase()) {
-      throw new DaemonError(400, "cannot accept your own offer");
-    }
-    const sessionKey = generatePrivateKey();
-    const acceptance = {
-      offerId,
-      player: this.wallet.address,
-      signer: privateKeyToAccount(sessionKey).address,
-      nonce: `0x${randomBytes(32).toString("hex")}` as Hex,
-    };
-    const signed = { acceptance, sig: await signAcceptance(sessionKey, acceptance) };
-    // Crash ordering: the record (with the signed acceptance) is on disk before the acceptance leaves.
-    this.records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter", acceptance: signed });
-    await this.opts.lobby.accept(signed);
   }
 
   private async onMatch(m: MatchEvent): Promise<void> {
@@ -302,9 +337,12 @@ export class ArenaDaemon {
       const fee = await this.hub.feeConfig();
       if (this.stopped) return release();
       const now = (await this.client.getBlock()).timestamp;
-      // M4: an offer the host matched after it expired must never be funded.
-      if (now >= rec.offer.expiresAt) {
-        this.log(`ignoring match for offer ${offerId}: offer has expired`);
+      // M4/I5: an offer the host matched after it expired must never be funded. Judged at match time, not now: the
+      // host sets fundingDeadline = matchTime + fundingWindow (at most MAX_FUNDING_WINDOW), so a deadline beyond
+      // expiresAt + MAX_FUNDING_WINDOW proves a late match, while an offerer who comes back after expiresAt to a
+      // match made in time still funds (checkMatchParams below still requires fundingDeadline > now).
+      if (m.params.fundingDeadline > rec.offer.expiresAt + MAX_FUNDING_WINDOW) {
+        this.log(`ignoring match for offer ${offerId}: it was matched after the offer expired`);
         return release();
       }
       // M3: fee equality — accept only the hub's current fee, and only if it is within this player's ceiling.
@@ -321,7 +359,7 @@ export class ArenaDaemon {
         minFeePerPlayer: fee.feePerPlayer,
         maxFeePerPlayer,
         now,
-        maxFundingWindow: 7200n,
+        maxFundingWindow: MAX_FUNDING_WINDOW,
       });
       if (problem) {
         this.log(`ignoring match for offer ${offerId}: ${problem}`);
@@ -384,14 +422,59 @@ export class ArenaDaemon {
     // I3/M1: re-check immediately before mutating `live` — the await above is a window another call (or a
     // stop()) could have used to already open this same channel, or to stop the daemon.
     if (this.stopped || this.live.has(record.channelId)) return;
-    const sessionSender = new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain);
-    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false });
-    await this.opts.relay.join(record.channelId, record.sessionKey);
-    // Crash recovery (Review Focus 5): re-send our latest own state so a message lost at the crash is delivered.
-    const latest = session.latest;
-    const mine = record.me === 0 ? latest.sigA : latest.sigB;
-    if (latest.state.turnNum > 0n && mine !== "0x") {
-      await this.opts.relay.send({ type: "state", channelId: record.channelId, signed: latest }).catch(() => undefined);
+    const sessionSender = new SerialTxSender(
+      new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
+    );
+    const signer = privateKeyToAccount(record.sessionKey);
+    const l: ChannelHandle = { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false };
+    this.live.set(record.channelId, l);
+    // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
+    // handled uniformly by onJoined() for the first join and for every later reconnect.
+    // I4: not awaited -- a slow or silent host must never hold up start() and with it the watchtower.
+    this.opts.relay.join(record.channelId, record.params, signer).catch((err: unknown) => {
+      if (l.record.finalized) return; // leave() rejected a join still in flight: nothing to report on a settled channel
+      l.lastError = `relay: ${errorText(err)}`;
+      this.log(`channel ${record.channelId}: ${l.lastError}`);
+    });
+  }
+
+  /**
+   * §7 relay reconnect: re-send this player's latest own-signed state, any pending own checkpoint proposal (the
+   * opponent may have missed it), and its Close signature, if any — so a message lost while disconnected (or
+   * before the very first join completed) is delivered once the relay confirms membership. Fires on the first
+   * join and again on every later reconnect.
+   */
+  private async onJoined(id: Hex): Promise<void> {
+    if (this.stopped) return;
+    const l = this.live.get(id);
+    if (!l || l.record.finalized) return;
+    const snap = l.session.snapshot();
+    const me = l.record.me;
+    const latest = snap.latest;
+    const mine = me === 0 ? latest.sigA : latest.sigB;
+    try {
+      if (latest.state.turnNum > 0n && mine !== "0x") {
+        await this.opts.relay.send({ type: "state", channelId: id, signed: latest });
+      }
+      if (this.stopped) return;
+      if (snap.pendingCheckpoint) {
+        await this.opts.relay.send({ type: "state", channelId: id, signed: snap.pendingCheckpoint });
+      }
+      if (this.stopped) return;
+      const closeSig = snap.closeSigs[me];
+      if (closeSig !== "0x") {
+        // Older snapshots (written before closeSigTargets existed) default that field to the zero hash on
+        // load — recompute the hash from closeState rather than re-send a target that can no longer verify.
+        const target = snap.closeSigTargets[me];
+        const stateHash =
+          target !== ZERO_HASH ? target : hashState((snap.closeState ?? snap.latest).state, this.domain);
+        await this.opts.relay.send({ type: "close", channelId: id, close: { stateHash, by: me, sig: closeSig } });
+      }
+      // A join failure recorded here earlier (e.g. the first join at start(), or a previous reconnect) no
+      // longer applies once a re-send round trips successfully.
+      if (l.lastError?.startsWith("relay:")) l.lastError = null;
+    } catch (err) {
+      l.lastError = `relay: ${errorText(err)}`;
     }
   }
 
@@ -430,9 +513,11 @@ export class ArenaDaemon {
     if (!l) return;
     try {
       if (msg.type === "state") {
-        await l.session.receive(msg.signed);
+        // A re-send after a reconnect (§7) can land as "duplicate" (we already hold it) or "stale" (we've moved
+        // past it): both are success, not an error, and neither needs an autoPlay pass.
+        const result = await l.session.receive(msg.signed);
         if (this.stopped) return;
-        await this.autoPlay(l);
+        if (result !== "duplicate" && result !== "stale") await this.autoPlay(l);
       } else {
         await l.session.receiveClose(msg.close);
         if (this.stopped) return;
@@ -572,6 +657,7 @@ export class ArenaDaemon {
     if (this.stopped || this.ticking) return;
     this.ticking = true;
     try {
+      await this.pruneOffers();
       for (const l of this.live.values()) {
         if (this.stopped) break;
         if (l.record.finalized) continue;
@@ -586,6 +672,33 @@ export class ArenaDaemon {
       this.ticking = false;
       if (!this.stopped) this.notify();
     }
+  }
+
+  /**
+   * I3: drops offer records that can no longer produce a fundable match (`expiresAt + MAX_FUNDING_WINDOW` is past)
+   * and stops watching them, so expired offers never pile up against the host's per-connection watch limit.
+   */
+  private async pruneOffers(): Promise<void> {
+    try {
+      const recs = this.records.offers();
+      if (recs.length === 0) return;
+      const now = (await this.client.getBlock()).timestamp;
+      const dead = recs.filter((r) => r.offer.expiresAt + MAX_FUNDING_WINDOW < now && !this.claiming.has(r.offerId));
+      if (dead.length === 0) return;
+      for (const r of dead) this.records.removeOffer(r.offerId);
+      this.opts.lobby.unwatch(dead.map((r) => r.offerId));
+    } catch (err) {
+      this.log(`offer pruning failed: ${errorText(err)}`);
+    }
+  }
+
+  /** Marks a channel settled or retired, persists it, and leaves its relay channel: nothing is sent on it again,
+   *  and its slot on the host connection is freed (I2). Idempotent. */
+  private markFinalized(l: ChannelHandle): void {
+    if (l.record.finalized) return;
+    l.record = { ...l.record, finalized: true };
+    this.records.saveChannel(l.record);
+    this.opts.relay.leave(l.record.channelId);
   }
 
   /** One watchtower pass for one channel (spec §6.3). Runs regardless of the controller. */
@@ -607,8 +720,7 @@ export class ArenaDaemon {
       // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
       // ChannelHub.sol) — mark it here, synchronously with our own confirmed tx, instead of only via the
       // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
-      l.record = { ...l.record, finalized: true };
-      this.records.saveChannel(l.record);
+      this.markFinalized(l);
     } else if (info.phase === "None" || (info.phase === "Funding" && !info.funded[me])) {
       // I4: the funding window closed and none of our money is in the channel (nobody funded, or only the
       // opponent did — theirs is theirs to reclaim). The channel can never open: retire it (abandoned), so it
@@ -619,27 +731,16 @@ export class ArenaDaemon {
       const fresh = await this.hub.channelInfo(id);
       if (!(fresh.phase === "None" || (fresh.phase === "Funding" && !fresh.funded[me]))) return;
       this.log(`channel ${id}: funding window closed without our deposit; retiring it`);
-      l.record = { ...l.record, finalized: true };
-      this.records.saveChannel(l.record);
+      this.markFinalized(l);
       await this.refreshChain(l);
       return;
     }
 
-    // 2. Adopt on-chain states from dispute events, in order. Stop at the first ingest failure (R9/4) and
-    // retry it next tick — advancing past a failed event would permanently skip it, since events are never
-    // revisited once `processedEvents` passes them.
+    // 2. Adopt on-chain states from dispute events (I3): scan forward from the persisted cursor in bounded chunks
+    // (real RPCs cap getLogs ranges), ingest in order, and never move the cursor past an event that failed to
+    // ingest. ingestOnChain ignores states it already holds, so re-reading a partly ingested block is harmless.
     if (this.stopped) return;
-    const events = await this.hub.disputeEvents(id, l.record.createdBlock);
-    let processed = l.processedEvents;
-    for (; processed < events.length; processed++) {
-      try {
-        await l.session.ingestOnChain(events[processed].signed);
-      } catch (err) {
-        l.lastError = `ingest: ${errorText(err)}`;
-        break;
-      }
-    }
-    l.processedEvents = processed;
+    await this.scanDisputes(l);
 
     // 3. Disputes (spec §6.3).
     if (this.stopped) return;
@@ -670,19 +771,65 @@ export class ArenaDaemon {
         // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:
         // `timeout()` itself only resolves one RPC round trip after Anvil mines the tx and flips the on-chain
         // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
-        l.record = { ...l.record, finalized: true };
-        this.records.saveChannel(l.record);
+        this.markFinalized(l);
       }
     }
 
     // 4. Settled channels are done.
     if (this.stopped) return;
     const after = await this.hub.channelInfo(id);
-    if (after.phase === "Finalized" || after.phase === "Reclaimed") {
-      l.record = { ...l.record, finalized: true };
-      this.records.saveChannel(l.record);
-    }
+    if (after.phase === "Finalized" || after.phase === "Reclaimed") this.markFinalized(l);
     await this.refreshChain(l);
+  }
+
+  /**
+   * I3: scans dispute events forward from the persisted cursor (`record.scannedBlock`, or `createdBlock - 1n`
+   * for a channel never scanned before) in chunks of at most `logChunkBlocks` blocks — real RPCs cap the range
+   * a single `getLogs` call may cover. Ingests events in order and never advances the cursor past one that
+   * failed to ingest (R9/4): it is retried, unskipped, on the next pass. Every scan also re-reads the trailing
+   * `DISPUTE_RESCAN_BLOCKS` blocks behind the cursor (never before `createdBlock`), so a `getLogs` result that
+   * silently omitted an event on an earlier pass — a load-balanced RPC whose head outran its own log index, or
+   * a shallow reorg — still gets a later chance; `ingestOnChain` ignores a state it already holds, so the
+   * overlap is harmless.
+   */
+  private async scanDisputes(l: ChannelHandle): Promise<void> {
+    const id = l.record.channelId;
+    const size = BigInt(this.opts.config.logChunkBlocks ?? DEFAULT_LOG_CHUNK_BLOCKS);
+    const scanned = l.record.scannedBlock ?? l.record.createdBlock - 1n;
+    const rescanFrom = scanned + 1n - DISPUTE_RESCAN_BLOCKS;
+    const start = rescanFrom > l.record.createdBlock ? rescanFrom : l.record.createdBlock;
+    let cursor = scanned; // only moves forward as chunks succeed; a scan with nothing new leaves it unchanged
+    try {
+      const head = await this.hub.blockNumber();
+      // At most 50 chunks per tick, so a long-dormant channel catches up over a few ticks without starving the others.
+      for (const r of chunkRanges(start, head, size).slice(0, 50)) {
+        if (this.stopped) break;
+        const events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
+        for (const e of events) {
+          try {
+            await l.session.ingestOnChain(e.signed);
+            l.processedEvents++;
+          } catch (err) {
+            l.lastError = `ingest: ${errorText(err)}`;
+            this.saveCursor(l, e.blockNumber - 1n);
+            return;
+          }
+        }
+        cursor = r.toBlock;
+      }
+      // Saved once for the whole pass (not per chunk): every ingest above already succeeded (or the loop
+      // returned early on the first failure), so this is the real, fully-ingested scanned head.
+      this.saveCursor(l, cursor);
+      if (l.lastError?.startsWith("events:") || l.lastError?.startsWith("ingest:")) l.lastError = null;
+    } catch (err) {
+      l.lastError = `events: ${errorText(err)}`;
+    }
+  }
+
+  private saveCursor(l: ChannelHandle, block: bigint): void {
+    if (l.record.scannedBlock === block) return;
+    l.record = { ...l.record, scannedBlock: block };
+    this.records.saveChannel(l.record);
   }
 
   // ------------------------------------------------------------------ status

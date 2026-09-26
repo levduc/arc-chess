@@ -8,6 +8,7 @@ import {
   HubRevertError,
   LocalKeyTxSender,
   MemoryStore,
+  chunkRanges,
   signState,
   type CloseTransaction,
   type SessionConfig,
@@ -341,5 +342,49 @@ describe("HubClient.disputeEvents", () => {
     expect(heads).toBe(1);
     expect(calls.map((c) => c.eventName).sort()).toEqual(["Challenged", "Responded"]);
     for (const c of calls) expect([c.fromBlock, c.toBlock]).toEqual([7n, 42n]);
+  });
+});
+
+describe("hub scans", () => {
+  it("chunkRanges splits inclusive ranges", () => {
+    expect(chunkRanges(10n, 12n, 2n)).toEqual([
+      { fromBlock: 10n, toBlock: 11n },
+      { fromBlock: 12n, toBlock: 12n },
+    ]);
+    expect(chunkRanges(5n, 4n, 10n)).toEqual([]);
+    expect(() => chunkRanges(0n, 1n, 0n)).toThrow();
+  });
+
+  // No existing lifecycle test both challenges and closes cooperatively (Finalized) in one flow; this scenario
+  // (challenge -> timeout -> Finalized, no Responded) is built fresh, mirroring "challenges via a session key,
+  // answers on-chain..." up to its first challenge/timeout instead of sharing state across `it` blocks.
+  it("hubEvents decodes a challenged-then-finalized channel in order; disputeEvents honours toBlock", async () => {
+    const x = await arena("hub-scan");
+    const { a, b } = await open(x);
+    const id = a.id;
+    const params = x.params;
+    const aliceSessionSender = new LocalKeyTxSender(x.sessionKeys[0], RPC, CHAIN);
+    await setEthBalance(aliceSessionSender.address, 10n ** 18n);
+
+    const e4 = await a.move("e2e4");
+    await b.receive(e4); // Bob goes quiet instead of answering
+    await x.hub.challenge(aliceSessionSender, a.challengeProof());
+    await increaseTime(Number(x.params.challengeTimeout));
+    await x.hub.timeout(x.alice, id);
+    expect((await x.hub.channelInfo(id)).phase).toBe("Finalized");
+
+    const events = await x.hub.hubEvents(0n, await x.hub.blockNumber());
+    const kinds = events.filter((e) => e.channelId === id).map((e) => e.kind);
+    expect(kinds[0]).toBe("ChannelCreated");
+    expect(kinds).toContain("Deposited");
+    expect(kinds).toContain("Opened");
+    expect(kinds.at(-1)).toMatch(/Finalized|Reclaimed/);
+    const created = events.find((e) => e.kind === "ChannelCreated" && e.channelId === id);
+    expect(created && created.kind === "ChannelCreated" && created.params).toEqual(params);
+
+    const all = await x.hub.disputeEvents(id, 0n);
+    expect(all.map((e) => e.kind)).toEqual(["Challenged"]); // Bob never responded
+    const first = all[0];
+    expect(await x.hub.disputeEvents(id, 0n, first.blockNumber - 1n)).toEqual([]);
   });
 });

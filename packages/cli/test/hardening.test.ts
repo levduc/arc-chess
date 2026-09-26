@@ -262,4 +262,89 @@ describe("minor fixes", () => {
     expect(sent).toHaveLength(2);
     await expect(bob.daemon.acceptOffer("./0x1234" as Hex)).rejects.toThrow(/offerId must be/);
   });
+
+  it("concurrent acceptOffer calls for one offer create exactly one acceptance (M-carry)", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const results = await Promise.allSettled([pair.bob.daemon.acceptOffer(offerId), pair.bob.daemon.acceptOffer(offerId)]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(rejected.reason)).toMatch(/already being accepted|already accepted/);
+  });
+
+  it("scans dispute events in chunks from a persisted cursor and survives a getLogs failure (I3)", async () => {
+    // Both periodic timers are parked (see the "calls timeout" test above for the same reasoning): the stub
+    // below fails hub.disputeEvents exactly once, for whichever caller happens to invoke it first. With a live
+    // periodic tick still running, that could be a background pass rather than the explicit one this test
+    // drives, and the assertion right after it would then flake against a scan that already recovered.
+    const pair = await startPair({ pollMs: 3_600_000, bobConfig: { logChunkBlocks: 2 } });
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await alice.daemon.idle();
+    await alice.daemon.tick(); // alice (offerer) deposits
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).funded[0], 20_000, "alice funded");
+    await bob.daemon.idle();
+    await bob.daemon.tick(); // bob (accepter) deposits now that funded[0] is true
+    await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "open");
+    bob.client.disconnect(); // Bob never sees e4 over the relay; only through the Challenged event
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await alice.daemon.challenge(id, "agent");
+    // A getLogs failure must not stop the rest of the watchtower pass.
+    const hub = bob.daemon.hub;
+    const real = hub.disputeEvents.bind(hub);
+    let failures = 1;
+    hub.disputeEvents = (...a: Parameters<typeof real>) => (failures-- > 0 ? Promise.reject(new Error("range too large")) : real(...a));
+    await bob.daemon.idle();
+    await bob.daemon.tick();
+    expect(bob.daemon.handle(id).lastError).toMatch(/^events:/);
+    await waitFor(async () => { await bob.daemon.idle(); await bob.daemon.tick(); return bob.daemon.handle(id).session.isMyTurn(); }, 20_000, "ingested e4 from chain");
+    const rec = bob.daemon.handle(id).record;
+    expect(rec.scannedBlock).toBeDefined();
+    expect(rec.scannedBlock! >= rec.createdBlock).toBe(true);
+  });
+
+  it("re-reads the trailing rescan window: an event a laggy getLogs hid on one scan is still ingested later", async () => {
+    // Both periodic timers are parked, for the same reason as the getLogs-failure test above: the stub below
+    // must be consumed by the explicit tick this test drives, not by a background pass racing ahead of it.
+    const pair = await startPair({ pollMs: 3_600_000 });
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await alice.daemon.idle();
+    await alice.daemon.tick(); // alice (offerer) deposits
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).funded[0], 20_000, "alice funded");
+    await bob.daemon.idle();
+    await bob.daemon.tick(); // bob (accepter) deposits now that funded[0] is true
+    await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "open");
+    bob.client.disconnect(); // Bob never sees e4 over the relay; only through the Challenged event
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await alice.daemon.challenge(id, "agent");
+    // Simulates a load-balanced RPC whose blockNumber() outran its own getLogs index: the very first call to
+    // disputeEvents (whatever range it's asked for) comes back empty, hiding the Challenged event entirely --
+    // yet the scan still reports a fully-scanned head, since it saw no failure.
+    const hub = bob.daemon.hub;
+    const real = hub.disputeEvents.bind(hub);
+    let hideOnce = true;
+    hub.disputeEvents = (...a: Parameters<typeof real>) => {
+      if (hideOnce) {
+        hideOnce = false;
+        return Promise.resolve([]);
+      }
+      return real(...a);
+    };
+    await bob.daemon.idle();
+    await bob.daemon.tick(); // the event is hidden; no failure is recorded, and the scan "completes" past it
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(bob.daemon.handle(id).session.isMyTurn()).toBe(false); // still unaware of e4
+    // Without the rescan window, the next scan would start strictly after the (falsely) fully-scanned head and
+    // would never see that block's event again. With it, the trailing DISPUTE_RESCAN_BLOCKS are re-read on the
+    // very next tick, and the real disputeEvents (hideOnce is now false) returns the event this time.
+    await waitFor(async () => { await bob.daemon.idle(); await bob.daemon.tick(); return bob.daemon.handle(id).session.isMyTurn(); }, 20_000, "ingested e4 on rescan");
+  });
 });

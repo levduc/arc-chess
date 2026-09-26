@@ -5,3 +5,6 @@ contracts/broadcast/
 contracts/test/vectors/
 contracts/deployments/31337.json
 .superpowers/
+*.db
+*.db-wal
+*.db-shm

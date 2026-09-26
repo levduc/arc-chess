@@ -5,4 +5,7 @@ export * from "./records.js";
 export * from "./daemon.js";
 export * from "./status.js";
 export * from "./api.js";
+export * from "./host.js";
+export * from "./lock.js";
+export * from "./run.js";
 export * from "./cli.js";

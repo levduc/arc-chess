@@ -34,3 +34,20 @@ export class LocalKeyTxSender implements TxSender {
     });
   }
 }
+
+/**
+ * Runs one send at a time per wallet, so two concurrent callers (funding two channels, a close racing a top-up) never
+ * fetch the same pending nonce. A send is finished once the node has accepted the transaction (hash returned).
+ */
+export class SerialTxSender implements TxSender {
+  private tail: Promise<unknown> = Promise.resolve();
+  constructor(private readonly inner: TxSender) {}
+  get address(): Address {
+    return this.inner.address;
+  }
+  send(tx: { to: Address; data: Hex; value?: bigint }): Promise<Hex> {
+    const run = this.tail.then(() => this.inner.send(tx));
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+}

@@ -10,3 +10,4 @@ export * from "./hub.js";
 export * from "./store.js";
 export * from "./session.js";
 export * from "./wire.js";
+export * from "./validate.js";

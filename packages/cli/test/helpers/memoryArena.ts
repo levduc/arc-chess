@@ -13,7 +13,14 @@ import {
   type SignedOffer,
 } from "@arena/sdk";
 
-type Member = { rooms: Set<Hex>; handlers: Set<(m: RelayMessage) => void>; connected: boolean };
+type Member = {
+  rooms: Set<Hex>;
+  watched: Set<Hex>;
+  unwatched: Hex[];
+  handlers: Set<(m: RelayMessage) => void>;
+  joinedHandlers: Set<(id: Hex) => void>;
+  connected: boolean;
+};
 
 /** In-process stand-in for the host (Plan 4) using the same SDK matching rules. */
 export class MemoryArena {
@@ -23,8 +30,25 @@ export class MemoryArena {
 
   constructor(private readonly terms: () => Promise<MatchTerms & { now: bigint }>) {}
 
-  client(): { lobby: LobbyClient; relay: RelayClient; disconnect(): void; reconnect(): void } {
-    const member: Member = { rooms: new Set(), handlers: new Set(), connected: true };
+  client(): {
+    lobby: LobbyClient;
+    relay: RelayClient;
+    disconnect(): void;
+    reconnect(): void;
+    /** Channels this client is currently joined to (left channels are gone). */
+    rooms(): Hex[];
+    /** Offer ids this client currently watches, and every id it has unwatched, in order. */
+    watched(): Hex[];
+    unwatched(): Hex[];
+  } {
+    const member: Member = {
+      rooms: new Set(),
+      watched: new Set(),
+      unwatched: [],
+      handlers: new Set(),
+      joinedHandlers: new Set(),
+      connected: true,
+    };
     this.members.add(member);
     const lobby: LobbyClient = {
       postOffer: async (so) => {
@@ -50,10 +74,22 @@ export class MemoryArena {
         this.matchHandlers.add(h);
         return () => this.matchHandlers.delete(h);
       },
+      watch: (ids) => {
+        for (const id of ids) member.watched.add(id);
+      },
+      unwatch: (ids) => {
+        for (const id of ids) {
+          member.watched.delete(id);
+          member.unwatched.push(id);
+        }
+      },
     };
     const relay: RelayClient = {
       join: async (channelId) => {
         member.rooms.add(channelId);
+        setTimeout(() => {
+          for (const h of member.joinedHandlers) h(channelId);
+        }, 0);
       },
       send: async (msg) => {
         if (!member.connected) throw new Error("disconnected");
@@ -69,6 +105,13 @@ export class MemoryArena {
         member.handlers.add(h);
         return () => member.handlers.delete(h);
       },
+      onJoined: (h) => {
+        member.joinedHandlers.add(h);
+        return () => member.joinedHandlers.delete(h);
+      },
+      leave: (channelId) => {
+        member.rooms.delete(channelId);
+      },
     };
     return {
       lobby,
@@ -76,9 +119,18 @@ export class MemoryArena {
       disconnect: () => {
         member.connected = false;
       },
+      // Simulates the real transport's re-join: fires every joined handler for every room already joined.
       reconnect: () => {
         member.connected = true;
+        for (const channelId of member.rooms) {
+          setTimeout(() => {
+            for (const h of member.joinedHandlers) h(channelId);
+          }, 0);
+        }
       },
+      rooms: () => [...member.rooms],
+      watched: () => [...member.watched],
+      unwatched: () => [...member.unwatched],
     };
   }
 }
