@@ -288,7 +288,9 @@ describe("channel lifecycle on Anvil", () => {
 
     const d = x.params.deposit;
     const f = x.params.feePerPlayer;
+    const s = x.params.stakePerGame;
     const bal = a.latest.state; // balances after both games (game 0 mate, game 1 resignation), both won by Alice
+    expect([bal.balanceA, bal.balanceB]).toEqual([d + 2n * s, d - 2n * s]); // Alice: the game-1 stake, plus game 0's
     expect(await usdcBalance(x.env.usdc, x.alice.address)).toBe(START - d - f + bal.balanceA);
     expect(await usdcBalance(x.env.usdc, x.bob.address)).toBe(START - d - f + bal.balanceB);
   });
