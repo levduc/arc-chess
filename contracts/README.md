@@ -60,8 +60,8 @@ delegation) therefore cannot revoke ECDSA signatures it already produced, while 
 
 ## Admin surface (spec §13)
 
-The owner (a multisig on mainnet) can change only four things, none of which touch deposits or existing
-channels, and the hub stays non-upgradeable:
+The owner (a multisig on mainnet) can change only fees, the two caps and the pause flag. None of these touch
+deposits or existing channels, and the hub stays non-upgradeable:
 
 - `setFee(feePerPlayer, feeRecipient)` — the fee snapshotted into channels created from now on.
 - `setLimits(maxDepositPerPlayer, maxCommittedEscrow)` — the per-channel deposit cap and the hub-wide
@@ -78,6 +78,14 @@ channels, and the hub stays non-upgradeable:
 
 The worst an owner (or a compromised owner key) can do is refuse new business; it can never move escrowed
 funds, alter an existing channel's terms, or block an exit.
+
+**Residual risk: first-come squatting of `maxCommittedEscrow`.** `params.fundingDeadline` is bounded to at
+most `block.timestamp + MAX_FUNDING_WINDOW` (a constant, 1 day) by `_validateNewParams` — without this, a
+self-dealing attacker could set an unbounded deadline, fund only their own side, and hold that reservation
+against the cap forever at roughly gas cost, since `reclaim` only becomes callable after the deadline
+passes. With the bound, any such reservation is reclaimable (by anyone) within one day, but an attacker can
+still occupy the cap for up to that window before it frees up. The owner's response to this, as to any other
+capacity pressure, is to raise `maxCommittedEscrow`.
 
 ## External entry points and Circle CLI
 

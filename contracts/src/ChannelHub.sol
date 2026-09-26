@@ -54,6 +54,10 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     bytes32 public constant CLOSE_TYPEHASH = keccak256("Close(bytes32 channelId,bytes32 stateHash)");
     uint64 public constant MIN_TIMEOUT = 60;
     uint64 public constant MAX_TIMEOUT = 7 days;
+    /// @notice Furthest a channel's `fundingDeadline` may be set from creation (spec §13 item 2's reservation
+    /// bound). Without it, an unbounded deadline would let a self-dealing creator hold a `committedEscrow`
+    /// reservation forever at roughly gas cost, since `reclaim` is only callable after the deadline passes.
+    uint64 public constant MAX_FUNDING_WINDOW = 1 days;
 
     IERC20 public immutable token;
     uint256 public immutable maxFeePerPlayer;
@@ -347,8 +351,10 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         emit LimitsUpdated(maxDepositPerPlayer_, maxCommittedEscrow_);
     }
 
-    // fundingDeadline must simply lie in the future relative to channel creation; miner-scale drift on
-    // block.timestamp is immaterial to a minutes-to-days-long window.
+    // fundingDeadline must lie in the future relative to channel creation, and no further out than
+    // MAX_FUNDING_WINDOW (spec §13 item 2's reservation bound: bounds how long a committedEscrow reservation
+    // can be held by an unfunded channel). Miner-scale drift on block.timestamp is immaterial to a
+    // minutes-to-a-day-long window.
     function _validateNewParams(Params memory p) private view {
         if (
             // slither-disable-next-line timestamp
@@ -356,6 +362,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
                 || p.signers[0] == address(0) || p.signers[1] == address(0) || p.signers[0] == p.signers[1]
                 || p.participants[0] == p.signers[1] || p.participants[1] == p.signers[0] || p.rules.code.length == 0
                 || p.stakePerGame == 0 || p.deposit < p.stakePerGame || p.fundingDeadline <= block.timestamp
+                || p.fundingDeadline > block.timestamp + MAX_FUNDING_WINDOW
                 || p.challengeTimeout < MIN_TIMEOUT || p.challengeTimeout > MAX_TIMEOUT
         ) {
             revert InvalidParams();

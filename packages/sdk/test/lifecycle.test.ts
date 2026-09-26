@@ -7,7 +7,9 @@ import {
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
+  MAX_FUNDING_WINDOW,
   MemoryStore,
+  channelHubAbi,
   chunkRanges,
   signState,
   type CloseTransaction,
@@ -132,6 +134,14 @@ describe("channel lifecycle on Anvil", () => {
 
   it("reads the launch limits and tracks committedEscrow across deposit and close", async () => {
     const x = await arena("limits");
+    // Drift check: the SDK's exported MAX_FUNDING_WINDOW must track the hub's own on-chain constant.
+    const onChainMaxFundingWindow = await x.env.pub.readContract({
+      address: x.env.hub,
+      abi: channelHubAbi,
+      functionName: "MAX_FUNDING_WINDOW",
+    });
+    expect(onChainMaxFundingWindow).toBe(MAX_FUNDING_WINDOW);
+
     const limits0 = await x.hub.limits();
     expect(limits0.maxDepositPerPlayer).toBe(10_000_000n);
     expect(limits0.maxCommittedEscrow).toBe(10n ** 12n);

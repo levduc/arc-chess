@@ -170,18 +170,24 @@ export class HubClient {
     return { feePerPlayer, feeRecipient };
   }
 
-  /** The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause flag. */
+  /**
+   * The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause
+   * flag. All four are read at one block number (cacheTime 0, as in `disputeEvents`/`hubEvents`) so a block
+   * mined between reads cannot produce an inconsistent snapshot (e.g. a cap and a commitment from different
+   * blocks).
+   */
   async limits(): Promise<{
     maxDepositPerPlayer: bigint;
     maxCommittedEscrow: bigint;
     committedEscrow: bigint;
     paused: boolean;
   }> {
+    const blockNumber = await this.client.getBlockNumber({ cacheTime: 0 });
     const [maxDepositPerPlayer, maxCommittedEscrow, committedEscrow, paused] = await Promise.all([
-      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxDepositPerPlayer" }),
-      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxCommittedEscrow" }),
-      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "committedEscrow" }),
-      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "paused" }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxDepositPerPlayer", blockNumber }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxCommittedEscrow", blockNumber }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "committedEscrow", blockNumber }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "paused", blockNumber }),
     ]);
     return { maxDepositPerPlayer, maxCommittedEscrow, committedEscrow, paused };
   }

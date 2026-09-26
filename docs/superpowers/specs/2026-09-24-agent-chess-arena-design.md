@@ -592,6 +592,13 @@ on-chain launch limits, and the §8 test campaign is extended (Plan 4.5) before 
    - Creating a channel that would push `committedEscrow` above the owner-set `maxCommittedEscrow` reverts with
      `EscrowCapReached`.
    - Lowering the cap below the current commitment only stops new channels.
+   - An unfunded channel's reservation cannot outlive `MAX_FUNDING_WINDOW` (a constant, 1 day): `_validateNewParams`
+     reverts `InvalidParams` if `params.fundingDeadline > block.timestamp + MAX_FUNDING_WINDOW`. Without this
+     bound, a self-dealing attacker could set `fundingDeadline` far in the future, fund only their own side,
+     and hold that reservation against `maxCommittedEscrow` indefinitely (at roughly gas cost), since
+     `reclaim` is only callable after the deadline passes. With the bound, an unfunded channel's reservation
+     is always reclaimable within one day. This still lets an attacker squat the cap for up to that window;
+     the owner's response is the same as for any other capacity pressure — raise `maxCommittedEscrow`.
 3. **Pause.**
    - `setPaused(bool)` (owner) blocks every `deposit`: new channels and second-side funding alike.
    - It never blocks `reclaim`, `closeCooperative`, `challenge`, `respond`, `timeout` or `claim`. Every open channel

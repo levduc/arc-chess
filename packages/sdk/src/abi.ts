@@ -57,6 +57,19 @@ export const channelHubAbi = [
   },
   {
     "type": "function",
+    "name": "MAX_FUNDING_WINDOW",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MAX_TIMEOUT",
     "inputs": [],
     "outputs": [

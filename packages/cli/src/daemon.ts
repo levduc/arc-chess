@@ -95,7 +95,8 @@ const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\
 export const DISPUTE_RESCAN_BLOCKS = 32n;
 
 /** The furthest out a funding deadline may be set from match time (`checkMatchParams`' `maxFundingWindow`): an
- *  offer this long past its expiry can no longer produce a fundable match. */
+ *  offer this long past its expiry can no longer produce a fundable match. Distinct from, and must stay well
+ *  under, the SDK's `MAX_FUNDING_WINDOW` (86400n): the hub's own hard cap on `fundingDeadline`. */
 export const MAX_FUNDING_WINDOW = 7200n;
 
 export class ArenaDaemon {

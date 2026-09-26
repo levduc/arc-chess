@@ -42,6 +42,23 @@ contract ChannelHubLimitsTest is HubFixture {
         hub.deposit(abi.encode(p2));
     }
 
+    // ------------------------------------------------------------- funding window bound (reservation bound)
+
+    function test_fundingDeadline_atMaxWindowSucceeds_maxWindowPlusOneReverts() public {
+        Params memory p = _params();
+        p.fundingDeadline = uint64(block.timestamp) + hub.MAX_FUNDING_WINDOW();
+        vm.prank(alice);
+        hub.deposit(abi.encode(p)); // exactly at the bound: succeeds
+        assertEq(uint8(hub.channelInfo(hub.channelId(p)).phase), uint8(ChannelHub.Phase.Funding));
+
+        Params memory p2 = _params();
+        p2.salt = keccak256("other");
+        p2.fundingDeadline = uint64(block.timestamp) + hub.MAX_FUNDING_WINDOW() + 1;
+        vm.prank(alice);
+        vm.expectRevert(ChannelHub.InvalidParams.selector);
+        hub.deposit(abi.encode(p2));
+    }
+
     // ------------------------------------------------------------- committed escrow accounting
 
     function test_committedEscrow_createFundClose_returnsToZero() public {
@@ -124,6 +141,28 @@ contract ChannelHubLimitsTest is HubFixture {
         vm.prank(alice);
         vm.expectRevert(ChannelHub.EscrowCapReached.selector);
         hub.deposit(abi.encode(p2));
+    }
+
+    /// A channel's commit is the fee snapshotted into its params at creation, not the hub's current fee: a
+    /// setFee between creation and settlement must not desync committedEscrow.
+    function test_committedEscrow_honoursFeeSnapshot_acrossClose() public {
+        Params memory p = _params(); // snapshots FEE
+        bytes32 id = _open(p);
+        vm.prank(owner);
+        hub.setFee(FEE * 3, feeRecipient);
+        _close(_resignedGame(p, id));
+        assertEq(hub.committedEscrow(), 0);
+    }
+
+    function test_committedEscrow_honoursFeeSnapshot_acrossReclaim() public {
+        Params memory p = _params(); // snapshots FEE
+        vm.prank(alice);
+        hub.deposit(abi.encode(p));
+        vm.prank(owner);
+        hub.setFee(FEE * 3, feeRecipient);
+        vm.warp(p.fundingDeadline + 1);
+        hub.reclaim(hub.channelId(p));
+        assertEq(hub.committedEscrow(), 0);
     }
 
     // ------------------------------------------------------------- pause: deposit only
