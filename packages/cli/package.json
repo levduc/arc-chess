@@ -1,0 +1,26 @@
+{
+  "name": "@arena/cli",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "arena": "./bin/arena.mjs"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@arena/sdk": "workspace:*",
+    "chess.js": "1.4.0",
+    "tsx": "4.23.15",
+    "viem": "2.56.8"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.8",
+    "typescript": "6.0.3",
+    "vitest": "5.0.1"
+  }
+}
