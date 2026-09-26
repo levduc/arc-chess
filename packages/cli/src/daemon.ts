@@ -547,8 +547,10 @@ export class ArenaDaemon {
         // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
         await this.hub.timeout(l.sessionSender, id);
         // Bug fix (Task 6 review): timeout() always finalizes in the same transaction (see ChannelHub.sol) —
-        // mark it here, synchronously with our own confirmed tx, so a caller reading `record.finalized` right
-        // after observing the phase change on-chain (e.g. via its own direct RPC poll) never loses that race.
+        // mark it here, synchronously with our own confirmed tx, rather than waiting for the next tick's
+        // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:
+        // `timeout()` itself only resolves one RPC round trip after Anvil mines the tx and flips the on-chain
+        // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
         l.record = { ...l.record, finalized: true };
         this.records.saveChannel(l.record);
       }

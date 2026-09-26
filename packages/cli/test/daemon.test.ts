@@ -217,10 +217,11 @@ describe("watchtower", () => {
     await increaseTime(601);
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Finalized", 20_000, "timeout");
     expect(await usdcBalance(env.usdc, alice.address)).toBe(START - 5_000n + 100_000n);
-    // R9/3b (flake fix): the daemon's own watchtower marks `record.finalized` synchronously right after its
-    // `timeout()` call confirms on-chain, in the same tick — but under load a *later* tick's own re-read (the
-    // "Settled channels are done" fallback) can be the one that actually lands it, a tick interval after the
-    // on-chain phase this test just observed above. Wait for the flag rather than asserting it instantly.
+    // R9/3b (flake fix): `hub.timeout()` only resolves once the daemon's own client has fetched a receipt for
+    // its transaction, one RPC round trip after Anvil mines it and flips the on-chain phase to "Finalized".
+    // This test's independent `channelInfo` poll above can observe that on-chain flip inside that round trip,
+    // before the daemon's own call returns and sets `record.finalized` — the sync assignment right after
+    // narrows this window to one RPC, it cannot close it. Wait for the flag rather than asserting it instantly.
     await waitFor(() => alice.daemon.handle(id).record.finalized, 5_000, "record.finalized");
   });
 
