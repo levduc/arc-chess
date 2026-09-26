@@ -50,26 +50,43 @@ function decStr(n: bigint): string {
 class BodyTooLargeError extends Error {}
 
 const MAX_BODY_BYTES = 64 * 1024;
+// once a body is rejected as too large, we still drain it (so the connection can flush the 413 and close cleanly
+// instead of the client seeing a raw reset) -- but only up to this much more. A client that keeps streaming past
+// this hard backstop gets its socket destroyed outright; draining is a courtesy, not an obligation.
+const MAX_DRAIN_BYTES = 1024 * 1024;
 
 /** Reads the whole request body as text, refusing (413) anything over `maxBytes` -- by content-length up front,
- *  and by actual bytes received in case content-length is missing or lied about. */
+ *  and by actual bytes received in case content-length is missing or lied about. Either way, once rejected, the
+ *  amount of additional data this will tolerate reading is capped at `MAX_DRAIN_BYTES`. */
 function readBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    let rejected = false;
+    let drained = 0;
+
+    function rejectOversized(): void {
+      if (rejected) return;
+      rejected = true;
+      reject(new BodyTooLargeError());
+      req.removeAllListeners("data");
+      req.on("data", (chunk: Buffer) => {
+        drained += chunk.length;
+        if (drained > MAX_DRAIN_BYTES) req.destroy();
+      });
+      req.resume();
+    }
+
     const declared = Number(req.headers["content-length"]);
     if (Number.isFinite(declared) && declared > maxBytes) {
-      req.resume();
-      reject(new BodyTooLargeError());
+      rejectOversized();
       return;
     }
+
     const chunks: Buffer[] = [];
     let size = 0;
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
       if (size > maxBytes) {
-        // drain and discard rather than destroy(): the socket must stay alive long enough for the 413 to go out
-        req.removeAllListeners("data");
-        req.resume();
-        reject(new BodyTooLargeError());
+        rejectOversized();
         return;
       }
       chunks.push(chunk);
@@ -86,6 +103,8 @@ async function withLobbyErrors(res: http.ServerResponse, fn: () => Promise<void>
     await fn();
   } catch (err) {
     if (err instanceof BodyTooLargeError) {
+      // don't offer keep-alive on a connection that just tried to push an oversized body through it
+      res.setHeader("connection", "close");
       sendJson(res, 413, { error: "body too large" });
     } else if (err instanceof WireFormatError) {
       sendJson(res, 400, { error: err.message });
@@ -166,7 +185,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     },
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/metrics") return false;
-      const offersOpen = repo.openOffers(await chain.now()).length;
+      const offersOpen = repo.openOfferTotal(await chain.now());
       ctx.res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
       ctx.res.end(renderMetrics(metrics, offersOpen));
       return true;
@@ -175,7 +194,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
       if (ctx.method !== "POST" || ctx.url.pathname !== "/offers") return false;
       await withLobbyErrors(ctx.res, async () => {
         const body = decodeWire(await readBody(ctx.req, MAX_BODY_BYTES));
-        const result = await lobby.post(body);
+        const result = await lobby.post(body, ctx.ip);
         sendJson(ctx.res, 201, result);
       });
       return true;
@@ -242,6 +261,9 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   }
 
   const httpServer = http.createServer((req, res) => void handle(req, res));
+  // backstops against a slow/stalled client holding a connection open indefinitely (headers, then the whole request)
+  httpServer.requestTimeout = 15_000;
+  httpServer.headersTimeout = 10_000;
   const wsHandle = attachWs(httpServer, { lobby, relay: null, cfg, metrics, log });
 
   const pruneInterval = setInterval(() => {

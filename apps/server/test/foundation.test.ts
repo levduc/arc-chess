@@ -122,17 +122,19 @@ describe("sqlite repo", () => {
       },
       sig: "0x" as `0x${string}`,
     };
-    expect(r.insertOffer(offerId, so)).toBe(true);
-    expect(r.insertOffer(offerId, so)).toBe(false); // duplicate id
+    expect(r.insertOffer(offerId, so, "127.0.0.1")).toBe(true);
+    expect(r.insertOffer(offerId, so, "127.0.0.1")).toBe(false); // duplicate id
     expect(r.offer(offerId)).toEqual({ signed: so, acceptance: null, match: null });
 
     const open = r.openOffers(1_000_000n);
     expect(open).toEqual([so]);
     expect(r.openOffers(1_000_200n)).toEqual([]); // expired relative to `now`
 
-    expect(r.openOfferCount("0x1111111111111111111111111111111111111111", 1_000_000n)).toBe(1);
-    const upperPlayer = "0X1111111111111111111111111111111111111111" as `0x${string}`;
-    expect(r.openOfferCount(upperPlayer, 1_000_000n)).toBe(1); // case-insensitive
+    // the open-offer cap is keyed by the poster's IP, not the (unauthenticated) offer.player
+    expect(r.openOfferCount("127.0.0.1", 1_000_000n)).toBe(1);
+    expect(r.openOfferCount("10.0.0.9", 1_000_000n)).toBe(0);
+    expect(r.openOfferTotal(1_000_000n)).toBe(1);
+    expect(r.openOfferTotal(1_000_200n)).toBe(0); // expired relative to `now`
 
     const sa = {
       acceptance: { offerId, player: so.offer.signer, signer: so.offer.signer, nonce: so.offer.nonce },
@@ -147,7 +149,7 @@ describe("sqlite repo", () => {
     // an expired *unmatched* offer is pruned only once it is more than a day past expiry
     const expiredId = ("0x" + "bb".repeat(32)) as `0x${string}`;
     const expiredOffer = { ...so, offer: { ...so.offer, expiresAt: 1_000_000n } };
-    r.insertOffer(expiredId, expiredOffer);
+    r.insertOffer(expiredId, expiredOffer, "127.0.0.1");
     expect(r.pruneOffers(1_000_000n + 3600n)).toBe(0); // only 1h past expiry, not pruned yet
     expect(r.pruneOffers(1_000_000n + 86_400n + 1n)).toBe(1); // matched offer above is untouched
     expect(r.offer(expiredId)).toBe(null);

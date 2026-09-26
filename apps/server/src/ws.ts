@@ -25,7 +25,7 @@ export type ClientFrame =
 /** Task 5 fills this in; while `null` here, `join`/`relay` frames just get an error. */
 export type Relay = unknown;
 
-const OFFER_ID_RE = /^0x[0-9a-f]{64}$/;
+const OFFER_ID_RE = /^0x[0-9a-f]{64}$/i;
 const HEARTBEAT_MS = 30_000;
 const RATE_LIMIT_KEY = "f";
 
@@ -74,7 +74,7 @@ export function attachWs(
       }
     }
     for (const raw of offerIds as string[]) {
-      const id = raw as Hex;
+      const id = raw.toLowerCase() as Hex; // ids are accepted case-insensitively and normalized to canonical lower-case
       if (state.watched.has(id)) continue;
       if (state.watched.size >= cfg.limits.maxWatchedOffers) {
         send(ws, { type: "error", error: "too many watched offers" });
@@ -113,8 +113,7 @@ export function attachWs(
     }
     const ip = socket.remoteAddress ?? "?";
     if (ipCount(ip) >= cfg.limits.wsPerIp) {
-      socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
-      socket.destroy();
+      socket.end("HTTP/1.1 429 Too Many Requests\r\n\r\n");
       return;
     }
     incIp(ip);

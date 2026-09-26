@@ -23,10 +23,15 @@ export type ChannelRow = {
 export type OfferEntry = { signed: SignedOffer; acceptance: SignedAcceptance | null; match: MatchEvent | null };
 
 export interface Repo {
-  insertOffer(offerId: Hex, so: SignedOffer): boolean;
+  insertOffer(offerId: Hex, so: SignedOffer, ip: string): boolean;
   offer(offerId: Hex): OfferEntry | null;
   openOffers(now: bigint): SignedOffer[];
-  openOfferCount(player: Address, now: bigint): number;
+  /** Open, unexpired offers posted from this IP -- the anti-spam key (I2 review): `offer.player` is unauthenticated
+   *  and free to mint, so keying the cap on it lets anyone burn a stranger's slots or dodge the cap with a fresh
+   *  address. The IP is what actually costs the poster something. */
+  openOfferCount(ip: string, now: bigint): number;
+  /** Total open, unexpired offers -- a single SQL COUNT(*), not a full deserialize-and-.length like `openOffers`. */
+  openOfferTotal(now: bigint): number;
   recordMatch(offerId: Hex, sa: SignedAcceptance, m: MatchEvent): boolean;
   pruneOffers(now: bigint): number;
   cacheRelay(channelId: Hex, sender: PlayerIndex, message: RelayMessage): void;
@@ -52,6 +57,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS offers (
   offer_id TEXT PRIMARY KEY,
   player TEXT NOT NULL,
+  ip TEXT NOT NULL DEFAULT '',
   expires_at TEXT NOT NULL,
   body TEXT NOT NULL,
   acceptance TEXT,
@@ -87,13 +93,13 @@ export class SqliteRepo implements Repo {
     this.db.exec(SCHEMA);
   }
 
-  insertOffer(offerId: Hex, so: SignedOffer): boolean {
+  insertOffer(offerId: Hex, so: SignedOffer, ip: string): boolean {
     const result = this.db
       .prepare(
-        "INSERT INTO offers (offer_id, player, expires_at, body, created_ms) VALUES (?, ?, ?, ?, ?) " +
+        "INSERT INTO offers (offer_id, player, ip, expires_at, body, created_ms) VALUES (?, ?, ?, ?, ?, ?) " +
           "ON CONFLICT(offer_id) DO NOTHING",
       )
-      .run(offerId, so.offer.player.toLowerCase(), padSeconds(so.offer.expiresAt), toWire(so), Date.now());
+      .run(offerId, so.offer.player.toLowerCase(), ip, padSeconds(so.offer.expiresAt), toWire(so), Date.now());
     return Number(result.changes) === 1; // 0 changes means offer_id already existed and was skipped
   }
 
@@ -116,10 +122,17 @@ export class SqliteRepo implements Repo {
     return rows.map((r) => fromWire<SignedOffer>(r.body));
   }
 
-  openOfferCount(player: Address, now: bigint): number {
+  openOfferCount(ip: string, now: bigint): number {
     const row = this.db
-      .prepare("SELECT COUNT(*) AS n FROM offers WHERE player = ? AND match IS NULL AND expires_at > ?")
-      .get(player.toLowerCase(), padSeconds(now)) as { n: number | bigint };
+      .prepare("SELECT COUNT(*) AS n FROM offers WHERE ip = ? AND match IS NULL AND expires_at > ?")
+      .get(ip, padSeconds(now)) as { n: number | bigint };
+    return Number(row.n);
+  }
+
+  openOfferTotal(now: bigint): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM offers WHERE match IS NULL AND expires_at > ?")
+      .get(padSeconds(now)) as { n: number | bigint };
     return Number(row.n);
   }
 

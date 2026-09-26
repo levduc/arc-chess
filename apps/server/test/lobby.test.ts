@@ -1,3 +1,4 @@
+import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { Hex } from "viem";
@@ -16,6 +17,8 @@ import {
   type SignedOffer,
 } from "@arena/sdk";
 import { DEFAULT_LIMITS } from "../src/config.js";
+import { Lobby, LobbyError } from "../src/lobby.js";
+import { SqliteRepo, type Repo } from "../src/repo.js";
 import { startServer, type ArenaServer } from "../src/server.js";
 import { FakeChain, testConfig } from "./helpers/fakeChain.js";
 import { wsConnect } from "./helpers/wsClient.js";
@@ -136,18 +139,13 @@ describe("lobby http", () => {
     expect(typeof res.body.error).toBe("string");
   });
 
-  it("limits open offers per player (429 after maxOpenOffersPerPlayer)", async () => {
+  it("limits open offers per IP (429 after maxOpenOffersPerIp), even from fresh player addresses", async () => {
     const chain = new FakeChain();
-    server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, maxOpenOffersPerPlayer: 2 } }), { chain });
-    const playerKey = generatePrivateKey();
-    const signerKey = generatePrivateKey();
-    const player = privateKeyToAccount(playerKey).address;
-    const signer = privateKeyToAccount(signerKey).address;
+    server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, maxOpenOffersPerIp: 2 } }), { chain });
 
-    const post = async () => {
-      const { so } = await makeOffer(chain, { player, signer, nonce: randomNonce() }, signerKey);
-      return postOffer(server!, so);
-    };
+    // every post below uses a brand-new player/signer key pair; only the IP (127.0.0.1, since this is a loopback
+    // test client) repeats. A per-player cap would never trip here -- proving the cap is keyed by IP, not player.
+    const post = async () => postOffer(server!, (await makeOffer(chain, { nonce: randomNonce() })).so);
     expect((await post()).status).toBe(201);
     expect((await post()).status).toBe(201);
     const third = await post();
@@ -237,6 +235,114 @@ describe("lobby http", () => {
     expect(res.status).toBe(413);
   });
 
+  it("closes the socket of a chunked request that keeps streaming past the cap", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const url = new URL(server.url);
+
+    let closed = false;
+    const req = http.request({ hostname: url.hostname, port: url.port, path: "/offers", method: "POST" });
+    req.on("error", () => {
+      closed = true;
+    });
+    req.on("close", () => {
+      closed = true;
+    });
+    req.flushHeaders();
+
+    const chunk = Buffer.alloc(64 * 1024, "x"); // one write already exceeds the 64 KiB cap
+    const start = Date.now();
+    const writer = setInterval(() => {
+      if (closed || req.destroyed) {
+        clearInterval(writer);
+        return;
+      }
+      req.write(chunk);
+    }, 10);
+
+    await new Promise<void>((resolve) => {
+      const poll = setInterval(() => {
+        if (closed || Date.now() - start > 5000) {
+          clearInterval(poll);
+          clearInterval(writer);
+          resolve();
+        }
+      }, 25);
+    });
+
+    expect(closed).toBe(true);
+    expect(Date.now() - start).toBeLessThan(5000); // closed well within "a couple of seconds", not left hanging
+  });
+
+  it("a losing concurrent accept goes through the recordMatch-false branch (forced race)", async () => {
+    // Rather than relying on incidental event-loop interleaving of two real HTTP requests (which may or may not
+    // land both `offer()` reads before either write), this drives `Lobby` directly against a `Repo` wrapper that
+    // *guarantees* both accept() calls see `match: null` on their initial read, so neither can take the idempotent
+    // "already matched" shortcut -- both must reach `recordMatch`, and exactly one of them must lose there.
+    const chain = new FakeChain();
+    const cfg = testConfig();
+    const real = new SqliteRepo(":memory:");
+    let offerReads = 0;
+    const repo: Repo = {
+      insertOffer: (offerId, so, ip) => real.insertOffer(offerId, so, ip),
+      offer: (offerId) => {
+        offerReads++;
+        const entry = real.offer(offerId);
+        return offerReads <= 2 && entry ? { ...entry, match: null, acceptance: null } : entry;
+      },
+      openOffers: (now) => real.openOffers(now),
+      openOfferCount: (ip, now) => real.openOfferCount(ip, now),
+      openOfferTotal: (now) => real.openOfferTotal(now),
+      recordMatch: (offerId, sa, m) => real.recordMatch(offerId, sa, m),
+      pruneOffers: (now) => real.pruneOffers(now),
+      cacheRelay: (channelId, sender, message) => real.cacheRelay(channelId, sender, message),
+      cachedRelay: (channelId) => real.cachedRelay(channelId),
+      cursor: () => real.cursor(),
+      setCursor: (block) => real.setCursor(block),
+      channelRow: (id) => real.channelRow(id),
+      saveChannelRow: (row) => real.saveChannelRow(row),
+      channelRowsFor: (player) => real.channelRowsFor(player),
+      recentChannels: (limit) => real.recentChannels(limit),
+      close: () => real.close(),
+    };
+
+    const lobby = new Lobby(repo, chain, cfg);
+    const { offer, so } = await makeOffer(chain);
+    const id = computeOfferId(offer);
+    real.insertOffer(id, so, "127.0.0.1");
+
+    const { sa: saA } = await makeAcceptance(id);
+    const { sa: saB } = await makeAcceptance(id);
+    const results = await Promise.allSettled([lobby.accept(id, saA), lobby.accept(id, saB)]);
+    const statuses = results.map((r) => (r.status === "fulfilled" ? 200 : (r.reason as LobbyError).status));
+    expect(statuses.sort()).toEqual([200, 409]);
+    real.close();
+  });
+
+  it("a throwing onMatch subscriber does not stop the match from being recorded and returned", async () => {
+    const chain = new FakeChain();
+    const cfg = testConfig();
+    const repo = new SqliteRepo(":memory:");
+    const lobby = new Lobby(repo, chain, cfg);
+    const { offer, so } = await makeOffer(chain);
+    const id = computeOfferId(offer);
+    repo.insertOffer(id, so, "127.0.0.1");
+
+    let sawEvent: MatchEvent | undefined;
+    lobby.onMatch(() => {
+      throw new Error("boom");
+    });
+    lobby.onMatch((m) => {
+      sawEvent = m;
+    });
+
+    const { sa } = await makeAcceptance(id);
+    const event = await lobby.accept(id, sa);
+    expect(event.offerId).toBe(id);
+    expect(sawEvent).toEqual(event); // the well-behaved handler still ran despite the throwing one ahead of it
+    repo.close();
+  });
+
   it("two concurrent accepts: exactly one wins", async () => {
     const chain = new FakeChain();
     server = await startServer(testConfig(), { chain });
@@ -282,7 +388,47 @@ describe("lobby over /ws", () => {
     expect((await c.next((f) => f.type === "error")).error).toMatch(/malformed/);
     c.send({ type: "subscribe", offerIds: [`0x${"ab".repeat(32)}`] });
     await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/);
+
+    // the connection is still open and functional (a positive round trip), not just quietly not-closed
+    const { offer, so } = await makeOffer(chain);
+    await postOffer(server, so);
+    const id = computeOfferId(offer);
+    const { sa } = await makeAcceptance(id);
+    await acceptOffer(server, id, sa);
+    c.send({ type: "subscribe", offerIds: [id] });
+    expect((await c.next((f) => f.type === "match")).event.offerId).toBe(id);
   });
+
+  it(
+    "accepts subscribe ids case-insensitively, normalizing them; adds none of a frame's ids when one is malformed",
+    async () => {
+      const chain = new FakeChain();
+      server = await startServer(testConfig(), { chain });
+      const { offer, so } = await makeOffer(chain);
+      await postOffer(server, so);
+      const id = computeOfferId(offer);
+
+      const c = await wsConnect(server.url);
+      const upper = id.toUpperCase().replace("0X", "0x") as Hex;
+      c.send({ type: "subscribe", offerIds: [upper] });
+      await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/); // accepted
+
+      const { sa } = await makeAcceptance(id);
+      await acceptOffer(server, id, sa);
+      // the uppercased id was normalized and watched: a later match still reaches this connection
+      expect((await c.next((f) => f.type === "match")).event.offerId).toBe(id);
+
+      // a second, fresh offer mixed with one malformed id: none of the frame's ids get added
+      const { offer: offer2, so: so2 } = await makeOffer(chain, { nonce: randomNonce() });
+      await postOffer(server, so2);
+      const id2 = computeOfferId(offer2);
+      c.send({ type: "subscribe", offerIds: [id2, "0xnothex"] });
+      expect((await c.next((f) => f.type === "error")).error).toMatch(/malformed/);
+      const { sa: sa2 } = await makeAcceptance(id2);
+      await acceptOffer(server, id2, sa2);
+      await expect(c.next((f) => f.type === "match", 300)).rejects.toThrow(/no matching frame/); // id2 never added
+    },
+  );
 
   it("caps watched offers per connection", async () => {
     const chain = new FakeChain();
@@ -318,11 +464,18 @@ describe("lobby over /ws", () => {
     expect(closeEvent.code).toBe(1008);
   });
 
-  it("refuses more than wsPerIp connections from one IP", async () => {
+  it("refuses more than wsPerIp connections from one IP, and frees the slot once one closes", async () => {
     const chain = new FakeChain();
     server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, wsPerIp: 2 } }), { chain });
-    await wsConnect(server.url);
+    const c1 = await wsConnect(server.url);
     await wsConnect(server.url);
     await expect(wsConnect(server.url)).rejects.toThrow();
+
+    c1.ws.close();
+    await c1.closed;
+    await new Promise((r) => setTimeout(r, 50)); // let the server's socket "close" (decrement) catch up
+
+    const c3 = await wsConnect(server.url); // the freed slot admits a new connection
+    expect(c3.nonce).toMatch(/^0x[0-9a-f]{64}$/);
   });
 });

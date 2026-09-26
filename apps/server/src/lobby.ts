@@ -48,7 +48,7 @@ export class Lobby {
     private readonly cfg: ServerConfig,
   ) {}
 
-  async post(body: unknown): Promise<{ offerId: Hex }> {
+  async post(body: unknown, ip: string): Promise<{ offerId: Hex }> {
     let so: SignedOffer;
     try {
       so = parseSignedOffer(body);
@@ -71,12 +71,12 @@ export class Lobby {
       throw new LobbyError(400, `expiresAt must be at most ${this.cfg.offerMaxLifetime} seconds from now`);
     }
 
-    if (this.repo.openOfferCount(offer.player, now) >= this.cfg.limits.maxOpenOffersPerPlayer) {
-      throw new LobbyError(429, "too many open offers for this player");
+    if (this.repo.openOfferCount(ip, now) >= this.cfg.limits.maxOpenOffersPerIp) {
+      throw new LobbyError(429, "too many open offers from this IP");
     }
 
     const id = computeOfferId(offer);
-    if (!this.repo.insertOffer(id, so)) throw new LobbyError(409, "duplicate offer id");
+    if (!this.repo.insertOffer(id, so, ip)) throw new LobbyError(409, "duplicate offer id");
     return { offerId: id };
   }
 
@@ -126,7 +126,13 @@ export class Lobby {
       if (fresh?.match) return this.resolveAlreadyMatched(fresh, sa);
       throw new LobbyError(409, "offer already matched");
     }
-    for (const h of this.handlers) h(event);
+    for (const h of this.handlers) {
+      try {
+        h(event);
+      } catch {
+        // a throwing subscriber must not turn a successfully recorded match into a 500 for the accepting player
+      }
+    }
     return event;
   }
 

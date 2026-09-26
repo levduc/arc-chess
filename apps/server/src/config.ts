@@ -3,13 +3,13 @@ import type { Address } from "viem";
 export type Limits = {
   httpPostBurst: number; httpPostPerSec: number; httpGetBurst: number; httpGetPerSec: number;
   wsPerIp: number; wsFrameBurst: number; wsFramePerSec: number; maxFrameBytes: number;
-  maxOpenOffersPerPlayer: number; maxWatchedOffers: number; maxJoinsPerConnection: number;
+  maxOpenOffersPerIp: number; maxWatchedOffers: number; maxJoinsPerConnection: number;
 };
 
 export const DEFAULT_LIMITS: Limits = {
   httpPostBurst: 30, httpPostPerSec: 1, httpGetBurst: 120, httpGetPerSec: 10,
   wsPerIp: 16, wsFrameBurst: 200, wsFramePerSec: 20, maxFrameBytes: 64 * 1024,
-  maxOpenOffersPerPlayer: 5, maxWatchedOffers: 256, maxJoinsPerConnection: 64,
+  maxOpenOffersPerIp: 5, maxWatchedOffers: 256, maxJoinsPerConnection: 64,
 };
 
 export type ServerConfig = {
