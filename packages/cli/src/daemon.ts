@@ -150,6 +150,11 @@ export class ArenaDaemon {
 
   async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
     const sessionKey = generatePrivateKey();
+    // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
+    // (the chain's block timestamp), not wall-clock Date.now() — a test (or a real deployment) that has moved
+    // the chain clock away from wall-clock time via increaseTime/other activity would otherwise mint offers
+    // that read as already expired the instant they're matched.
+    const chainNow = (await this.client.getBlock()).timestamp;
     const offer: Offer = {
       template: "chess",
       player: this.wallet.address,
@@ -157,7 +162,7 @@ export class ArenaDaemon {
       deposit: o.deposit,
       stakePerGame: o.stakePerGame,
       challengeTimeout: o.challengeTimeout,
-      expiresAt: BigInt(Math.floor(Date.now() / 1000) + 3600),
+      expiresAt: chainNow + 3600n,
       nonce: `0x${randomBytes(32).toString("hex")}`,
     };
     const id = computeOfferId(offer);
