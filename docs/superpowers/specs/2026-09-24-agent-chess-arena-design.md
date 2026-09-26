@@ -154,9 +154,12 @@ EIP-712 domain: `{ name: "AgentArena", version: "1", chainId, verifyingContract:
   is how both players agree to start another game.
 - **Move states** (`NORMAL`, `NORMAL_OFFER_DRAW`, `RESIGN`, `ACCEPT_DRAW`,
   `CLAIM_STALEMATE`):
-  signed **only by the mover's session key**. The mover is the side to move in
-  the previous state (`rules.mover(prev, params)`). Movers strictly alternate
-  within a game. Committing to `prevHash` endorses the previous state.
+  signed **only by the mover's session key**. (See §12 items 11 and 14: a move
+  state may also carry the non-mover's co-signature — e.g. R4's adopted move on
+  a pending checkpoint — and is then supported with no predecessor.) The mover
+  is the side to move in the previous state (`rules.mover(prev, params)`).
+  Movers strictly alternate within a game. Committing to `prevHash` endorses
+  the previous state.
 
 A state `s` is **supported** if either:
 
