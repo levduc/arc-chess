@@ -358,7 +358,7 @@ describe("hub scans", () => {
   // No existing lifecycle test both challenges and closes cooperatively (Finalized) in one flow; this scenario
   // (challenge -> timeout -> Finalized, no Responded) is built fresh, mirroring "challenges via a session key,
   // answers on-chain..." up to its first challenge/timeout instead of sharing state across `it` blocks.
-  it("hubEvents decodes every hub event of a challenged-then-finalized channel in chain order; disputeEvents honours an explicit toBlock", async () => {
+  it("hubEvents decodes a challenged-then-finalized channel in order; disputeEvents honours toBlock", async () => {
     const x = await arena("hub-scan");
     const { a, b } = await open(x);
     const id = a.id;

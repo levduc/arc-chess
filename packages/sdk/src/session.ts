@@ -404,9 +404,10 @@ export class ChannelSession {
 
   /**
    * M5: a message this player already holds, or one older than its latest, arrives again after a relay reconnect
-   * (both daemons re-send their latest). Neither changes anything, so neither is an error. A *different* state at
-   * the latest turn still is (equivocation evidence). Returns null for everything else, which then takes the
-   * normal path, including the late-countersignature repair of `prev`, which must win over "stale".
+   * (both daemons re-send their latest). Neither changes anything, so neither is an error. A different, unverified
+   * state at the latest turn is refused here (not treated as evidence -- no signature is checked in this method;
+   * it is just not the state this player already has for that turn). Returns null for everything else, which then
+   * takes the normal path, including the late-countersignature repair of `prev`, which must win over "stale".
    */
   private classifyRepeat(data: SessionSnapshot, msg: SignedState): "duplicate" | "stale" | null {
     let s: State;

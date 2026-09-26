@@ -270,6 +270,15 @@ describe("ChannelSession", () => {
     // M5: an exact duplicate of latest (here, the opening state) is a no-op, not an error.
     expect(await a.receive({ ...a.latest })).toBe("duplicate");
     expect(encodeMove(0, 0, 0, KIND.NONE)).toBe(0);
+    // A genuinely new state (latest+1) encoding KIND.NONE is not a legal move and is rejected.
+    const latest = a.latest.state;
+    const noneMove = {
+      ...latest,
+      turnNum: latest.turnNum + 1n,
+      prevHash: hashState(latest, domain),
+      move: encodeMove(0, 0, 0, KIND.NONE),
+    };
+    await expect(a.receive({ state: noneMove, sigA: "0x", sigB: "0x" })).rejects.toThrow(ArenaProtocolError);
   });
 
   // --- Fix round 1 -----------------------------------------------------------------------------------------
@@ -927,6 +936,16 @@ describe("ChannelSession", () => {
       const saves = bobStore.snapshots.length;
       expect(await bob.receive(resignState)).toBe("duplicate");
       expect(bobStore.snapshots.length).toBe(saves); // classifyRepeat returns before store.save
+    });
+
+    // Pins the ordering inside receive(): classifyRepeat runs first and only short-circuits duplicate/stale
+    // messages; a message at a turn this player has never seen falls through to the closing check as before.
+    it("a genuinely new message at latest+1 is still refused while closing", async () => {
+      const { alice, bob } = await openPair();
+      await finishGame(alice, bob);
+      await bob.signClose();
+      const proposal = await alice.proposeNewGame(); // never seen by bob: not "duplicate", not "stale"
+      await expect(bob.receive(proposal)).rejects.toThrow(/closing/);
     });
 
     it("receiveClose of a signature this player already holds is a no-op", async () => {
