@@ -31,7 +31,15 @@ async function sessions() {
   return { a, b, rec };
 }
 
-const OPEN: ChainView = { phase: "Open", funded: [true, true], deadline: 0n, challenger: 0, registeredTurn: null, now: 1000n };
+const OPEN: ChainView = {
+  phase: "Open",
+  funded: [true, true],
+  deadline: 0n,
+  challenger: 0,
+  registeredTurn: null,
+  cooldownUntil: [0n, 0n],
+  now: 1000n,
+};
 const view = (s: ChannelSession, record: ChannelRecord, chain = OPEN) =>
   buildStatus({ record, snapshot: s.snapshot(), myTurn: s.isMyTurn(), chain, lastError: null });
 
@@ -46,6 +54,7 @@ describe("buildStatus", () => {
     expect(sa.attention).toBe("your-turn");
     expect(sa.balances).toEqual({ me: "1.000000", opponent: "1.000000" });
     expect(sa.board).toContain("r  n  b  q  k  b  n  r");
+    expect(sa.cooldown).toEqual({ meSeconds: 0, opponentSeconds: 0 });
     expect(sa.suggestedActions.some((x) => x.startsWith("arena move"))).toBe(true);
     const sb = view(b, rec(1));
     expect(sb.color).toBe("black");
@@ -76,9 +85,17 @@ describe("buildStatus", () => {
   it("flags a challenge that needs this player's move", async () => {
     const { a, b, rec } = await sessions();
     await b.receive(await a.move("e2e4"));
-    const s = view(b, rec(1), { ...OPEN, phase: "Challenged", deadline: 1600n, challenger: 0, registeredTurn: 1n });
+    const s = view(b, rec(1), {
+      ...OPEN,
+      phase: "Challenged",
+      deadline: 1600n,
+      challenger: 0,
+      registeredTurn: 1n,
+      cooldownUntil: [1900n, 1300n],
+    });
     expect(s.challenge).toEqual({ deadline: "1600", secondsLeft: 600, mustMove: true, challenger: "opponent" });
     expect(s.attention).toBe("your-turn");
+    expect(s.cooldown).toEqual({ meSeconds: 300, opponentSeconds: 900 });
   });
 
   it("stays quiet while a human controls the channel", async () => {

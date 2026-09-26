@@ -140,4 +140,41 @@ describe("ArenaDaemon core", () => {
     await waitFor(async () => (await pair.alice.daemon.hub.channelInfo(id)).funded[0], 20_000, "alice funded");
     expect(pair.alice.daemon.channelIds().length).toBe(1);
   });
+
+  // R8.4: status()/channels()/wait() themselves, exercised against a real matched-and-funded channel.
+  it("R8.4a: status() reports phase, attention and zero cooldown right after a match", async () => {
+    const { alice, id } = await matched();
+    const status = await alice.daemon.status();
+    expect(status.channelId).toBe(id);
+    expect(status.phase).toBe("Open");
+    expect(status.attention).toBe("your-turn");
+    expect(status.cooldown).toEqual({ meSeconds: 0, opponentSeconds: 0 });
+  });
+
+  it("R8.4b: wait() resolves your-turn once the opponent's move arrives", async () => {
+    const { alice, bob, id } = await matched();
+    const waiting = bob.daemon.wait({ timeoutMs: 10_000 });
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "your-turn" });
+  });
+
+  it("R8.4c: wait() resolves control-changed on a handoff even without new attention", async () => {
+    const { alice, bob, id } = await matched();
+    // Make it bob's turn, so alice has no `attention` for wait() to notice first.
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    const waiting = alice.daemon.wait({ timeoutMs: 10_000 });
+    await alice.daemon.handoff(undefined, "human", "taking over");
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "control-changed" });
+  });
+
+  it("R8.4d: wait() times out when the human-controlled channel has no attention and no control change", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await alice.daemon.handoff(undefined, "human", "reviewing");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn (relay)");
+    await expect(alice.daemon.wait({ timeoutMs: 500 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+  });
 });

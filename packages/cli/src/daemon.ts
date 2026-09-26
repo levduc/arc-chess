@@ -45,6 +45,7 @@ export type ChainView = {
   deadline: bigint;
   challenger: number;
   registeredTurn: bigint | null;
+  cooldownUntil: readonly [bigint, bigint];
   now: bigint;
 };
 
@@ -110,6 +111,9 @@ export class ArenaDaemon {
     for (const record of this.records.channels()) {
       if (!record.finalized) await this.openChannel(record);
     }
+    // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see
+    // attention right after a restart instead of waiting up to pollMs for the first periodic tick.
+    if (!this.stopped) await this.tick();
     this.timer = setInterval(() => void this.tick(), this.opts.config.pollMs);
   }
 
@@ -489,14 +493,25 @@ export class ArenaDaemon {
     return out;
   }
 
-  /** Long-poll: resolves as soon as a channel needs the agent, or after `timeoutMs`. */
+  /**
+   * Long-poll: resolves as soon as a watched channel needs the agent, its controller changes (R8.2 — a
+   * handoff that produces no `attention` must still wake a waiter), or after `timeoutMs`.
+   */
   async wait(opts: { ref?: string; timeoutMs: number }): Promise<{ channelId: Hex | null; reason: string }> {
     const end = Date.now() + opts.timeoutMs;
+    // Controllers seen per channel so far: recorded the first time each channel is observed (whether that's at
+    // entry, or later if `opts.ref` is unset and a new channel joins `live` mid-wait), so a fresh sighting never
+    // trips a spurious control-changed, but a real change on any watched channel does.
+    const controllers = new Map<Hex, Controller>();
     for (;;) {
       const targets = opts.ref ? [this.pick(opts.ref)] : [...this.live.values()];
       for (const l of targets) {
+        const id = l.record.channelId;
+        const prev = controllers.get(id);
+        if (prev === undefined) controllers.set(id, l.record.controller);
+        else if (prev !== l.record.controller) return { channelId: id, reason: "control-changed" };
         const st = this.statusOf(l);
-        if (st.attention) return { channelId: l.record.channelId, reason: st.attention };
+        if (st.attention) return { channelId: id, reason: st.attention };
       }
       const left = end - Date.now();
       if (left <= 0) return { channelId: null, reason: "timeout" };
@@ -524,6 +539,7 @@ export class ArenaDaemon {
       deadline: info.deadline,
       challenger: info.challenger,
       registeredTurn,
+      cooldownUntil: info.cooldownUntil,
       now: block.timestamp,
     };
   }

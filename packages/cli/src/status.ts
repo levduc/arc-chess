@@ -20,6 +20,7 @@ export type ChannelStatus = {
   gameStatus: "playing" | "draw_offered" | "white_won" | "black_won" | "draw";
   outcome: Outcome;
   balances: { me: string; opponent: string };
+  cooldown: { meSeconds: number; opponentSeconds: number };
   newGame: "none" | "proposed_by_me" | "proposed_by_opponent";
   closing: boolean;
   opponentWantsToClose: boolean;
@@ -71,6 +72,12 @@ export function buildStatus(input: StatusInput): ChannelStatus {
           challenger: (chain.challenger === me ? "me" : "opponent") as "me" | "opponent",
         }
       : null;
+  const cooldown = chain
+    ? {
+        meSeconds: Math.max(0, Number(chain.cooldownUntil[me] - chain.now)),
+        opponentSeconds: Math.max(0, Number(chain.cooldownUntil[opponent] - chain.now)),
+      }
+    : { meSeconds: 0, opponentSeconds: 0 };
   const over = isGameOver(s);
   const live = phase === "Open" || phase === "Challenged";
 
@@ -113,6 +120,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     gameStatus: GAME_STATUS[status] ?? "playing",
     outcome: outcome(s),
     balances: { me: usdc(mine), opponent: usdc(theirs) },
+    cooldown,
     newGame,
     closing,
     opponentWantsToClose,
