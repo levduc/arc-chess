@@ -19,16 +19,23 @@ fs_permissions = [
 ]
 
 [invariant]
-runs = 64
-depth = 50
-fail_on_revert = false
+runs = 1500
+depth = 100
+fail_on_revert = true
 
 # Deeper invariant/fuzz sweep, run explicitly via `pnpm test:contracts:deep` (not part of the default
 # `pnpm test:contracts` loop, which must stay fast).
 [profile.deep.invariant]
 runs = 1000
 depth = 200
-fail_on_revert = false
+fail_on_revert = true
 
 [profile.deep.fuzz]
 runs = 20000
+
+# Fast profile used only by scripts/tools/mutants.sh, so 18 mutants can each get a full test run without
+# the mutation sweep itself taking 10+ minutes.
+[profile.mutation.invariant]
+runs = 128
+depth = 150
+fail_on_revert = true

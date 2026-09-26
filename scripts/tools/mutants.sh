@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Mutation test for ChannelHub.sol (Plan 4.5 Task 3, fix round 1).
+#
+# Applies each of the 18 one-line mutants from the reviewer's mutation pass (task-3-review.md) — the 6
+# already known to be caught plus the 12 that survived the original suite — to a throwaway copy of the
+# whole contracts/ tree, runs the invariant + unit suite against each mutant, and asserts every one of
+# them is killed (i.e. the suite fails). The real repo is never touched: everything happens in a fresh
+# temp directory, removed on exit via a trap.
+#
+# Usage: scripts/tools/mutants.sh
+# Env:   MUTATION_PROFILE (default: mutation) - the foundry.toml profile used for the per-mutant test run.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROFILE="${MUTATION_PROFILE:-mutation}"
+TMP="$(mktemp -d)"
+
+cleanup() {
+  rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+echo "==> Copying contracts/ to $TMP (original repo is never modified)"
+rsync -a --exclude 'out' --exclude 'cache' --exclude 'broadcast' "$ROOT/contracts/" "$TMP/contracts/"
+
+HUB="$TMP/contracts/src/ChannelHub.sol"
+PRISTINE="$TMP/ChannelHub.sol.pristine"
+cp "$HUB" "$PRISTINE"
+
+# --------------------------------------------------------------------------------------------------
+# Mutant definitions. Each `mutant_<ID>` function edits $HUB in place with a single sed pass. IDs match
+# task-3-review.md exactly. F6/F8/F14/F15/F16 were never assigned mutants by the reviewer ("not
+# reported, pick your own if useful") and are intentionally omitted rather than invented after the fact.
+# --------------------------------------------------------------------------------------------------
+
+mutant_C1() { # claim: pause check at the top of the function
+  sed -i '/^    function claim(address to) external nonReentrant {$/a\        if (paused) revert Paused();' "$HUB"
+}
+mutant_C2() { # claim: pause check placed after NothingToClaim
+  sed -i '/^        if (amount == 0) revert NothingToClaim();$/a\        if (paused) revert Paused();' "$HUB"
+}
+mutant_C3() { # _finalize: committedEscrow decremented using the CURRENT fee, not the channel's snapshot
+  sed -i '400s/committedEscrow -= 2 \* (p\.deposit + p\.feePerPlayer);/committedEscrow -= 2 * (p.deposit + feePerPlayer);/' "$HUB"
+}
+mutant_C4() { # challenge: StaleState check removed
+  sed -i '272s/.*/            \/\/ MUTATED: if (s.turnNum < reg || (s.turnNum == reg \&\& h != c.registeredHash)) revert StaleState();/' "$HUB"
+}
+mutant_C5() { # _pay: owed[to] = amount instead of +=
+  sed -i 's/owed\[to\] += amount;/owed[to] = amount;/' "$HUB"
+}
+mutant_C6() { # _pay: always defers to owed, even on a successful direct transfer
+  sed -i 's/if (ok \&\& (ret\.length == 0 || abi\.decode(ret, (bool)))) return;/if (false) return;/' "$HUB"
+}
+mutant_F1() { # challenge: added pause check (must never block an exit)
+  sed -i '/^    function challenge(bytes calldata encodedProof) external nonReentrant {$/a\        if (paused) revert Paused();' "$HUB"
+}
+mutant_F2() { # respond: added pause check
+  sed -i '/^    function respond(bytes calldata encodedProof) external nonReentrant {$/a\        if (paused) revert Paused();' "$HUB"
+}
+mutant_F3() { # timeout: off-by-one, < -> <=, makes the exact-deadline call revert TooEarly
+  sed -i '308s/if (block\.timestamp < c\.deadline) revert TooEarly();/if (block.timestamp <= c.deadline) revert TooEarly();/' "$HUB"
+}
+mutant_F4() { # closeCooperative: NotClosable check removed (non-terminal states become closable)
+  sed -i '248s/.*/        \/\/ MUTATED: if (s.turnNum != 0 \&\& !rules.isCheckpoint(s) \&\& !rules.isGameOver(s)) revert NotClosable();/' "$HUB"
+}
+mutant_F5() { # deposit: AlreadyFunded check removed
+  sed -i '196s/.*/        \/\/ MUTATED: if (c.funded[i]) revert AlreadyFunded();/' "$HUB"
+}
+mutant_F7() { # _finalize: fee paid to the CURRENT feeRecipient, not the channel's own p.feeRecipient
+  sed -i '405s/_pay(p\.feeRecipient, fee);/_pay(feeRecipient, fee);/' "$HUB"
+}
+mutant_F9() { # closeCooperative: StaleState check removed
+  sed -i '249s/.*/        \/\/ MUTATED: if (c.hasRegistered \&\& s.turnNum < c.registered.turnNum) revert StaleState();/' "$HUB"
+}
+mutant_F10() { # challenge: any address may challenge (NotParticipant bypassed)
+  sed -i '264s/uint8 who = _playerIndex(p, msg\.sender);/uint8 who = 0; \/\/ MUTATED: bypassed _playerIndex/' "$HUB"
+}
+mutant_F11() { # timeout: TooEarly check removed entirely (timeout allowed before the deadline)
+  sed -i '308s/.*/        \/\/ MUTATED: if (block.timestamp < c.deadline) revert TooEarly();/' "$HUB"
+}
+mutant_F12() { # respond: DeadlinePassed check removed (respond allowed after the deadline)
+  sed -i '290s/.*/        \/\/ MUTATED: if (block.timestamp >= c.deadline) revert DeadlinePassed();/' "$HUB"
+}
+mutant_F13() { # closeCooperative: signature check removed
+  sed -i '246s/.*/        \/\/ MUTATED: if (!_signedBy(p.signers[0], h, ss.sigA) || !_signedBy(p.signers[1], h, ss.sigB)) revert BadSignature();/' "$HUB"
+}
+mutant_F17() { # respond: does not register the new state
+  sed -i '294s/_register(c, s, h);/\/\/ MUTATED: _register(c, s, h);/' "$HUB"
+}
+
+MUTANT_IDS=(C1 C2 C3 C4 C5 C6 F1 F2 F3 F4 F5 F7 F9 F10 F11 F12 F13 F17)
+declare -A DESC=(
+  [C1]="claim: pause check at top (previously caught)"
+  [C2]="claim: pause check after NothingToClaim (previously caught)"
+  [C3]="_finalize: committedEscrow uses current fee, not snapshot (previously caught)"
+  [C4]="challenge: StaleState check removed (previously caught, deep profile only)"
+  [C5]="_pay: owed[to] = amount instead of += (previously caught, deep profile only)"
+  [C6]="_pay: always defers to owed (previously caught, unit test only)"
+  [F1]="challenge: pause check added"
+  [F2]="respond: pause check added"
+  [F3]="timeout: off-by-one (< -> <=)"
+  [F4]="closeCooperative: NotClosable check removed"
+  [F5]="deposit: AlreadyFunded check removed"
+  [F7]="_finalize: fee paid to current feeRecipient, not channel's own"
+  [F9]="closeCooperative: StaleState check removed"
+  [F10]="challenge: any address may challenge"
+  [F11]="timeout: TooEarly check removed"
+  [F12]="respond: DeadlinePassed check removed"
+  [F13]="closeCooperative: signature check removed"
+  [F17]="respond: does not register the new state"
+)
+
+declare -A RESULT
+FAIL=0
+
+for id in "${MUTANT_IDS[@]}"; do
+  cp "$PRISTINE" "$HUB"
+  "mutant_${id}"
+
+  if cmp -s "$PRISTINE" "$HUB"; then
+    RESULT[$id]="NOT_APPLIED"
+    FAIL=1
+    continue
+  fi
+
+  BUILD_LOG="$TMP/build_${id}.log"
+  if ! (cd "$TMP/contracts" && FOUNDRY_PROFILE="$PROFILE" PATH="$HOME/.foundry/bin:$PATH" forge build) \
+      > "$BUILD_LOG" 2>&1; then
+    RESULT[$id]="COMPILE_ERROR"
+    FAIL=1
+    continue
+  fi
+
+  TEST_LOG="$TMP/test_${id}.log"
+  if (cd "$TMP/contracts" && FOUNDRY_PROFILE="$PROFILE" PATH="$HOME/.foundry/bin:$PATH" \
+      forge test --match-path test/ChannelHub.invariant.t.sol) > "$TEST_LOG" 2>&1; then
+    RESULT[$id]="SURVIVED"
+    FAIL=1
+  else
+    RESULT[$id]="KILLED"
+  fi
+done
+
+# Restore the pristine file in the temp copy (defensive; the trap already removes $TMP wholesale, and the
+# real repo's ChannelHub.sol was never touched).
+cp "$PRISTINE" "$HUB"
+
+echo
+echo "== Mutation kill table =="
+printf "%-6s %-9s %s\n" "ID" "RESULT" "DESCRIPTION"
+for id in "${MUTANT_IDS[@]}"; do
+  printf "%-6s %-9s %s\n" "$id" "${RESULT[$id]}" "${DESC[$id]}"
+done
+echo
+echo "Profile: $PROFILE"
+
+SURVIVORS=()
+for id in "${MUTANT_IDS[@]}"; do
+  if [[ "${RESULT[$id]}" != "KILLED" ]]; then
+    SURVIVORS+=("$id (${RESULT[$id]})")
+  fi
+done
+
+if [[ $FAIL -ne 0 ]]; then
+  echo "FAILED: not every mutant was killed: ${SURVIVORS[*]}"
+  exit 1
+fi
+
+echo "PASSED: all ${#MUTANT_IDS[@]} mutants killed."

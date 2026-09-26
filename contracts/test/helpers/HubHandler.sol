@@ -13,22 +13,28 @@ import {ChessTestUtils} from "./ChessTestUtils.sol";
 /// participant forces ChannelHub's `_pay` fallback (owed) instead of a direct transfer.
 interface IBlockableToken {
     function setBlocked(address who, bool isBlocked) external;
+    function blocked(address who) external view returns (bool);
 }
 
 /// @notice Drives random multi-pair channel lifecycles (funding, disputes, cooperative close, timeouts,
-/// admin toggles, blocklisting) against a ChannelHub and tracks, independently of the contract's own
-/// bookkeeping, everything the invariants in ChannelHub.invariant.t.sol check.
+/// admin toggles, blocklisting, and deliberately adversarial attempts) against a ChannelHub and tracks,
+/// independently of the contract's own bookkeeping, everything the invariants in ChannelHub.invariant.t.sol
+/// check.
 contract HubHandler is Test, ChessTestUtils {
+    /// @dev An unrelated, always-wrong signing key: any signature produced with it must fail `_signedBy`
+    /// against a real signer, used to test that the hub actually checks signatures rather than ignoring them.
+    uint256 internal constant BAD_KEY = 0xB1;
+
     ChannelHub internal hub;
     ChessRules internal rules;
     IERC20 internal token;
     address internal owner;
-    address internal feeRecipient;
 
     address[] internal participants; // pairs at [2i], [2i+1]
     address[] internal signers; // pairs at [2i], [2i+1]
+    address[] internal feeRecipients; // >=2, so the fee recipient actually changes over the run
     mapping(address => uint256) internal keyOf; // keyed by signer address
-    address[] internal knownAddrs; // participants + signers + feeRecipient, for claim/blocklist/owed scans
+    address[] internal knownAddrs; // participants + feeRecipients only (the only addresses that ever get paid)
 
     Params[] internal channels;
 
@@ -39,10 +45,15 @@ contract HubHandler is Test, ChessTestUtils {
     mapping(bytes32 => uint64) internal ghostLastTurnNum;
     mapping(bytes32 => uint8) public ghostFinalizedCount;
     mapping(bytes32 => uint8) public ghostReclaimedCount;
+    mapping(bytes32 => uint8) public ghostLine; // last line (0-3) successfully registered per channel
 
     bool public turnNumViolation;
     bool public payoutMismatch;
     bool public pausedViolation;
+    bool public livenessViolation; // a call reverted despite every precondition the handler controls being met
+    bool public adversarialViolation; // a call the hub must reject (bad sender/sig/phase/timing) succeeded
+    bool public registrationViolation; // registeredState didn't match what a successful challenge/respond submitted
+    bool public staleCloseViolation; // closeCooperative succeeded on a state staler than one already registered
     uint256 public deferredPayouts; // count of individual _pay calls observed to have deferred to `owed`
 
     uint256 internal nonce;
@@ -52,29 +63,33 @@ contract HubHandler is Test, ChessTestUtils {
         ChessRules rules_,
         IERC20 token_,
         address owner_,
-        address feeRecipient_,
         address[] memory participants_,
         address[] memory signers_,
-        uint256[] memory keys_
+        uint256[] memory keys_,
+        address[] memory feeRecipients_
     ) {
         require(
             participants_.length == signers_.length && signers_.length == keys_.length
                 && participants_.length % 2 == 0 && participants_.length > 0,
             "pairs must come in twos"
         );
+        require(feeRecipients_.length >= 2, "need >=2 fee recipients");
         hub = hub_;
         rules = rules_;
         token = token_;
         owner = owner_;
-        feeRecipient = feeRecipient_;
         participants = participants_;
         signers = signers_;
+        feeRecipients = feeRecipients_;
         for (uint256 i = 0; i < signers_.length; i++) {
             keyOf[signers_[i]] = keys_[i];
-            knownAddrs.push(participants_[i]);
-            knownAddrs.push(signers_[i]);
         }
-        knownAddrs.push(feeRecipient_);
+        for (uint256 i = 0; i < participants_.length; i++) {
+            knownAddrs.push(participants_[i]);
+        }
+        for (uint256 i = 0; i < feeRecipients_.length; i++) {
+            knownAddrs.push(feeRecipients_[i]);
+        }
     }
 
     // ------------------------------------------------------------- views for invariants
@@ -102,7 +117,7 @@ contract HubHandler is Test, ChessTestUtils {
         p.participants = [participants[2 * pi], participants[2 * pi + 1]];
         p.signers = [signers[2 * pi], signers[2 * pi + 1]];
         p.rules = address(rules);
-        p.feeRecipient = feeRecipient;
+        p.feeRecipient = hub.feeRecipient(); // snapshot the CURRENT recipient (it may change over the run)
         p.feePerPlayer = hub.feePerPlayer();
         p.stakePerGame = 100_000;
         p.deposit = bound(depositSeed, 100_000, 5_000_000);
@@ -120,10 +135,15 @@ contract HubHandler is Test, ChessTestUtils {
     function fund(uint256 idx) external {
         (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Funding);
         if (!found || block.timestamp > p.fundingDeadline) return;
+        bool mayLegitimatelyFail = hub.paused() || _isBlocked(p.participants[1]);
         vm.prank(p.participants[1]);
         try hub.deposit(abi.encode(p)) {
             ghostEscrow += p.deposit + p.feePerPlayer;
-        } catch {}
+        } catch {
+            // deposit() legitimately reverts Paused() (spec §13); that alone is never a violation here —
+            // only an unexplained revert (neither paused nor a blocked sender) is (see mayLegitimatelyFail).
+            if (!mayLegitimatelyFail) livenessViolation = true;
+        }
     }
 
     function reclaim(uint256 idx) external {
@@ -132,7 +152,7 @@ contract HubHandler is Test, ChessTestUtils {
         if (block.timestamp <= p.fundingDeadline) vm.warp(p.fundingDeadline + 1);
         bytes32 id = hub.channelId(p);
         ChannelHub.ChannelInfo memory info = hub.channelInfo(id);
-        address[3] memory addrs = [p.participants[0], p.participants[1], feeRecipient];
+        address[3] memory addrs = [p.participants[0], p.participants[1], p.feeRecipient];
         uint256[3] memory expected = [
             info.funded[0] ? p.deposit + p.feePerPlayer : 0,
             info.funded[1] ? p.deposit + p.feePerPlayer : 0,
@@ -148,26 +168,33 @@ contract HubHandler is Test, ChessTestUtils {
             ghostReclaimedCount[id] += 1;
         } catch (bytes memory reason) {
             _checkNotPaused(reason);
+            livenessViolation = true; // phase==Funding and deadline passed: reclaim must always succeed
         }
     }
 
+    /// @dev Unblocks the recipient first (claim always pays `to == msg.sender`), so a real claim, not just
+    /// an attempt, actually goes through — the original design could populate `owed` and then never be
+    /// able to drain it, undercounting how often the claim path truly executes.
     function claim(uint256 seed) external {
         address addr = knownAddrs[seed % knownAddrs.length];
         uint256 amount = hub.owed(addr);
         if (amount == 0) return;
+        IBlockableToken(address(token)).setBlocked(addr, false);
         vm.prank(addr);
         try hub.claim(addr) {
             if (ghostOwed[addr] != amount) payoutMismatch = true;
             ghostOwed[addr] = 0;
         } catch (bytes memory reason) {
             _checkNotPaused(reason);
+            livenessViolation = true; // owed>0 and unblocked: claim must always succeed
         }
     }
 
     // ------------------------------------------------------------------- close
 
     /// @dev Closes on the opening state (line 0) or a resigned-and-terminal state (line 3): both are
-    /// closable per ChannelHub.closeCooperative (turnNum 0, or `rules.isGameOver`).
+    /// closable per ChannelHub.closeCooperative (turnNum 0, or `rules.isGameOver`). No staleness
+    /// pre-check: a stale `s` must be rejected by the hub itself (StaleState, caught below).
     function closeCooperativeAction(uint256 idx, uint256 lineSeed) external {
         (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Open);
         if (!found) (found, p) = _pick(idx, ChannelHub.Phase.Challenged);
@@ -175,23 +202,21 @@ contract HubHandler is Test, ChessTestUtils {
         bytes32 id = hub.channelId(p);
         uint8 line = (lineSeed % 2 == 0) ? 0 : 3;
         State memory s = _lineState(id, p, line);
-        // No staleness pre-check here: a stale `s` must be rejected by the hub itself (StaleState, caught
-        // below), so this invariant suite actually exercises that guard rather than only mirroring it.
         SignedState memory ss = SignedState({
             state: s,
             sigA: _signClose(keyOf[p.signers[0]], s),
             sigB: _signClose(keyOf[p.signers[1]], s)
         });
-        address[3] memory addrs = [p.participants[0], p.participants[1], feeRecipient];
+        address[3] memory addrs = [p.participants[0], p.participants[1], p.feeRecipient];
         uint256[3] memory expected = [s.balanceA, s.balanceB, 2 * p.feePerPlayer];
         (uint256[3] memory balBefore, uint256[3] memory owedBefore) = _snap(addrs);
         try hub.closeCooperative(abi.encode(ss)) {
+            if (s.turnNum < ghostLastTurnNum[id]) staleCloseViolation = true;
             _checkPayout(addrs, expected, balBefore, owedBefore);
             uint256 commit = 2 * (p.deposit + p.feePerPlayer);
             ghostCommitted -= commit;
             ghostEscrow -= commit;
             ghostFinalizedCount[id] += 1;
-            _syncTurnNum(id);
         } catch (bytes memory reason) {
             _checkNotPaused(reason);
         }
@@ -206,30 +231,30 @@ contract HubHandler is Test, ChessTestUtils {
         ChannelHub.ChannelInfo memory info = hub.channelInfo(id);
         uint8 line = uint8(lineSeed % 4);
         State memory s = _lineState(id, p, line);
-        // No staleness pre-check: a stale/equivocating `s` must be rejected by the hub's own StaleState
-        // guard (caught below), so this suite actually exercises that guard instead of only mirroring it.
         uint8 who = uint8(whoSeed % 2);
         if (block.timestamp < info.cooldownUntil[who]) return;
         bytes memory proof = _proof(s, p);
         vm.prank(p.participants[who]);
         try hub.challenge(proof) {
-            _syncTurnNum(id);
-        } catch {}
+            _afterRegister(id, line, s);
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
     }
 
     function respond(uint256 idx, uint256 lineSeed) external {
         (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Challenged);
         if (!found) return;
         bytes32 id = hub.channelId(p);
-        ChannelHub.ChannelInfo memory info = hub.channelInfo(id);
-        if (block.timestamp >= info.deadline) return;
+        if (block.timestamp >= hub.channelInfo(id).deadline) return;
         uint8 line = uint8(lineSeed % 4);
         State memory s = _lineState(id, p, line);
-        // No staleness pre-check: same rationale as above.
         bytes memory proof = _proof(s, p);
         try hub.respond(proof) {
-            _syncTurnNum(id);
-        } catch {}
+            _afterRegister(id, line, s);
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
     }
 
     function timeoutChannel(uint256 idx) external {
@@ -238,10 +263,13 @@ contract HubHandler is Test, ChessTestUtils {
         bytes32 id = hub.channelId(p);
         uint64 deadline = hub.channelInfo(id).deadline;
         if (block.timestamp < deadline) vm.warp(deadline);
-        State memory reg = hub.registeredState(id);
+        // Expected payout is derived from the ghost of the last *successfully submitted* line, not from
+        // re-reading the hub's own `registeredState` — otherwise a bug in challenge/respond that fails to
+        // register (e.g. F17) would be invisible here, because both sides would read the same stale state.
+        State memory reg = _lineState(id, p, ghostLine[id]);
         (uint256 aExp, uint256 bExp) =
             rules.isGameOver(reg) ? (reg.balanceA, reg.balanceB) : rules.forfeitBalances(reg, p);
-        address[3] memory addrs = [p.participants[0], p.participants[1], feeRecipient];
+        address[3] memory addrs = [p.participants[0], p.participants[1], p.feeRecipient];
         uint256[3] memory expected = [aExp, bExp, 2 * p.feePerPlayer];
         (uint256[3] memory balBefore, uint256[3] memory owedBefore) = _snap(addrs);
         try hub.timeout(id) {
@@ -250,20 +278,22 @@ contract HubHandler is Test, ChessTestUtils {
             ghostCommitted -= commit;
             ghostEscrow -= commit;
             ghostFinalizedCount[id] += 1;
-            _syncTurnNum(id);
         } catch (bytes memory reason) {
             _checkNotPaused(reason);
+            livenessViolation = true; // phase==Challenged and deadline reached: timeout must always succeed
         }
     }
 
     // ------------------------------------------------------------------ admin
 
-    function ownerSetFee(uint256 feeSeed) external {
-        // Deliberately allowed to exceed maxFeePerPlayer: the hub's own InvalidParams guard must reject it
-        // (caught below), so this suite exercises that cap rather than only mirroring it in invariant 7.
-        uint256 fee = bound(feeSeed, 0, 2 * hub.maxFeePerPlayer());
+    function ownerSetFee(uint256 feeSeed, uint256 recipientSeed) external {
+        // Mostly in-cap (so setFee actually succeeds and the recipient genuinely switches between channel
+        // creation and settlement — needed to exercise a fee-paid-to-the-wrong-recipient bug), occasionally
+        // above cap so invariant 7's own rejection path stays exercised too.
+        uint256 fee = bound(feeSeed, 0, hub.maxFeePerPlayer() + hub.maxFeePerPlayer() / 4);
+        address recipient = feeRecipients[recipientSeed % feeRecipients.length];
         vm.prank(owner);
-        try hub.setFee(fee, feeRecipient) {} catch {}
+        try hub.setFee(fee, recipient) {} catch {}
     }
 
     function ownerSetLimits(uint256 depSeed, uint256 commitSeed) external {
@@ -273,14 +303,20 @@ contract HubHandler is Test, ChessTestUtils {
         try hub.setLimits(dep, commit) {} catch {}
     }
 
-    function ownerSetPaused(bool paused_) external {
+    /// @dev Biased toward unpaused (~10% true), so exit actions (reclaim/close/timeout/claim/challenge/
+    /// respond) run under both pause states across a run instead of coin-flipping into gridlock.
+    function ownerSetPaused(uint256 seed) external {
+        bool wantPaused = (seed % 10 == 0);
         vm.prank(owner);
-        try hub.setPaused(paused_) {} catch {}
+        try hub.setPaused(wantPaused) {} catch {}
     }
 
-    /// @notice Invariant 6, reinforced: while paused, probe calls that a correct hub must reject for a
-    /// *non-pause* reason (NothingToClaim / WrongPhase), so any `Paused()` selector here is unambiguously a
-    /// violation — without risking a real (ghost-desyncing) settlement the way an unconstrained probe would.
+    /// @notice Invariant 6, reinforced. Two safe probes while paused:
+    /// (a) `claim` on an address with nothing owed -> a correct hub rejects with `NothingToClaim`.
+    /// (b) reclaim/timeout/challenge/respond/closeCooperative on an already-Finalized/Reclaimed channel,
+    ///     using minimal (possibly garbage) payloads -> every one of those five must reject with
+    ///     `WrongPhase` *before* touching anything else, so this is safe regardless of payload contents
+    ///     and can never accidentally trigger a real settlement.
     function probePausedExits(uint256 seed) external {
         if (!hub.paused()) return;
         address addr = knownAddrs[seed % knownAddrs.length];
@@ -294,11 +330,24 @@ contract HubHandler is Test, ChessTestUtils {
         Params memory p = channels[seed % n];
         bytes32 id = hub.channelId(p);
         ChannelHub.Phase ph = hub.channelInfo(id).phase;
-        if (ph == ChannelHub.Phase.Finalized || ph == ChannelHub.Phase.Reclaimed) {
-            (bool ok1, bytes memory ret1) = address(hub).call(abi.encodeCall(hub.reclaim, (id)));
-            if (!ok1) _checkNotPaused(ret1);
-            (bool ok2, bytes memory ret2) = address(hub).call(abi.encodeCall(hub.timeout, (id)));
-            if (!ok2) _checkNotPaused(ret2);
+        if (ph != ChannelHub.Phase.Finalized && ph != ChannelHub.Phase.Reclaimed) return;
+        _probeMustReject(abi.encodeCall(hub.reclaim, (id)));
+        _probeMustReject(abi.encodeCall(hub.timeout, (id)));
+        Proof memory pr;
+        pr.latest.state.channelId = id;
+        _probeMustReject(abi.encodeCall(hub.challenge, (abi.encode(pr))));
+        _probeMustReject(abi.encodeCall(hub.respond, (abi.encode(pr))));
+        SignedState memory ss;
+        ss.state.channelId = id;
+        _probeMustReject(abi.encodeCall(hub.closeCooperative, (abi.encode(ss))));
+    }
+
+    function _probeMustReject(bytes memory data) internal {
+        (bool ok, bytes memory ret) = address(hub).call(data);
+        if (!ok) {
+            _checkNotPaused(ret);
+        } else {
+            adversarialViolation = true; // a terminal channel accepted a state-mutating call
         }
     }
 
@@ -312,15 +361,190 @@ contract HubHandler is Test, ChessTestUtils {
         IBlockableToken(address(token)).setBlocked(addr, false);
     }
 
+    // ------------------------------------------------------------- adversarial
+    // Each of these attempts something a correct hub must reject (wrong sender, wrong signature, wrong
+    // phase/timing, or a repeat), catches the (expected) revert, and only ever updates ghosts from the
+    // actually-observed effect if the call unexpectedly succeeds — in which case it also flags a violation.
+
+    function adversarialChallenge(uint256 idx, uint256 lineSeed, uint256 senderSeed) external {
+        (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Open);
+        if (!found) return;
+        bytes32 id = hub.channelId(p);
+        uint8 line = uint8(lineSeed % 4);
+        State memory s = _lineState(id, p, line);
+        bytes memory proof = _proof(s, p);
+        address sender = _adversarialSender(senderSeed, p);
+        bool authorized = sender == p.participants[0] || sender == p.participants[1] || sender == p.signers[0]
+            || sender == p.signers[1];
+        vm.prank(sender);
+        try hub.challenge(proof) {
+            if (!authorized) adversarialViolation = true;
+            _afterRegister(id, line, s);
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
+    }
+
+    /// @notice A hasPrev proof built from two consecutive, correctly-signed lines (opening -> one move),
+    /// exercising the `_supported` hasPrev branch that the solo-proof-only normal actions never reach.
+    function adversarialHasPrevChallenge(uint256 idx) external {
+        (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Open);
+        if (!found) return;
+        bytes32 id = hub.channelId(p);
+        State memory prevState = _lineState(id, p, 0); // opening: needs no signature to be endorsed
+        State memory latestState = _lineState(id, p, 1); // one legal move, white (signers[0]) to have moved
+        Proof memory pr;
+        pr.hasPrev = true;
+        pr.prev.state = prevState;
+        pr.latest.state = latestState;
+        pr.latest.sigA = _sign(keyOf[p.signers[0]], latestState);
+        vm.prank(p.participants[0]);
+        try hub.challenge(abi.encode(pr)) {
+            _afterRegister(id, 1, latestState);
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
+    }
+
+    /// @notice Challenge or respond with one signature corrupted (turnNum > 0, so a signature is actually
+    /// required) — a correct hub must reject with BadSignature (kills a signature-check-removed mutant).
+    function adversarialBadSig(uint256 idx, uint256 lineSeed, uint256 targetSeed) external {
+        uint8 line = uint8(1 + (lineSeed % 3)); // never 0: the opening needs no signature at all
+        bool useRespond = (targetSeed % 2 == 1);
+        (bool found, Params memory p) = _pick(idx, useRespond ? ChannelHub.Phase.Challenged : ChannelHub.Phase.Open);
+        if (!found) return;
+        bytes32 id = hub.channelId(p);
+        if (useRespond && block.timestamp >= hub.channelInfo(id).deadline) return;
+        State memory s = _lineState(id, p, line);
+        Proof memory pr;
+        pr.latest.state = s;
+        pr.latest.sigA = _sign(keyOf[p.signers[0]], s);
+        pr.latest.sigB = _badSig(hub.hashState(s));
+        bytes memory proof = abi.encode(pr);
+        if (useRespond) {
+            try hub.respond(proof) {
+                adversarialViolation = true;
+                _afterRegister(id, line, s);
+            } catch (bytes memory reason) {
+                _checkNotPaused(reason);
+            }
+        } else {
+            try hub.challenge(proof) {
+                adversarialViolation = true;
+                _afterRegister(id, line, s);
+            } catch (bytes memory reason) {
+                _checkNotPaused(reason);
+            }
+        }
+    }
+
+    /// @notice Cooperative close on a non-terminal line (F4: NotClosable removed) or with a corrupted
+    /// close signature (F13: signature check removed) — a correct hub must reject both.
+    function adversarialClose(uint256 idx, uint256 lineSeed, uint256 corruptSeed) external {
+        (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Open);
+        if (!found) (found, p) = _pick(idx, ChannelHub.Phase.Challenged);
+        if (!found) return;
+        bytes32 id = hub.channelId(p);
+        uint8 line = uint8(lineSeed % 4);
+        State memory s = _lineState(id, p, line);
+        uint8 corrupt = uint8(corruptSeed % 3); // 0 = none, 1 = corrupt sigA, 2 = corrupt sigB
+        bytes memory sigA = corrupt == 1 ? _badSig(hub.hashClose(s)) : _signClose(keyOf[p.signers[0]], s);
+        bytes memory sigB = corrupt == 2 ? _badSig(hub.hashClose(s)) : _signClose(keyOf[p.signers[1]], s);
+        SignedState memory ss = SignedState({state: s, sigA: sigA, sigB: sigB});
+        address[3] memory addrs = [p.participants[0], p.participants[1], p.feeRecipient];
+        uint256[3] memory expected = [s.balanceA, s.balanceB, 2 * p.feePerPlayer];
+        (uint256[3] memory balBefore, uint256[3] memory owedBefore) = _snap(addrs);
+        try hub.closeCooperative(abi.encode(ss)) {
+            bool nonTerminal = (line == 1 || line == 2);
+            if (nonTerminal || corrupt != 0) adversarialViolation = true;
+            if (s.turnNum < ghostLastTurnNum[id]) staleCloseViolation = true;
+            _checkPayout(addrs, expected, balBefore, owedBefore);
+            uint256 commit = 2 * (p.deposit + p.feePerPlayer);
+            ghostCommitted -= commit;
+            ghostEscrow -= commit;
+            ghostFinalizedCount[id] += 1;
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
+    }
+
+    /// @notice A second deposit from the participant that already funded (F5: AlreadyFunded removed).
+    function adversarialDeposit(uint256 idx) external {
+        (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Funding);
+        if (!found) (found, p) = _pick(idx, ChannelHub.Phase.Open);
+        if (!found) return;
+        vm.prank(p.participants[0]); // always the participant `create()` funded first
+        try hub.deposit(abi.encode(p)) {
+            adversarialViolation = true;
+            ghostEscrow += p.deposit + p.feePerPlayer; // deposit() always moves exactly this much in
+        } catch {
+            // deposit() is the one function that legitimately reverts Paused() (spec §13) — unlike every
+            // other action here, that is not itself a violation, so we don't route it to _checkNotPaused.
+        }
+    }
+
+    /// @notice timeout strictly before the deadline (F11: TooEarly removed/weakened).
+    function adversarialTimeout(uint256 idx) external {
+        (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Challenged);
+        if (!found) return;
+        bytes32 id = hub.channelId(p);
+        if (block.timestamp >= hub.channelInfo(id).deadline) return;
+        try hub.timeout(id) {
+            adversarialViolation = true;
+            State memory reg = _lineState(id, p, ghostLine[id]);
+            uint256 commit = 2 * (p.deposit + p.feePerPlayer);
+            ghostCommitted -= commit;
+            ghostEscrow -= commit;
+            ghostFinalizedCount[id] += 1;
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
+    }
+
+    /// @notice respond at or after the deadline (F12: DeadlinePassed removed/weakened).
+    function adversarialRespondLate(uint256 idx, uint256 lineSeed) external {
+        (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Challenged);
+        if (!found) return;
+        bytes32 id = hub.channelId(p);
+        ChannelHub.ChannelInfo memory info = hub.channelInfo(id);
+        if (block.timestamp < info.deadline) return;
+        uint8 line = uint8(lineSeed % 4);
+        State memory s = _lineState(id, p, line);
+        if (s.turnNum <= hub.registeredState(id).turnNum) return;
+        bytes memory proof = _proof(s, p);
+        try hub.respond(proof) {
+            adversarialViolation = true;
+            _afterRegister(id, line, s);
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
+    }
+
+    /// @notice claim with nothing owed (NothingToClaim removed).
+    function adversarialClaimNothing(uint256 seed) external {
+        address addr = knownAddrs[seed % knownAddrs.length];
+        if (hub.owed(addr) != 0) return;
+        vm.prank(addr);
+        try hub.claim(addr) {
+            adversarialViolation = true;
+        } catch (bytes memory reason) {
+            _checkNotPaused(reason);
+        }
+    }
+
     // --------------------------------------------------------------- internal
 
-    /// @dev Invariant 6: none of the exit paths (reclaim, claim, closeCooperative, timeout) may ever revert
-    /// with `Paused()` — only `deposit` is allowed to. Each of those functions' catch blocks routes its
-    /// revert reason here, whether or not the hub happens to be paused right now.
+    /// @dev Invariant 6: none of the exit paths (reclaim, claim, closeCooperative, timeout, challenge,
+    /// respond) may ever revert with `Paused()` — only `deposit` is allowed to. Every catch block routes
+    /// its revert reason here, whether or not the hub happens to be paused right now.
     function _checkNotPaused(bytes memory reason) internal {
         if (reason.length >= 4 && bytes4(reason) == ChannelHub.Paused.selector) {
             pausedViolation = true;
         }
+    }
+
+    function _isBlocked(address who) internal view returns (bool) {
+        return IBlockableToken(address(token)).blocked(who);
     }
 
     function _pick(uint256 idx, ChannelHub.Phase phase) internal view returns (bool, Params memory) {
@@ -355,6 +579,12 @@ contract HubHandler is Test, ChessTestUtils {
         for (uint256 i = 0; i < 3; i++) {
             uint256 balAfter = token.balanceOf(addrs[i]);
             uint256 owedAfter = hub.owed(addrs[i]);
+            if (balAfter < balBefore[i] || owedAfter < owedBefore[i]) {
+                // Should never happen (nothing here ever decreases); guard rather than let an unchecked
+                // subtraction revert the handler call (which would be misclassified under fail_on_revert).
+                payoutMismatch = true;
+                continue;
+            }
             uint256 delivered = (balAfter - balBefore[i]) + (owedAfter - owedBefore[i]);
             if (delivered != expected[i]) payoutMismatch = true;
             if (owedAfter > owedBefore[i]) {
@@ -372,6 +602,28 @@ contract HubHandler is Test, ChessTestUtils {
         } else {
             ghostLastTurnNum[id] = cur;
         }
+    }
+
+    /// @dev Called after every successful challenge/respond (normal or adversarial) that submitted a
+    /// `_lineState`-built state. Records which line is now registered (so `timeoutChannel` can compute its
+    /// expected payout independently of the hub's own `registeredState`) and checks that the hub's
+    /// registered state actually is what was just submitted (kills a "respond doesn't register" mutant).
+    function _afterRegister(bytes32 id, uint8 line, State memory s) internal {
+        ghostLine[id] = line;
+        State memory reg = hub.registeredState(id);
+        if (reg.turnNum != s.turnNum || hub.hashState(reg) != hub.hashState(s)) {
+            registrationViolation = true;
+        }
+        _syncTurnNum(id);
+    }
+
+    function _adversarialSender(uint256 seed, Params memory p) internal pure returns (address) {
+        uint256 k = seed % 5;
+        if (k == 0) return address(uint160(uint256(keccak256(abi.encode("adversarial-stranger", seed)))));
+        if (k == 1) return p.participants[0];
+        if (k == 2) return p.participants[1];
+        if (k == 3) return p.signers[0];
+        return p.signers[1];
     }
 
     /// @dev Builds one of four fixed, legal lines from the opening state (spec §4/§12): the opening itself
@@ -412,6 +664,11 @@ contract HubHandler is Test, ChessTestUtils {
 
     function _signClose(uint256 key, State memory s) internal view returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 sg) = vm.sign(key, hub.hashClose(s));
+        return abi.encodePacked(r, sg, v);
+    }
+
+    function _badSig(bytes32 hash) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 sg) = vm.sign(BAD_KEY, hash);
         return abi.encodePacked(r, sg, v);
     }
 }
