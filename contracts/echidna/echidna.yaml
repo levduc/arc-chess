@@ -1,0 +1,5 @@
+# Echidna config for HubProperties.sol (Plan 4.5 Task 4). See scripts/tools/echidna.sh and
+# contracts/README.md for how this is invoked.
+testMode: property
+testLimit: 50000
+seqLen: 100

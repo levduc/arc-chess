@@ -10,7 +10,25 @@ On-chain half of the Agent Chess Arena (spec: `docs/superpowers/specs/2026-09-24
 
     pnpm vectors                 # generate chess.js differential vectors (needed by forge test)
     pnpm test:contracts          # vectors + full forge test suite
+    pnpm analyze:slither         # Slither static analysis on src/ (scripts/tools/slither.sh)
+    pnpm fuzz:echidna            # Echidna property fuzzing on ChannelHub (scripts/tools/echidna.sh)
     forge script script/Deploy.s.sol --rpc-url <rpc> --broadcast --private-key <key>
+
+`pnpm analyze:slither` runs Slither (via `uvx`, pinned in the script) against `contracts/src/`, excluding
+`lib/`, `test/`, `script/` and `echidna/`. Pass bar: zero High or Medium findings on `src/` (excluding
+`src/dev/`, which is dev-only and never deployed); Low/Informational findings on new code are fixed or
+annotated with `slither-disable-next-line <detector>` and a justification, matching the existing style in
+ChannelHub.sol. It requires `forge` on PATH (crytic-compile's Foundry integration shells out to it).
+
+`pnpm fuzz:echidna` runs Echidna (downloaded and sha256-verified into the gitignored `tools/bin/` on first
+use) against `contracts/echidna/HubProperties.sol`, a self-contained harness (it deploys its own MockUSDC,
+ChessRules and ChannelHub) that restates invariants 1, 2, 4 and 7 of `ChannelHub.invariant.t.sol` as
+`echidna_*` properties over `deposit`/`fund`/`reclaim`/close-on-opening/`challenge`/`respond`/`timeout`
+actions. It is a second, coverage-guided opinion alongside Task 3's deep Foundry invariant/fuzz suite, not a
+replacement for it — Echidna has no `vm.sign`/`vm.prank`/`vm.warp` equivalent, so the harness stands in with
+mock ERC-1271 "always valid" signers and forwarder "wallet" contracts instead of real signatures and sender
+impersonation. It requires `forge` and a pinned `crytic-compile` (installed via `uv tool install`, pinned in
+the script) on PATH.
 
 Deploy env: `ARENA_OWNER`, `ARENA_FEE_RECIPIENT`, `ARENA_TOKEN` (required on every chain except the local
 chain 31337, where MockUSDC is deployed if it is unset; elsewhere the script reverts without it),

@@ -7,6 +7,8 @@
     "test:contracts": "pnpm vectors && forge test --root contracts",
     "test:contracts:deep": "pnpm vectors && FOUNDRY_PROFILE=deep forge test --root contracts",
     "test:contracts:mutants": "bash scripts/tools/mutants.sh",
+    "analyze:slither": "bash scripts/tools/slither.sh",
+    "fuzz:echidna": "bash scripts/tools/echidna.sh",
     "test:sdk": "pnpm --filter @arena/sdk test",
     "test:cli": "pnpm --filter @arena/cli test",
     "test:server": "pnpm --filter @arena/server test"
