@@ -64,6 +64,8 @@ export type ChannelHandle = {
   lastProgressAt: bigint | null;
   /** I2: fingerprint of the session/phase at `lastProgressAt`; any change counts as progress. */
   progressKey: string | null;
+  /** M-c: set while an autoPlay (relay- or tick-driven) runs, so the two never both try to resign the same mate. */
+  autoPlaying: boolean;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -363,7 +365,7 @@ export class ArenaDaemon {
     // stop()) could have used to already open this same channel, or to stop the daemon.
     if (this.stopped || this.live.has(record.channelId)) return;
     const sessionSender = new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain);
-    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null });
+    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false });
     await this.opts.relay.join(record.channelId, record.sessionKey);
     // Crash recovery (Review Focus 5): re-send our latest own state so a message lost at the crash is delivered.
     const latest = session.latest;
@@ -427,10 +429,16 @@ export class ArenaDaemon {
 
   /** Spec §6.3: sign RESIGN when checkmated and CLAIM_STALEMATE when stalemated, regardless of controller. */
   protected async autoPlay(l: ChannelHandle): Promise<void> {
-    if (!l.session.isMyTurn()) return;
-    const o = outcome(l.session.latest.state);
-    if (o === "checkmate") await this.sendState(l, await l.session.resign());
-    else if (o === "stalemate") await this.sendState(l, await l.session.claimStalemate());
+    if (l.autoPlaying) return; // the run in progress will finish the job
+    l.autoPlaying = true;
+    try {
+      if (!l.session.isMyTurn()) return;
+      const o = outcome(l.session.latest.state);
+      if (o === "checkmate") await this.sendState(l, await l.session.resign());
+      else if (o === "stalemate") await this.sendState(l, await l.session.claimStalemate());
+    } finally {
+      l.autoPlaying = false;
+    }
   }
 
   protected async sendState(l: ChannelHandle, signed: SignedState): Promise<void> {
@@ -615,7 +623,11 @@ export class ArenaDaemon {
 
     // 3. Disputes (spec §6.3).
     if (this.stopped) return;
-    if (info.phase === "Challenged") {
+    if (info.phase === "Open") {
+      // M-c: self-heal a crash between receiving a mating (or stalemating) move and answering it — the relay
+      // path that normally calls autoPlay will not see that move again.
+      await this.autoPlay(l);
+    } else if (info.phase === "Challenged") {
       const registered = await this.hub.registeredState(id);
       const latest = l.session.latest.state;
       if (now < info.deadline && latest.turnNum > registered.turnNum) {

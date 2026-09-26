@@ -4,9 +4,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import type { Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { buildParams, hashState, offerId as computeOfferId, signClose, type MatchEvent } from "@arena/sdk";
+import { ChannelSession, buildParams, hashState, offerId as computeOfferId, signClose, type MatchEvent } from "@arena/sdk";
+import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
 import { increaseTime, now } from "../../sdk/test/helpers/chain.js";
-import { ArenaDaemon, DaemonError, RecordStore, loadConfig, type ChannelRecord } from "../src/index.js";
+import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but these tests craft host events. */
@@ -171,5 +172,37 @@ describe("I4: never-fundable offers and never-funded channels", () => {
     const passes = bob.daemon.handle(id).passes;
     await bob.daemon.tick();
     expect(bob.daemon.handle(id).passes).toBe(passes);
+  });
+});
+
+describe("minor fixes", () => {
+  it("M-c: a restart after receiving a mating move, but before auto-resigning, resigns from the Open-phase tick", async () => {
+    const { alice, bob, id, env } = await matched();
+    for (const m of SCHOLARS_MATE.slice(0, -1)) {
+      const [mover, other] = alice.daemon.handle(id).session.isMyTurn() ? [alice, bob] : [bob, alice];
+      await mover.daemon.move(id, m, { actor: "agent" });
+      const turn = mover.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => other.daemon.handle(id).session.latest.state.turnNum === turn, 5_000, `relay ${m}`);
+    }
+    // Bob "crashes": his daemon stops, then the mating move reaches (and is persisted by) his session alone.
+    await bob.daemon.stop();
+    await alice.daemon.move(id, SCHOLARS_MATE.at(-1)!, { actor: "agent" });
+    const record = new RecordStore(bob.home).channel(id)!;
+    const session = await ChannelSession.open({
+      params: record.params,
+      me: record.me,
+      sessionKey: record.sessionKey,
+      domain: env.domain,
+      store: new FileSessionStore(arenaPaths(bob.home).channelSession(id)),
+    });
+    expect(await session.receive(alice.daemon.handle(id).session.latest)).toBe("move");
+    expect(session.isMyTurn()).toBe(true); // mated, and not yet resigned
+
+    const restarted = new ArenaDaemon({ home: bob.home, config: loadConfig(bob.home), walletKey: bob.walletKey, lobby: bob.client.lobby, relay: bob.client.relay });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    await waitFor(async () => (await alice.daemon.status(id)).gameStatus === "white_won", 10_000, "auto-resign reaches alice");
+    expect(restarted.handle(id).session.isMyTurn()).toBe(false);
+    expect((await restarted.status(id)).gameStatus).toBe("white_won");
   });
 });
