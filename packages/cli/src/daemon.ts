@@ -25,6 +25,7 @@ import {
 import { arenaPaths, type ArenaConfig } from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
+import { buildStatus, type ChannelStatus } from "./status.js";
 
 export type Actor = "agent" | "human";
 
@@ -468,14 +469,75 @@ export class ArenaDaemon {
       if (info.phase === "None" && me === 0) await this.fund(l);
       else if (info.phase === "Funding" && !info.funded[me] && (me === 0 || info.funded[0])) await this.fund(l);
     }
+    await this.refreshChain(l);
+  }
+
+  // ------------------------------------------------------------------ status
+
+  async status(ref?: string): Promise<ChannelStatus> {
+    const l = this.pick(ref);
+    await this.refreshChain(l);
+    return this.statusOf(l);
+  }
+
+  async channels(): Promise<ChannelStatus[]> {
+    const out: ChannelStatus[] = [];
+    for (const l of this.live.values()) {
+      await this.refreshChain(l);
+      out.push(this.statusOf(l));
+    }
+    return out;
+  }
+
+  /** Long-poll: resolves as soon as a channel needs the agent, or after `timeoutMs`. */
+  async wait(opts: { ref?: string; timeoutMs: number }): Promise<{ channelId: Hex | null; reason: string }> {
+    const end = Date.now() + opts.timeoutMs;
+    for (;;) {
+      const targets = opts.ref ? [this.pick(opts.ref)] : [...this.live.values()];
+      for (const l of targets) {
+        const st = this.statusOf(l);
+        if (st.attention) return { channelId: l.record.channelId, reason: st.attention };
+      }
+      const left = end - Date.now();
+      if (left <= 0) return { channelId: null, reason: "timeout" };
+      await this.nextChange(Math.min(left, 1000));
+    }
+  }
+
+  private statusOf(l: ChannelHandle): ChannelStatus {
+    return buildStatus({
+      record: l.record,
+      snapshot: l.session.snapshot(),
+      myTurn: l.session.isMyTurn(),
+      chain: l.chain,
+      lastError: l.lastError,
+    });
+  }
+
+  private async refreshChain(l: ChannelHandle): Promise<void> {
+    const id = l.record.channelId;
+    const [info, block] = await Promise.all([this.hub.channelInfo(id), this.client.getBlock()]);
+    const registeredTurn = info.hasRegistered ? (await this.hub.registeredState(id)).turnNum : null;
     l.chain = {
       phase: info.phase,
       funded: info.funded,
       deadline: info.deadline,
       challenger: info.challenger,
-      registeredTurn: null,
-      now,
+      registeredTurn,
+      now: block.timestamp,
     };
+  }
+
+  private nextChange(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.changes.off("change", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      this.changes.on("change", done);
+    });
   }
 
   // ------------------------------------------------------------------ helpers
