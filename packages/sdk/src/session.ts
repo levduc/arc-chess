@@ -317,7 +317,12 @@ export class ChannelSession {
     });
   }
 
-  /** Checks an incoming message against `draft` without changing it; returns what to record. */
+  /**
+   * Checks an incoming message against `draft` and returns what to record. It leaves `draft` unchanged except in
+   * one case: the opponent's first move on this player's own pending checkpoint (R4), where `moveOnPending`
+   * co-signs that move through `signInto`, which writes the equivocation guard (`lastSignedTurn`) into `draft`.
+   * `draft` is only a copy — nothing is visible until the caller's `store.save(draft)` succeeds.
+   */
   private async classifyIncoming(
     draft: SessionSnapshot,
     msg: SignedState,

@@ -3,6 +3,7 @@ import type { PublicClient } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import {
   ChannelSession,
+  EMPTY_SIGNED,
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
@@ -293,6 +294,30 @@ describe("channel lifecycle on Anvil", () => {
     expect([bal.balanceA, bal.balanceB]).toEqual([d + 2n * s, d - 2n * s]); // Alice: the game-1 stake, plus game 0's
     expect(await usdcBalance(x.env.usdc, x.alice.address)).toBe(START - d - f + bal.balanceA);
     expect(await usdcBalance(x.env.usdc, x.bob.address)).toBe(START - d - f + bal.balanceB);
+  });
+
+  it("R4 respond path: Bob challenges at checkpoint C; Alice answers with her co-signed C+1 and no predecessor", async () => {
+    // Reviewer's final-review probe, committed: the hub accepts R4's both-signed, prev-less move on `respond`
+    // (spec §12 items 11 and 14), not only on `challenge`.
+    const x = await arena("r4-respond");
+    const { a, b } = await open(x);
+    await play(a, b, SCHOLARS_MATE);
+    await a.receive(await b.resign());
+    const proposal = await a.proposeNewGame(); // A's pending checkpoint C
+    await b.receive(proposal);
+    const full = await b.countersignNewGame(); // withheld from A
+    const resign = await b.resign(); // C+1, delivered to A off-chain
+    expect(await a.receive(resign)).toBe("move"); // R4: A adopts C+1 and co-signs it
+
+    // Bob registers the (both-signed) checkpoint C, hiding the move he already made on it.
+    await x.hub.challenge(x.bob, { hasPrev: false, prev: EMPTY_SIGNED, latest: full });
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Challenged");
+    const proof = a.challengeProof();
+    expect(proof.hasPrev).toBe(false);
+    expect(proof.latest.state).toEqual(resign.state);
+    await x.hub.respond(x.alice, proof);
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Open");
+    expect((await x.hub.registeredState(a.id)).turnNum).toBe(resign.state.turnNum);
   });
 });
 
