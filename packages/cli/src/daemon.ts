@@ -155,15 +155,9 @@ export class ArenaDaemon {
       try {
         await this.openChannel(entry.record);
       } catch (err) {
-        const opened = this.live.get(entry.record.channelId);
-        if (opened) {
-          // The session loaded and the channel is watched; only the relay join failed (the re-send itself now
-          // happens later, asynchronously, from onJoined — it never runs as part of this catch).
-          opened.lastError = `relay: ${errorText(err)}`;
-          this.log(`channel ${entry.channelId}: ${opened.lastError}`);
-        } else {
-          this.markDegraded(entry.channelId, errorText(err));
-        }
+        // only a session that failed to load gets here: a relay join failure is recorded as the channel's
+        // lastError by openChannel itself, without holding up this loop
+        this.markDegraded(entry.channelId, errorText(err));
       }
     }
     // Replays match events for offers this daemon posted/accepted while it was down.
@@ -426,10 +420,16 @@ export class ArenaDaemon {
     const sessionSender = new SerialTxSender(
       new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
     );
-    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false });
+    const signer = privateKeyToAccount(record.sessionKey);
+    const l: ChannelHandle = { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null, autoPlaying: false };
+    this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
     // handled uniformly by onJoined() for the first join and for every later reconnect.
-    await this.opts.relay.join(record.channelId, record.params, privateKeyToAccount(record.sessionKey));
+    // I4: not awaited -- a slow or silent host must never hold up start() and with it the watchtower.
+    this.opts.relay.join(record.channelId, record.params, signer).catch((err: unknown) => {
+      l.lastError = `relay: ${errorText(err)}`;
+      this.log(`channel ${record.channelId}: ${l.lastError}`);
+    });
   }
 
   /**

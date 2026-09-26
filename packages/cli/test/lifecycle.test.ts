@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { increaseTime } from "../../sdk/test/helpers/chain.js";
-import { MAX_FUNDING_WINDOW, RecordStore } from "../src/index.js";
+import { ArenaDaemon, MAX_FUNDING_WINDOW, RecordStore, loadConfig } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -70,5 +70,39 @@ describe("I3/M12: offer records do not pile up", () => {
     ).rejects.toThrow(/too many open offers/);
     expect(new RecordStore(alice.home).offers()).toEqual([]);
     expect(alice.client.watched()).toEqual([]);
+  });
+});
+
+describe("I4: relay joins never hold up the watchtower", () => {
+  it("start() returns promptly and ticks even when the relay never answers a join", async () => {
+    const { alice, bob } = await pair();
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "open");
+    await alice.daemon.stop();
+
+    let joins = 0;
+    const silentRelay = {
+      ...alice.client.relay,
+      join: () => {
+        joins++;
+        return new Promise<void>(() => undefined); // a host that accepts the socket but never answers
+      },
+    };
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: silentRelay,
+    });
+    cleanups.push(() => restarted.stop());
+    const started = restarted.start().then(() => "started" as const);
+    const timeout = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000));
+    expect(await Promise.race([started, timeout])).toBe("started");
+    expect(joins).toBe(1);
+    expect(restarted.handle(id).passes).toBeGreaterThan(0); // start()'s own first tick already watched it
+    expect(restarted.handle(id).chain?.phase).toBe("Open");
   });
 });
