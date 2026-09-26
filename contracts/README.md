@@ -14,7 +14,11 @@ On-chain half of the Agent Chess Arena (spec: `docs/superpowers/specs/2026-09-24
 
 Deploy env: `ARENA_OWNER`, `ARENA_FEE_RECIPIENT`, `ARENA_TOKEN` (required on every chain except the local
 chain 31337, where MockUSDC is deployed if it is unset; elsewhere the script reverts without it),
-`ARENA_FEE_PER_PLAYER` (default 5000 = $0.005), `ARENA_MAX_FEE_PER_PLAYER` (default 1000000).
+`ARENA_FEE_PER_PLAYER` (default 5000 = $0.005), `ARENA_MAX_FEE_PER_PLAYER` (default 1000000),
+`ARENA_MAX_DEPOSIT_PER_PLAYER` (default 10000000 = 10 USDC), `ARENA_MAX_COMMITTED_ESCROW` (default
+1000000000 = 1,000 USDC). The last two are the spec §13 launch limits (see "Admin surface" below); they are
+deployment parameters, not constants, and the owner is expected to raise them as operating history
+accumulates.
 Output: `deployments/<chainId>.json` → `{ token, chessRules, channelHub }`.
 
 ## Encodings (shared with the TypeScript SDK)
@@ -49,6 +53,31 @@ delegation) therefore cannot revoke ECDSA signatures it already produced, while 
   audited game templates (daemons refuse unlisted rules by default). A reverting or malicious rules contract
   blocks every exit that consults it (challenge, respond, timeout, and cooperative close on any later state):
   the only remaining exit is `closeCooperative` on the opening state (`turnNum` 0), which never calls `rules`.
+- The hub is to launch directly on Arc mainnet, with no prior testnet phase and no external audit first
+  (spec §13, decided 2026-09-26), an accepted risk. To bound a contract defect's damage, the owner-set launch limits
+  (`maxDepositPerPlayer`, `maxCommittedEscrow`, `paused`) cap exposure while operating history accumulates;
+  see "Admin surface" below for what they do and do not let the owner do.
+
+## Admin surface (spec §13)
+
+The owner (a multisig on mainnet) can change only four things, none of which touch deposits or existing
+channels, and the hub stays non-upgradeable:
+
+- `setFee(feePerPlayer, feeRecipient)` — the fee snapshotted into channels created from now on.
+- `setLimits(maxDepositPerPlayer, maxCommittedEscrow)` — the per-channel deposit cap and the hub-wide
+  commitment cap, both checked only at channel creation. Lowering either affects only channels created
+  afterwards; the second deposit into an already-created channel is never blocked by them, and `setLimits`
+  accepts any values, including a cap below the current `committedEscrow`.
+  - `maxDepositPerPlayer`: a first `deposit` whose `params.deposit` exceeds it reverts `DepositTooLarge`.
+  - `maxCommittedEscrow`: `committedEscrow` tracks `2 * (deposit + feePerPlayer)` per unsettled channel
+    (reserving both sides at once, so the second deposit is never blocked by the cap), added at creation and
+    subtracted at `_finalize`/`reclaim`. Creation that would push it over the cap reverts `EscrowCapReached`.
+- `setPaused(bool)` — blocks every `deposit` (new channels and second-side funding alike) while set. It never
+  blocks `reclaim`, `closeCooperative`, `challenge`, `respond`, `timeout` or `claim`: every open channel can
+  always settle, and a half-funded channel is still refunded by `reclaim` after its funding deadline.
+
+The worst an owner (or a compromised owner key) can do is refuse new business; it can never move escrowed
+funds, alter an existing channel's terms, or block an exit.
 
 ## External entry points and Circle CLI
 

@@ -170,6 +170,22 @@ export class HubClient {
     return { feePerPlayer, feeRecipient };
   }
 
+  /** The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause flag. */
+  async limits(): Promise<{
+    maxDepositPerPlayer: bigint;
+    maxCommittedEscrow: bigint;
+    committedEscrow: bigint;
+    paused: boolean;
+  }> {
+    const [maxDepositPerPlayer, maxCommittedEscrow, committedEscrow, paused] = await Promise.all([
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxDepositPerPlayer" }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxCommittedEscrow" }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "committedEscrow" }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "paused" }),
+    ]);
+    return { maxDepositPerPlayer, maxCommittedEscrow, committedEscrow, paused };
+  }
+
   /** The hub's accepted `challengeTimeout` range in seconds (`MIN_TIMEOUT`..`MAX_TIMEOUT`, inclusive). */
   async timeoutBounds(): Promise<{ min: bigint; max: bigint }> {
     const [min, max] = await Promise.all([
@@ -238,8 +254,8 @@ export class HubClient {
   /**
    * Every hub event for every channel in `[fromBlock, toBlock]`, chain order -- for a watchtower scanning the
    * whole hub rather than one channel at a time, since it may not know every channel to poll for ahead of time.
-   * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, EIP712DomainChanged, OZ Ownership*) are
-   * skipped.
+   * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, LimitsUpdated, PausedSet,
+   * EIP712DomainChanged, OZ Ownership*) are skipped.
    */
   async hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
     const logs = await this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, fromBlock, toBlock });

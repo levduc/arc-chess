@@ -37,7 +37,8 @@ contract Demo is Script, ChessTestUtils {
         vm.startBroadcast(DEPLOYER);
         usdc = new MockUSDC();
         rules = new ChessRules();
-        hub = new ChannelHub(IERC20(address(usdc)), vm.addr(DEPLOYER), HOST, 5_000, 1_000_000);
+        hub =
+            new ChannelHub(IERC20(address(usdc)), vm.addr(DEPLOYER), HOST, 5_000, 1_000_000, 10_000_000, 1_000_000_000);
         usdc.mint(alice, 10e6);
         usdc.mint(bob, 10e6);
         vm.stopBroadcast();

@@ -49,12 +49,23 @@ async function deploy(name: string, args: unknown[]): Promise<Address> {
   return getAddress(receipt.contractAddress);
 }
 
-/** Deploys a fresh MockUSDC, ChessRules and ChannelHub (fee 5000 per player, max 1e6, host = account 3). */
+/**
+ * Deploys a fresh MockUSDC, ChessRules and ChannelHub (fee 5000 per player, max 1e6, host = account 3).
+ * The launch limits (maxDepositPerPlayer, maxCommittedEscrow) are generous so existing tests are unaffected.
+ */
 export async function deployArena() {
   const host = privateKeyToAccount(ANVIL_KEYS[3]).address;
   const usdc = await deploy("MockUSDC", []);
   const rules = await deploy("ChessRules", []);
-  const hub = await deploy("ChannelHub", [usdc, deployer.account.address, host, 5_000n, 1_000_000n]);
+  const hub = await deploy("ChannelHub", [
+    usdc,
+    deployer.account.address,
+    host,
+    5_000n,
+    1_000_000n,
+    10_000_000n,
+    10n ** 12n,
+  ]);
   const domain: ArenaDomain = { chainId: CHAIN.id, hub };
   return { pub: publicClient(), usdc, rules, hub, host, domain };
 }

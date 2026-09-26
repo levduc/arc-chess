@@ -130,6 +130,32 @@ describe("channel lifecycle on Anvil", () => {
     expect((await x.hub.channelInfo(a.id)).phase).toBe("Reclaimed");
   });
 
+  it("reads the launch limits and tracks committedEscrow across deposit and close", async () => {
+    const x = await arena("limits");
+    const limits0 = await x.hub.limits();
+    expect(limits0.maxDepositPerPlayer).toBe(10_000_000n);
+    expect(limits0.maxCommittedEscrow).toBe(10n ** 12n);
+    expect(limits0.paused).toBe(false);
+    expect(limits0.committedEscrow).toBe(0n);
+
+    const commit = 2n * (x.params.deposit + x.params.feePerPlayer);
+    await x.hub.deposit(x.alice, x.params);
+    expect((await x.hub.limits()).committedEscrow).toBe(commit);
+
+    await x.hub.deposit(x.bob, x.params); // second deposit never changes committedEscrow
+    expect((await x.hub.limits()).committedEscrow).toBe(commit);
+
+    const a = await ChannelSession.create(x.cfg(0));
+    const b = await ChannelSession.create(x.cfg(1));
+    await b.receive(await a.resign());
+    await b.receiveClose(await a.signClose());
+    await a.receiveClose(await b.signClose());
+    const tx = a.closeTransaction();
+    expect(tx).not.toBeNull();
+    await x.hub.closeCooperative(x.alice, tx!);
+    expect((await x.hub.limits()).committedEscrow).toBe(0n);
+  });
+
   it("surfaces hub custom errors by name", async () => {
     const x = await arena("errors");
     const { a, b } = await open(x);
