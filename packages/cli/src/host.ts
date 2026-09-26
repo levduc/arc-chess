@@ -50,6 +50,20 @@ const JOIN_TIMEOUT_MS = 10_000;
 const DEFAULT_MIN_BACKOFF_MS = 250;
 const DEFAULT_MAX_BACKOFF_MS = 10_000;
 
+/**
+ * Error-frame message prefixes (relay.ts's `join`) that mean a join is refused for good: the same channelId,
+ * params and signer would be refused again by any server holding this same on-chain state, so it must not stay
+ * registered for retry. Every other join refusal -- a per-connection capacity limit ("too many channels on this
+ * connection"), a server-side hiccup ("internal", "relay unavailable"), a client-side timeout with no error
+ * frame at all, or any other message this ruling did not name (e.g. "malformed join frame") -- leaves the
+ * channel registered and it is retried on the next `hello` instead.
+ */
+export const PERMANENT_JOIN_REFUSAL_PREFIXES = [
+  "params do not match",
+  "not a member of this channel",
+  "bad join signature",
+] as const;
+
 type JoinEntry = { params: Params; signer: RelaySigner };
 type JoinWaiter = { resolve(): void; reject(err: Error): void };
 
@@ -196,12 +210,18 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
         const msg = typeof frame.error === "string" ? frame.error : "unknown error";
         const channelId = typeof frame.channelId === "string" ? (frame.channelId as Hex) : undefined;
         // Not yet confirmed joined on this socket, but registered for (re-)join: this error is almost certainly
-        // the server refusing that join, not a later forward failure on an already-joined channel -- drop it
-        // from the re-join set so it isn't retried on every future `hello`. A channel that *is* joined keeps its
-        // entry: an unrelated forward error (bad signature, wrong sender, ...) must not deregister a good join.
+        // the server refusing that join, not a later forward failure on an already-joined channel. A channel
+        // that *is* joined always keeps its entry: an unrelated forward error (bad signature, wrong sender, ...)
+        // must not deregister a good join. Among join refusals, only a *permanent* one (PERMANENT_JOIN_REFUSAL_
+        // PREFIXES) drops the channel from the re-join set; every other refusal stays registered and is retried
+        // on the next `hello`.
         if (channelId && joins.has(channelId) && !joinedOnSocket.has(channelId)) {
-          joins.delete(channelId);
-          log(`host: join to ${channelId} refused, not retrying: ${msg}`);
+          if (PERMANENT_JOIN_REFUSAL_PREFIXES.some((prefix) => msg.startsWith(prefix))) {
+            joins.delete(channelId);
+            log(`host: join to ${channelId} refused permanently, not retrying: ${msg}`);
+          } else {
+            log(`host: join to ${channelId} refused, will retry on the next hello: ${msg}`);
+          }
         } else {
           log(`host: server error: ${msg}`);
         }

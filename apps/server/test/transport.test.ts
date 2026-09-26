@@ -18,6 +18,7 @@ import {
   type SignedAcceptance,
   type SignedOffer,
 } from "@arena/sdk";
+import { DEFAULT_LIMITS } from "../src/config.js";
 import { startServer, type ArenaServer } from "../src/server.js";
 import { FakeChain, testConfig } from "./helpers/fakeChain.js";
 import { makeChannelFixture, rawStateAt, signStateAs } from "./helpers/channel.js";
@@ -247,6 +248,35 @@ describe("host transports (connectHost) against a real server", () => {
       await waitFor(() => hostA.connected());
       await new Promise((r) => setTimeout(r, 200)); // a resend-on-hello, if it happened, would show up by now
       expect(logs.filter((l) => l.includes("not a member")).length).toBe(1); // not repeated on the reconnect
+    } finally {
+      hostA.close();
+    }
+  });
+
+  it("a transient join refusal (too many channels on this connection) is retried after a reconnect", async () => {
+    // A per-connection capacity error names no permanent property of the join itself (a fresh connection with
+    // fewer other channels already joined could accept the very same join) -- unlike "not a member of this
+    // channel" above, it must stay registered and be retried on the next `hello`, not dropped.
+    const cfg = testConfig({ limits: { ...DEFAULT_LIMITS, maxJoinsPerConnection: 1 } });
+    server = await startServer(cfg, { chain: new FakeChain() });
+    const fx1 = makeChannelFixture(cfg);
+    const fx2 = makeChannelFixture(cfg);
+    const logs: string[] = [];
+    const hostA = connectHost(server.url, { minBackoffMs: 20, maxBackoffMs: 100, log: (l) => logs.push(l) });
+    try {
+      await waitFor(() => hostA.connected());
+      await hostA.relay.join(fx1.id, fx1.params, privateKeyToAccount(fx1.kA)); // takes the connection's one slot
+      await expect(hostA.relay.join(fx2.id, fx2.params, privateKeyToAccount(fx2.kA))).rejects.toThrow(
+        /too many channels/,
+      );
+      await waitFor(() => logs.some((l) => l.includes("will retry")));
+
+      server.dropConnections();
+      await waitFor(() => hostA.connected());
+      // The fresh connection re-attempts fx1 and fx2 (in that registration order) on its next `hello`; fx1 still
+      // wins the connection's one slot first, so fx2 is refused again -- proving fx2's join was resent, not
+      // silently dropped after the first refusal.
+      await waitFor(() => logs.filter((l) => l.includes("too many channels")).length >= 2, 10_000);
     } finally {
       hostA.close();
     }
