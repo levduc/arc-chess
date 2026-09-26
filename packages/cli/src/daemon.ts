@@ -335,9 +335,12 @@ export class ArenaDaemon {
       const fee = await this.hub.feeConfig();
       if (this.stopped) return release();
       const now = (await this.client.getBlock()).timestamp;
-      // M4: an offer the host matched after it expired must never be funded.
-      if (now >= rec.offer.expiresAt) {
-        this.log(`ignoring match for offer ${offerId}: offer has expired`);
+      // M4/I5: an offer the host matched after it expired must never be funded. Judged at match time, not now: the
+      // host sets fundingDeadline = matchTime + fundingWindow (at most MAX_FUNDING_WINDOW), so a deadline beyond
+      // expiresAt + MAX_FUNDING_WINDOW proves a late match, while an offerer who comes back after expiresAt to a
+      // match made in time still funds (checkMatchParams below still requires fundingDeadline > now).
+      if (m.params.fundingDeadline > rec.offer.expiresAt + MAX_FUNDING_WINDOW) {
+        this.log(`ignoring match for offer ${offerId}: it was matched after the offer expired`);
         return release();
       }
       // M3: fee equality — accept only the hub's current fee, and only if it is within this player's ceiling.
