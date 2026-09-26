@@ -4,3 +4,5 @@ export * from "./fileStore.js";
 export * from "./records.js";
 export * from "./daemon.js";
 export * from "./status.js";
+export * from "./api.js";
+export * from "./cli.js";
