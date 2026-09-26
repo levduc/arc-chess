@@ -389,7 +389,16 @@ export class ArenaDaemon {
     try {
       await this.hub.closeCooperative(this.wallet, tx);
     } catch (err) {
-      if (!(err instanceof HubRevertError && err.errorName === "WrongPhase")) throw err;
+      if (!(err instanceof HubRevertError)) throw err;
+      // Both sides race to submit the same cooperative close once they hold both signatures (each one's own
+      // call, and the other's relayed close message, land within the same window). The loser's simulate can
+      // still see phase "Open" (the winner hasn't mined yet), so it only reverts once mined — a status revert
+      // with no decodable reason, unlike the (rarer) already-stale-simulate case that decodes as "WrongPhase".
+      // Either way, once the channel is no longer Open/Challenged, the close already went through: not an error.
+      if (err.errorName !== "WrongPhase") {
+        const after = await this.hub.channelInfo(l.record.channelId);
+        if (after.phase === "Open" || after.phase === "Challenged") throw err;
+      }
     }
   }
 
