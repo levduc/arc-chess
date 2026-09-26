@@ -253,6 +253,10 @@ describe("watchtower", () => {
     await alice.daemon.move(undefined, "e4", { actor: "agent" }); // turn 1; Bob (black) is on move there
     await alice.daemon.challenge(undefined, "agent"); // registers turn 1 on-chain
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Challenged", 20_000, "challenge");
+    // Bob is on move in the registered state and silent: Alice's own watchtower would legitimately call
+    // timeout() once the deadline passes. Stop her daemon so only Bob's watchtower runs from here — this
+    // test is about Bob's on-move invariant, not a race against Alice's own (correct) timeout call.
+    await alice.daemon.stop();
     await increaseTime(601);
     await bob.daemon.idle();
     let before = bob.daemon.handle(id).passes;
