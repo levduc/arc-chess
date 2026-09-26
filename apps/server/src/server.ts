@@ -1,10 +1,12 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { decodeWire, toWire, WireFormatError } from "@arena/sdk";
+import type { Address, Hex } from "viem";
+import { decodeWire, fenOf, statusOf, toWire, WireFormatError } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 import { RpcChainReader, type ChainReader } from "./chain.js";
+import { chessSkillMd, indexHtml, llmsTxt, skillMd, watchHtml } from "./docs.js";
+import { Indexer, playerStats } from "./indexer.js";
 import { RateLimiter } from "./limits.js";
-import { chessSkillMd, indexHtml, llmsTxt, skillMd } from "./docs.js";
 import { Lobby, LobbyError } from "./lobby.js";
 import { Relay } from "./relay.js";
 import { SqliteRepo, type Repo } from "./repo.js";
@@ -24,6 +26,7 @@ export type ArenaServer = {
   port: number;
   config: ServerConfig;
   repo: Repo;
+  indexer: Indexer;
   dropConnections(): void; // closes every WebSocket (tests: simulate a relay outage)
   close(): Promise<void>;
 };
@@ -149,7 +152,7 @@ function renderMetrics(m: Metrics, offersOpen: number): string {
       "arena_indexer_block",
       "Last block the indexer has processed.",
       "gauge",
-      m.indexerBlock === null ? "NaN" : m.indexerBlock.toString(),
+      m.indexerBlock === null ? "0" : m.indexerBlock.toString(),
     ) +
     line(
       "arena_indexer_lag_blocks",
@@ -161,6 +164,14 @@ function renderMetrics(m: Metrics, offersOpen: number): string {
 }
 
 const MARKDOWN_ROUTES = ["/skill.md", "/llms.txt", "/templates/chess/skill.md"] as const;
+
+const ADDR_ROUTE_RE = /^0x[0-9a-fA-F]{40}$/;
+const HEX32_ROUTE_RE = /^0x[0-9a-f]{64}$/i;
+
+/** Canonicalizes a channel id path segment: lower-cases it and rejects anything that isn't 0x + 64 hex chars. */
+function canonicalChannelId(raw: string): Hex | null {
+  return HEX32_ROUTE_RE.test(raw) ? (raw.toLowerCase() as Hex) : null;
+}
 
 export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Promise<ArenaServer> {
   const repo = new SqliteRepo(cfg.dbPath);
@@ -175,6 +186,8 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
 
   const lobby = new Lobby(repo, chain, cfg);
   const relay = new Relay(repo, cfg, metrics, log);
+  const indexer = new Indexer(repo, chain, cfg, log);
+  indexer.start();
 
   // filled once listen() resolves; route handlers close over this box rather than a value, so they always see it
   const self: { url: string } = { url: "" };
@@ -188,8 +201,66 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/metrics") return false;
       const offersOpen = repo.openOfferTotal(await chain.now());
+      metrics.indexerBlock = repo.cursor() ?? 0n;
+      metrics.indexerLag = await indexer.lag();
       ctx.res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
       ctx.res.end(renderMetrics(metrics, offersOpen));
+      return true;
+    },
+    async (ctx) => {
+      const match = /^\/players\/([^/]+)$/.exec(ctx.url.pathname);
+      if (ctx.method !== "GET" || !match) return false;
+      const addr = match[1];
+      if (!ADDR_ROUTE_RE.test(addr)) {
+        sendJson(ctx.res, 400, { error: "bad address" });
+        return true;
+      }
+      sendJson(ctx.res, 200, playerStats(repo, relay, addr.toLowerCase() as Address));
+      return true;
+    },
+    async (ctx) => {
+      const match = /^\/api\/channels\/([^/]+)$/.exec(ctx.url.pathname);
+      if (ctx.method !== "GET" || !match) return false;
+      const id = canonicalChannelId(match[1]);
+      if (!id) {
+        sendJson(ctx.res, 400, { error: "bad channel id" });
+        return true;
+      }
+      const row = repo.channelRow(id);
+      const latestSigned = relay.latestState(id);
+      if (!row && !latestSigned) {
+        sendJson(ctx.res, 404, { error: "not found" });
+        return true;
+      }
+      const latest = latestSigned
+        ? {
+            turnNum: decStr(latestSigned.state.turnNum),
+            gameIndex: latestSigned.state.gameIndex,
+            fen: fenOf(latestSigned.state),
+            balanceA: decStr(latestSigned.state.balanceA),
+            balanceB: decStr(latestSigned.state.balanceB),
+            status: statusOf(latestSigned.state),
+          }
+        : null;
+      sendJson(ctx.res, 200, {
+        channelId: id,
+        // No indexer row means this channel is known only through the relay's live/cached state (e.g. it hasn't
+        // been seen on-chain yet by this process): phase, participants and the on-chain params below are then
+        // unknown and reported as null, rather than guessed from `latest`.
+        phase: row ? row.phase : null,
+        participants: row ? row.params.participants : null,
+        stakePerGame: row ? decStr(row.params.stakePerGame) : null,
+        deposit: row ? decStr(row.params.deposit) : null,
+        createdBlock: row ? decStr(row.createdBlock) : null,
+        latest,
+      });
+      return true;
+    },
+    async (ctx) => {
+      const match = /^\/watch\/([^/]+)$/.exec(ctx.url.pathname);
+      if (ctx.method !== "GET" || !match) return false;
+      ctx.res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      ctx.res.end(watchHtml(match[1] as Hex));
       return true;
     },
     async (ctx) => {
@@ -236,7 +307,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/") return false;
       ctx.res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      ctx.res.end(indexHtml(repo.recentChannels(50)));
+      ctx.res.end(indexHtml(repo.recentChannels(20)));
       return true;
     },
   ];
@@ -290,10 +361,12 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     port,
     config: cfg,
     repo,
+    indexer,
     dropConnections() {
       wsHandle.dropAll();
     },
     async close() {
+      indexer.stop();
       clearInterval(pruneInterval);
       await wsHandle.close();
       httpServer.closeAllConnections();

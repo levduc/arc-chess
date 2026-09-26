@@ -107,12 +107,116 @@ export function indexHtml(channels: ChannelRow[]): string {
   ].join("\n");
 }
 
+/** Client-side board/status script for `watchHtml`. `channelId` is spliced in as a JS string literal (see
+ *  `watchHtml`, which JSON-encodes it) -- everything else here is static. Escapes to `<` are neutralized by the
+ *  caller so a malicious id can't break out of the surrounding `<script>` element. */
+const WATCH_SCRIPT = `
+  const GLYPH = {
+    p: "\\u265F", n: "\\u265E", b: "\\u265D", r: "\\u265C", q: "\\u265B", k: "\\u265A",
+    P: "\\u2659", N: "\\u2658", B: "\\u2657", R: "\\u2656", Q: "\\u2655", K: "\\u2654",
+  };
+  const STATUS_NAME = ["playing", "draw offered", "white won", "black won", "draw"];
+
+  function renderBoard(fen) {
+    const board = document.getElementById("board");
+    board.innerHTML = "";
+    const placement = fen.split(" ")[0];
+    const ranks = placement.split("/");
+    for (let rank = 0; rank < 8; rank++) {
+      const row = ranks[rank] || "8";
+      let file = 0;
+      for (const ch of row) {
+        if (/[1-8]/.test(ch)) {
+          for (let i = 0; i < Number(ch); i++) {
+            file = placeSquare(board, rank, file);
+          }
+        } else {
+          const sq = document.createElement("div");
+          const dark = (rank + file) % 2 === 1;
+          sq.className = "sq " + (dark ? "dark" : "light");
+          sq.textContent = GLYPH[ch] || "";
+          board.appendChild(sq);
+          file += 1;
+        }
+      }
+    }
+  }
+
+  function placeSquare(board, rank, file) {
+    const sq = document.createElement("div");
+    const dark = (rank + file) % 2 === 1;
+    sq.className = "sq " + (dark ? "dark" : "light");
+    board.appendChild(sq);
+    return file + 1;
+  }
+
+  function fmtUsdc(decStr) {
+    const neg = decStr.startsWith("-");
+    const n = BigInt(neg ? decStr.slice(1) : decStr);
+    const whole = n / 1000000n;
+    const frac = (n % 1000000n).toString().padStart(6, "0");
+    return (neg ? "-" : "") + whole.toString() + "." + frac;
+  }
+
+  async function tick() {
+    let data;
+    try {
+      const res = await fetch("/api/channels/" + channelId);
+      if (!res.ok) return;
+      data = await res.json();
+    } catch {
+      return;
+    }
+    const info = document.getElementById("info");
+    const phase = data.phase == null ? "unknown" : data.phase;
+    if (!data.latest) {
+      document.getElementById("board").innerHTML = "";
+      info.textContent = "phase: " + phase + " -- waiting for the first move";
+      return;
+    }
+    renderBoard(data.latest.fen);
+    const statusName = STATUS_NAME[data.latest.status] || String(data.latest.status);
+    info.textContent =
+      "phase: " + phase +
+      " | game " + data.latest.gameIndex +
+      " | balances: " + fmtUsdc(data.latest.balanceA) + " / " + fmtUsdc(data.latest.balanceB) + " USDC" +
+      " | status: " + statusName;
+  }
+
+  tick();
+  setInterval(tick, 2000);
+`;
+
+/** A self-contained spectator page (inline CSS/JS, no external assets): an 8x8 board rendered from the channel's
+ *  latest FEN (rank 8 at the top, Unicode glyphs), plus phase/game/balances/status, polling
+ *  `/api/channels/:id` every 2s. `channelId` is JSON-encoded into the script rather than string-concatenated, and
+ *  every other occurrence is HTML-escaped. */
 export function watchHtml(channelId: Hex): string {
+  // JSON.stringify does not escape "/", so a raw "</script>" inside the id would close the element early; folding
+  // every "<" to its unicode escape removes that substring regardless of content.
+  const idLiteral = JSON.stringify(channelId).replace(/</g, "\\u003c");
   return [
     "<!doctype html>",
     '<html lang="en"><head><meta charset="utf-8">',
-    `<title>Channel ${esc(channelId)}</title></head><body>`,
-    `<h1>${esc(channelId)}</h1>`,
+    `<title>Watching ${esc(channelId)}</title>`,
+    "<style>",
+    "body{font-family:monospace;background:#111;color:#eee;padding:1rem}",
+    "h1{font-size:1rem;font-weight:normal}",
+    "#board{display:grid;grid-template-columns:repeat(8,2.5rem);grid-template-rows:repeat(8,2.5rem);" +
+      "border:2px solid #555;width:max-content}",
+    ".sq{display:flex;align-items:center;justify-content:center;font-size:1.8rem}",
+    ".light{background:#e8e8e8;color:#111}",
+    ".dark{background:#4a4a4a;color:#111}",
+    "#info{margin-top:1rem}",
+    "</style>",
+    "</head><body>",
+    `<h1>Watching ${esc(channelId.slice(0, 10))}…</h1>`,
+    '<div id="board"></div>',
+    '<div id="info">waiting for the first move</div>',
+    "<script>",
+    `const channelId = ${idLiteral};`,
+    WATCH_SCRIPT,
+    "</script>",
     "</body></html>",
   ].join("\n");
 }

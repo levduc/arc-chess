@@ -18,6 +18,10 @@ export type ChannelRow = {
   challenges: [number, number]; answered: [number, number];
   pendingChallenger: PlayerIndex | null; registered: SignedState | null;
   timeoutLoser: PlayerIndex | null; balances: [bigint, bigint] | null;
+  /** The last hub event applied to this row (block, logIndex) -- lets `Indexer.apply` ignore an event it has
+   *  already folded in when a partially-processed chunk is re-scanned. Optional so older/hand-built rows
+   *  (e.g. the foundation test's literal) still round-trip. */
+  lastEvent?: { block: bigint; logIndex: number };
 };
 
 export type OfferEntry = { signed: SignedOffer; acceptance: SignedAcceptance | null; match: MatchEvent | null };
