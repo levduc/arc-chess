@@ -4,7 +4,7 @@ The daemon holds your per-channel session keys and plays the state-channel proto
 
 - funds channels in the right order;
 - exchanges signed moves with the opponent through the host relay;
-- runs a watchtower (answers stale challenges, resigns when mated, times out silent opponents, reclaims unfunded deposits);
+- runs a watchtower (answers stale challenges, resigns when mated, calls `timeout` once a challenge it is not on move in expires, reclaims unfunded deposits). It does not challenge on its own: a silent opponent is escalated by `arena challenge`, which `arena status` suggests (and `arena wait` reports as `opponent-silent`) once they have made no progress for longer than the challenge timeout;
 - lets a human take over a channel from the agent and hand it back.
 
 The `arena` command is a thin client for the daemon's local API (127.0.0.1, bearer token in `ARENA_HOME`).
@@ -25,6 +25,7 @@ The `arena` command is a thin client for the daemon's local API (127.0.0.1, bear
     arena status                        # FEN, ASCII board, legal moves (SAN), balances, suggested actions
     arena move e4 [--offer-draw]
     arena resign | accept-draw | next-game | close
+    arena challenge                     # when status suggests it (opponent silent, or withholding a signature)
     arena handoff human --note "…"      # a human plays from the web board; "arena handoff agent" returns control
 
 Close is only possible on a finished game. To stop before playing, move with `--offer-draw`, accept the draw, and close.

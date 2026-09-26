@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import type { Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
-import { ChannelSession, MemoryStore, type ArenaDomain } from "@arena/sdk";
+import { ChannelSession, MemoryStore, signClose, type ArenaDomain } from "@arena/sdk";
 import { buildStatus, type ChainView, type ChannelRecord } from "../src/index.js";
 import { makeParams, SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
 
@@ -28,7 +29,7 @@ async function sessions() {
     note: "",
     finalized: false,
   });
-  return { a, b, rec };
+  return { a, b, rec, keys };
 }
 
 const OPEN: ChainView = {
@@ -40,8 +41,18 @@ const OPEN: ChainView = {
   cooldownUntil: [0n, 0n],
   now: 1000n,
 };
-const view = (s: ChannelSession, record: ChannelRecord, chain = OPEN) =>
-  buildStatus({ record, snapshot: s.snapshot(), myTurn: s.isMyTurn(), chain, lastError: null });
+const view = (s: ChannelSession, record: ChannelRecord, chain = OPEN, lastProgressAt: bigint | null = null) =>
+  buildStatus({ record, snapshot: s.snapshot(), myTurn: s.isMyTurn(), chain, lastError: null, lastProgressAt });
+
+async function finished() {
+  const x = await sessions();
+  for (const m of SCHOLARS_MATE) {
+    const [mover, other] = x.a.isMyTurn() ? [x.a, x.b] : [x.b, x.a];
+    await other.receive(await mover.move(m));
+  }
+  await x.a.receive(await x.b.resign()); // game 0 over: white (a) won
+  return x;
+}
 
 describe("buildStatus", () => {
   it("describes the opening for both sides", async () => {
@@ -103,5 +114,101 @@ describe("buildStatus", () => {
     const s = view(a, { ...rec(0), controller: "human", note: "mine now" });
     expect(s.attention).toBeNull();
     expect(s.note).toBe("mine now");
+  });
+
+  it("I2(a): suggests arena challenge after arena wait while the opponent is on move", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4"));
+    const s = view(a, rec(0));
+    expect(s.attention).toBeNull();
+    expect(s.suggestedActions).toEqual(["arena wait", "arena challenge   (if the opponent stops responding)"]);
+    // Already Challenged: the escalation is under way, so it is not suggested again.
+    const c = view(a, rec(0), { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n });
+    expect(c.suggestedActions).toEqual(["arena wait"]);
+  });
+
+  it("I2(b): with our new-game proposal unanswered, suggests challenge and never arena close", async () => {
+    const { a, b, rec } = await finished();
+    await b.receive(await a.proposeNewGame());
+    const s = view(a, rec(0));
+    expect(s.newGame).toBe("proposed_by_me");
+    expect(s.attention).toBeNull();
+    expect(s.suggestedActions).not.toContain("arena close");
+    expect(s.suggestedActions).toEqual([
+      "wait: new game proposed",
+      "arena challenge   (settles the finished game on-chain if the opponent never answers)",
+    ]);
+  });
+
+  it("I2(c): after signing Close, suggests challenge while the opponent's Close signature is missing", async () => {
+    const { a, b, rec } = await finished();
+    await b.receiveClose(await a.signClose());
+    const s = view(a, rec(0));
+    expect(s.closing).toBe(true);
+    expect(s.suggestedActions).toEqual([
+      "wait: close signed; waiting for the opponent's close signature",
+      "arena challenge   (settles the finished game on-chain if they never sign)",
+    ]);
+  });
+
+  it("I2: close-requested only for a finished game with nothing pending and while we are not closing", async () => {
+    const { a, b, rec, keys } = await finished();
+    // An opponent Close signature on the finished game is a request we can honour. (Signed with b's raw key, so
+    // b's own session is not frozen and can still receive a proposal below.)
+    const close = { sig: await signClose(keys[1], a.latest.state, domain) };
+    const oppClosed = { ...a.snapshot(), closeSigs: ["0x", close.sig] as [Hex, Hex] };
+    const req = buildStatus({ record: rec(0), snapshot: oppClosed, myTurn: false, chain: OPEN, lastError: null });
+    expect(req.attention).toBe("close-requested");
+    // A Close signature recorded against a non-terminal latest (as a snapshot written before the SDK refused them
+    // could hold) must not raise close-requested: `arena close` would always fail there.
+    const fresh = await sessions();
+    await fresh.b.receive(await fresh.a.move("e2e4"));
+    const early = { ...fresh.a.snapshot(), closeSigs: ["0x", `0x${"11".repeat(65)}`] as [Hex, Hex] };
+    const e = buildStatus({ record: fresh.rec(0), snapshot: early, myTurn: false, chain: OPEN, lastError: null });
+    expect(e.opponentWantsToClose).toBe(true);
+    expect(e.attention).toBeNull();
+    // Nor while a new-game proposal is pending either way.
+    const proposal = await a.proposeNewGame();
+    const pendingMine = { ...a.snapshot(), closeSigs: ["0x", close.sig] as [Hex, Hex] };
+    expect(buildStatus({ record: rec(0), snapshot: pendingMine, myTurn: false, chain: OPEN, lastError: null }).attention).toBeNull();
+    await b.receive(proposal);
+    const pendingTheirs = { ...b.snapshot(), closeSigs: [close.sig, "0x"] as [Hex, Hex] };
+    expect(buildStatus({ record: rec(1), snapshot: pendingTheirs, myTurn: false, chain: OPEN, lastError: null }).attention).toBe(
+      "new-game-proposed",
+    );
+  });
+
+  it("I2: raises opponent-silent once the opponent has not progressed for more than challengeTimeout", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4")); // a waits on b's move
+    // Exactly challengeTimeout (600 s) of silence is not yet "more than".
+    expect(view(a, rec(0), OPEN, OPEN.now - 600n).attention).toBeNull();
+    const s = view(a, rec(0), OPEN, OPEN.now - 601n);
+    expect(s.attention).toBe("opponent-silent");
+    expect(s.suggestedActions[0]).toMatch(/^arena challenge .*no progress for over 600s/);
+    expect(s.suggestedActions).toContain("arena wait");
+    expect(s.suggestedActions.filter((x) => x.startsWith("arena challenge"))).toHaveLength(1);
+    // Unknown progress time, a human in control, our own turn, or an ongoing challenge: no opponent-silent.
+    expect(view(a, rec(0), OPEN, null).attention).toBeNull();
+    expect(view(a, { ...rec(0), controller: "human" }, OPEN, OPEN.now - 601n).attention).toBeNull();
+    expect(view(b, rec(1), OPEN, OPEN.now - 601n).attention).toBe("your-turn");
+    expect(view(a, rec(0), { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n }, OPEN.now - 601n).attention).toBeNull();
+  });
+
+  it("I2: opponent-silent also covers an unanswered proposal and a withheld Close, but not our own game-over decision", async () => {
+    const x = await finished();
+    expect(view(x.a, x.rec(0), OPEN, OPEN.now - 601n).attention).toBe("game-over"); // our call, not their silence
+    await x.b.receive(await x.a.proposeNewGame());
+    expect(view(x.a, x.rec(0), OPEN, OPEN.now - 601n).attention).toBe("opponent-silent");
+    const y = await finished();
+    await y.a.signClose();
+    expect(view(y.a, y.rec(0), OPEN, OPEN.now - 601n).attention).toBe("opponent-silent");
+  });
+
+  it("I4: a channel retired unfunded reports done instead of waiting for funding", async () => {
+    const { a, rec } = await sessions();
+    const none: ChainView = { ...OPEN, phase: "None", funded: [false, false] };
+    expect(view(a, rec(0), none).suggestedActions).toEqual(["wait: the channel is being funded"]);
+    expect(view(a, { ...rec(0), finalized: true }, none).suggestedActions[0]).toMatch(/^done: the funding window closed/);
   });
 });

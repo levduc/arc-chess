@@ -60,6 +60,10 @@ export type ChannelHandle = {
   lastError: string | null;
   /** R9/3b: counts every `watch()` attempt for this channel — lets tests confirm an explicit `tick()` actually ran a pass (as opposed to being swallowed by the concurrent-tick guard) instead of just assuming it. */
   passes: number;
+  /** I2: chain time of the last observed progress on this channel (in memory only; set on the first refresh after start). */
+  lastProgressAt: bigint | null;
+  /** I2: fingerprint of the session/phase at `lastProgressAt`; any change counts as progress. */
+  progressKey: string | null;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -351,7 +355,7 @@ export class ArenaDaemon {
     // stop()) could have used to already open this same channel, or to stop the daemon.
     if (this.stopped || this.live.has(record.channelId)) return;
     const sessionSender = new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain);
-    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0 });
+    this.live.set(record.channelId, { record, session, sessionSender, processedEvents: 0, chain: null, lastError: null, passes: 0, lastProgressAt: null, progressKey: null });
     await this.opts.relay.join(record.channelId, record.sessionKey);
     // Crash recovery (Review Focus 5): re-send our latest own state so a message lost at the crash is delivered.
     const latest = session.latest;
@@ -679,6 +683,7 @@ export class ArenaDaemon {
       myTurn: l.session.isMyTurn(),
       chain: l.chain,
       lastError: l.lastError,
+      lastProgressAt: l.lastProgressAt,
     });
   }
 
@@ -695,6 +700,24 @@ export class ArenaDaemon {
       cooldownUntil: info.cooldownUntil,
       now: block.timestamp,
     };
+    // I2: progress is any change to the states and signatures held (our move, a received move, a checkpoint
+    // proposed or completed, a Close signature either way, an on-chain adoption) or to the phase (the channel
+    // opening, a challenge being answered). Observed here — every tick and every status call — on chain time.
+    const snap = l.session.snapshot();
+    const sig = (x: Hex) => (x === "0x" ? "-" : "s");
+    const key = [
+      info.phase,
+      snap.latest.state.turnNum,
+      sig(snap.latest.sigA) + sig(snap.latest.sigB),
+      snap.pendingCheckpoint ? "p" : "-",
+      snap.incomingCheckpoint ? "i" : "-",
+      snap.closeState ? "c" : "-",
+      sig(snap.closeSigs[0]) + sig(snap.closeSigs[1]),
+    ].join("|");
+    if (key !== l.progressKey) {
+      l.progressKey = key;
+      l.lastProgressAt = block.timestamp;
+    }
   }
 
   private nextChange(ms: number): Promise<void> {

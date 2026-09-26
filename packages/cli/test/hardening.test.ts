@@ -1,6 +1,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { hashState, signClose } from "@arena/sdk";
+import { increaseTime } from "../../sdk/test/helpers/chain.js";
 import { ArenaDaemon, RecordStore, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -64,5 +66,46 @@ describe("I1: one bad channel entry never disables the watchtower", () => {
     expect(degraded.find((d) => d.channelId === foreign)!.error).toMatch(/does not match this hub and chain/);
     expect(degraded.find((d) => d.channelId === "not-a-channel")!.error).toMatch(/canonical/);
     await expect(restarted.status(garbage)).rejects.toThrow(/could not be loaded/);
+  });
+});
+
+describe("I2: stalled and withheld states escalate instead of looping", () => {
+  it("P1 regression: an opponent Close signature on a non-terminal state is refused and wait() does not hot-loop", async () => {
+    const { alice, bob, id, env } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent" }); // now Bob's turn; Bob stalls
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    const s = bob.daemon.handle(id).session.latest.state;
+    const sig = await signClose(bob.daemon.handle(id).record.sessionKey, s, env.domain);
+    await bob.client.relay.send({ type: "close", channelId: id, close: { stateHash: hashState(s, env.domain), by: 1, sig } });
+    await waitFor(() => /not a finished game/.test(alice.daemon.handle(id).lastError ?? ""), 5_000, "close refused");
+    const st = await alice.daemon.status(id);
+    expect(st.opponentWantsToClose).toBe(false);
+    expect(st.attention).toBeNull();
+    for (let i = 0; i < 2; i++) {
+      const t0 = Date.now();
+      await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+    }
+  });
+
+  it("wait() returns opponent-silent once the opponent is silent on their move for more than challengeTimeout", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.stop();
+    bob.client.disconnect();
+    await alice.daemon.status(id); // the move is observed as progress, on chain time
+    expect(alice.daemon.handle(id).lastProgressAt).not.toBeNull();
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    await increaseTime(601); // challengeTimeout is 600 s
+    await expect(alice.daemon.wait({ timeoutMs: 10_000 })).resolves.toEqual({ channelId: id, reason: "opponent-silent" });
+    const st = await alice.daemon.status(id);
+    expect(st.attention).toBe("opponent-silent");
+    expect(st.suggestedActions[0]).toMatch(/^arena challenge/);
+    // Following the suggestion ends the silence alarm: the channel is now Challenged and Bob must answer on-chain.
+    await alice.daemon.challenge(id, "agent");
+    const after = await alice.daemon.status(id);
+    expect(after.phase).toBe("Challenged");
+    expect(after.attention).toBeNull();
   });
 });

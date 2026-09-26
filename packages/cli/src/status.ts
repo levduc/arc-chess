@@ -25,7 +25,7 @@ export type ChannelStatus = {
   closing: boolean;
   opponentWantsToClose: boolean;
   challenge: null | { deadline: string; secondsLeft: number; mustMove: boolean; challenger: "me" | "opponent" };
-  attention: null | "your-turn" | "new-game-proposed" | "game-over" | "close-requested";
+  attention: null | "your-turn" | "new-game-proposed" | "game-over" | "close-requested" | "opponent-silent";
   suggestedActions: string[];
   lastError: string | null;
 };
@@ -36,6 +36,11 @@ export type StatusInput = {
   myTurn: boolean;
   chain: ChainView | null;
   lastError: string | null;
+  /**
+   * I2: chain time at which the daemon last saw this channel progress (a state, checkpoint, Close signature or
+   * phase change), or null if not yet observed. Drives `opponent-silent`.
+   */
+  lastProgressAt?: bigint | null;
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -80,28 +85,62 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     : { meSeconds: 0, opponentSeconds: 0 };
   const over = isGameOver(s);
   const live = phase === "Open" || phase === "Challenged";
+  const open = phase === "Open";
+
+  // I2: the channel waits on the opponent — their move, their countersignature on our new-game proposal, or their
+  // Close signature once we have signed ours. Silence beyond challengeTimeout (chain time) escalates (spec §7).
+  const waitingOnOpponent =
+    open && !myTurn && (!over || newGame === "proposed_by_me" || (closing && !opponentWantsToClose));
+  const lastProgressAt = input.lastProgressAt ?? null;
+  const silent =
+    waitingOnOpponent && chain !== null && lastProgressAt !== null && chain.now - lastProgressAt > record.params.challengeTimeout;
 
   let attention: ChannelStatus["attention"] = null;
   if (live && record.controller === "agent") {
     if (myTurn) attention = "your-turn";
     else if (newGame === "proposed_by_opponent" && !closing) attention = "new-game-proposed";
-    else if (opponentWantsToClose && !closing) attention = "close-requested";
+    // I2: only a request we can honour — `arena close` works only on a finished game with no proposal pending.
+    else if (opponentWantsToClose && over && !closing && newGame === "none") attention = "close-requested";
     else if (over && !closing && newGame === "none") attention = "game-over";
+    else if (silent) attention = "opponent-silent";
   }
 
   const suggestedActions: string[] = [];
-  if (phase === "None" || phase === "Funding") suggestedActions.push("wait: the channel is being funded");
-  else if (phase === "Finalized") suggestedActions.push("done: the channel is settled");
+  // I2: the on-chain escape from a stalled or withheld state (only while Open; once Challenged it is under way).
+  let challengeHint: string | null = null;
+  if (phase === "None" || phase === "Funding") {
+    suggestedActions.push(
+      record.finalized
+        ? "done: the funding window closed without this channel opening; nothing is left to do"
+        : "wait: the channel is being funded",
+    );
+  } else if (phase === "Finalized") suggestedActions.push("done: the channel is settled");
   else if (phase === "Reclaimed") suggestedActions.push("done: the channel was never funded and deposits were returned");
-  else if (closing) suggestedActions.push("wait: close signed; waiting for the opponent's close signature");
-  else if (myTurn) {
+  else if (closing) {
+    suggestedActions.push("wait: close signed; waiting for the opponent's close signature");
+    if (open && !opponentWantsToClose) challengeHint = "arena challenge   (settles the finished game on-chain if they never sign)";
+  } else if (myTurn) {
     suggestedActions.push(`arena move <move>   (one of: ${game.moves().slice(0, 8).join(", ")}${game.moves().length > 8 ? ", …" : ""})`);
     suggestedActions.push("arena move <move> --offer-draw", "arena resign");
     if (status === STATUS.DRAW_OFFERED) suggestedActions.push("arena accept-draw");
   } else if (over) {
-    suggestedActions.push(newGame === "proposed_by_me" ? "wait: new game proposed" : "arena next-game", "arena close");
+    if (newGame === "proposed_by_me") {
+      // `arena close` always fails while our own proposal is pending, so it is not offered here.
+      suggestedActions.push("wait: new game proposed");
+      if (open) challengeHint = "arena challenge   (settles the finished game on-chain if the opponent never answers)";
+    } else {
+      suggestedActions.push("arena next-game", "arena close");
+    }
   } else {
     suggestedActions.push("arena wait");
+    if (open) challengeHint = "arena challenge   (if the opponent stops responding)";
+  }
+  if (silent) {
+    suggestedActions.unshift(
+      `arena challenge   (the opponent has made no progress for over ${record.params.challengeTimeout}s; forces an answer on-chain)`,
+    );
+  } else if (challengeHint) {
+    suggestedActions.push(challengeHint);
   }
 
   return {
