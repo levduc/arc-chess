@@ -10,6 +10,8 @@ import {
   LocalKeyTxSender,
   channelId as computeChannelId,
   checkMatchParams,
+  isGameOver,
+  mover,
   offerId as computeOfferId,
   outcome,
   signAcceptance,
@@ -461,17 +463,70 @@ export class ArenaDaemon {
     }
   }
 
-  /** One watchtower pass for one channel. Task 4 funds only; Task 6 adds disputes. */
+  /** One watchtower pass for one channel (spec §6.3). Runs regardless of the controller. */
   protected async watch(l: ChannelHandle): Promise<void> {
     const id = l.record.channelId;
     const p = l.record.params;
     const info = await this.hub.channelInfo(id);
     const now = (await this.client.getBlock()).timestamp;
     const me = l.record.me;
-    // Funding order (spec §5): the offerer creates the channel; the accepter deposits only after funded[0].
+
+    // 1. Funding in order (spec §5), or reclaim after the deadline if this player already funded.
     if (now <= p.fundingDeadline) {
       if (info.phase === "None" && me === 0) await this.fund(l);
       else if (info.phase === "Funding" && !info.funded[me] && (me === 0 || info.funded[0])) await this.fund(l);
+    } else if (info.phase === "Funding" && info.funded[me]) {
+      if (this.stopped) return;
+      await this.hub.reclaim(this.wallet, id);
+      // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
+      // ChannelHub.sol) — mark it here, synchronously with our own confirmed tx, instead of only via the
+      // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
+      l.record = { ...l.record, finalized: true };
+      this.records.saveChannel(l.record);
+    }
+
+    // 2. Adopt on-chain states from dispute events, in order. Errors are recorded but never stop the pass.
+    if (this.stopped) return;
+    const events = await this.hub.disputeEvents(id, l.record.createdBlock);
+    for (const ev of events.slice(l.processedEvents)) {
+      try {
+        await l.session.ingestOnChain(ev.signed);
+      } catch (err) {
+        l.lastError = `ingest: ${errorText(err)}`;
+      }
+    }
+    l.processedEvents = events.length;
+
+    // 3. Disputes (spec §6.3).
+    if (this.stopped) return;
+    if (info.phase === "Challenged") {
+      const registered = await this.hub.registeredState(id);
+      const latest = l.session.latest.state;
+      if (latest.turnNum > registered.turnNum) {
+        // Stale challenge: we hold a newer supported state, so answer it with our proof.
+        await this.respondIfChallenged(l);
+      } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
+        // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
+        // otherwise leave it for the controller (status shows mustMove).
+        await this.autoPlay(l);
+      } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
+        // Never call timeout while we are on move in the registered state — that would forfeit our own stake.
+        if (this.stopped) return;
+        await this.hub.timeout(this.wallet, id);
+        // Bug fix (Task 6 review): timeout() always finalizes in the same transaction (see ChannelHub.sol) —
+        // mark it here, synchronously with our own confirmed tx, so a caller reading `record.finalized` right
+        // after observing the phase change on-chain (e.g. via its own direct RPC poll) never loses that race.
+        l.record = { ...l.record, finalized: true };
+        this.records.saveChannel(l.record);
+      }
+    }
+
+    // 4. Settled channels are done.
+    if (this.stopped) return;
+    const after = await this.hub.channelInfo(id);
+    if (after.phase === "Finalized" || after.phase === "Reclaimed") {
+      l.record = { ...l.record, finalized: true };
+      this.records.saveChannel(l.record);
     }
     await this.refreshChain(l);
   }

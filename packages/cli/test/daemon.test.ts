@@ -4,7 +4,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
 import { DaemonError, type ArenaDaemon } from "../src/index.js";
-import { now, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { increaseTime, now, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
@@ -176,5 +176,63 @@ describe("ArenaDaemon core", () => {
     await bob.daemon.move(id, "e5", { actor: "agent" });
     await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn (relay)");
     await expect(alice.daemon.wait({ timeoutMs: 500 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+  });
+});
+
+describe("watchtower", () => {
+  it("answers a stale challenge automatically", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    const stale = alice.daemon.handle(id).session.challengeProof(); // turn 1
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn");
+    // A misbehaving Alice registers the stale state; Bob's watchtower must answer with turn 2.
+    await alice.daemon.hub.challenge(alice.daemon.handle(id).sessionSender, stale);
+    await waitFor(async () => (await bob.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "respond");
+    expect((await bob.daemon.hub.registeredState(id)).turnNum).toBe(2n);
+  });
+
+  it("times out a silent opponent and never times out itself", async () => {
+    const { alice, bob, env, id } = await matched();
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.stop();
+    bob.client.disconnect();
+    await alice.daemon.challenge(undefined, "agent");
+    // Bob is on move in the registered state. Alice's watchtower must not have called timeout before the deadline.
+    await new Promise((r) => setTimeout(r, 500));
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+    await increaseTime(601);
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Finalized", 20_000, "timeout");
+    expect(await usdcBalance(env.usdc, alice.address)).toBe(START - 5_000n + 100_000n);
+    expect(alice.daemon.handle(id).record.finalized).toBe(true);
+  });
+
+  it("does not time out a challenge in which it is on move", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await alice.daemon.challenge(undefined, "agent"); // Bob must move
+    await alice.daemon.stop(); // only Bob's watchtower runs from here
+    await increaseTime(601);
+    await bob.daemon.tick();
+    await bob.daemon.tick();
+    // Bob is on move in the registered state and past the deadline: calling timeout would forfeit Bob's stake.
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+    expect((await bob.daemon.status(id)).challenge?.mustMove).toBe(true);
+  });
+
+  it("reclaims a deposit when the counterparty never funds", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    await pair.bob.daemon.stop(); // Bob matches but will never deposit
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.bob.daemon.acceptOffer(offerId); // records Bob's acceptance; Bob's daemon is stopped so no funding
+    const id = await waitFor(() => pair.alice.daemon.channelIds()[0], 20_000, "alice match");
+    await waitFor(async () => (await pair.alice.daemon.hub.channelInfo(id)).phase === "Funding", 20_000, "alice funded");
+    await increaseTime(3601);
+    await waitFor(async () => (await pair.alice.daemon.hub.channelInfo(id)).phase === "Reclaimed", 20_000, "reclaim");
+    expect(await usdcBalance(pair.env.usdc, pair.alice.address)).toBe(START);
   });
 });
