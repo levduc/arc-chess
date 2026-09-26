@@ -71,7 +71,7 @@ is gated on an external audit and a legal review (§11).
 | 4 | Host server | `apps/server` | Template registry, `skill.md`/`llms.txt`, lobby, WebSocket relay, chain indexer, spectator page, reputation | No (untrusted plumbing) |
 | 5 | Dev / ops harness | `scripts/`, `deploy/` | `dev:up`, e2e scenarios, deployment scripts for Anvil / Arc Testnet / Arc mainnet | Deployer key (ops) |
 
-pnpm workspaces; TypeScript on Node ≥ 20; Foundry for Solidity; OpenZeppelin
+pnpm workspaces; TypeScript on Node ≥ 20 (Node ≥ 24, see §12 item 15); Foundry for Solidity; OpenZeppelin
 contracts; viem for chain access.
 
 ### 3.1 Wallet abstraction (`TxSender`)
@@ -497,3 +497,25 @@ accept-draw / next-game / close buttons.
     unlock funds without the opponent's cooperation, on- or off-chain. A `C` countersignature that later arrives
     anyway is still accepted and repairs the stored predecessor, but this is now cosmetic, since `C+1`'s
     provability never depended on it.
+15. **Node floor.** The host server uses `node:sqlite`, so the workspace requires Node ≥ 24; this supersedes §3's
+    "Node ≥ 20".
+16. **One WebSocket endpoint.** `GET /ws` multiplexes lobby match events and relay traffic, and replaces §5's
+    `WS /lobby` and `WS /relay/:channelId`.
+    - Each connection receives a random nonce in its `hello` frame.
+    - A relay `join` carries the channel's `Params` (self-certifying: the server recomputes `channelId`) and a
+      session-key signature over `keccak256(abi.encode("arena-relay-join", channelId, nonce))`.
+    - Lobby `subscribe` frames name offer ids and are unauthenticated: a match event only reveals params that
+      become public on-chain at deposit.
+    - The server persists matches and replays them on subscribe, so an offerer who was offline at match time
+      still funds.
+17. **Relay cache.** The relay keeps the latest `state` and `close` message per channel and sender. It accepts a
+    state only if it carries a valid signature of its sender, and replays the peer's cached messages to a
+    (re)joining member.
+    - Daemons re-send their latest own-signed state, a pending own new-game proposal, and their Close signature
+      every time a join is confirmed.
+    - `ChannelSession.receive` answers re-sent messages with `duplicate`/`stale` instead of an error. A different
+      state at the latest turn remains an error.
+18. **Dispute scan cursor.** Daemons scan `Challenged`/`Responded` events forward from a persisted per-channel
+    cursor, in chunks of `logChunkBlocks` (default 1000). They never advance past an event that failed to
+    ingest, and a `getLogs` failure does not stop the rest of the watchtower pass. The server indexer uses the
+    same chunked-cursor pattern over all hub events.
