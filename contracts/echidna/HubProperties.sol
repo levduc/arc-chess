@@ -154,11 +154,19 @@ contract HubProperties is ChessTestUtils {
         wallet0.forward(address(hub), abi.encodeCall(hub.challenge, (proof))); // no escrow effect either way
     }
 
-    function respondChannel(uint256 idx, uint256 lineSeed) external {
+    /// @dev Unlike challengeChannel, the line is chosen deterministically (the cheapest available line
+    /// strictly past the currently-registered turnNum) rather than randomly: ChannelHub.respond's own
+    /// "solo/both-signed" support path (see _proofFor) never checks that the submitted state is a legal
+    /// successor of the registered one, only that its turnNum is higher and the challenge window hasn't
+    /// closed -- so the only two things that can make this call fail are staleness (fixed by this) and
+    /// timing (tuned via echidna.yaml's maxTimeDelay, see task-4-report.md fix round 2).
+    function respondChannel(uint256 idx) external {
         (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Challenged);
         if (!found) return;
         bytes32 id = hub.channelId(p);
-        State memory s = _lineState(id, p, uint8(lineSeed % 4));
+        (uint8 line, bool ok) = _respondLine(hub.registeredState(id).turnNum);
+        if (!ok) return;
+        State memory s = _lineState(id, p, line);
         bytes memory proof = _proofFor(s);
         // respond has no sender restriction in ChannelHub; called directly, no escrow effect either way.
         // slither-disable-next-line unused-return
@@ -232,8 +240,11 @@ contract HubProperties is ChessTestUtils {
         return none;
     }
 
-    /// @dev Fixed lines from the opening state, mirroring HubHandler.sol's `_lineState`: opening (0), one
-    /// legal move (1), two legal moves (2), or a resignation making the game terminal (3).
+    /// @dev Fixed lines from the opening state, mirroring HubHandler.sol's `_lineState`, extended with two
+    /// further plies (4, 5) so respondChannel always has a line strictly past whatever challengeChannel's
+    /// random pick among 0-3 registered: opening (0, turnNum 0), one legal move (1, turnNum 1), two legal
+    /// moves (2, turnNum 2), a resignation making the game terminal (3, turnNum 2), three legal moves (4,
+    /// turnNum 3), four legal moves (5, turnNum 4).
     function _lineState(bytes32 id, Params memory p, uint8 line) internal view returns (State memory s) {
         s = rules.initialState(id, p);
         if (line == 0) return s;
@@ -241,7 +252,24 @@ contract HubProperties is ChessTestUtils {
         if (line == 1) return s;
         if (line == 3) return _step(s, p, B.encodeMove(0, 0, 0, B.KIND_RESIGN));
         s = _step(s, p, uci("e7e5"));
-        return s;
+        if (line == 2) return s;
+        s = _step(s, p, uci("g1f3"));
+        if (line == 4) return s;
+        s = _step(s, p, uci("b8c6"));
+        return s; // line == 5
+    }
+
+    /// @dev The cheapest fixed line (see _lineState) whose turnNum is strictly greater than `registered` --
+    /// respond's own support check (ChannelHub._supported's no-hasPrev, both-signed branch) never requires
+    /// the submitted state to be a legal successor of the currently-registered one, only that its turnNum
+    /// is higher, so picking deterministically here removes line-selection luck as a blocker and leaves
+    /// timing (the challenge window) as the only remaining variable.
+    function _respondLine(uint64 registered) internal pure returns (uint8 line, bool ok) {
+        if (registered == 0) return (1, true);
+        if (registered == 1) return (2, true);
+        if (registered == 2) return (4, true);
+        if (registered == 3) return (5, true);
+        return (0, false);
     }
 
     function _step(State memory prev, Params memory p, uint32 move) internal view returns (State memory next) {

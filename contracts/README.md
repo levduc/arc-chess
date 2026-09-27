@@ -27,8 +27,9 @@ ChessRules and ChannelHub) that restates invariants 1, 2, 4 and 7 of `ChannelHub
 actions. It is a second, coverage-guided opinion alongside Task 3's deep Foundry invariant/fuzz suite, not a
 replacement for it — Echidna has no `vm.sign`/`vm.prank`/`vm.warp` equivalent, so the harness stands in with
 mock ERC-1271 "always valid" signers and forwarder "wallet" contracts instead of real signatures and sender
-impersonation. It requires `forge` and a pinned `crytic-compile` (installed via `uv tool install`, pinned in
-the script) on PATH.
+impersonation. It requires `forge` on PATH; the script itself writes a repo-local, pinned `crytic-compile`
+wrapper into the gitignored `tools/bin/` (which runs it via `uvx` on demand) rather than installing anything
+globally.
 
 Deploy env: `ARENA_OWNER`, `ARENA_FEE_RECIPIENT`, `ARENA_TOKEN` (required on every chain except the local
 chain 31337, where MockUSDC is deployed if it is unset; elsewhere the script reverts without it),

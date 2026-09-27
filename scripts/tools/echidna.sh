@@ -34,7 +34,7 @@ mkdir -p "$BIN_DIR"
 
 if [[ ! -f "$ARCHIVE" ]]; then
   echo "==> Downloading echidna ${ECHIDNA_VERSION} to $ARCHIVE"
-  curl -sL -o "$ARCHIVE" "$ECHIDNA_URL"
+  curl -fsSL -o "$ARCHIVE" "$ECHIDNA_URL"
 fi
 
 echo "==> Verifying sha256 of $ARCHIVE"
@@ -43,6 +43,7 @@ if [[ "$ACTUAL_SHA256" != "$ECHIDNA_SHA256" ]]; then
   echo "FATAL: sha256 mismatch for $ARCHIVE" >&2
   echo "  expected: $ECHIDNA_SHA256" >&2
   echo "  actual:   $ACTUAL_SHA256" >&2
+  rm -f "$ARCHIVE" # don't leave a bad archive around to be silently reused (or re-"verified") next run
   exit 1
 fi
 
