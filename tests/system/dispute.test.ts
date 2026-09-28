@@ -12,8 +12,17 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { createPublicClient, createTestClient, http, type Hex, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
-import { HubClient, LocalKeyTxSender, playerOnMove, type Proof, type SessionSnapshot } from "@arena/sdk";
-import { readJson, type ChannelRecord } from "@arena/cli";
+import {
+  ChannelSession,
+  HubClient,
+  LocalKeyTxSender,
+  channelHubAbi,
+  isGameOver,
+  playerOnMove,
+  type Proof,
+  type SessionSnapshot,
+} from "@arena/sdk";
+import { FileSessionStore, readJson, type ChannelRecord } from "@arena/cli";
 import { startStack, usdcBalanceOf, type Player, type Stack } from "./harness.js";
 import { playLine, playRandomGame, waitStatus, type Status } from "./bot.js";
 
@@ -132,6 +141,21 @@ async function scholarsMate(alice: Player, bob: Player, id: Hex, from = 0): Prom
   await waitStatus(bob, (s) => s.gameStatus === "white_won", 15_000, id);
 }
 
+/** The sender (lower-cased) of the transaction that emitted this channel's `Finalized` event. */
+async function finalizedBy(s: Stack, id: Hex): Promise<string> {
+  const { pub } = hubOf(s);
+  const logs = await pub.getContractEvents({
+    address: s.hub,
+    abi: channelHubAbi,
+    eventName: "Finalized",
+    args: { channelId: id },
+    fromBlock: 0n,
+  });
+  expect(logs).toHaveLength(1);
+  const tx = await pub.getTransaction({ hash: logs[0].transactionHash });
+  return tx.from.toLowerCase();
+}
+
 async function expectBalances(s: Stack, want: Array<[Player | "host", bigint]>): Promise<void> {
   for (const [who, amount] of want) {
     const addr = who === "host" ? s.host : who.address;
@@ -172,8 +196,11 @@ async function challengeAnsweredByMove(s: Stack): Promise<{ alice: Player; bob: 
   const after = await hub.channelInfo(id);
   expect(after.cooldownUntil[0]).toBeGreaterThan(0n);
   await waitStatus(alice, (st) => st.phase === "Open" && st.turnNum === "2" && st.myTurn, 15_000, id);
-  // Informational: which watchtower's respond landed. Bob's daemon submits it right after relaying his move; Alice's
-  // own watchtower may race it (it also holds the newer state once the relay delivers it) -- both are correct.
+  // Informational only: which daemon's respond landed. Bob's daemon submits it right after relaying his move; Alice's
+  // own watchtower may race it (it also holds the newer state once the relay delivers it) -- both are correct, so it
+  // is logged, not asserted. The responder's identity is covered at unit level in packages/cli/test/daemon.test.ts:
+  // "answers a stale challenge automatically" (lines 203-207: the Responded tx came from the answering daemon's
+  // session key) and the respond-race tests after it.
   const [ev] = (await hub.disputeEvents(id)).filter((e) => e.kind === "Responded");
   const tx = await pub.getTransaction({ hash: ev.transactionHash });
   const params = await hub.channelParams(id);
@@ -207,6 +234,8 @@ describe("dispute paths end-to-end (real server, real `arena daemon` processes, 
       await stack.increaseTime(TIMEOUT + 1);
       await waitPhase(hub, id, "Finalized");
       await waitStatus(alice, (s) => s.phase === "Finalized", 15_000, id);
+      // The timeout came from Alice's watchtower, through her session key (spec §3.1), not from the test.
+      expect(await finalizedBy(stack, id)).toBe((await hub.channelParams(id)).signers[0].toLowerCase());
       await expectBalances(stack, [
         [alice, START + STAKE - FEE],
         [bob, START - STAKE - FEE],
@@ -293,6 +322,10 @@ describe("dispute paths end-to-end (real server, real `arena daemon` processes, 
       const sessionAddr = record.params.signers[0];
 
       const before = await hub.channelInfo(id);
+      // Anvil mines only when a transaction arrives, so an unchanged block number means no transaction at all. Nothing
+      // else can send one in this window: the channel is Open with the game in progress and Alice to move, so neither
+      // watchtower has anything to do (no funding, no challenge to answer or time out, no close signatures), and the
+      // test sends nothing itself. The nonce checks pin Alice's two senders specifically.
       const blockBefore = await pub.getBlockNumber({ cacheTime: 0 });
       const nonces = async () =>
         Promise.all([pub.getTransactionCount({ address: alice.address }), pub.getTransactionCount({ address: sessionAddr })]);
@@ -396,7 +429,7 @@ describe("dispute paths end-to-end (real server, real `arena daemon` processes, 
   );
 
   timed(
-    "7. restart in the middle of a dispute: Alice's restarted watchtower adopts Bob's Responded state",
+    "7. restart in the middle of a dispute: Alice's restarted watchtower adopts a Responded state only the chain carries",
     async () => {
       stack = await startStack();
       const alice = await stack.player("alice");
@@ -407,26 +440,42 @@ describe("dispute paths end-to-end (real server, real `arena daemon` processes, 
 
       await alice.api("POST", "/challenge", { channel: id });
       await waitPhase(hub, id, "Challenged");
-      await alice.kill("SIGKILL");
-      await alice.start();
-      // The restarted daemon sees the live dispute from chain state.
-      const restarted = await waitStatus(alice, (s) => s.phase === "Challenged", 15_000, id);
-      expect((restarted.challenge as any).challenger).toBe("me");
-
       await waitStatus(bob, (s) => (s.challenge as any)?.mustMove === true, 15_000, id);
-      await bob.api("POST", "/move", { move: "e7e5", channel: id });
+      // Both daemons go down: Alice mid-dispute (SIGKILL), Bob cleanly, so his session files can be used offline.
+      await alice.kill("SIGKILL");
+      await bob.kill("SIGTERM");
+
+      // Bob answers offline, straight from his own session files: the move never touches the relay (so neither a
+      // live relay delivery nor the relay's rejoin cache can hand it to Alice) -- only the chain carries it.
+      const bobDir = join(bob.home, "channels", id);
+      const bobRecord = readJson<ChannelRecord>(join(bobDir, "record.json"))!;
+      const bobSession = await ChannelSession.open({
+        params: bobRecord.params,
+        me: bobRecord.me,
+        sessionKey: bobRecord.sessionKey,
+        domain: { chainId: stack.chainId, hub: stack.hub },
+        store: new FileSessionStore(join(bobDir, "session.json")),
+      });
+      await bobSession.move("e7e5");
+      const bobSender = new LocalKeyTxSender(bobRecord.sessionKey, stack.rpcUrl, foundry);
+      await hub.respond(bobSender, bobSession.challengeProof());
       await waitPhase(hub, id, "Open");
       expect((await hub.registeredState(id)).turnNum).toBe(2n);
-
-      await waitStatus(alice, (s) => s.phase === "Open" && s.turnNum === "2" && s.myTurn, 20_000, id);
-      // The restarted watchtower's dispute scan has covered the Responded event (its persisted cursor is past it).
       const responded = (await hub.disputeEvents(id)).filter((e) => e.kind === "Responded");
       expect(responded).toHaveLength(1);
+
+      // Alice restarts alone (Bob still down): her watchtower must adopt turn 2 from the Responded event.
+      await alice.start();
+      await waitStatus(alice, (s) => s.phase === "Open" && s.turnNum === "2" && s.myTurn, 20_000, id);
       await waitFor(
         () => (readJson<ChannelRecord>(join(alice.home, "channels", id, "record.json"))!.scannedBlock ?? -1n) >= responded[0].blockNumber,
         15_000,
-        "alice's dispute scan to pass the Responded event",
+        "alice's dispute scan cursor to pass the Responded event",
       );
+
+      // Bob comes back (his session already holds turn 2) and play resumes off-chain to the end and a close.
+      await bob.start();
+      await waitStatus(bob, (s) => s.phase === "Open" && s.turnNum === "2" && !s.myTurn, 20_000, id);
       await playLine(alice, bob, id, SCHOLARS_MATE.slice(2));
       await waitStatus(alice, (s) => s.gameStatus === "white_won", 15_000, id);
       await closeBoth(alice, bob, id, hub);
@@ -470,6 +519,46 @@ describe("dispute paths end-to-end (real server, real `arena daemon` processes, 
       await expectBalances(stack, [
         [alice, START + 2n * STAKE - FEE],
         [bob, START - 2n * STAKE - FEE],
+        ["host", 2n * FEE],
+      ]);
+      await expectNoErrors(alice);
+    },
+    90_000,
+  );
+
+  timed(
+    "8b. opponent silent before countersigning the checkpoint: the finished game 0 settles as-is, no game-1 forfeit",
+    async () => {
+      stack = await startStack();
+      const alice = await stack.player("alice");
+      const bob = await stack.player("bob");
+      const { hub } = hubOf(stack);
+      const id = await matchAndOpen(alice, bob);
+      await scholarsMate(alice, bob, id); // game 0: Alice +stake; Bob's auto-resign (turn 8) is the terminal state
+
+      // Alice proposes game 1; Bob sees the proposal but never countersigns, and goes silent.
+      await alice.api("POST", "/next-game", { channel: id });
+      await waitStatus(bob, (s) => s.attention === "new-game-proposed", 15_000, id);
+      await bob.kill("SIGKILL");
+      const aliceView = await waitStatus(alice, (s) => s.newGame === "proposed_by_me", 5_000, id);
+      expect(aliceView.gameIndex).toBe(0);
+
+      // A lone-signed checkpoint is not provable on-chain, so Alice's challenge registers the finished game 0.
+      await alice.api("POST", "/challenge", { channel: id });
+      await waitPhase(hub, id, "Challenged");
+      const registered = await hub.registeredState(id);
+      expect(registered.gameIndex).toBe(0);
+      expect(registered.turnNum).toBe(8n);
+      expect(isGameOver(registered)).toBe(true);
+
+      // Past the deadline Alice's watchtower times out a terminal state: balances as-is (Alice keeps game 0's stake).
+      await stack.increaseTime(TIMEOUT + 1);
+      await waitPhase(hub, id, "Finalized");
+      await waitStatus(alice, (s) => s.phase === "Finalized", 15_000, id);
+      expect(await finalizedBy(stack, id)).toBe((await hub.channelParams(id)).signers[0].toLowerCase());
+      await expectBalances(stack, [
+        [alice, START + STAKE - FEE],
+        [bob, START - STAKE - FEE],
         ["host", 2n * FEE],
       ]);
       await expectNoErrors(alice);
