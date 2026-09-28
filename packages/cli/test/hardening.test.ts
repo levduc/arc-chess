@@ -541,3 +541,38 @@ describe("Plan 4.5 Task 10: a move is not failed by an RPC error after it was se
     await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 1n, 5_000, "bob holds turn 1");
   });
 });
+
+describe("Plan 4.5 Task 10: the watchtower retries a failed cooperative close", () => {
+  it("both sides' close submissions fail on an RPC error; the next watchtower pass submits it and clears close:", async () => {
+    const { alice, bob, id } = await matched();
+    for (const m of SCHOLARS_MATE) {
+      const [mover, other] = alice.daemon.handle(id).session.isMyTurn() ? [alice, bob] : [bob, alice];
+      await mover.daemon.move(id, m, { actor: "agent" });
+      const turn = mover.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => other.daemon.handle(id).session.latest.state.turnNum >= turn, 5_000, `relay ${m}`);
+    }
+    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 8n, 5_000, "bob's auto-resign");
+    // The first submission on each side fails in transport (an RPC blip), after both Close signatures exist.
+    const failures: string[] = [];
+    for (const p of [alice, bob]) {
+      const hub = p.daemon.hub;
+      const real = hub.closeCooperative.bind(hub);
+      let failed = false;
+      hub.closeCooperative = async (sender, tx) => {
+        if (!failed) {
+          failed = true;
+          failures.push(p === alice ? "alice" : "bob");
+          throw new Error("HTTP request failed.");
+        }
+        return real(sender, tx);
+      };
+    }
+    await alice.daemon.close(id, "agent"); // alice alone: nothing to submit yet
+    await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
+    await expect(bob.daemon.close(id, "agent")).rejects.toThrow(/HTTP request failed/);
+    await waitFor(() => failures.length === 2, 5_000, "alice's relay-path submission to fail too");
+    // Before the fix nothing retried: the channel stayed Open with a fully co-signed close.
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Finalized", 10_000, "the watchtower's retry");
+    await waitFor(() => alice.daemon.handle(id).lastError === null && bob.daemon.handle(id).lastError === null, 5_000, "close: cleared");
+  });
+});

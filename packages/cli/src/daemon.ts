@@ -74,6 +74,9 @@ export type ChannelHandle = {
    *  revert caused by the hub's launch limits (Paused/DepositTooLarge/EscrowCapReached) -- so the watchtower
    *  backs off instead of retrying the same revert on every tick. Null once funding succeeds. */
   fundBlockedUntil: bigint | null;
+  /** Plan 4.5 Task 10: set while a cooperative-close submission runs, so the relay path, the close API and the
+   *  watchtower's retry never submit the same close twice at once. */
+  submittingClose: boolean;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -485,6 +488,7 @@ export class ArenaDaemon {
       progressKey: null,
       autoPlaying: false,
       fundBlockedUntil: null,
+      submittingClose: false,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -595,6 +599,7 @@ export class ArenaDaemon {
     if (this.stopped) return;
     const l = this.live.get(msg.channelId);
     if (!l) return;
+    let closeReceived = false;
     try {
       if (msg.type === "state") {
         // A re-send after a reconnect (§7) can land as "duplicate" (we already hold it) or "stale" (we've moved
@@ -604,14 +609,16 @@ export class ArenaDaemon {
         if (result !== "duplicate" && result !== "stale") await this.autoPlay(l);
       } else {
         await l.session.receiveClose(msg.close);
-        if (this.stopped) return;
-        await this.trySubmitClose(l);
+        closeReceived = true;
       }
       l.lastError = null;
     } catch (err) {
       l.lastError = errorText(err);
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }
+    if (this.stopped) return;
+    // A failed submission is recorded as `close:` by trySubmitClose and retried by the watchtower.
+    if (closeReceived) await this.trySubmitClose(l).catch(() => undefined);
     if (this.stopped) return;
     this.notify();
   }
@@ -677,7 +684,29 @@ export class ArenaDaemon {
     if (l.lastError?.startsWith("respond:")) l.lastError = null;
   }
 
+  /**
+   * Submits the cooperative close once this player holds both Close signatures. Called when the second signature
+   * arrives (relay or the close API) and, Plan 4.5 Task 10, again on every watchtower pass while the channel is
+   * still Open/Challenged -- so a submission that failed on a transient error (an RPC blip on both sides at once)
+   * is retried instead of leaving a fully co-signed close unsubmitted until someone runs `arena close` again. A
+   * failure is recorded as a `close:` lastError (cleared once a submission goes through) and rethrown.
+   */
   private async trySubmitClose(l: ChannelHandle): Promise<void> {
+    if (!l.session.closeTransaction() || l.submittingClose) return;
+    l.submittingClose = true;
+    try {
+      await this.submitClose(l);
+      if (l.lastError?.startsWith("close:")) l.lastError = null;
+    } catch (err) {
+      l.lastError = `close: ${errorText(err)}`;
+      this.log(`channel ${l.record.channelId}: submitting the cooperative close failed (the watchtower retries): ${errorText(err)}`);
+      throw err;
+    } finally {
+      l.submittingClose = false;
+    }
+  }
+
+  private async submitClose(l: ChannelHandle): Promise<void> {
     const tx = l.session.closeTransaction();
     if (!tx) return;
     const info = await this.hub.channelInfo(l.record.channelId);
@@ -808,6 +837,8 @@ export class ArenaDaemon {
   /** Marks a channel settled or retired, persists it, and leaves its relay channel: nothing is sent on it again,
    *  and its slot on the host connection is freed (I2). Idempotent. */
   private markFinalized(l: ChannelHandle): void {
+    // A failed close submission no longer matters once the channel is settled (the other side's went through).
+    if (l.lastError?.startsWith("close:")) l.lastError = null;
     if (l.record.finalized) return;
     l.record = { ...l.record, finalized: true };
     this.records.saveChannel(l.record);
@@ -891,6 +922,12 @@ export class ArenaDaemon {
         // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
         this.markFinalized(l);
       }
+    }
+
+    // Plan 4.5 Task 10: a fully co-signed close whose submission failed earlier is retried here.
+    if (this.stopped) return;
+    if ((info.phase === "Open" || info.phase === "Challenged") && l.session.closeTransaction()) {
+      await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`; retried on the next pass
     }
 
     // 4. Settled channels are done.
