@@ -207,6 +207,27 @@ describe("watchtower", () => {
     expect(tx.from.toLowerCase()).toBe(bobSessionAddr.toLowerCase());
   });
 
+  it("losing the race to answer a challenge someone else already answered leaves no lastError (Plan 4.5 Task 8)", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await alice.daemon.challenge(undefined, "agent"); // Bob must move
+    await alice.daemon.stop(); // only Bob's daemon from here, so the race below is the one this test stages
+    // Both watchtowers answer the same challenge once both hold Bob's move (his own right after the move, Alice's
+    // on her next tick): the other respond lands between Bob's phase check and his own respond, which reverts
+    // WrongPhase. Staged here by landing an identical respond just before the daemon's own call.
+    const hub = bob.daemon.hub;
+    const original = hub.respond.bind(hub);
+    hub.respond = async (sender, proof) => {
+      await original(sender, proof); // "the other watchtower" wins
+      return original(sender, proof); // the daemon's own call, now against an Open channel
+    };
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    expect((await hub.channelInfo(id)).phase).toBe("Open");
+    expect((await hub.registeredState(id)).turnNum).toBe(2n);
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+  });
+
   it("times out a silent opponent and never times out itself", async () => {
     const { alice, bob, env, id } = await matched();
     await alice.daemon.move(undefined, "e4", { actor: "agent" });

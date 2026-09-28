@@ -633,8 +633,17 @@ export class ArenaDaemon {
     try {
       await this.hub.respond(l.sessionSender, l.session.challengeProof());
     } catch (err) {
-      l.lastError = `respond: ${errorText(err)}`;
+      // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
+      // challenger's own watchtower once the relay delivers that move), and the loser's respond reverts because the
+      // winner's already returned the channel to Open. The challenge is answered either way: not an error, and a
+      // lastError left here would stay on the channel (nothing else clears it) long after the dispute ended.
+      const after = await this.hub.channelInfo(id).catch(() => null);
+      if (after?.phase !== "Open") {
+        l.lastError = `respond: ${errorText(err)}`;
+        return;
+      }
     }
+    if (l.lastError?.startsWith("respond:")) l.lastError = null;
   }
 
   private async trySubmitClose(l: ChannelHandle): Promise<void> {
