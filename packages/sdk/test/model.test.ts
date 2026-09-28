@@ -14,7 +14,7 @@
  *
  * `MODEL_RUNS` overrides the run count (default 200) and `MODEL_SEED` the seed.
  */
-import { afterAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import type { Address, Hex } from "viem";
 import { keccak256, toHex } from "viem";
@@ -32,6 +32,7 @@ import {
   mover,
   recoverCloseSigner,
   recoverStateSigner,
+  outcome,
   statusOf,
   successor,
   type ArenaDomain,
@@ -76,10 +77,13 @@ type Action =
   | { t: "resign"; who: Actor }
   | { t: "acceptDraw"; who: Actor }
   | { t: "claimStalemate"; who: Actor }
-  | { t: "propose"; who: PlayerIndex }
+  /** who 2 = the player who will be black in the next game (so the countersigner moves first: R4 races). */
+  | { t: "propose"; who: Actor }
   | { t: "countersign"; who: PlayerIndex }
+  | { t: "countersignThenMove"; who: PlayerIndex; pick: number; race: boolean; crash: 0 | 1 | 2 }
   | { t: "signClose"; who: PlayerIndex }
   | { t: "deliver"; pick: number }
+  | { t: "deliverLast" }
   | { t: "drop"; pick: number }
   | { t: "duplicate"; pick: number }
   | { t: "crash"; who: PlayerIndex }
@@ -100,13 +104,21 @@ const actionArb: fc.Arbitrary<Action> = fc.oneof(
       offerDraw: fc.integer({ min: 0, max: 4 }).map((n) => n === 0), // 20%
     }),
   },
-  { weight: 6, arbitrary: fc.record({ t: fc.constant("resign" as const), who: actor }) },
+  { weight: 20, arbitrary: fc.record({ t: fc.constant("resign" as const), who: actor }) },
   { weight: 6, arbitrary: fc.record({ t: fc.constant("acceptDraw" as const), who: actor }) },
   { weight: 1, arbitrary: fc.record({ t: fc.constant("claimStalemate" as const), who: actor }) },
-  { weight: 8, arbitrary: fc.record({ t: fc.constant("propose" as const), who: player }) },
+  { weight: 12, arbitrary: fc.record({ t: fc.constant("propose" as const), who: actor }) },
   { weight: 6, arbitrary: fc.record({ t: fc.constant("countersign" as const), who: player }) },
+  // An agent that countersigns and plays its first move at once: with both messages in flight, a reordering
+  // network delivers the move first (R9/R4 adoption on the proposer's pending checkpoint) and the late
+  // countersignature afterwards (checkpoint-repaired). Kept as its own action so those paths are not rare.
+  {
+    weight: 15,
+    arbitrary: fc.record({ t: fc.constant("countersignThenMove" as const), who: player, pick, race: fc.constantFrom(true, true, true, false), crash: fc.constantFrom<0 | 1 | 2>(0, 1, 2) }),
+  },
   { weight: 2, arbitrary: fc.record({ t: fc.constant("signClose" as const), who: player }) },
   { weight: 35, arbitrary: fc.record({ t: fc.constant("deliver" as const), pick }) },
+  { weight: 10, arbitrary: fc.record({ t: fc.constant("deliverLast" as const) }) },
   { weight: 3, arbitrary: fc.record({ t: fc.constant("drop" as const), pick }) },
   { weight: 3, arbitrary: fc.record({ t: fc.constant("duplicate" as const), pick }) },
   { weight: 3, arbitrary: fc.record({ t: fc.constant("crash" as const), who: player }) },
@@ -114,12 +126,16 @@ const actionArb: fc.Arbitrary<Action> = fc.oneof(
   { weight: 2, arbitrary: fc.record({ t: fc.constant("challenge" as const), who: player }) },
 );
 
-/** deposit == stake (a single loss blocks the next game), a few games, or many games. */
-const depositArb = fc.constantFrom(100_000n, 300_000n, 1_000_000n);
+/** deposit == stake (a single loss blocks the next game), a few games, or many games (most runs). */
+const depositArb = fc.oneof(
+  { weight: 1, arbitrary: fc.constant(100_000n) },
+  { weight: 1, arbitrary: fc.constant(300_000n) },
+  { weight: 3, arbitrary: fc.constant(1_000_000n) },
+);
 
 // ------------------------------------------------------------------------------------------------ stats
 
-const stats = {
+const freshStats = () => ({
   runs: 0,
   steps: 0,
   signatures: 0,
@@ -130,10 +146,13 @@ const stats = {
   crashes: 0,
   ingestAccepted: 0,
   r4Adoptions: 0,
+  crashAfter: new Map<string, number>(),
   livenessRounds: [0, 0, 0, 0] as number[],
   results: new Map<string, number>(),
   errors: new Map<string, number>(),
-};
+});
+/** Coverage counters for the property currently running (reset and printed per property). */
+let stats = freshStats();
 function bump(m: Map<string, number>, k: string): void {
   m.set(k, (m.get(k) ?? 0) + 1);
 }
@@ -143,6 +162,24 @@ function bump(m: Map<string, number>, k: string): void {
  * guard, a conflicting state at an already-held turn, or a Close refused because something later was signed.
  */
 const FORBIDDEN = [/conflicting state for turn/, /refusing to sign turn/, /already signed a later state/];
+
+/** What the model expects of one API call: it must succeed, or only a refusal matching the pattern is allowed. */
+const MUST = Symbol("must succeed");
+type Expect = typeof MUST | RegExp;
+const CLOSING_ONLY = /^channel is closing; no further states are signed or accepted$/;
+const OFF_TURN = /^(not your turn|channel is closing; no further states are signed or accepted)$/;
+
+/** The previous step's notable event, for counting crashes that land right after it. */
+type CrashContext =
+  | "other"
+  | "move"
+  | "terminal"
+  | "propose"
+  | "countersign"
+  | "checkpoint-complete"
+  | "r4"
+  | "repair"
+  | "signClose";
 
 // ------------------------------------------------------------------------------------------------ oracle
 
@@ -280,6 +317,12 @@ class Oracle {
     if (snap.closeSigs[me] !== NO_SIG) this.frozen[me] = true;
   }
 
+  /** True when `sig` is a signature this run's oracle has seen on exactly `s` (i.e. its signer really signed it). */
+  signed(sig: Hex, s: State): boolean {
+    const known = this.bySig.get(sig);
+    return known !== undefined && sameState(known, s);
+  }
+
   /** Mirrors ChannelHub._supported (ChannelHub.sol), minus the registered-state branch. Returns a reason or null. */
   async hubRejects(proof: Proof): Promise<string | null> {
     const s = proof.latest.state;
@@ -400,14 +443,20 @@ class World {
     return this.s[0].isMyTurn() ? 0 : this.s[1].isMyTurn() ? 1 : null;
   }
 
-  /** Runs an honest public-API call; an ArenaProtocolError is an expected refusal, anything else fails the run. */
-  private async attempt<T>(label: string, fn: () => Promise<T> | T): Promise<T | undefined> {
+  /**
+   * Runs an honest public-API call. `expect` says what the model knows about the call before it runs:
+   * `MUST` means an honest session has to succeed (any throw is a violation); otherwise only an
+   * ArenaProtocolError whose message matches `allowed` is an expected refusal. Anything else fails the run.
+   */
+  private async attempt<T>(label: string, expect: Expect, fn: () => Promise<T> | T): Promise<T | undefined> {
     try {
       return await fn();
     } catch (err) {
       if (!(err instanceof ArenaProtocolError)) throw err;
       const msg = err.message;
       if (FORBIDDEN.some((re) => re.test(msg))) throw new Violation(`${label}: honest run hit "${msg}"`);
+      if (expect === MUST) throw new Violation(`${label}: must succeed but refused: "${msg}"`);
+      if (!expect.test(msg)) throw new Violation(`${label}: unexpected refusal "${msg}" (allowed: ${expect})`);
       bump(stats.errors, `${label}: ${msg.replace(/\d+/g, "N")}`);
       return undefined;
     }
@@ -421,18 +470,53 @@ class World {
     if (cs) this.net.push({ to: (1 - from) as PlayerIndex, kind: "close", cs: structuredClone(cs) });
   }
 
-  async deliver(m: Msg): Promise<void> {
+  /**
+   * What an honest receiver must do with an honest peer's state message, from its own snapshot: a turn it
+   * already has (duplicate, stale, or the late countersignature that repairs `prev`), the next turn, or the
+   * peer's move on its own pending checkpoint (R9/R4) must be accepted. Only a message that is early (its
+   * predecessor has not arrived yet) may be refused, and a closing receiver may refuse anything new.
+   */
+  private expectReceive(q: PlayerIndex, signed: SignedState): Expect {
+    const snap = this.s[q].snapshot();
+    const t = signed.state.turnNum;
+    const latest = snap.latest.state.turnNum;
+    if (snap.closeState !== null) return CLOSING_ONLY;
+    if (t <= latest || t === latest + 1n) return MUST;
+    if (snap.pendingCheckpoint && t === snap.pendingCheckpoint.state.turnNum + 1n) return MUST;
+    return /^unexpected turn \d+; expected \d+$/;
+  }
+
+  /** A Close signature for the receiver's own close target must be recorded; one for another state is early. */
+  private expectReceiveClose(q: PlayerIndex, cs: CloseSignature): Expect {
+    const snap = this.s[q].snapshot();
+    const target = (snap.closeState ?? snap.latest).state;
+    return cs.stateHash === hashState(target, domain) ? MUST : /^close signature is for a different state$/;
+  }
+
+  async deliver(m: Msg, oracle: Oracle): Promise<void> {
     const s = this.s[m.to];
+    const from = (1 - m.to) as PlayerIndex;
     if (m.kind === "close") {
-      await this.attempt(`receiveClose@${m.to}`, () => s.receiveClose(m.cs));
+      const expect = this.expectReceiveClose(m.to, m.cs);
+      await this.attempt(`receiveClose@${m.to}`, expect, () => s.receiveClose(m.cs));
       return;
     }
+    const senderSig = from === 0 ? m.signed.sigA : m.signed.sigB;
+    if (!oracle.signed(senderSig, m.signed.state)) {
+      throw new Violation(`network carries a state its sender (player ${from}) never signed`);
+    }
     const hadPending = s.snapshot().pendingCheckpoint !== null;
-    const r = await this.attempt(`receive@${m.to}`, () => s.receive(m.signed));
+    const expect = this.expectReceive(m.to, m.signed);
+    const r = await this.attempt(`receive@${m.to}`, expect, () => s.receive(m.signed));
     if (r) {
       bump(stats.results, r);
       if (r === "checkpoint-complete") stats.newGamesCompleted++;
-      if (r === "move" && hadPending && s.snapshot().pendingCheckpoint === null) stats.r4Adoptions++;
+      if (r === "checkpoint-repaired") this.event = "repair";
+      else if (r === "move" && hadPending && s.snapshot().pendingCheckpoint === null) {
+        stats.r4Adoptions++;
+        this.event = "r4";
+      } else if (r === "move" && isGameOver(m.signed.state)) this.event = "terminal";
+      else if (r === "checkpoint-complete") this.event = "checkpoint-complete";
     }
   }
 
@@ -449,52 +533,159 @@ class World {
     }
   }
 
+  private async countersign(who: PlayerIndex): Promise<SignedState | undefined> {
+    const snap = this.s[who].snapshot();
+    const expect =
+      snap.closeState !== null ? CLOSING_ONLY : snap.incomingCheckpoint ? MUST : /^no new-game proposal to countersign$/;
+    const r = await this.attempt(`countersign@${who}`, expect, () => this.s[who].countersignNewGame());
+    if (r) [this.event, this.eventBy] = ["countersign", who];
+    this.sendState(who, r);
+    return r;
+  }
+
+  /**
+   * The daemon restores exactly like this: a fresh instance over the same store. The store is always fully
+   * written (MemoryStore.save is atomic), so a torn or lost write is outside this model.
+   */
+  private async crashRestore(p: PlayerIndex, after: CrashContext, by: PlayerIndex | null = p): Promise<void> {
+    this.s[p] = await ChannelSession.open(this.cfg[p]);
+    stats.crashes++;
+    if (after !== "other") bump(stats.crashAfter, `${after}/${by === p ? "self" : "peer"}`);
+  }
+
+  /** Records what a successful own action did, for the crash-after-event counters. */
+  private played(p: PlayerIndex, signed: SignedState | undefined): SignedState | undefined {
+    if (signed) this.event = isGameOver(signed.state) ? "terminal" : "move";
+    this.eventBy = p;
+    return signed;
+  }
+
+  /** Last step's notable event (and who it happened to), for counting crashes right after it. */
+  private event: CrashContext = "other";
+  private eventBy: PlayerIndex | null = null;
+
   async step(a: Action, oracle: Oracle): Promise<void> {
     stats.steps++;
+    const lastEvent = this.event;
+    const lastBy = this.eventBy;
+    this.event = "other";
+    this.eventBy = null;
     switch (a.t) {
       case "move": {
         const p = this.actor(a.who);
         if (p === null) return;
         const s = this.s[p];
         // Off-turn, fall back to the position's legal moves so the "not your turn" guard is exercised too.
-        const moves = s.isMyTurn() ? s.legalMoves() : legalMoves(s.latest.state);
+        const onMove = s.isMyTurn();
+        const moves = onMove ? s.legalMoves() : legalMoves(s.latest.state);
         if (moves.length === 0) return;
         const mv = moves[a.pick % moves.length];
-        this.sendState(p, await this.attempt(`move@${p}`, () => s.move(mv, { offerDraw: a.offerDraw })));
+        const expect = onMove ? MUST : OFF_TURN;
+        this.sendState(p, this.played(p, await this.attempt(`move@${p}`, expect, () => s.move(mv, { offerDraw: a.offerDraw }))));
         return;
       }
       case "resign": {
         const p = this.actor(a.who);
         if (p === null) return;
-        this.sendState(p, await this.attempt(`resign@${p}`, () => this.s[p].resign()));
+        const expect = this.s[p].isMyTurn() ? MUST : OFF_TURN;
+        this.sendState(p, this.played(p, await this.attempt(`resign@${p}`, expect, () => this.s[p].resign())));
         return;
       }
       case "acceptDraw": {
         const p = this.actor(a.who);
         if (p === null) return;
         if (statusOf(this.s[p].latest.state) !== STATUS.DRAW_OFFERED) return; // honest: only when offered
-        this.sendState(p, await this.attempt(`acceptDraw@${p}`, () => this.s[p].acceptDraw()));
+        const expect = this.s[p].isMyTurn() ? MUST : OFF_TURN;
+        this.sendState(p, this.played(p, await this.attempt(`acceptDraw@${p}`, expect, () => this.s[p].acceptDraw())));
         return;
       }
       case "claimStalemate": {
         const p = this.actor(a.who);
         if (p === null) return;
-        this.sendState(p, await this.attempt(`claimStalemate@${p}`, () => this.s[p].claimStalemate()));
+        const s = this.s[p];
+        const expect = !s.isMyTurn()
+          ? OFF_TURN
+          : outcome(s.latest.state) === "stalemate"
+            ? MUST
+            : /^illegal: not a stalemate$/;
+        this.sendState(p, this.played(p, await this.attempt(`claimStalemate@${p}`, expect, () => s.claimStalemate())));
         return;
       }
-      case "propose":
-        this.sendState(a.who, await this.attempt(`propose@${a.who}`, () => this.s[a.who].proposeNewGame()));
+      case "propose": {
+        // gameIndex g's white is g % 2, so the next game's black is the current game's white.
+        const who: PlayerIndex = a.who === 2 ? ((this.s[0].latest.state.gameIndex % 2) as PlayerIndex) : a.who;
+        const snap = this.s[who].snapshot();
+        const st = snap.latest.state;
+        const expect =
+          snap.closeState !== null
+            ? CLOSING_ONLY
+            : snap.pendingCheckpoint || snap.incomingCheckpoint
+              ? MUST
+              : !isGameOver(st)
+                ? /^the game is still in progress$/
+                : st.balanceA < this.params.stakePerGame || st.balanceB < this.params.stakePerGame
+                  ? /^illegal: a balance is below the stake$/
+                  : MUST;
+        const r = await this.attempt(`propose@${who}`, expect, () => this.s[who].proposeNewGame());
+        if (r) [this.event, this.eventBy] = ["propose", who];
+        this.sendState(who, r);
         return;
+      }
       case "countersign":
-        this.sendState(a.who, await this.attempt(`countersign@${a.who}`, () => this.s[a.who].countersignNewGame()));
+        await this.countersign(a.who);
         return;
-      case "signClose":
-        this.sendClose(a.who, await this.attempt(`signClose@${a.who}`, () => this.s[a.who].signClose()));
+      case "countersignThenMove": {
+        // Taken by whichever side holds a proposal (if either does). If the countersigner is then on move (it is
+        // white in the new game) it plays at once; with `race`, the network hands the proposer the move before
+        // the countersignature: R9/R4 adoption on its pending checkpoint, then checkpoint-repaired.
+        const who = this.s[a.who].snapshot().incomingCheckpoint ? a.who : ((1 - a.who) as PlayerIndex);
+        const r = await this.countersign(who);
+        if (!r || !this.s[who].isMyTurn()) return;
+        const s = this.s[who];
+        const moves = s.legalMoves();
+        const mv = moves[a.pick % moves.length];
+        this.sendState(who, this.played(who, await this.attempt(`move@${who}`, MUST, () => s.move(mv))));
+        if (a.race && this.net.length >= 2) {
+          const [cs, first] = this.net.splice(this.net.length - 2, 2);
+          const proposer = (1 - who) as PlayerIndex;
+          await oracle.check(this, "race: both signed"); // log the new signatures before they are delivered
+          await this.deliver(first, oracle);
+          await oracle.check(this, "race: first move delivered");
+          // crash 1: the proposer restarts right after the R4 adoption (before the late countersignature).
+          if (a.crash === 1) await this.crashRestore(proposer, this.event);
+          await this.deliver(cs, oracle);
+          // crash 2: the proposer restarts right after the late countersignature repaired `prev`.
+          if (a.crash === 2) {
+            await oracle.check(this, "race: countersignature delivered");
+            await this.crashRestore(proposer, this.event);
+          }
+        }
         return;
-      case "deliver": {
+      }
+      case "signClose": {
+        const snap = this.s[a.who].snapshot();
+        const expect =
+          snap.closeState !== null
+            ? hashState(snap.closeState.state, domain) === hashState(snap.latest.state, domain)
+              ? MUST
+              : /^already signed Close for another state$/
+            : snap.pendingCheckpoint
+              ? /^a new-game proposal is pending/
+              : !isGameOver(snap.latest.state)
+                ? /^can only close on a finished game$/
+                : MUST;
+        const r = await this.attempt(`signClose@${a.who}`, expect, () => this.s[a.who].signClose());
+        if (r) [this.event, this.eventBy] = ["signClose", a.who];
+        this.sendClose(a.who, r);
+        return;
+      }
+      case "deliver":
+      case "deliverLast": {
         if (this.net.length === 0) return;
-        const [m] = this.net.splice(a.pick % this.net.length, 1);
-        await this.deliver(m);
+        const i = a.t === "deliverLast" ? this.net.length - 1 : a.pick % this.net.length;
+        const [m] = this.net.splice(i, 1);
+        this.eventBy = m.to;
+        await this.deliver(m, oracle);
         return;
       }
       case "drop":
@@ -504,9 +695,7 @@ class World {
         if (this.net.length > 0) this.net.push(structuredClone(this.net[a.pick % this.net.length]));
         return;
       case "crash":
-        // The daemon restores exactly like this: a fresh instance over the same store.
-        this.s[a.who] = await ChannelSession.open(this.cfg[a.who]);
-        stats.crashes++;
+        await this.crashRestore(a.who, lastEvent, lastBy);
         return;
       case "resend":
         this.resend(a.who);
@@ -514,16 +703,35 @@ class World {
       case "challenge": {
         // `who` registers its challengeProof() on-chain (the hub must accept it); the other side's watchtower
         // ingests the registered state.
-        const proof = await this.attempt(`challengeProof@${a.who}`, () => this.s[a.who].challengeProof());
+        const proof = await this.attempt(`challengeProof@${a.who}`, MUST, () => this.s[a.who].challengeProof());
         if (!proof) return;
         const why = await oracle.hubRejects(proof);
         if (why) throw new Violation(`challenge@${a.who}: hub would reject the proof: ${why}`);
         const other = (1 - a.who) as PlayerIndex;
-        const ok = await this.attempt(`ingestOnChain@${other}`, () => this.s[other].ingestOnChain(proof.latest));
+        const expect = this.expectIngest(other, proof.latest);
+        const ok = await this.attempt(`ingestOnChain@${other}`, expect, () =>
+          this.s[other].ingestOnChain(proof.latest),
+        );
         if (ok) stats.ingestAccepted++;
         return;
       }
     }
+  }
+
+  /**
+   * An honest peer's registered state must be ingested (or ignored as not newer) when the receiver can verify it
+   * by the rules of `ingestOnChain`: not newer, both signatures, the next turn, or the move on its own pending
+   * checkpoint. Only a state further ahead is legitimately unverifiable.
+   */
+  private expectIngest(q: PlayerIndex, ss: SignedState): Expect {
+    const snap = this.s[q].snapshot();
+    const t = ss.state.turnNum;
+    const latest = snap.latest.state.turnNum;
+    if (t <= latest || (ss.sigA !== NO_SIG && ss.sigB !== NO_SIG) || t === latest + 1n) return MUST;
+    if (snap.pendingCheckpoint && snap.closeState === null && t === snap.pendingCheckpoint.state.turnNum + 1n) {
+      return MUST;
+    }
+    return /^unverifiable on-chain state$/;
   }
 }
 
@@ -545,17 +753,19 @@ const LIVENESS_ROUNDS = 3;
 // ------------------------------------------------------------------------------------------------ tests
 
 describe("ChannelSession model (fast-check)", () => {
-  afterAll(() => {
+  /** Prints one property's coverage counters and resets them for the next property. */
+  function report(name: string): void {
     const top = (m: Map<string, number>) =>
       [...m.entries()]
         .sort((x, y) => y[1] - x[1])
         .map(([k, v]) => `    ${v}\t${k}`)
         .join("\n");
-    const { results, errors, ...rest } = stats;
+    const { results, errors, crashAfter, ...rest } = stats;
     console.log(
-      `model stats (runs=${NUM_RUNS}, seed=${SEED}):\n  ${JSON.stringify(rest)}\n  receive results:\n${top(results)}\n  refusals:\n${top(errors)}`,
+      `model stats: ${name} (runs=${NUM_RUNS}, seed=${SEED}):\n  ${JSON.stringify(rest)}\n  receive results:\n${top(results)}\n  crashes right after (event/whose):\n${top(crashAfter)}\n  refusals:\n${top(errors)}`,
     );
-  });
+    stats = freshStats();
+  }
 
   it(
     "safety: no equivocation, conservation, Close only on terminal states and freezes signing, monotone turns, " +
@@ -568,13 +778,15 @@ describe("ChannelSession model (fast-check)", () => {
         }),
         { numRuns: NUM_RUNS, seed: SEED },
       );
+      report("safety");
     },
     TIMEOUT,
   );
 
   /**
    * Shrunk counterexamples the model produced against deliberately broken copies of session.ts (Close on a
-   * non-terminal state, a proof without its predecessor, R4 without the co-signature, no freeze after Close).
+   * non-terminal state, a proof without its predecessor, R4 without the co-signature, no freeze after Close, and
+   * the review's fault: `signedBy` refusing every opponent signature at a turn divisible by 5).
    * The real session must pass each of them; they pin the scenarios that prove the oracle can see those bugs.
    */
   it.each<[string, bigint, Action[]]>([
@@ -618,6 +830,24 @@ describe("ChannelSession model (fast-check)", () => {
         { t: "propose", who: 0 },
       ],
     ],
+    [
+      // Review fault: signedBy() rejecting every opponent signature at turn 5 -- the next expected move, delivered
+      // in order from an honest peer, must be accepted, so the refusal is a safety failure, not "expected".
+      "an in-order next move from an honest peer is accepted (turn 5)",
+      100_000n,
+      [
+        { t: "move", who: 0, pick: 0, offerDraw: true },
+        { t: "deliverLast" },
+        { t: "move", who: 1, pick: 0, offerDraw: true },
+        { t: "deliver", pick: 0 },
+        { t: "move", who: 0, pick: 0, offerDraw: true },
+        { t: "deliver", pick: 0 },
+        { t: "move", who: 2, pick: 0, offerDraw: true },
+        { t: "deliver", pick: 0 },
+        { t: "acceptDraw", who: 0 },
+        { t: "deliver", pick: 0 },
+      ],
+    ],
   ])("pinned scenario: %s", async (_name, deposit, actions) => {
     await runSafety(deposit, actions);
   });
@@ -636,7 +866,7 @@ describe("ChannelSession model (fast-check)", () => {
             w.resend(0);
             w.resend(1);
             while (w.net.length > 0) {
-              await w.deliver(w.net.shift()!);
+              await w.deliver(w.net.shift()!, oracle);
               await oracle.check(w, `liveness round ${round}`);
             }
             converged = convergedPair(w);
@@ -647,6 +877,7 @@ describe("ChannelSession model (fast-check)", () => {
         }),
         { numRuns: NUM_RUNS, seed: SEED + 1 },
       );
+      report("liveness");
     },
     TIMEOUT,
   );
