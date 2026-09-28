@@ -635,13 +635,23 @@ export class ArenaDaemon {
     } catch (err) {
       // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
       // challenger's own watchtower once the relay delivers that move), and the loser's respond reverts because the
-      // winner's already returned the channel to Open. The challenge is answered either way: not an error, and a
-      // lastError left here would stay on the channel (nothing else clears it) long after the dispute ended.
-      const after = await this.hub.channelInfo(id).catch(() => null);
+      // winner's already returned the channel to Open. The challenge is answered either way, so a hub revert on a
+      // channel that is Open again is not surfaced as lastError (nothing would clear it on a quiet channel) -- but
+      // it is always logged, with both turns, because the registered state can legitimately be older than ours
+      // (the winner answered with the state it held), which also means a genuinely bad proof of ours would only
+      // show up here. A failure that is not a hub revert (transport, our own gas) is always this daemon's problem.
+      const after = err instanceof HubRevertError ? await this.hub.channelInfo(id).catch(() => null) : null;
       if (after?.phase !== "Open") {
         l.lastError = `respond: ${errorText(err)}`;
         return;
       }
+      const reg = await this.hub.registeredState(id).then(
+        (s) => s.turnNum.toString(),
+        () => "unknown",
+      );
+      this.log(
+        `channel ${id}: respond reverted but the challenge was already answered (registered turn ${reg}, ours ${l.session.latest.state.turnNum}): ${errorText(err)}`,
+      );
     }
     if (l.lastError?.startsWith("respond:")) l.lastError = null;
   }

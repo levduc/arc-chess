@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
+import { HubRevertError, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
 import { DaemonError, type ArenaDaemon } from "../src/index.js";
 import { increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
@@ -207,25 +207,54 @@ describe("watchtower", () => {
     expect(tx.from.toLowerCase()).toBe(bobSessionAddr.toLowerCase());
   });
 
-  it("losing the race to answer a challenge someone else already answered leaves no lastError (Plan 4.5 Task 8)", async () => {
-    const { alice, bob, id } = await matched();
+  /** Alice challenges on Bob's turn and stops; returns Bob's daemon with `hub.respond` replaced by `patch`, and a
+   *  capture of Bob's daemon log. Shared by the respond-failure tests below (Plan 4.5 Task 8 and its review). */
+  async function bobMustRespond(patch: (original: ArenaDaemon["hub"]["respond"]) => ArenaDaemon["hub"]["respond"]) {
+    const m = await matched();
+    const { alice, bob, id } = m;
     await alice.daemon.move(undefined, "e4", { actor: "agent" });
     await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
     await alice.daemon.challenge(undefined, "agent"); // Bob must move
-    await alice.daemon.stop(); // only Bob's daemon from here, so the race below is the one this test stages
+    await alice.daemon.stop(); // only Bob's daemon from here, so each race below is the one the test stages
+    const hub = bob.daemon.hub;
+    hub.respond = patch(hub.respond.bind(hub));
+    const logs: string[] = [];
+    (bob.daemon as unknown as { opts: { log?: (line: string) => void } }).opts.log = (line) => logs.push(line);
+    return { ...m, hub, logs };
+  }
+
+  it("losing the race to answer a challenge someone else already answered leaves no lastError, but logs it (Plan 4.5 Task 8)", async () => {
     // Both watchtowers answer the same challenge once both hold Bob's move (his own right after the move, Alice's
     // on her next tick): the other respond lands between Bob's phase check and his own respond, which reverts
-    // WrongPhase. Staged here by landing an identical respond just before the daemon's own call.
-    const hub = bob.daemon.hub;
-    const original = hub.respond.bind(hub);
-    hub.respond = async (sender, proof) => {
+    // WrongPhase. Staged here by landing an identical respond just before the daemon's own.
+    const { bob, id, hub, logs } = await bobMustRespond((original) => async (sender, proof) => {
       await original(sender, proof); // "the other watchtower" wins
       return original(sender, proof); // the daemon's own call, now against an Open channel
-    };
+    });
     await bob.daemon.move(undefined, "e5", { actor: "agent" });
     expect((await hub.channelInfo(id)).phase).toBe("Open");
     expect((await hub.registeredState(id)).turnNum).toBe(2n);
     expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(logs.some((l) => /already answered \(registered turn 2, ours 2\).*WrongPhase/.test(l))).toBe(true);
+  });
+
+  it("a respond that fails while the channel is still Challenged sets lastError (review: negative case)", async () => {
+    const { bob, id, hub } = await bobMustRespond(() => async () => {
+      throw new HubRevertError("BadSignature", new Error("stubbed revert"));
+    });
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    expect((await hub.channelInfo(id)).phase).toBe("Challenged");
+    expect(bob.daemon.handle(id).lastError).toBe("respond: hub reverted: BadSignature");
+  });
+
+  it("a respond failure that is not a hub revert sets lastError even if the channel is Open again (review)", async () => {
+    const { bob, id, hub } = await bobMustRespond((original) => async (sender, proof) => {
+      await original(sender, proof); // the challenge does get answered...
+      throw new Error("socket hang up"); // ...but this daemon's own send failed in transport: its problem to report
+    });
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    expect((await hub.channelInfo(id)).phase).toBe("Open");
+    expect(bob.daemon.handle(id).lastError).toBe("respond: socket hang up");
   });
 
   it("times out a silent opponent and never times out itself", async () => {
