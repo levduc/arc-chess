@@ -634,7 +634,14 @@ export class ArenaDaemon {
     await this.opts.relay.send({ type: "state", channelId: l.record.channelId, signed }).catch((err) => {
       l.lastError = `relay: ${errorText(err)}`;
     });
-    await this.respondIfChallenged(l);
+    // Plan 4.5 Task 10: the state is signed, persisted and relayed by now, so a failure of the follow-up
+    // "is a challenge pending?" read (an RPC blip) must not fail the move, resign or accept that produced it -- an
+    // agent told its move failed retries it and gets "not your turn". The watchtower's Challenged branch answers
+    // any pending challenge on its next pass; a failed respond transaction still sets `respond:` (in
+    // respondIfChallenged), only the chain reads around it are logged here instead.
+    await this.respondIfChallenged(l).catch((err: unknown) => {
+      this.log(`channel ${l.record.channelId}: challenge check after sending turn ${signed.state.turnNum} failed (the watchtower retries): ${errorText(err)}`);
+    });
   }
 
   /** If a challenge is pending and we now hold a newer supported state, answer it on-chain from the session key. */

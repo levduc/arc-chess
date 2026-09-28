@@ -519,3 +519,25 @@ describe("Plan 4.5 Task 10: transient RPC failures", () => {
     expect(alice.daemon.handle(id).passes).toBeGreaterThan(1);
   });
 });
+
+describe("Plan 4.5 Task 10: a move is not failed by an RPC error after it was sent", () => {
+  it("move() resolves when the follow-up challenge check cannot reach the chain; the peer still gets the move", async () => {
+    const { alice, bob, id } = await matched();
+    const hub = alice.daemon.hub;
+    const real = hub.channelInfo.bind(hub);
+    let fail = false;
+    hub.channelInfo = async (c) => {
+      if (fail) throw new Error("HTTP request failed.");
+      return real(c);
+    };
+    fail = true; // every chain read of alice's daemon fails for the length of the move call
+    try {
+      // Before the fix this rejected, although the move had been signed, persisted and relayed.
+      await alice.daemon.move(id, "e4", { actor: "agent" });
+    } finally {
+      fail = false;
+    }
+    expect(alice.daemon.handle(id).session.latest.state.turnNum).toBe(1n);
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 1n, 5_000, "bob holds turn 1");
+  });
+});
