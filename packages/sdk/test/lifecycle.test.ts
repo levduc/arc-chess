@@ -14,6 +14,7 @@ import {
   signState,
   type CloseTransaction,
   type SessionConfig,
+  type TxSender,
 } from "../src/index.js";
 import { ANVIL_KEYS, CHAIN, RPC, deployArena, increaseTime, mintUsdc, now, setEthBalance, usdcBalance } from "./helpers/chain.js";
 import { SCHOLARS_MATE, makeParams } from "./helpers/fixtures.js";
@@ -185,6 +186,31 @@ describe("channel lifecycle on Anvil", () => {
     expect(err).toBeInstanceOf(HubRevertError);
     expect((err as HubRevertError).errorName).toBe("BadSignature");
     await expect(x.hub.deposit(x.alice, x.params)).rejects.toThrow(/WrongPhase/);
+  });
+
+  it("a revert at send time (state changed after the simulate) also surfaces as a named HubRevertError", async () => {
+    // Plan 4.5 Task 8: two daemons race the same cooperative close. The loser's simulate still sees "Open", but by
+    // the time its own send estimates gas the winner's tx is mined, so the node refuses it (WrongPhase) inside
+    // sender.send -- which escaped HubClient.write as a raw viem error, bypassing every HubRevertError handler.
+    const x = await arena("send-race");
+    const { a, b } = await open(x);
+    await b.receive(await a.move("e2e4"));
+    await a.receive(await b.resign());
+    await b.receiveClose(await a.signClose());
+    await a.receiveClose(await b.signClose());
+    const tx = a.closeTransaction()!;
+    // A sender that lets the other player's close land between HubClient.write's simulate and its own send.
+    const racing: TxSender = {
+      address: x.alice.address,
+      async send(t) {
+        await x.hub.closeCooperative(x.bob, tx);
+        return x.alice.send(t);
+      },
+    };
+    const err = await x.hub.closeCooperative(racing, tx).catch((e: unknown) => e);
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Finalized");
+    expect(err).toBeInstanceOf(HubRevertError);
+    expect((err as HubRevertError).errorName).toBe("WrongPhase");
   });
 
   // --- R8: Close only on terminal states (regressions for PoC1a/PoC1b) -------------------------------------

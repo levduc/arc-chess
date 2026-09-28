@@ -1,5 +1,6 @@
 import {
   BaseError,
+  ExecutionRevertedError,
   decodeErrorResult,
   encodeFunctionData,
   erc20Abi,
@@ -96,6 +97,12 @@ export function decodeRevert(err: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** True if a viem error is an execution revert (with decodable data or not), as opposed to a transport failure. */
+function isRevert(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return false;
+  return decodeRevert(err) !== undefined || err.walk((e) => e instanceof ExecutionRevertedError) !== null;
 }
 
 export class HubClient {
@@ -330,14 +337,24 @@ export class HubClient {
     return this.write(sender, this.hub, data);
   }
 
-  /** Simulates first so reverts surface as named errors, then sends and waits for success. */
+  /**
+   * Simulates first so reverts surface as named errors, then sends and waits for success. The chain can change
+   * between the simulate and the send (e.g. two players racing the same cooperative close): a revert the sender's
+   * own gas estimate hits is reported as a HubRevertError too, named when decodable, never as a raw viem error.
+   */
   private async write(sender: TxSender, to: Address, data: Hex): Promise<TransactionReceipt> {
     try {
       await this.client.call({ account: sender.address, to, data });
     } catch (err) {
       throw new HubRevertError(decodeRevert(err), err);
     }
-    const hash = await sender.send({ to, data });
+    let hash: Hex;
+    try {
+      hash = await sender.send({ to, data });
+    } catch (err) {
+      if (isRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      throw err; // not a revert (RPC down, nonce, a non-viem sender's own failure): the caller sees it unchanged
+    }
     const receipt = await this.client.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new HubRevertError(undefined, new Error(`transaction ${hash} reverted`));
     return receipt;
