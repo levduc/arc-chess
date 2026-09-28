@@ -817,7 +817,10 @@ export class ArenaDaemon {
           // no longer applies. Without this, a quiet channel kept that error in lastError indefinitely.
           if (l.lastError?.startsWith("watch:")) l.lastError = null;
         } catch (err) {
-          l.lastError = `watch: ${errorText(err)}`;
+          // A pass that settled the channel and then failed on its final bookkeeping read (refreshChain) leaves
+          // nothing to retry: the channel is never watched again, so the error would stick. Logged instead.
+          if (l.record.finalized) this.log(`channel ${l.record.channelId}: settled; a read after settling failed: ${errorText(err)}`);
+          else l.lastError = `watch: ${errorText(err)}`;
         }
       }
     } finally {
@@ -847,8 +850,10 @@ export class ArenaDaemon {
   /** Marks a channel settled or retired, persists it, and leaves its relay channel: nothing is sent on it again,
    *  and its slot on the host connection is freed (I2). Idempotent. */
   private markFinalized(l: ChannelHandle): void {
-    // A failed close submission no longer matters once the channel is settled (the other side's went through).
-    if (l.lastError?.startsWith("close:")) l.lastError = null;
+    // Transient failures no longer matter once the channel is settled -- a failed close submission (the other
+    // side's went through), a failed pass or dispute scan -- and a settled channel is never watched again, so
+    // nothing else would ever clear them.
+    if (/^(close|watch|events):/.test(l.lastError ?? "")) l.lastError = null;
     if (l.record.finalized) return;
     l.record = { ...l.record, finalized: true };
     this.records.saveChannel(l.record);

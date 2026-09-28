@@ -600,3 +600,40 @@ describe("Plan 4.5 Task 10: a match whose handling fails on an RPC error is retr
     await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 20_000, "funded and open");
   });
 });
+
+describe("Plan 4.5 Task 10: a settled channel keeps no transient error", () => {
+  it("the pass that sees Finalized, then fails its last read, leaves lastError null (the channel is never watched again)", async () => {
+    // Manual ticks only (a long pollMs), so each pass below is exactly the one the test stages.
+    const pair = await startPair({ pollMs: 3_600_000 });
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "match");
+    await waitFor(async () => {
+      for (const p of [alice, bob]) {
+        await p.daemon.idle();
+        await p.daemon.tick();
+      }
+      return (await alice.daemon.hub.channelInfo(id)).phase === "Open";
+    }, 20_000, "funding by manual ticks");
+    // Inside one pass: an earlier failure is on record, the step-4 read sees Finalized, then refreshChain's read
+    // fails. (The phase is faked: this is the daemon's bookkeeping, not the hub's.)
+    const hub = alice.daemon.hub;
+    const real = hub.channelInfo.bind(hub);
+    let call = 0;
+    hub.channelInfo = async (c) => {
+      call++;
+      if (call === 1) return real(c); // the pass's first read
+      if (call === 2) return { ...(await real(c)), phase: "Finalized" }; // step 4: settled
+      throw new Error("HTTP request failed."); // refreshChain
+    };
+    alice.daemon.handle(id).lastError = "watch: HTTP request failed."; // from an earlier failed pass
+    await alice.daemon.idle();
+    await alice.daemon.tick();
+    expect(call).toBe(3);
+    expect(alice.daemon.handle(id).record.finalized).toBe(true);
+    // Before the fix: "watch: HTTP request failed." for good.
+    expect(alice.daemon.handle(id).lastError).toBeNull();
+  });
+});
