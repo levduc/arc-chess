@@ -336,7 +336,9 @@ class Oracle {
       }
       this.maxTurn[p] = latest.state.turnNum;
 
-      const fp = `${latest.state.turnNum}:${latest.sigA}:${latest.sigB}`;
+      // Re-check the proof whenever latest or prev changes (prev changes alone on checkpoint-repaired).
+      const prev = s.snapshot().prev;
+      const fp = `${latest.state.turnNum}:${latest.sigA}:${latest.sigB}:${prev?.sigA}:${prev?.sigB}`;
       if (fp !== this.proofChecked[p]) {
         let proof: Proof;
         try {
