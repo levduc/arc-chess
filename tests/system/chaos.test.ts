@@ -384,6 +384,43 @@ function startSampler(log: EquivocationLog, players: Player[], ms = 150): { samp
   };
 }
 
+/** Starts sampling a channel's signatures from both sessions and the relay cache; `finish()` adds the chain's dispute
+ *  states (and the MITM's frames, if any), then asserts every signature is valid and nobody equivocated. */
+async function watchEquivocation(
+  s: Stack,
+  players: Player[],
+  id: Hex,
+  mitm?: Mitm,
+): Promise<{ log: EquivocationLog; finish(): Promise<void> }> {
+  const { hub } = hubOf(s);
+  const log = new EquivocationLog({ chainId: s.chainId, hub: s.hub }, id, await signersOf(players[0], id), s.serverDbPath);
+  const sampler = startSampler(log, players);
+  cleanups.push(async () => {
+    await sampler.stop(); // a failed test never reaches finish(): stop sampling before the stack goes away
+    log.close();
+  });
+  return {
+    log,
+    async finish(minPairs = 8) {
+      await sampler.stop();
+      if (mitm) await log.addMitmFrames(mitm);
+      await log.addChain(hub);
+      log.close();
+      console.log(`[chaos] equivocation check: ${log.counts.sigs} signatures, ${log.pairs} (signer, turn) pairs, by source ${JSON.stringify(log.counts.bySource)}`);
+      expect(log.counts.invalid, "signatures that did not recover to their seat's signer").toBe(0);
+      expect(log.violations()).toEqual([]);
+      expect(log.pairs, "(signer, turn) pairs seen: the check must not pass vacuously").toBeGreaterThanOrEqual(minPairs);
+    },
+  };
+}
+
+/** The channel's session signers, from a daemon's own channel record (known off-chain before the channel exists on
+ *  chain, unlike `channelParams`, which reads zeros until the first deposit). */
+async function signersOf(p: Player, id: Hex): Promise<readonly [Address, Address]> {
+  const record = await waitFor(() => readJson<ChannelRecord>(join(p.home, "channels", id, "record.json")), 20_000, `${p.name}'s record`);
+  return [record.params.signers[0], record.params.signers[1]];
+}
+
 // ------------------------------------------------------------------------------------------------ crash loop
 
 const KILL_POINTS = [
@@ -444,8 +481,7 @@ async function crashLoop(seed: number): Promise<void> {
     await crash(); // 2. after match
     const id = await channelOf(bob);
     await channelOf(alice);
-    const params = (await hub.channelParams(id)) as { signers: readonly [Address, Address] };
-    log = new EquivocationLog({ chainId: s.chainId, hub: s.hub }, id, [params.signers[0], params.signers[1]], s.serverDbPath);
+    log = new EquivocationLog({ chainId: s.chainId, hub: s.hub }, id, await signersOf(bob, id), s.serverDbPath);
     sampler = startSampler(log, [alice, bob]);
 
     await waitFor(async () => (await hub.channelInfo(id)).funded[0], 30_000, "alice's deposit");
@@ -625,6 +661,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         const offerId = (await retry("post offer", () => postOffer(alice)))!;
         await retry("accept", () => bob.api("POST", "/offers/accept", { offerId }));
         const id = await channelOf(bob, 60_000);
+        const equivocation = await watchEquivocation(s, [alice, bob], id);
         await waitSt(alice, (st) => st.phase === "Open", 90_000, id, "Open");
         await waitSt(bob, (st) => st.phase === "Open", 90_000, id, "Open");
 
@@ -698,7 +735,15 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         sampling = false;
         await errorSampler;
         for (const p of proxies) p.setFaults({});
-        await sleep(1500);
+        // A pass can still be held by a request delayed just before the switch (11 s, then viem retries): wait for
+        // the passes after it to clear what the faults left, rather than a fixed sleep.
+        await waitFor(async () => {
+          for (const p of [alice, bob]) {
+            const chs = (await p.api("GET", "/channels")) as Array<{ lastError: string | null }>;
+            if (chs.some((c) => c.lastError !== null)) return false;
+          }
+          return true;
+        }, 45_000, "every lastError to clear once the faults stop");
         await expectBalances(s, [
           [alice, START + STAKE - FEE],
           [bob, START - STAKE - FEE],
@@ -718,6 +763,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
           expect(p.stats.maxGetLogsSpan).toBeLessThanOrEqual(2000);
         }
         expect(aliceRpc.stats.lagged + bobRpc.stats.lagged + serverRpc.stats.lagged).toBeGreaterThan(0);
+        await equivocation.finish();
         expect(lastErrors.size).toBeGreaterThan(0); // the faults reached the daemons, not just viem's retries
       } catch (err) {
         console.error(`[chaos] rpc-fault failed with CHAOS_SEED=${seed}\n--- alice ---\n${alice.logs().slice(-6000)}\n--- bob ---\n${bob.logs().slice(-6000)}`);
@@ -741,6 +787,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       const offerId = await postOffer(alice);
       await bob.api("POST", "/offers/accept", { offerId });
       const id = await channelOf(bob);
+      const equivocation = await watchEquivocation(s, [alice, bob], id);
       await waitSt(alice, (st) => st.phase === "Open", 30_000, id, "Open");
       await waitSt(bob, (st) => st.phase === "Open", 30_000, id, "Open");
       await moveOnce(alice, bob, id, "e2e4");
@@ -790,6 +837,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         ["host", 2n * FEE],
       ]);
       await expectNoErrors(alice, bob);
+      await equivocation.finish();
     },
     120_000,
   );
@@ -806,6 +854,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         const offerId = await postOffer(alice);
         await bob.api("POST", "/offers/accept", { offerId });
         const id = await channelOf(bob);
+        const equivocation = await watchEquivocation(s, [alice, bob], id);
         await waitPhase(hub, id, "Open", 30_000);
         await waitSt(alice, (st) => st.phase === "Open", 20_000, id, "Open");
         await waitSt(bob, (st) => st.phase === "Open", 20_000, id, "Open");
@@ -854,6 +903,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
           ["host", 2n * FEE],
         ]);
         await expectNoErrors(alice, bob);
+        await equivocation.finish();
       },
       120_000,
     );
@@ -893,6 +943,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       dropMatches = false;
       await s.restartServer();
       const id = await channelOf(bob, 30_000);
+      const equivocation = await watchEquivocation(s, [bob, alice], id, mitm); // bob's record exists already
       expect(await channelOf(alice, 30_000)).toBe(id);
       expect(mitm.connections.length).toBeGreaterThanOrEqual(connsBefore + 2); // both daemons reconnected
       const replayed = mitm.connections.slice(connsBefore).flatMap((c) => c.seen.down).filter((f: any) => f?.type === "match");
@@ -923,6 +974,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         ["host", 2n * FEE],
       ]);
       await expectNoErrors(alice, bob);
+      await equivocation.finish();
     },
     120_000,
   );
