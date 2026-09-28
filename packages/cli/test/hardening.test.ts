@@ -576,3 +576,27 @@ describe("Plan 4.5 Task 10: the watchtower retries a failed cooperative close", 
     await waitFor(() => alice.daemon.handle(id).lastError === null && bob.daemon.handle(id).lastError === null, 5_000, "close: cleared");
   });
 });
+
+describe("Plan 4.5 Task 10: a match whose handling fails on an RPC error is retried", () => {
+  it("the offerer's first read at match time fails; the next tick handles the match and the channel opens", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const hub = alice.daemon.hub;
+    const real = hub.feeConfig.bind(hub);
+    let failed = false;
+    hub.feeConfig = async () => {
+      if (!failed) {
+        failed = true;
+        throw new Error("HTTP request failed.");
+      }
+      return real();
+    };
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    // Before the fix the host's one match event was lost to the failed read: alice never opened (or funded) it.
+    const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "alice handles the match");
+    expect(failed).toBe(true);
+    await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 20_000, "funded and open");
+  });
+});

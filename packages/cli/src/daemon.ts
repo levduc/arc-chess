@@ -134,6 +134,10 @@ export class ArenaDaemon {
   private readonly claiming = new Set<Hex>();
   /** Guards against two concurrent acceptOffer calls for the same offerId both going through. */
   private readonly accepting = new Set<Hex>();
+  /** Plan 4.5 Task 10: match events whose handling failed on an error (an RPC blip), by offerId -- retried on the
+   *  next tick. The host sends a match once per subscription, so without a retry one failed read at match time
+   *  left the channel unopened (and unfunded) for good. Explicit rejections are never retried. */
+  private readonly retryMatches = new Map<Hex, MatchEvent>();
 
   constructor(protected readonly opts: DaemonOptions) {
     const c = opts.config;
@@ -440,7 +444,8 @@ export class ArenaDaemon {
       void this.tick();
     } catch (err) {
       release();
-      this.log(`match handling failed: ${errorText(err)}`);
+      if (!this.stopped) this.retryMatches.set(offerId, m);
+      this.log(`match handling failed (retried on the next tick): ${errorText(err)}`);
     }
   }
 
@@ -797,6 +802,11 @@ export class ArenaDaemon {
     this.ticking = true;
     try {
       await this.pruneOffers();
+      for (const m of [...this.retryMatches.values()]) {
+        if (this.stopped) break;
+        this.retryMatches.delete(m.offerId);
+        await this.onMatch(m);
+      }
       for (const l of this.live.values()) {
         if (this.stopped) break;
         if (l.record.finalized) continue;
