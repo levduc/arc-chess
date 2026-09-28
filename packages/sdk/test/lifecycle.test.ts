@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { PublicClient } from "viem";
+import { BaseError, ExecutionRevertedError, type PublicClient } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import {
   ChannelSession,
@@ -404,6 +404,42 @@ describe("HubClient.disputeEvents", () => {
     expect(heads).toBe(1);
     expect(calls.map((c) => c.eventName).sort()).toEqual(["Challenged", "Responded"]);
     for (const c of calls) expect([c.fromBlock, c.toBlock]).toEqual([7n, 42n]);
+  });
+});
+
+describe("HubClient.write send-time errors (stubbed)", () => {
+  // The simulate passes; the sender's own send then fails with `err` (Plan 4.5 Task 8 fix round).
+  const stubHub = () =>
+    new HubClient("0x000000000000000000000000000000000000beef", { call: async () => ({ data: "0x" }) } as unknown as PublicClient);
+  const failingSender = (err: unknown): TxSender => ({
+    address: "0x000000000000000000000000000000000000a11c",
+    send: async () => {
+      throw err;
+    },
+  });
+  // What viem's getNodeError builds from a node message: an ExecutionRevertedError whose `details` carry it.
+  const nodeError = (message: string) =>
+    new ExecutionRevertedError({ cause: new BaseError("RPC Request failed.", { details: message }), message });
+  const id = `0x${"11".repeat(32)}` as const;
+
+  it("a no-data 'execution reverted' from the node is a HubRevertError with no name", async () => {
+    const err = await stubHub().timeout(failingSender(nodeError("execution reverted")), id).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HubRevertError);
+    expect((err as HubRevertError).errorName).toBeUndefined();
+  });
+
+  it("'gas required exceeds allowance' (viem also calls it ExecutionRevertedError) passes through unchanged", async () => {
+    const original = nodeError("gas required exceeds allowance (0)");
+    expect(original.message).toMatch(/execution reverted/i); // the top-level message would have misled a naive check
+    const err = await stubHub().timeout(failingSender(original), id).catch((e: unknown) => e);
+    expect(err).toBe(original);
+    expect(err).not.toBeInstanceOf(HubRevertError);
+  });
+
+  it("a non-viem send failure passes through unchanged", async () => {
+    const original = new Error("socket hang up");
+    const err = await stubHub().timeout(failingSender(original), id).catch((e: unknown) => e);
+    expect(err).toBe(original);
   });
 });
 

@@ -99,10 +99,18 @@ export function decodeRevert(err: unknown): string | undefined {
   }
 }
 
-/** True if a viem error is an execution revert (with decodable data or not), as opposed to a transport failure. */
-function isRevert(err: unknown): boolean {
+/**
+ * True if an error thrown by `TxSender.send` is an execution revert, as opposed to a failure of the send itself.
+ * Decodable revert data settles it. Without data, only the node's own message counts, and only if it says
+ * "execution reverted": viem also classifies "gas required exceeds allowance" (the sender cannot pay for gas, not
+ * a hub revert) as an ExecutionRevertedError, and its top-level message reads "Execution reverted with reason:
+ * ..." either way -- so the raw node message (`details`, propagated up the cause chain) is what is tested.
+ */
+function isSendRevert(err: unknown): boolean {
   if (!(err instanceof BaseError)) return false;
-  return decodeRevert(err) !== undefined || err.walk((e) => e instanceof ExecutionRevertedError) !== null;
+  if (decodeRevert(err) !== undefined) return true;
+  const reverted = err.walk((e) => e instanceof ExecutionRevertedError) as BaseError | null;
+  return reverted !== null && /execution reverted/i.test(reverted.details ?? "");
 }
 
 export class HubClient {
@@ -352,8 +360,9 @@ export class HubClient {
     try {
       hash = await sender.send({ to, data });
     } catch (err) {
-      if (isRevert(err)) throw new HubRevertError(decodeRevert(err), err);
-      throw err; // not a revert (RPC down, nonce, a non-viem sender's own failure): the caller sees it unchanged
+      if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      // not a revert (RPC down, nonce, gas allowance, a non-viem sender's own failure): the caller sees it unchanged
+      throw err;
     }
     const receipt = await this.client.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new HubRevertError(undefined, new Error(`transaction ${hash} reverted`));
