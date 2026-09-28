@@ -5,7 +5,7 @@
  * (`packages/cli/bin/arena.mjs`) -- so later tasks (dispute e2e, adversarial, chaos, load, LLM games) can build on
  * one API instead of re-inventing process plumbing each time.
  */
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -275,7 +275,9 @@ async function waitForHttp(t: Tracked, url: string, timeoutMs = 20_000): Promise
 
 // --------------------------------------------------------------------------------------------------- contracts
 
-function artifact(name: string, outDir: string): { abi: Abi; bytecode: Hex } {
+/** A compiled contract's ABI and creation bytecode from `contracts/out` (or `outDir`). Exported for tests that deploy
+ *  a contract of their own next to the stack's (e.g. an attacker's second ChannelHub). */
+export function artifact(name: string, outDir: string = CONTRACTS_OUT): { abi: Abi; bytecode: Hex } {
   const json = JSON.parse(readFileSync(join(outDir, `${name}.sol/${name}.json`), "utf8")) as {
     abi: Abi;
     bytecode: { object: Hex };
@@ -344,7 +346,12 @@ export type Stack = {
   serverUrl: string;
   server: ChildProcess;
   anvil: ChildProcess;
-  player(name: string, key?: Hex): Promise<Player>;
+  /** Creates, funds and starts a daemon player. `opts.serverUrl` points its `arena init --server` (and so its
+   *  daemon's host connection) somewhere other than the stack's own server -- e.g. at a MITM proxy in front of it. */
+  player(name: string, key?: Hex, opts?: { serverUrl?: string }): Promise<Player>;
+  /** Gives `address` native gas (100 ETH) and, unless `usdc` is 0, mints it MockUSDC (default 10 USDC) -- the same
+   *  funding `player()` gives a daemon's wallet, for SDK-only actors (a malicious peer, an attacker). */
+  fund(address: Address, usdc?: bigint): Promise<void>;
   restartServer(): Promise<void>;
   setLimits(maxDeposit: bigint, maxCommitted: bigint): Promise<void>;
   setPaused(p: boolean): Promise<void>;
@@ -354,13 +361,23 @@ export type Stack = {
 
 // ------------------------------------------------------------------------------------------------- Stack build
 
-function runCliSync(args: string[], home: string): { stdout: string; stderr: string; status: number } {
-  const res = spawnSync("node", [CLI_BIN, ...args], {
-    cwd: REPO_ROOT,
-    env: { ...process.env, ARENA_HOME: home },
-    encoding: "utf8",
+/** Runs one `arena` CLI command to completion. Asynchronous on purpose (not spawnSync): a caller may be serving the
+ *  very endpoint the command talks to from this same process -- e.g. a MITM proxy in front of the server that `arena
+ *  init --server` fetches `/templates` through -- and a blocked event loop would deadlock against it. */
+export function runCli(args: string[], home: string): Promise<{ stdout: string; stderr: string; status: number }> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("node", [CLI_BIN, ...args], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, ARENA_HOME: home },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
+    child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+    child.once("error", reject);
+    child.once("close", (code) => resolvePromise({ stdout, stderr, status: code ?? 1 }));
   });
-  return { stdout: res.stdout ?? "", stderr: res.stderr ?? "", status: res.status ?? 1 };
 }
 
 // A pathological run of bad luck (or a systemic problem unrelated to the port itself, e.g. a missing `anvil`
@@ -453,24 +470,29 @@ export async function startStack(
 
     const players: Array<{ home: string; getTracked: () => Tracked }> = [];
 
-    async function player(name: string, key?: Hex): Promise<Player> {
+    async function fund(address: Address, amount = 10_000_000n): Promise<void> {
+      await testClient.setBalance({ address, value: 10n ** 20n });
+      if (amount === 0n) return;
+      const mintHash = await deployer.writeContract({
+        address: usdc,
+        abi: mockUsdcAbi,
+        functionName: "mint",
+        args: [address, amount],
+        chain: foundry,
+        account: deployer.account!,
+      });
+      await pub.waitForTransactionReceipt({ hash: mintHash });
+    }
+
+    async function player(name: string, key?: Hex, opts: { serverUrl?: string } = {}): Promise<Player> {
     const walletKey = key ?? generatePrivateKey();
     const address = privateKeyToAccount(walletKey).address;
-    await testClient.setBalance({ address, value: 10n ** 20n });
-    const mintHash = await deployer.writeContract({
-      address: usdc,
-      abi: mockUsdcAbi,
-      functionName: "mint",
-      args: [address, 10_000_000n],
-      chain: foundry,
-      account: deployer.account!,
-    });
-    await pub.waitForTransactionReceipt({ hash: mintHash });
+    await fund(address);
 
     const home = mkdtempSync(join(dir, `player-${name}-`));
     const apiPort = await freeTcpPort();
-    const init = runCliSync(
-      ["init", "--server", serverUrl, "--wallet-key", walletKey, "--port", String(apiPort), "--poll-ms", "200"],
+    const init = await runCli(
+      ["init", "--server", opts.serverUrl ?? serverUrl, "--wallet-key", walletKey, "--port", String(apiPort), "--poll-ms", "200"],
       home,
     );
     if (init.status !== 0) {
@@ -548,6 +570,7 @@ export async function startStack(
       return anvilTracked.child;
     },
     player,
+    fund,
     async restartServer(): Promise<void> {
       await terminate(serverTracked);
       serverTracked = spawnTracked(`server:${serverPort}`, "node", [SERVER_BIN, "--config", serverConfigPath], { cwd: REPO_ROOT });

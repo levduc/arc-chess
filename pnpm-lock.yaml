@@ -268,10 +268,16 @@ importers:
       viem:
         specifier: 2.56.8
         version: 2.56.8(typescript@6.0.3)
+      ws:
+        specifier: 8.21.3
+        version: 8.21.3
     devDependencies:
       '@types/node':
         specifier: 25.9.8
         version: 25.9.8
+      '@types/ws':
+        specifier: 8.18.1
+        version: 8.18.1
       tsx:
         specifier: 4.23.15
         version: 4.23.15
