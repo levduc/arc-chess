@@ -20,6 +20,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   createPublicClient,
   createTestClient,
+  erc20Abi,
   http,
   recoverTypedDataAddress,
   type Address,
@@ -860,6 +861,12 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         await waitSt(bob, (st) => st.phase === "Open", 20_000, id, "Open");
         await waitFor(async () => (await serverChannel(s, id)).phase === "Open", 20_000, "indexer: Open");
 
+        // The reorg targets a deposit whose funding flow has completed. Bob's status can read Open while his
+        // watchtower pass is still inside viem's receipt wait for that deposit (its immediate receipt check can
+        // miss a just-mined transaction; it then polls every 4 s). Anvil discards reorged-out transactions rather
+        // than returning them to the mempool, so a receipt wait caught by the reorg never ends before viem's
+        // 180 s timeout, stalling the whole pass (see the Task 10 report). Let any such poll finish first.
+        await sleep(5_000);
         const deposits = async () =>
           pub.getContractEvents({ address: s.hub, abi: channelHubAbi, eventName: "Deposited", args: { channelId: id }, fromBlock: 0n });
         const [, second] = await deposits();
@@ -879,7 +886,44 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         expect(reorged.funded).toEqual([true, false]);
 
         // Bob's watchtower sees the channel back in Funding and deposits again; the server follows.
-        await waitPhase(hub, id, "Open", 30_000);
+        const tReorg = Date.now();
+        const timeline: string[] = [];
+        let tracing = true;
+        const tracer = (async () => {
+          let last = "";
+          while (tracing) {
+            try {
+              const [info, allowance, st] = await Promise.all([
+                hub.channelInfo(id),
+                pub.readContract({ address: s.usdc, abi: erc20Abi, functionName: "allowance", args: [bob.address, s.hub] }),
+                bob.api("GET", `/channels`) as Promise<Array<{ lastError: string | null }>>,
+              ]);
+              const [latestNonce, pendingNonce, pool] = await Promise.all([
+                pub.getTransactionCount({ address: bob.address, blockTag: "latest" }),
+                pub.getTransactionCount({ address: bob.address, blockTag: "pending" }),
+                rpc<{ pending: string; queued: string }>(s.rpcUrl, "txpool_status", []),
+              ]);
+              const now =
+                `${info.phase} funded=${info.funded} allowance=${allowance > 0n ? "yes" : "no"} head=${await pub.getBlockNumber({ cacheTime: 0 })} ` +
+                `bobNonce=${latestNonce}/${pendingNonce} pool=${pool.pending}/${pool.queued} bobErr=${st[0]?.lastError}`;
+              if (now !== last) timeline.push(`+${Date.now() - tReorg}ms ${now}`);
+              last = now;
+            } catch (err) {
+              timeline.push(`+${Date.now() - tReorg}ms trace error ${String(err).slice(0, 80)}`);
+            }
+            await sleep(100);
+          }
+        })();
+        try {
+          await waitPhase(hub, id, "Open", 30_000);
+        } catch (err) {
+          console.error(`[chaos] depth ${depth} re-funding timeline:\n  ${timeline.join("\n  ")}\n--- bob ---\n${bob.logs().slice(-4000)}`);
+          throw err;
+        } finally {
+          tracing = false;
+          await tracer;
+        }
+        console.log(`[chaos] depth ${depth}: re-funded and Open again ${Date.now() - tReorg} ms after the reorg`);
         await waitSt(bob, (st) => st.phase === "Open", 20_000, id, "Open again");
         await waitFor(async () => (await serverChannel(s, id)).phase === "Open", 20_000, "indexer: Open again");
         expect((await deposits()).length).toBe(2);
