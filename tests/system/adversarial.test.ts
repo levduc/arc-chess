@@ -905,6 +905,9 @@ describe("malicious opponent (SDK-only peer on the real relay)", () => {
     // per-connection frame burst, so the relay forwards them all rather than cutting the peer off).
     const before = snapshotOf(alice, id);
     const stale = [...peer.sent];
+    const deliveredBefore = m.connections
+      .flatMap((c) => c.seen.down)
+      .filter((f: any) => f.type === "relay" && f.message.signed?.state.turnNum < 5n).length;
     expect(stale.map((s) => s.state.turnNum)).toEqual([2n, 4n]);
     const t0 = Date.now();
     for (let i = 0; i < 150; i++) peer.sendState(stale[i % stale.length]);
@@ -918,7 +921,7 @@ describe("malicious opponent (SDK-only peer on the real relay)", () => {
     }
     const delivered = () =>
       m.connections.flatMap((c) => c.seen.down).filter((f: any) => f.type === "relay" && f.message.signed?.state.turnNum < 5n).length;
-    await waitFor(() => delivered() >= 150, 15_000, "all 150 stale states delivered to alice");
+    await waitFor(() => delivered() - deliveredBefore >= 150, 15_000, "all 150 stale states delivered to alice");
     console.log(`[adversarial] stale spam: max /status latency ${maxLatency} ms over ${Date.now() - t0} ms`);
     expect(maxLatency).toBeLessThan(1_000);
     expect(peer.serverErrors).toEqual([]);
