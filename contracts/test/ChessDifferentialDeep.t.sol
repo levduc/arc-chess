@@ -17,12 +17,21 @@ import {ChessDifferentialBase} from "./helpers/ChessDifferentialBase.sol";
 /// any chunk number beyond the real count, and `test_deepVectorsPresent` fails loudly if chunk-0 is missing
 /// entirely (i.e. `pnpm vectors:deep` was never run).
 contract ChessDifferentialDeepTest is ChessDifferentialBase {
+    // Must match tools/vectors/src/generate.ts's DEEP_CHUNK_CEILING and this file's test_chunk0..test_chunk199.
+    uint256 internal constant DEEP_CHUNK_CEILING = 200;
+
     function test_deepVectorsPresent() public {
         if (vm.envOr("ARENA_DEEP_VECTORS", uint256(0)) != 1) {
             vm.skip(true);
             return;
         }
         require(vm.exists(_chunkPath(0)), "no deep vectors found: run `pnpm vectors:deep`");
+        // generate.ts refuses to write more than DEEP_CHUNK_CEILING chunks, but fail loudly (not silently
+        // under-test) if that guard was ever bypassed or the ceiling constants drift out of sync.
+        require(
+            !vm.exists(_chunkPath(DEEP_CHUNK_CEILING)),
+            "chunk-200.hex exists but only test_chunk0..test_chunk199 are defined: raise DEEP_CHUNK_CEILING in both generate.ts and here, and add more test_chunkN functions"
+        );
     }
 
     function _runOrSkip(uint256 chunk) internal {

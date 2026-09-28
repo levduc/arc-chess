@@ -18,6 +18,11 @@ fs_permissions = [
   { access = "read", path = "./test/vectors-deep" },
   { access = "read-write", path = "./deployments" },
 ]
+# ChessDifferentialDeepTest declares 200 test_chunkN functions so each chunk gets its own gas/memory budget
+# (see ChessDifferentialDeep.t.sol), but under the default profile ARENA_DEEP_VECTORS is never set, so all of
+# them just skip — 200+ skipped tests of pure noise in `pnpm test:contracts`. Excluded here; re-included under
+# [profile.deep] below, where it's actually meant to run.
+no_match_contract = "ChessDifferentialDeepTest"
 
 [invariant]
 runs = 1500
@@ -29,6 +34,10 @@ fail_on_revert = true
 # per-call-frame limit because the deep chess vector chunks are larger than the default set.
 [profile.deep]
 memory_limit = 1073741824
+# Override [profile.default]'s exclusion (profiles inherit unset keys from default): this is the one profile
+# ChessDifferentialDeepTest is meant to run under. "^$" (matches only the empty string, which no contract name
+# ever is) represents "exclude nothing" — an empty pattern instead matches everything, excluding everything.
+no_match_contract = "^$"
 
 [profile.deep.invariant]
 runs = 1000

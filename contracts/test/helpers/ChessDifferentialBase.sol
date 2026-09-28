@@ -62,8 +62,9 @@ abstract contract ChessDifferentialBase is Test {
             // a large deep-mode chunk (100+ positions, each with dozens of legal/illegal moves) directly in
             // this loop measurably ran out of gas partway through a chunk even after chunking itself was
             // fixed to reset memory only between chunks (see ChessDifferentialDeep.t.sol). `this.` is a real
-            // CALL, not a jump, so memory resets per position while assertion/failure state (which forge-std
-            // tracks in contract storage, not call-local memory) still accumulates correctly.
+            // CALL, not a jump, so memory resets per position while assertion/failure state — which forge-std
+            // signals through the `vm.assertTrue`/`vm.assertEq`-style cheatcode, not call-local memory —
+            // still accumulates correctly.
             this.checkPositionExternal(cases[i]);
         }
     }

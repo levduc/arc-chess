@@ -3,7 +3,18 @@ import { encodeAbiParameters } from "viem";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { STATUS, FIFTY_MOVE_HALFMOVES, MAX_PLY } from "@arena/sdk";
+import {
+  STATUS,
+  FIFTY_MOVE_HALFMOVES,
+  MAX_PLY,
+  KIND,
+  ZERO_HASH,
+  encodeMove,
+  unpackMeta,
+  successor as sdkSuccessor,
+  type Params as SdkParams,
+  type State as SdkState,
+} from "@arena/sdk";
 import { encodeFen, squareIndex, PROMO } from "./encode.js";
 import { CURATED_FENS } from "./curated.js";
 
@@ -26,21 +37,31 @@ const DEEP_KEEP_PROB = Number(process.env.VECTOR_KEEP_PROB ?? (DEEP ? 0.55 : 1))
 // analysis, is the dominant cost of `pnpm vectors:deep`, so fewer plies per game is the lever that matters).
 const GAME_PLY_CAP = Number(process.env.VECTOR_MAX_PLIES ?? (DEEP ? 90 : 250));
 const DEEP_POSITIONS_PER_CHUNK = 150;
+// ChessDifferentialDeepTest (contracts/test/ChessDifferentialDeep.t.sol) declares exactly 200 test_chunkN
+// functions (test_chunk0..test_chunk199), one per chunk so each gets its own gas/memory budget. If deep mode
+// ever produced more chunks than that, the extra ones would silently go unchecked, so writeDeep() throws
+// instead. Keep this in sync with that file's function count if it's ever regenerated with more/larger chunks.
+const DEEP_CHUNK_CEILING = 200;
 const ILLEGAL_PER_POSITION = 12;
 const SEED = Number(process.env.VECTOR_SEED ?? 20260924);
 const OUT_DIR = resolve(import.meta.dirname, `../../../contracts/test/${DEEP ? "vectors-deep" : "vectors"}`);
 const STAMP_PATH = resolve(OUT_DIR, ".generation-stamp.json");
+const SDK_SRC_DIR = resolve(import.meta.dirname, "../../../packages/sdk/src");
 
 /**
- * Deep generation is slow (20,000 random games, ~an hour; see task-5-report.md), so `pnpm vectors:deep`
- * caches its output: a stamp file records a hash of the generator sources plus the parameters that affect
- * the output (seed, game count, sampling). Re-running with the same sources and parameters is a no-op unless
- * `--force` is passed. Only deep mode caches — the default/CI set is fast enough that it isn't worth it, and
+ * Deep generation is slow (20,000 random games, ~13 minutes; see task-5-report.md), so `pnpm vectors:deep`
+ * caches its output: a stamp file records a hash of the generator sources (this package, plus the `@arena/sdk`
+ * modules it calls into for the three-way status check below) plus the parameters that affect the output
+ * (seed, game count, sampling). Re-running with the same sources and parameters is a no-op unless `--force`
+ * is passed. Only deep mode caches — the default/CI set is fast enough that it isn't worth it, and
  * `pnpm test:contracts` should always reflect the current sources.
  */
 function generationFingerprint(): string {
-  const sources = ["generate.ts", "curated.ts", "encode.ts"]
-    .map((f) => readFileSync(resolve(import.meta.dirname, f), "utf8"))
+  const sources = [
+    ...["generate.ts", "curated.ts", "encode.ts"].map((f) => resolve(import.meta.dirname, f)),
+    ...["constants.ts", "encoding.ts", "chess.ts"].map((f) => resolve(SDK_SRC_DIR, f)),
+  ]
+    .map((f) => readFileSync(f, "utf8"))
     .join("\0");
   const params = JSON.stringify({
     SEED,
@@ -153,6 +174,47 @@ function statusAfter(after: Chess, moverWasWhite: boolean): number {
   return STATUS.PLAYING;
 }
 
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
+// Only board/meta and the move matter for the status oracle below; balances just need to be large enough that
+// NEW_GAME's stake check (irrelevant here — every call below plays KIND.NORMAL) could never be the reason a
+// move is rejected. Mirrors the Params ChessDifferentialBase.sol's tests construct.
+const SDK_PARAMS: SdkParams = {
+  participants: [ZERO_ADDRESS, ZERO_ADDRESS],
+  signers: [ZERO_ADDRESS, ZERO_ADDRESS],
+  rules: ZERO_ADDRESS,
+  feeRecipient: ZERO_ADDRESS,
+  feePerPlayer: 0n,
+  deposit: (1n << 128n) - 1n,
+  stakePerGame: 1n,
+  challengeTimeout: 0n,
+  fundingDeadline: 0n,
+  salt: ZERO_HASH,
+};
+
+/**
+ * The status `@arena/sdk`'s `successor()` records after playing this move as KIND_NORMAL from (board, meta).
+ * This is a second, independent-of-chess.js-internals oracle for the same fact `statusAfter` computes above
+ * (per the task-5 ruling): `statusAfter` is built from chess.js primitives plus the protocol's own limit
+ * constants, while this one runs the actual `successor()` the SDK ships (which itself mirrors
+ * ChessRules.sol). Callers compare the two and throw on disagreement — see `positionCase`.
+ */
+function sdkStatusAfter(board: bigint, meta: bigint, from: number, to: number, promo: number): number {
+  const prev: SdkState = {
+    channelId: ZERO_HASH,
+    turnNum: 0n,
+    prevHash: ZERO_HASH,
+    balanceA: SDK_PARAMS.deposit,
+    balanceB: SDK_PARAMS.deposit,
+    gameIndex: 0,
+    move: 0,
+    board,
+    meta,
+  };
+  const t = sdkSuccessor(prev, encodeMove(from, to, promo, KIND.NORMAL), SDK_PARAMS);
+  if (!t.ok) throw new Error(`__SDK_REJECTED__:${t.reason}`);
+  return unpackMeta(t.next.meta).status;
+}
+
 function positionCase(fen: string, rand: () => number) {
   const game = new Chess(fen);
   const { board, meta } = encodeFen(fen);
@@ -162,16 +224,37 @@ function positionCase(fen: string, rand: () => number) {
     const after = new Chess(fen);
     after.move({ from: m.from, to: m.to, promotion: m.promotion });
     const enc = encodeFen(after.fen());
+    const from = squareIndex(m.from);
+    const to = squareIndex(m.to);
+    const promo = m.promotion ? PROMO[m.promotion] : 0;
+    const uci = `${m.from}${m.to}${m.promotion ?? ""}`;
+    const chessJsStatus = statusAfter(after, turnIsWhite);
+    let sdkStatus: number;
+    try {
+      sdkStatus = sdkStatusAfter(board, meta, from, to, promo);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message.replace(/^__SDK_REJECTED__:/, "") : String(e);
+      throw new Error(
+        `three-way status oracle disagreement at ${fen} for move ${uci}: chess.js says the move is legal ` +
+          `with status ${chessJsStatus}, but @arena/sdk's successor() rejected it: ${reason}`,
+      );
+    }
+    if (sdkStatus !== chessJsStatus) {
+      throw new Error(
+        `three-way status oracle disagreement at ${fen} for move ${uci}: chess.js says status ${chessJsStatus}, ` +
+          `@arena/sdk's successor() says status ${sdkStatus}`,
+      );
+    }
     return {
-      from: squareIndex(m.from),
-      to: squareIndex(m.to),
-      promo: m.promotion ? PROMO[m.promotion] : 0,
+      from,
+      to,
+      promo,
       board: enc.board,
       side: Number(enc.meta & 0xffn),
       castling: Number((enc.meta >> 8n) & 0xffn),
       halfmove: Number((enc.meta >> 24n) & 0xffffn),
       ply: Number((enc.meta >> 40n) & 0xffffn),
-      status: statusAfter(after, turnIsWhite),
+      status: chessJsStatus,
     };
   });
   const key = (f: number, t: number, p: number) => `${f}-${t}-${p}`;
@@ -242,6 +325,14 @@ function writeDefault(cases: ReturnType<typeof positionCase>[]) {
 
 function writeDeep(cases: ReturnType<typeof positionCase>[]) {
   const chunkCount = Math.max(1, Math.ceil(cases.length / DEEP_POSITIONS_PER_CHUNK));
+  if (chunkCount > DEEP_CHUNK_CEILING) {
+    throw new Error(
+      `deep vectors would need ${chunkCount} chunks, but ChessDifferentialDeepTest only defines ` +
+        `test_chunk0..test_chunk${DEEP_CHUNK_CEILING - 1} (DEEP_CHUNK_CEILING=${DEEP_CHUNK_CEILING}). ` +
+        `Raise DEEP_POSITIONS_PER_CHUNK, lower the position target, or add more test_chunkN functions to ` +
+        `contracts/test/ChessDifferentialDeep.t.sol and bump DEEP_CHUNK_CEILING to match.`,
+    );
+  }
   for (let i = 0; i < chunkCount; i++) {
     const chunk = cases.slice(i * DEEP_POSITIONS_PER_CHUNK, (i + 1) * DEEP_POSITIONS_PER_CHUNK);
     writeFileSync(resolve(OUT_DIR, `chunk-${i}.hex`), encodeAbiParameters(CASES_ABI, [chunk]));
