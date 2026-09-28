@@ -126,6 +126,12 @@ export type MatchExpectation = {
   maxFeePerPlayer: bigint;
   now: bigint;
   maxFundingWindow: bigint;
+  /**
+   * The other side's wallet and session key, when this player already knows them -- the accepter does: it accepted
+   * one specific signed offer. Without it, the other side is not bound (the offerer's case: any accepter may match),
+   * and a host could seat anyone opposite this player on the same terms (Plan 4.5 Task 9).
+   */
+  opponent?: { player: Address; signer: Address };
 };
 
 const same = (x: string, y: string) => x.toLowerCase() === y.toLowerCase();
@@ -135,6 +141,11 @@ export function checkMatchParams(p: Params, e: MatchExpectation): string | null 
   if (!same(p.participants[e.me], e.player)) return "params do not name this player's wallet";
   if (!same(p.signers[e.me], e.signer)) return "params do not name this player's session key";
   if (same(p.participants[0], p.participants[1]) || same(p.signers[0], p.signers[1])) return "participants or signers repeat";
+  if (e.opponent) {
+    const other = e.me === 0 ? 1 : 0;
+    if (!same(p.participants[other], e.opponent.player)) return "params do not name the expected opponent's wallet";
+    if (!same(p.signers[other], e.opponent.signer)) return "params do not name the expected opponent's session key";
+  }
   if (!same(p.rules, e.rules)) return "unexpected rules contract";
   if (p.deposit !== e.deposit || p.stakePerGame !== e.stakePerGame || p.challengeTimeout !== e.challengeTimeout) {
     return "amounts differ from the agreed offer";

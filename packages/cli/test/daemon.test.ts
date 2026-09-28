@@ -8,7 +8,11 @@ import { increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helper
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
-type Internals = { onMatch(m: MatchEvent): Promise<void>; records: { saveOffer(r: unknown): void } };
+type Internals = {
+  onMatch(m: MatchEvent): Promise<void>;
+  records: { saveOffer(r: unknown): void };
+  opts: { log?: (line: string) => void };
+};
 const internals = (d: ArenaDaemon): Internals => d as unknown as Internals;
 
 const randomNonce = (): Hex => `0x${randomBytes(32).toString("hex")}`;
@@ -115,6 +119,28 @@ describe("ArenaDaemon core", () => {
     };
     await internals(pair.bob.daemon).onMatch({ offerId, params: swapped });
     expect(pair.bob.daemon.channelIds()).toEqual([]);
+  });
+
+  it("Plan 4.5 Task 9: the accepter refuses a match that substitutes the offerer (wallet and session key)", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const so = (await pair.alice.client.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
+    if (!so) throw new Error("offer not found");
+    // Bob accepted alice's offer (the record is what acceptOffer stores); the only match he sees is the host's
+    // substituted one below, which names an impostor (wallet and session key) in the offerer's seat.
+    const sessionKey = generatePrivateKey();
+    internals(pair.bob.daemon).records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter" });
+    const t = await now();
+    const terms = { rules: pair.env.rules, feeRecipient: pair.env.host, feePerPlayer: 5_000n, fundingWindow: 3600n };
+    const acceptance = { offerId, player: pair.bob.address, signer: privateKeyToAccount(sessionKey).address, nonce: randomNonce() };
+    const impostorOffer = { ...so.offer, player: privateKeyToAccount(generatePrivateKey()).address, signer: privateKeyToAccount(generatePrivateKey()).address };
+    const substituted = buildParams(impostorOffer, acceptance, terms, t);
+    const logs: string[] = [];
+    internals(pair.bob.daemon).opts.log = (l: string) => logs.push(l);
+    await internals(pair.bob.daemon).onMatch({ offerId, params: substituted });
+    expect(pair.bob.daemon.channelIds()).toEqual([]);
+    expect(logs.join("\n")).toMatch(/ignoring match for offer .*: params do not name the expected opponent's wallet/);
   });
 
   it("I3: two match events for one offer open and fund exactly one channel", async () => {

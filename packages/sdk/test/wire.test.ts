@@ -99,6 +99,33 @@ describe("wire", () => {
     ).toBeNull();
   });
 
+  it("Plan 4.5 Task 9: an expected opponent binds the other side's wallet and session key too", async () => {
+    const aKey = generatePrivateKey();
+    const bKey = generatePrivateKey();
+    const offer = offerFor(aKey);
+    const acc: Acceptance = { offerId: offerId(offer), player: BOB, signer: privateKeyToAccount(bKey).address, nonce: keccak256(toHex("n3")) };
+    const p = buildParams(offer, acc, TERMS, 1_000n);
+    const base = {
+      rules: TERMS.rules,
+      deposit: offer.deposit,
+      stakePerGame: offer.stakePerGame,
+      challengeTimeout: offer.challengeTimeout,
+      feeRecipient: TERMS.feeRecipient,
+      minFeePerPlayer: 5_000n,
+      maxFeePerPlayer: 10_000n,
+      now: 1_000n,
+      maxFundingWindow: 7_200n,
+    };
+    // The accepter knows whose offer it accepted: the offer's wallet and session key.
+    const bob = { ...base, me: 1 as const, player: BOB, signer: acc.signer, opponent: { player: ALICE, signer: offer.signer } };
+    expect(checkMatchParams(p, bob)).toBeNull();
+    const mallory = privateKeyToAccount(generatePrivateKey()).address;
+    expect(checkMatchParams({ ...p, participants: [mallory, BOB] }, bob)).toMatch(/expected opponent's wallet/);
+    expect(checkMatchParams({ ...p, signers: [mallory, acc.signer] }, bob)).toMatch(/expected opponent's session key/);
+    // Without an expected opponent (the offerer's side: any accepter may match), the other side is not bound.
+    expect(checkMatchParams({ ...p, participants: [ALICE, mallory] }, { ...base, me: 0, player: ALICE, signer: offer.signer })).toBeNull();
+  });
+
   it("rejects malformed $bigint payloads", () => {
     expect(() => fromWire('{"a":{"$bigint":"12a"}}')).toThrow("invalid $bigint");
     expect(() => fromWire(`{"a":{"$bigint":"${"1".repeat(81)}"}}`)).toThrow("invalid $bigint");

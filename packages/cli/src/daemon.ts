@@ -392,6 +392,11 @@ export class ArenaDaemon {
         maxFeePerPlayer,
         now,
         maxFundingWindow: MAX_FUNDING_WINDOW,
+        // Plan 4.5 Task 9: the accepter accepted one specific signed offer, so it also binds the offerer's seat to
+        // that offer's wallet and session key -- a host must not be able to seat someone else opposite it (who
+        // would then fund first, exactly as the watchtower waits for). The offerer cannot know its accepter in
+        // advance: any accepter may match its open offer.
+        opponent: rec.role === "accepter" ? { player: rec.offer.player, signer: rec.offer.signer } : undefined,
       });
       if (problem) {
         this.log(`ignoring match for offer ${offerId}: ${problem}`);
