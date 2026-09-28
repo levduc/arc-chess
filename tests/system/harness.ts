@@ -346,9 +346,13 @@ export type Stack = {
   serverUrl: string;
   server: ChildProcess;
   anvil: ChildProcess;
+  /** The host server's sqlite database file (e.g. to read its relay cache from a test). */
+  serverDbPath: string;
   /** Creates, funds and starts a daemon player. `opts.serverUrl` points its `arena init --server` (and so its
-   *  daemon's host connection) somewhere other than the stack's own server -- e.g. at a MITM proxy in front of it. */
-  player(name: string, key?: Hex, opts?: { serverUrl?: string }): Promise<Player>;
+   *  daemon's host connection) somewhere other than the stack's own server -- e.g. at a MITM proxy in front of it.
+   *  `opts.rpcUrl` overrides the RPC the daemon uses (`arena init --rpc`) -- e.g. a faulty RPC proxy in front of
+   *  this stack's Anvil; everything else still comes from the server's `/templates`. */
+  player(name: string, key?: Hex, opts?: { serverUrl?: string; rpcUrl?: string }): Promise<Player>;
   /** Gives `address` native gas (100 ETH) and, unless `usdc` is 0, mints it MockUSDC (default 10 USDC) -- the same
    *  funding `player()` gives a daemon's wallet, for SDK-only actors (a malicious peer, an attacker). */
   fund(address: Address, usdc?: bigint): Promise<void>;
@@ -484,7 +488,7 @@ export async function startStack(
       await pub.waitForTransactionReceipt({ hash: mintHash });
     }
 
-    async function player(name: string, key?: Hex, opts: { serverUrl?: string } = {}): Promise<Player> {
+    async function player(name: string, key?: Hex, opts: { serverUrl?: string; rpcUrl?: string } = {}): Promise<Player> {
     const walletKey = key ?? generatePrivateKey();
     const address = privateKeyToAccount(walletKey).address;
     await fund(address);
@@ -492,7 +496,18 @@ export async function startStack(
     const home = mkdtempSync(join(dir, `player-${name}-`));
     const apiPort = await freeTcpPort();
     const init = await runCli(
-      ["init", "--server", opts.serverUrl ?? serverUrl, "--wallet-key", walletKey, "--port", String(apiPort), "--poll-ms", "200"],
+      [
+        "init",
+        "--server",
+        opts.serverUrl ?? serverUrl,
+        ...(opts.rpcUrl ? ["--rpc", opts.rpcUrl] : []),
+        "--wallet-key",
+        walletKey,
+        "--port",
+        String(apiPort),
+        "--poll-ms",
+        "200",
+      ],
       home,
     );
     if (init.status !== 0) {
@@ -563,6 +578,7 @@ export async function startStack(
     rules,
     host,
     serverUrl,
+    serverDbPath: baseConfig.dbPath,
     get server(): ChildProcess {
       return serverTracked.child;
     },
