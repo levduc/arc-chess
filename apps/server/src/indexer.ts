@@ -71,6 +71,15 @@ export class Indexer {
       this.repo.pruneRelayCache(Date.now());
       const head = await this.chain.head();
       const cursor = this.repo.cursor() ?? this.cfg.indexer.startBlock - 1n;
+      if (cursor > head) {
+        // The chunk range below (from just past the cursor to head) is then empty, so this poll silently does
+        // nothing -- which looks identical to "fully caught up" on /metrics unless this is logged. The usual
+        // cause is a database left over from a different chain instance (a redeployed local Anvil, a chain
+        // reset) reusing a cursor that no longer makes sense; `startServer`'s chain-identity check now refuses
+        // to start in that situation for a *new* config, but a long-lived process whose underlying chain was
+        // reset out from under it (without a restart) still needs this warning.
+        this.log(`indexer: cursor (${cursor}) is ahead of the chain head (${head}) -- indexing is stalled until the chain catches up`);
+      }
       const rescan = cursor + 1n - INDEXER_RESCAN_BLOCKS;
       const from = rescan > this.cfg.indexer.startBlock ? rescan : this.cfg.indexer.startBlock;
       const ranges = chunkRanges(from, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL);

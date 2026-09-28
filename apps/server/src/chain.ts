@@ -1,4 +1,4 @@
-import { createPublicClient, defineChain, http, type Address, type PublicClient } from "viem";
+import { createPublicClient, defineChain, http, type Address, type Hex, type PublicClient } from "viem";
 import { HubClient, type HubEvent } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 
@@ -18,6 +18,11 @@ export interface ChainReader {
   /** The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause
    *  flag. `RpcChainReader` caches this for `LIMITS_CACHE_MS`. */
   limits(): Promise<Limits>;
+  /** Block 0's hash -- identifies *this chain instance*, not just its chain id (a chain id like 31337 is shared
+   *  by every fresh Anvil/Hardhat node, so it alone cannot tell a redeployed local chain from the one a database
+   *  was last opened against). Used at startup to detect a database that belongs to a different chain/deployment
+   *  than the one this config points at. */
+  genesisHash(): Promise<Hex>;
 }
 
 const NOW_CACHE_MS = 1000;
@@ -34,6 +39,7 @@ export class RpcChainReader implements ChainReader {
   private cachedNow: { value: bigint; at: number } | undefined;
   private timeoutBoundsPromise: Promise<{ min: bigint; max: bigint }> | undefined;
   private cachedLimits: { value: Limits; at: number } | undefined;
+  private genesisHashPromise: Promise<Hex> | undefined;
 
   constructor(cfg: Pick<ServerConfig, "rpcUrl" | "chainId" | "hub">, hub?: HubLike) {
     const chain = defineChain({
@@ -87,5 +93,20 @@ export class RpcChainReader implements ChainReader {
 
   hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
     return this.hub.hubEvents(fromBlock, toBlock);
+  }
+
+  /** Immutable once the chain exists, so memoized forever like `timeoutBounds` -- with the same un-stick-on-
+   *  rejection behavior for a transient RPC failure. */
+  genesisHash(): Promise<Hex> {
+    if (!this.genesisHashPromise) {
+      this.genesisHashPromise = this.client
+        .getBlock({ blockNumber: 0n })
+        .then((block) => block.hash)
+        .catch((err: unknown) => {
+          this.genesisHashPromise = undefined;
+          throw err;
+        });
+    }
+    return this.genesisHashPromise;
   }
 }

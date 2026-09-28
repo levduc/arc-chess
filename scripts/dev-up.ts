@@ -10,9 +10,8 @@
  * :8545/:8080) -- it never kills another process to make room. Ctrl-C tears down everything it started.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -118,6 +117,28 @@ async function stopChild(label: string, child: ChildProcess | undefined, graceMs
   await exited;
 }
 
+// Module-level (not local to `main()`) so both the signal handlers *and* the top-level `.catch()` below can
+// reach the same teardown -- a failure partway through `main()` (a bad deploy, `arena init` failing, ...) must
+// tear down whatever was already spawned just as surely as a Ctrl-C does; it must never leave Anvil or the
+// server running with nothing left able to stop them.
+let anvil: ChildProcess | undefined;
+let server: ChildProcess | undefined;
+let shuttingDown = false;
+
+async function teardown(): Promise<void> {
+  await stopChild("server", server);
+  await stopChild("anvil", anvil);
+}
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.stderr.write(`\ndev-up: caught ${signal}, tearing down\n`);
+  await teardown();
+  process.stderr.write("dev-up: stopped\n");
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
   const { port: serverPort, anvilPort, players: numPlayers } = parseArgs(process.argv.slice(2));
 
@@ -136,22 +157,17 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Wipe any previous run's state before starting anything new. This run deploys a fresh set of contracts on a
+  // fresh chain (even at the same --anvil-port, Anvil starts from block 0 again each time), so reusing an old
+  // .arena-dev/server.sqlite here would point the indexer's persisted cursor -- and the server's whole notion of
+  // which chain/deployment this database belongs to -- at a chain that no longer exists. The server's own
+  // startup now refuses to run against a mismatched database (see apps/server's chain-identity check), but
+  // dev-up avoids ever hitting that refusal by not reusing stale state in the first place.
+  rmSync(DEV_DIR, { recursive: true, force: true });
   mkdirSync(DEV_DIR, { recursive: true });
   const playersDir = join(DEV_DIR, "players");
   mkdirSync(playersDir, { recursive: true });
 
-  let anvil: ChildProcess | undefined;
-  let server: ChildProcess | undefined;
-  let shuttingDown = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    process.stderr.write(`\ndev-up: caught ${signal}, tearing down\n`);
-    await stopChild("server", server);
-    await stopChild("anvil", anvil);
-    process.stderr.write("dev-up: stopped\n");
-    process.exit(0);
-  };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
@@ -178,9 +194,7 @@ async function main(): Promise<void> {
     stdio: ["ignore", "inherit", "inherit"],
   });
   if (deploy.status !== 0) {
-    process.stderr.write("dev-up: forge script failed\n");
-    await stopChild("anvil", anvil);
-    process.exit(1);
+    throw new Error("forge script failed (see output above)");
   }
   const deploymentPath = join(CONTRACTS_DIR, "deployments", `${foundry.id}.json`);
   const deployment = JSON.parse(readFileSync(deploymentPath, "utf8")) as {
@@ -260,10 +274,7 @@ async function main(): Promise<void> {
       { cwd: REPO_ROOT, env: { ...process.env, ARENA_HOME: home }, encoding: "utf8" },
     );
     if (init.status !== 0) {
-      process.stderr.write(`dev-up: arena init failed for ${name}:\n${init.stderr}\n`);
-      await stopChild("server", server);
-      await stopChild("anvil", anvil);
-      process.exit(1);
+      throw new Error(`arena init failed for ${name}:\n${init.stderr}`);
     }
     commands.push(`ARENA_HOME=${home} node ${CLI_BIN} daemon`);
   }
@@ -282,7 +293,14 @@ async function main(): Promise<void> {
   await new Promise<void>(() => {}); // keep running until Ctrl-C
 }
 
-main().catch((err) => {
-  process.stderr.write(`dev-up: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+main().catch(async (err: unknown) => {
+  process.stderr.write(`dev-up: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+  // Route through the same teardown as a Ctrl-C: whatever was already spawned (Anvil, at minimum, since it's
+  // always the first thing started) must not be left running just because the failure happened after spawn
+  // instead of before it. `shuttingDown` also guards against racing an in-flight SIGINT/SIGTERM handler.
+  if (!shuttingDown) {
+    shuttingDown = true;
+    await teardown().catch(() => {});
+  }
   process.exit(1);
 });

@@ -202,6 +202,38 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
   const log = deps.log ?? ((line: string) => console.log(line));
+
+  // Product hardening: a database recorded against one chain/deployment (chain id, hub address, and the chain's
+  // own genesis hash -- chain id alone cannot tell a redeployed local chain apart from the one the database was
+  // last opened against) must never be silently reused against another. Without this, e.g. re-running a local
+  // dev stack against a fresh Anvil instance left the indexer's persisted cursor pointing past the new chain's
+  // head, and it would silently index nothing from then on (see indexer.ts's cursor-ahead-of-head warning).
+  let genesisHash: Hex;
+  try {
+    genesisHash = await chain.genesisHash();
+  } catch (err) {
+    repo.close();
+    throw new Error(`could not read the chain's genesis block to verify database identity: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const recorded = repo.identity();
+  if (recorded === null) {
+    repo.setIdentity({ chainId: cfg.chainId, hub: cfg.hub, genesisHash });
+  } else {
+    const mismatch =
+      recorded.chainId !== cfg.chainId ||
+      recorded.hub.toLowerCase() !== cfg.hub.toLowerCase() ||
+      recorded.genesisHash.toLowerCase() !== genesisHash.toLowerCase();
+    if (mismatch) {
+      repo.close();
+      throw new Error(
+        `database ${cfg.dbPath} belongs to another chain/deployment: it was opened against ` +
+          `chainId=${recorded.chainId} hub=${recorded.hub} genesisHash=${recorded.genesisHash}, but this config is ` +
+          `chainId=${cfg.chainId} hub=${cfg.hub} genesisHash=${genesisHash}. Use a fresh --db, or point this config ` +
+          `back at the original chain/deployment.`,
+      );
+    }
+  }
+
   if (cfg.dbPath === ":memory:") {
     log(
       JSON.stringify({

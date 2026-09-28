@@ -58,21 +58,39 @@ type Tracked = {
 };
 
 const TRACKED_PGIDS = new Set<number>();
-let exitHookInstalled = false;
+let processHooksInstalled = false;
 
-/** Kills every process group this module has ever spawned. Registered once; guards against a crashed or aborted
- *  test run leaving Anvil/server/daemon children behind. */
-function installExitHook(): void {
-  if (exitHookInstalled) return;
-  exitHookInstalled = true;
-  process.on("exit", () => {
-    for (const pgid of TRACKED_PGIDS) {
-      try {
-        process.kill(-pgid, "SIGKILL");
-      } catch {
-        // already gone
-      }
+/** Kills every process group this module has ever spawned, best-effort. Shared by the `exit` backstop and the
+ *  explicit SIGINT/SIGTERM handlers below. */
+function killAllTracked(): void {
+  for (const pgid of TRACKED_PGIDS) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {
+      // already gone
     }
+  }
+}
+
+/** Registered once per process. Two layers, because they cover different cases:
+ *  - `process.on("exit", ...)` is the backstop for a normal exit (the test run finishes, or `process.exit()` is
+ *    called elsewhere) -- 'exit' listeners can only do synchronous work, which `killAllTracked` is.
+ *  - `process.on("SIGINT"/"SIGTERM", ...)` is required *in addition*: Node's default disposition for a signal
+ *    that reaches a process with no listener registered for it is to terminate immediately, without ever
+ *    emitting 'exit' -- so a bare Ctrl-C (or a `kill`) during a test run would otherwise leave every detached
+ *    Anvil/server/daemon child orphaned. Registering a handler switches Node to the listener-driven path, so this
+ *    process's own shutdown is now in our control: clean up, then exit with the conventional 128+signal code. */
+function installProcessHooks(): void {
+  if (processHooksInstalled) return;
+  processHooksInstalled = true;
+  process.on("exit", killAllTracked);
+  process.on("SIGINT", () => {
+    killAllTracked();
+    process.exit(130);
+  });
+  process.on("SIGTERM", () => {
+    killAllTracked();
+    process.exit(143);
   });
 }
 
@@ -101,7 +119,7 @@ function attachLogging(t: Tracked, stream: NodeJS.ReadableStream | null): void {
 /** Spawns `cmd` in its own process group (so the harness can kill the whole tree it starts), capturing combined
  *  stdout+stderr for diagnostics. */
 function spawnTracked(label: string, cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Tracked {
-  installExitHook();
+  installProcessHooks();
   const child = spawn(cmd, args, {
     cwd: opts.cwd,
     env: opts.env ?? process.env,
@@ -187,17 +205,27 @@ export async function freeTcpPort(): Promise<number> {
   });
 }
 
+const ANVIL_PORT_MIN = 8600;
+const ANVIL_PORT_MAX = 8699;
+
 /** Picks an Anvil port from the 8600-8699 range reserved for this harness (never the demo stack's :8545), with a
- *  bind check so two stacks started back to back don't race for the same port. */
-export async function pickAnvilPort(preferred?: number): Promise<number> {
+ *  bind check so two stacks started back to back don't race for the same port. `excluding` skips ports already
+ *  known to be bad in this call (e.g. Anvil itself just failed to bind one, even though the bind check said it
+ *  was free -- a caller retrying after such a failure passes the previous port back in here). An explicit
+ *  `preferred` port outside the reserved range is refused outright, never silently reassigned. */
+export async function pickAnvilPort(preferred?: number, excluding: ReadonlySet<number> = new Set()): Promise<number> {
   if (preferred !== undefined) {
+    if (preferred < ANVIL_PORT_MIN || preferred > ANVIL_PORT_MAX) {
+      throw new Error(`anvil port ${preferred} is outside the harness's reserved range ${ANVIL_PORT_MIN}-${ANVIL_PORT_MAX}`);
+    }
     if (!(await isPortFree(preferred))) throw new Error(`anvil port ${preferred} is already in use`);
     return preferred;
   }
-  for (let port = 8600; port <= 8699; port++) {
+  for (let port = ANVIL_PORT_MIN; port <= ANVIL_PORT_MAX; port++) {
+    if (excluding.has(port)) continue;
     if (await isPortFree(port)) return port;
   }
-  throw new Error("no free anvil port in 8600-8699");
+  throw new Error(`no free anvil port in ${ANVIL_PORT_MIN}-${ANVIL_PORT_MAX}`);
 }
 
 // -------------------------------------------------------------------------------------------------- readiness
@@ -247,8 +275,8 @@ async function waitForHttp(t: Tracked, url: string, timeoutMs = 20_000): Promise
 
 // --------------------------------------------------------------------------------------------------- contracts
 
-function artifact(name: string): { abi: Abi; bytecode: Hex } {
-  const json = JSON.parse(readFileSync(join(CONTRACTS_OUT, `${name}.sol/${name}.json`), "utf8")) as {
+function artifact(name: string, outDir: string): { abi: Abi; bytecode: Hex } {
+  const json = JSON.parse(readFileSync(join(outDir, `${name}.sol/${name}.json`), "utf8")) as {
     abi: Abi;
     bytecode: { object: Hex };
   };
@@ -259,9 +287,10 @@ async function deployContracts(
   deployer: WalletClient,
   pub: PublicClient,
   host: Address,
+  outDir: string,
 ): Promise<{ usdc: Address; rules: Address; hub: Address }> {
   const deploy = async (name: string, args: unknown[]): Promise<Address> => {
-    const a = artifact(name);
+    const a = artifact(name, outDir);
     const hash = await deployer.deployContract({
       abi: a.abi,
       bytecode: a.bytecode,
@@ -334,58 +363,97 @@ function runCliSync(args: string[], home: string): { stdout: string; stderr: str
   return { stdout: res.stdout ?? "", stderr: res.stderr ?? "", status: res.status ?? 1 };
 }
 
-export async function startStack(opts: { anvilPort?: number; serverOverrides?: object; blockTime?: number } = {}): Promise<Stack> {
+// A pathological run of bad luck (or a systemic problem unrelated to the port itself, e.g. a missing `anvil`
+// binary) must not retry forever -- cap it well under the size of the reserved range.
+const MAX_ANVIL_BIND_ATTEMPTS = 5;
+
+/** Spawns Anvil, retrying with the next free port in 8600-8699 if it exits early (a bind failure the free-port
+ *  check above missed, e.g. a race with something else grabbing the port) -- but only when the caller let this
+ *  function pick the port itself; an explicit `preferred` port's failure is never silently swapped out from under
+ *  the caller. */
+async function startAnvil(preferred: number | undefined, blockTime: number | undefined): Promise<{ tracked: Tracked; port: number; rpcUrl: string }> {
+  const tried = new Set<number>();
+  const attempts = preferred !== undefined ? 1 : MAX_ANVIL_BIND_ATTEMPTS;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    const port = await pickAnvilPort(preferred, tried);
+    tried.add(port);
+    const rpcUrl = `http://127.0.0.1:${port}`;
+    const anvilArgs = ["--port", String(port), "--silent"];
+    if (blockTime !== undefined) anvilArgs.push("--block-time", String(blockTime));
+    const tracked = spawnTracked(`anvil:${port}`, "anvil", anvilArgs, {
+      env: { ...process.env, PATH: `${process.env.HOME}/.foundry/bin:${process.env.PATH ?? ""}` },
+    });
+    try {
+      await waitForRpc(tracked, rpcUrl);
+      return { tracked, port, rpcUrl };
+    } catch (err) {
+      await terminate(tracked).catch(() => {});
+      lastErr = err;
+      // Only retry when Anvil actually exited (a real bind/startup failure). A timeout with the process still
+      // running is a different, more concerning failure mode (e.g. RPC hung) -- surface it immediately rather
+      // than masking it as a port race.
+      if (!isExited(tracked)) throw err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("anvil did not start after retrying free ports");
+}
+
+export async function startStack(
+  opts: {
+    anvilPort?: number;
+    serverOverrides?: object;
+    blockTime?: number;
+    /** Test-only: overrides where compiled contract artifacts are read from, to exercise `startStack()`'s
+     *  cleanup-on-partial-failure path (e.g. point it at a directory with no `MockUSDC.sol/MockUSDC.json`). */
+    contractsOutOverride?: string;
+  } = {},
+): Promise<Stack> {
   const dir = mkdtempSync(join(tmpdir(), "arena-system-"));
-  const anvilPort = await pickAnvilPort(opts.anvilPort);
-  const rpcUrl = `http://127.0.0.1:${anvilPort}`;
+  const registry: Tracked[] = [];
+  try {
+    const { tracked: anvilTracked, port: anvilPort, rpcUrl } = await startAnvil(opts.anvilPort, opts.blockTime);
+    registry.push(anvilTracked);
 
-  const anvilArgs = ["--port", String(anvilPort), "--silent"];
-  if (opts.blockTime !== undefined) anvilArgs.push("--block-time", String(opts.blockTime));
-  const anvilTracked = spawnTracked(`anvil:${anvilPort}`, "anvil", anvilArgs, {
-    env: { ...process.env, PATH: `${process.env.HOME}/.foundry/bin:${process.env.PATH ?? ""}` },
-  });
-  await waitForRpc(anvilTracked, rpcUrl);
+    const pub = createPublicClient({ chain: foundry, transport: http(rpcUrl) }) as PublicClient;
+    const deployer = createWalletClient({ account: privateKeyToAccount(ANVIL_KEYS[0]), chain: foundry, transport: http(rpcUrl) });
+    const testClient = createTestClient({ mode: "anvil", chain: foundry, transport: http(rpcUrl) });
+    const host = privateKeyToAccount(ANVIL_KEYS[3]).address;
+    const { usdc, rules, hub } = await deployContracts(deployer, pub, host, opts.contractsOutOverride ?? CONTRACTS_OUT);
 
-  const pub = createPublicClient({ chain: foundry, transport: http(rpcUrl) }) as PublicClient;
-  const deployer = createWalletClient({ account: privateKeyToAccount(ANVIL_KEYS[0]), chain: foundry, transport: http(rpcUrl) });
-  const testClient = createTestClient({ mode: "anvil", chain: foundry, transport: http(rpcUrl) });
-  const host = privateKeyToAccount(ANVIL_KEYS[3]).address;
-  const { usdc, rules, hub } = await deployContracts(deployer, pub, host);
+    const serverPort = await freeTcpPort();
+    const serverConfigPath = join(dir, "server.json");
+    const baseConfig = {
+      host: "127.0.0.1",
+      port: serverPort,
+      publicUrl: "",
+      rpcUrl,
+      publicRpcUrl: "",
+      chainId: foundry.id,
+      hub,
+      usdc,
+      rules,
+      dbPath: join(dir, "server.sqlite"),
+      fundingWindow: "3600",
+      offerMaxLifetime: "86400",
+      defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" },
+      cliCommand: "arena",
+      audit: "unaudited (development build)",
+      indexer: { pollMs: 200, chunkBlocks: 1000, startBlock: 0 },
+      limits: {},
+      trustProxy: false,
+      ...(opts.serverOverrides ?? {}),
+    };
+    writeFileSync(serverConfigPath, JSON.stringify(baseConfig, null, 2));
+    const serverUrl = `http://127.0.0.1:${serverPort}`;
 
-  const serverPort = await freeTcpPort();
-  const serverConfigPath = join(dir, "server.json");
-  const baseConfig = {
-    host: "127.0.0.1",
-    port: serverPort,
-    publicUrl: "",
-    rpcUrl,
-    publicRpcUrl: "",
-    chainId: foundry.id,
-    hub,
-    usdc,
-    rules,
-    dbPath: join(dir, "server.sqlite"),
-    fundingWindow: "3600",
-    offerMaxLifetime: "86400",
-    defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" },
-    cliCommand: "arena",
-    audit: "unaudited (development build)",
-    indexer: { pollMs: 200, chunkBlocks: 1000, startBlock: 0 },
-    limits: {},
-    trustProxy: false,
-    ...(opts.serverOverrides ?? {}),
-  };
-  writeFileSync(serverConfigPath, JSON.stringify(baseConfig, null, 2));
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
+    let serverTracked = spawnTracked(`server:${serverPort}`, "node", [SERVER_BIN, "--config", serverConfigPath], { cwd: REPO_ROOT });
+    registry.push(serverTracked);
+    await waitForHttp(serverTracked, `${serverUrl}/healthz`);
 
-  let serverTracked = spawnTracked(`server:${serverPort}`, "node", [SERVER_BIN, "--config", serverConfigPath], { cwd: REPO_ROOT });
-  await waitForHttp(serverTracked, `${serverUrl}/healthz`);
+    const players: Array<{ home: string; getTracked: () => Tracked }> = [];
 
-  const registry: Tracked[] = [anvilTracked, serverTracked];
-
-  const players: Array<{ home: string; getTracked: () => Tracked }> = [];
-
-  async function player(name: string, key?: Hex): Promise<Player> {
+    async function player(name: string, key?: Hex): Promise<Player> {
     const walletKey = key ?? generatePrivateKey();
     const address = privateKeyToAccount(walletKey).address;
     await testClient.setBalance({ address, value: 10n ** 20n });
@@ -520,7 +588,18 @@ export async function startStack(opts: { anvilPort?: number; serverOverrides?: o
         // best effort
       }
     },
-  };
+    };
+  } catch (err) {
+    // A failure at any point above (a bad deploy, the server never becoming healthy, ...) must not leave whatever
+    // was already spawned (Anvil, at minimum) running with nothing left to stop it and no test able to reach it.
+    await Promise.all(registry.map((t) => terminate(t).catch(() => {})));
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+    throw err;
+  }
 }
 
 /** Reads an ERC-20 (MockUSDC) balance directly from the chain -- for asserting exact settlement amounts. */

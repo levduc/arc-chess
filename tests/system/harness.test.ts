@@ -1,8 +1,15 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Hex } from "viem";
-import { hasLockFile, startStack, usdcBalanceOf, type Player, type Stack } from "./harness.js";
+import { hasLockFile, isPortFree, pickAnvilPort, startStack, usdcBalanceOf, type Player, type Stack } from "./harness.js";
 import { playLine, waitStatus } from "./bot.js";
-import { SCHOLARS_MATE } from "../../packages/sdk/test/helpers/fixtures.js";
+
+// A local copy, not an import of packages/sdk/test/helpers/fixtures.ts: tests/system is its own workspace
+// package with its own package.json/tsconfig, and reaching into another package's test-internal files (not part
+// of its public `exports`) is a fragile cross-package dependency this suite should not have.
+const SCHOLARS_MATE = ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"];
 
 const DEPOSIT = "1000000";
 const STAKE = "100000";
@@ -91,5 +98,24 @@ describe("system harness (real Anvil, real server, real `arena daemon` processes
       await waitStatus(bob, (s) => s.myTurn, 10_000, id);
     },
     90_000,
+  );
+
+  it(
+    "startStack() cleans up everything already spawned when a later step fails",
+    async () => {
+      // Anvil starts and becomes ready fine; the contract deploy step fails right after (no MockUSDC.sol/
+      // MockUSDC.json under this bogus artifacts directory) -- exercising the cleanup path for a failure that
+      // happens *after* a child process is already running, not before anything was spawned.
+      const anvilPort = await pickAnvilPort();
+      const badOutDir = mkdtempSync(join(tmpdir(), "arena-bad-artifacts-"));
+      try {
+        await expect(startStack({ anvilPort, contractsOutOverride: badOutDir })).rejects.toThrow();
+        const freed = await waitFor(() => isPortFree(anvilPort), 10_000);
+        expect(freed).toBe(true);
+      } finally {
+        rmSync(badOutDir, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 });

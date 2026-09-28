@@ -253,6 +253,41 @@ describe("Indexer.poll and Indexer.apply", () => {
     expect(repo.channelRow(unknown)).toBe(null);
     repo.close();
   });
+
+  it("logs a warning when the persisted cursor is ahead of the chain head (fix-round item 2)", async () => {
+    // The scenario that motivated this: a database's indexer cursor survives a chain reset (e.g. a local Anvil
+    // restarted from block 0 for a fresh deployment) and ends up recorded at a block number the new chain has
+    // not reached yet. `chunkRanges(from, head, ...)` with `from > head` returns no ranges, so `poll` would
+    // otherwise do nothing every tick with no signal that anything is wrong.
+    const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks: 10, startBlock: 0n } });
+    const repo = new SqliteRepo(":memory:");
+    repo.setCursor(500n);
+    const chain = new FakeChain();
+    chain.block = 10n; // head is far behind the persisted cursor
+    const logs: string[] = [];
+    const indexer = new Indexer(repo, chain, cfg, (l) => logs.push(l));
+
+    await indexer.poll();
+
+    expect(logs.some((l) => /cursor/i.test(l) && /500/.test(l) && /10/.test(l))).toBe(true);
+    expect(repo.cursor()).toBe(500n); // unchanged: nothing was indexed, and the stale cursor was not disturbed
+    repo.close();
+  });
+
+  it("does not warn when the cursor is at or behind the chain head", async () => {
+    const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks: 10, startBlock: 0n } });
+    const repo = new SqliteRepo(":memory:");
+    repo.setCursor(5n);
+    const chain = new FakeChain();
+    chain.block = 10n;
+    const logs: string[] = [];
+    const indexer = new Indexer(repo, chain, cfg, (l) => logs.push(l));
+
+    await indexer.poll();
+
+    expect(logs.some((l) => /ahead of the chain head/i.test(l))).toBe(false);
+    repo.close();
+  });
 });
 
 describe("playerStats", () => {

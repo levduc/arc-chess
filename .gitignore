@@ -8,6 +8,7 @@ contracts/test/vectors/
 contracts/test/vectors-deep/
 contracts/deployments/31337.json
 .arena-dev/
+tests/system/.tmp-sigint-*/
 .superpowers/
 *.db
 *.db-wal
