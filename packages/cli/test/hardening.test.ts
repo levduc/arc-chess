@@ -637,3 +637,34 @@ describe("Plan 4.5 Task 10: a settled channel keeps no transient error", () => {
     expect(alice.daemon.handle(id).lastError).toBeNull();
   });
 });
+
+describe("Plan 4.5 Task 10: a close that went through is not reported as failed", () => {
+  it("the close transaction lands but the RPC fails before its receipt: close() resolves and leaves no close: error", async () => {
+    const { alice, bob, id } = await matched();
+    for (const m of SCHOLARS_MATE) {
+      const [mover, other] = alice.daemon.handle(id).session.isMyTurn() ? [alice, bob] : [bob, alice];
+      await mover.daemon.move(id, m, { actor: "agent" });
+      const turn = mover.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => other.daemon.handle(id).session.latest.state.turnNum >= turn, 5_000, `relay ${m}`);
+    }
+    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 8n, 5_000, "bob's auto-resign");
+    for (const p of [alice, bob]) {
+      const hub = p.daemon.hub;
+      const real = hub.closeCooperative.bind(hub);
+      hub.closeCooperative = async (sender, tx) => {
+        const receipt = await real(sender, tx); // mined...
+        // ...but the RPC fails before this daemon hears so, after its watchtower has already seen Finalized.
+        await waitFor(() => p.daemon.handle(id).record.finalized, 5_000, "the watchtower marks it settled");
+        throw new Error(`HTTP request failed. (${receipt.status})`);
+      };
+    }
+    await alice.daemon.close(id, "agent");
+    await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
+    // Before the fix this rejected with the transport error and left "close: HTTP request failed." for good.
+    await bob.daemon.close(id, "agent");
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Finalized");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 5_000, "alice settled");
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(alice.daemon.handle(id).lastError).toBeNull();
+  });
+});

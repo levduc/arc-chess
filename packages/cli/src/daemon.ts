@@ -703,7 +703,8 @@ export class ArenaDaemon {
       await this.submitClose(l);
       if (l.lastError?.startsWith("close:")) l.lastError = null;
     } catch (err) {
-      l.lastError = `close: ${errorText(err)}`;
+      // Once settled (the watchtower may have marked it meanwhile), nothing would ever clear the error again.
+      if (!l.record.finalized) l.lastError = `close: ${errorText(err)}`;
       this.log(`channel ${l.record.channelId}: submitting the cooperative close failed (the watchtower retries): ${errorText(err)}`);
       throw err;
     } finally {
@@ -719,16 +720,17 @@ export class ArenaDaemon {
     try {
       await this.hub.closeCooperative(this.wallet, tx);
     } catch (err) {
-      if (!(err instanceof HubRevertError)) throw err;
       // Both sides race to submit the same cooperative close once they hold both signatures (each one's own
       // call, and the other's relayed close message, land within the same window). The loser's simulate can
       // still see phase "Open" (the winner hasn't mined yet), so it only reverts once mined — a status revert
       // with no decodable reason, unlike the (rarer) already-stale-simulate case that decodes as "WrongPhase".
+      // Plan 4.5 Task 10: a transport failure is no different -- the transaction may have been sent and mined
+      // before the RPC failed (e.g. while waiting for the receipt), or the other side's close landed meanwhile.
       // Either way, once the channel is no longer Open/Challenged, the close already went through: not an error.
-      if (err.errorName !== "WrongPhase") {
-        const after = await this.hub.channelInfo(l.record.channelId);
-        if (after.phase === "Open" || after.phase === "Challenged") throw err;
-      }
+      if (err instanceof HubRevertError && err.errorName === "WrongPhase") return;
+      const after = await this.hub.channelInfo(l.record.channelId).catch(() => null);
+      if (after && after.phase !== "Open" && after.phase !== "Challenged") return;
+      throw err;
     }
   }
 
