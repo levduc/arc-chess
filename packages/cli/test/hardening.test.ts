@@ -497,3 +497,25 @@ describe("Plan 4.5 Task 10: reorg resilience", () => {
     expect(alice.daemon.handle(second).lastError).toBeNull();
   });
 });
+
+describe("Plan 4.5 Task 10: transient RPC failures", () => {
+  it("a watchtower pass that fails on an RPC error sets a watch: lastError, and the next good pass clears it", async () => {
+    const { alice, id } = await matched();
+    const hub = alice.daemon.hub;
+    const real = hub.channelInfo.bind(hub);
+    let fail = true;
+    hub.channelInfo = async (c) => {
+      if (fail) {
+        fail = false;
+        throw new Error("HTTP request failed.");
+      }
+      return real(c);
+    };
+    // Whichever periodic pass hits the failure records it ("watch: …" after the fix)...
+    await waitFor(() => /HTTP request failed/.test(alice.daemon.handle(id).lastError ?? ""), 5_000, "the failed pass");
+    expect(fail).toBe(false);
+    // ...and the next good pass clears it. Before the fix it stayed until a relay message happened to arrive.
+    await waitFor(() => alice.daemon.handle(id).lastError === null, 5_000, "a good pass to clear it");
+    expect(alice.daemon.handle(id).passes).toBeGreaterThan(1);
+  });
+});

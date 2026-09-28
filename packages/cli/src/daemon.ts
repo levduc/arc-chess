@@ -767,8 +767,11 @@ export class ArenaDaemon {
         l.passes++;
         try {
           await this.watch(l);
+          // Plan 4.5 Task 10: a pass that got all the way through means an earlier pass's failure (an RPC blip)
+          // no longer applies. Without this, a quiet channel kept that error in lastError indefinitely.
+          if (l.lastError?.startsWith("watch:")) l.lastError = null;
         } catch (err) {
-          l.lastError = errorText(err);
+          l.lastError = `watch: ${errorText(err)}`;
         }
       }
     } finally {
