@@ -7,6 +7,7 @@ contracts/crytic-export/
 contracts/test/vectors/
 contracts/test/vectors-deep/
 contracts/deployments/31337.json
+.arena-dev/
 .superpowers/
 *.db
 *.db-wal

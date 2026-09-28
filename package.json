@@ -12,6 +12,12 @@
     "fuzz:echidna": "bash scripts/tools/echidna.sh",
     "test:sdk": "pnpm --filter @arena/sdk test",
     "test:cli": "pnpm --filter @arena/cli test",
-    "test:server": "pnpm --filter @arena/server test"
+    "test:server": "pnpm --filter @arena/server test",
+    "test:system": "pnpm --filter @arena/system-tests test",
+    "dev:up": "tsx scripts/dev-up.ts"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15",
+    "viem": "2.56.8"
   }
 }

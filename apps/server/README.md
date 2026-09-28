@@ -6,6 +6,35 @@ events into SQLite for the spectator page and reputation stats, and the template
 how to play. It holds no private keys and no funds — everything it forwards is verified independently by the
 daemons that receive it (spec §3, row 4; §12 item 17).
 
+## Local dev stack (`pnpm dev:up`)
+
+From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 2]` brings up a whole local stack
+for manual play: Anvil, a fresh contract deployment (`forge script contracts/script/Deploy.s.sol`), this server
+pointed at it, and one funded `ARENA_HOME` per player (`arena init --server ...`, minted 100 USDC each) under
+`.arena-dev/` at the repo root (gitignored). It refuses cleanly — without starting or killing anything — if the
+requested Anvil or server port is already in use (e.g. by another dev stack, or a running demo); pass `--port`/
+`--anvil-port` to pick free ones. It does not start the players' daemons itself: it prints the exact
+`ARENA_HOME=... node .../arena.mjs daemon` command for each one, to run in its own terminal. The deployer stays
+the `ChannelHub` owner; its private key is printed too, labelled as a local-dev-only key (it is Anvil's
+well-known default account 0 — never use it where real funds could reach it). Ctrl-C tears down the server and
+Anvil.
+
+## System tests (`pnpm test:system`)
+
+`tests/system` is a separate workspace package with a process harness (`tests/system/harness.ts`) that drives
+real OS processes the same way a deployment would: Anvil (on a port from 8600-8699, picked with a bind check so
+it never collides with a `pnpm dev:up` stack or this port range's other users), the contracts (deployed through
+viem from the compiled `contracts/out` artifacts — not `forge script`, so nothing races the shared
+`contracts/deployments/<chainid>.json` file), this server (`apps/server/bin/arena-server.mjs`), and `arena
+daemon` child processes (`packages/cli/bin/arena.mjs`). `startStack()` returns a `Stack` with a `player(name)`
+helper (provisions an `ARENA_HOME`, mints USDC, and starts a daemon process) and stack-level chain controls
+(`setLimits`, `setPaused`, `increaseTime`); each `Player` supports `kill(signal)` (SIGKILL included) and
+`start()` to exercise restarts and crash recovery. `tests/system/bot.ts` drives games entirely over the
+daemons' HTTP API (`playLine`, `playRandomGame`, `waitStatus`) — the same surface an agent uses. `pnpm
+test:system` runs this suite with `fileParallelism: false`; it is not part of `test:sdk`, `test:cli` or
+`test:server`. Later hardening test campaigns (dispute e2e, adversarial, chaos, load, LLM games) build on this
+harness rather than re-implementing process plumbing.
+
 ## Running it
 
 ```

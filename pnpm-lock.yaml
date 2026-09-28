@@ -164,7 +164,14 @@ settings:
 
 importers:
 
-  .: {}
+  .:
+    devDependencies:
+      tsx:
+        specifier: 4.23.15
+        version: 4.23.15
+      viem:
+        specifier: 2.56.8
+        version: 2.56.8(typescript@6.0.3)
 
   apps/server:
     dependencies:
@@ -237,6 +244,34 @@ importers:
       fast-check:
         specifier: 4.10.0
         version: 4.10.0
+      tsx:
+        specifier: 4.23.15
+        version: 4.23.15
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: 5.0.1
+        version: 5.0.1(@types/node@25.9.8)(vite@8.3.1(@types/node@25.9.8)(esbuild@0.28.2)(tsx@4.23.15))
+
+  tests/system:
+    dependencies:
+      '@arena/cli':
+        specifier: workspace:*
+        version: link:../../packages/cli
+      '@arena/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
+      '@arena/server':
+        specifier: workspace:*
+        version: link:../../apps/server
+      viem:
+        specifier: 2.56.8
+        version: 2.56.8(typescript@6.0.3)
+    devDependencies:
+      '@types/node':
+        specifier: 25.9.8
+        version: 25.9.8
       tsx:
         specifier: 4.23.15
         version: 4.23.15

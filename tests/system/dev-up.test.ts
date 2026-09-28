@@ -1,0 +1,129 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { freeTcpPort, isPortFree } from "./harness.js";
+
+const REPO_ROOT = join(import.meta.dirname, "../..");
+const TSX_BIN = join(REPO_ROOT, "node_modules/.bin/tsx");
+const DEV_UP_SCRIPT = join(REPO_ROOT, "scripts/dev-up.ts");
+// `forge script`'s Deploy.s.sol always writes here (vm.projectRoot() is fixed), regardless of --anvil-port: this
+// is the file the running demo stack's own past deployment left behind. dev-up overwrites it every run (a known,
+// documented trade-off of using `forge script` for dev-up -- see the harness, which deploys through viem instead
+// to avoid exactly this), so the test snapshots and restores it to leave no trace on the machine.
+const DEPLOYMENT_31337 = join(REPO_ROOT, "contracts/deployments/31337.json");
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+let child: ChildProcess | undefined;
+let deploymentSnapshot: string | null | undefined;
+
+afterEach(async () => {
+  if (child && child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+  child = undefined;
+  if (deploymentSnapshot !== undefined) {
+    if (deploymentSnapshot === null) rmSync(DEPLOYMENT_31337, { force: true });
+    else writeFileSync(DEPLOYMENT_31337, deploymentSnapshot);
+    deploymentSnapshot = undefined;
+  }
+}, 20_000);
+
+/** Reads lines from `child`'s stdout until `predicate` matches a parsed JSON line, or `ms` elapses. */
+async function waitForJsonLine(target: ChildProcess, predicate: (o: Record<string, unknown>) => boolean, ms: number): Promise<Record<string, unknown>> {
+  let buf = "";
+  const found = new Promise<Record<string, unknown>>((resolvePromise, reject) => {
+    const onData = (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        try {
+          const parsed = JSON.parse(line) as Record<string, unknown>;
+          if (predicate(parsed)) {
+            target.stdout?.removeListener("data", onData);
+            resolvePromise(parsed);
+            return;
+          }
+        } catch {
+          // not JSON (or not the line we want): ignore
+        }
+      }
+    };
+    target.stdout?.on("data", onData);
+    target.once("exit", (code, signal) => reject(new Error(`process exited before the expected line (code=${code} signal=${signal})`)));
+  });
+  return Promise.race([
+    found,
+    sleep(ms).then(() => {
+      throw new Error(`timed out after ${ms}ms waiting for a matching JSON line on stdout`);
+    }),
+  ]);
+}
+
+describe("pnpm dev:up", () => {
+  it(
+    "starts anvil + server on free ports, prints a ready line, and Ctrl-C frees both ports",
+    async () => {
+      deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+      expect(await isPortFree(anvilPort)).toBe(true);
+      expect(await isPortFree(serverPort)).toBe(true);
+
+      child = spawn(
+        TSX_BIN,
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--players", "2"],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
+      );
+
+      const ready = await waitForJsonLine(child, (o) => o.ready === true, 60_000);
+      expect(ready.anvilPort).toBe(anvilPort);
+      expect(ready.serverPort).toBe(serverPort);
+
+      // Both services are actually reachable, not just "the script said so".
+      const rpcRes = await fetch(`http://127.0.0.1:${anvilPort}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+      });
+      expect(rpcRes.ok).toBe(true);
+      const healthRes = await fetch(`http://127.0.0.1:${serverPort}/healthz`);
+      expect(healthRes.ok).toBe(true);
+
+      expect(await isPortFree(anvilPort)).toBe(false);
+      expect(await isPortFree(serverPort)).toBe(false);
+
+      const pid = child.pid;
+      expect(pid).toBeDefined();
+      const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      process.kill(-pid!, "SIGINT"); // simulates a terminal Ctrl-C: signals dev-up's whole process group
+      await Promise.race([
+        exited,
+        sleep(20_000).then(() => {
+          throw new Error("dev-up did not exit within 20s of SIGINT");
+        }),
+      ]);
+
+      // Ports free up promptly after teardown; poll briefly for the OS to release them.
+      const end = Date.now() + 10_000;
+      let anvilFree = false;
+      let serverFree = false;
+      while (Date.now() < end && !(anvilFree && serverFree)) {
+        anvilFree = await isPortFree(anvilPort);
+        serverFree = await isPortFree(serverPort);
+        if (!(anvilFree && serverFree)) await sleep(200);
+      }
+      expect(anvilFree).toBe(true);
+      expect(serverFree).toBe(true);
+    },
+    120_000,
+  );
+});
