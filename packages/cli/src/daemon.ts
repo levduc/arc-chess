@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, http, maxUint256, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, http, maxUint256, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -125,7 +125,6 @@ export class ArenaDaemon {
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
   private ticking = false;
-  private approved = false;
   /** M1: set by stop(); every handler checks this before any side effect (open/join/fund) it hasn't started yet. */
   private stopped = false;
   /** I3: offerIds currently being turned into a channel — guards against two match events racing the same offer. */
@@ -542,9 +541,19 @@ export class ArenaDaemon {
   protected async fund(l: ChannelHandle): Promise<void> {
     if (this.stopped) return;
     const p = l.record.params;
-    if (!this.approved) {
+    // Plan 4.5 Task 10: read the allowance every time instead of remembering "approved" in memory -- a reorg can
+    // drop the approve transaction (and a wallet owner can revoke it), after which a remembered flag would make
+    // every later deposit revert on the allowance until the daemon restarts. fund() only runs while this player
+    // still owes a deposit, so the extra read is rare.
+    const allowance = await this.client.readContract({
+      address: this.opts.config.usdc,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.wallet.address, this.opts.config.hub],
+    });
+    if (allowance < p.deposit + p.feePerPlayer) {
+      if (this.stopped) return;
       await this.hub.approve(this.wallet, this.opts.config.usdc, maxUint256);
-      this.approved = true;
     }
     if (this.stopped) return;
     if (this.opts.config.sessionGasWei > 0n) {

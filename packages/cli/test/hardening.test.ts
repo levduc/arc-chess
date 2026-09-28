@@ -6,6 +6,7 @@ import type { Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
+  LocalKeyTxSender,
   buildParams,
   hashState,
   offerId as computeOfferId,
@@ -14,7 +15,7 @@ import {
   type SignedAcceptance,
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
-import { increaseTime, now, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
+import { CHAIN, RPC, increaseTime, now, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
 import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -475,5 +476,24 @@ describe("minor fixes", () => {
     // would never see that block's event again. With it, the trailing DISPUTE_RESCAN_BLOCKS are re-read on the
     // very next tick, and the real disputeEvents (hideOnce is now false) returns the event this time.
     await waitFor(async () => { await bob.daemon.idle(); await bob.daemon.tick(); return bob.daemon.handle(id).session.isMyTurn(); }, 20_000, "ingested e4 on rescan");
+  });
+});
+
+describe("Plan 4.5 Task 10: reorg resilience", () => {
+  it("re-approves USDC when the allowance is gone (an approve dropped by a reorg, or revoked) instead of remembering it", async () => {
+    const { alice, bob, env } = await matched(); // alice's daemon approved the hub while funding channel 1
+    // The approve is gone, as after a reorg deeper than the deposit (the system chaos test drops it with anvil_reorg).
+    const aliceWallet = new LocalKeyTxSender(alice.walletKey, RPC, CHAIN);
+    await alice.daemon.hub.approve(aliceWallet, env.usdc, 0n);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const second = await waitFor(
+      () => alice.daemon.channelIds().find((c) => alice.daemon.handle(c).record.offerId === offerId) ?? null,
+      20_000,
+      "second match",
+    );
+    // Before the fix, alice's in-memory "approved" flag skipped the approve and her deposit reverted on every tick.
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(second)).phase === "Open", 20_000, "second channel funded");
+    expect(alice.daemon.handle(second).lastError).toBeNull();
   });
 });
