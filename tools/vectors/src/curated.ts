@@ -21,4 +21,9 @@ export const CURATED_FENS: string[] = [
   "8/8/8/8/8/8/1b6/k5BK w - - 0 1", // same-coloured bishops
   "8/8/8/8/8/8/b7/k5BK w - - 0 1", // opposite-coloured bishops
   "8/8/8/8/3R4/8/8/K6k w - - 99 120", // one move from the fifty-move limit
+  "r3k2r/8/1N6/8/8/8/8/R3K2R w KQkq - 0 1", // Nb6xa8: castling right lost by a rook capture, not a king/rook move
+  "k7/b1K5/8/8/8/8/8/R7 b - - 0 1", // Ra1 pins Ba7 on the a-file so it can't move at all: stalemate
+  "k7/8/8/8/8/2N5/5N2/7K w - - 0 1", // K+N+N v K: neither side calls this insufficient material
+  "7k/Q7/6K1/8/8/8/8/8 w - - 99 60", // halfmove 99->100: Qa8# still wins; every other legal move hits the cap and draws
+  "1q6/8/8/8/8/6k1/8/7K b - - 0 150", // ply 299->300 (black to move): Qb1# still wins; every other legal move draws
 ];

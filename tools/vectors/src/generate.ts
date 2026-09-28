@@ -1,16 +1,52 @@
 import { Chess } from "chess.js";
 import { encodeAbiParameters } from "viem";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { STATUS, FIFTY_MOVE_HALFMOVES, MAX_PLY } from "@arena/sdk";
 import { encodeFen, squareIndex, PROMO } from "./encode.js";
 import { CURATED_FENS } from "./curated.js";
 
-const CHUNKS = 10; // must match ChessDifferentialTest
-const GAMES = Number(process.env.VECTOR_GAMES ?? 60);
-const SAMPLES_PER_GAME = Number(process.env.VECTOR_SAMPLES ?? 10);
+const DEEP = process.argv.includes("--deep");
+const FORCE = process.argv.includes("--force");
+
+// Default (CI) mode: unchanged in size (only the curated set grew, by design; see task-5-report.md).
+const CHUNKS = 10; // must match ChessDifferentialTest's test_chunk0..9
+const GAMES = Number(process.env.VECTOR_GAMES ?? (DEEP ? 20_000 : 60));
+const SAMPLES_PER_GAME = Number(process.env.VECTOR_SAMPLES ?? (DEEP ? 1 : 10));
+// Deep mode samples a fraction of its 20,000 games (biased toward each game's final position) so the
+// vector file stays well under ~50MB. See task-5-report.md for the size/count this produces.
+const DEEP_KEEP_PROB = Number(process.env.VECTOR_KEEP_PROB ?? 0.15);
+const DEEP_POSITIONS_PER_CHUNK = 150;
 const ILLEGAL_PER_POSITION = 12;
 const SEED = Number(process.env.VECTOR_SEED ?? 20260924);
-const OUT_DIR = resolve(import.meta.dirname, "../../../contracts/test/vectors");
+const OUT_DIR = resolve(import.meta.dirname, `../../../contracts/test/${DEEP ? "vectors-deep" : "vectors"}`);
+const STAMP_PATH = resolve(OUT_DIR, ".generation-stamp.json");
+
+/**
+ * Deep generation is slow (20,000 random games, ~an hour; see task-5-report.md), so `pnpm vectors:deep`
+ * caches its output: a stamp file records a hash of the generator sources plus the parameters that affect
+ * the output (seed, game count, sampling). Re-running with the same sources and parameters is a no-op unless
+ * `--force` is passed. Only deep mode caches — the default/CI set is fast enough that it isn't worth it, and
+ * `pnpm test:contracts` should always reflect the current sources.
+ */
+function generationFingerprint(): string {
+  const sources = ["generate.ts", "curated.ts", "encode.ts"]
+    .map((f) => readFileSync(resolve(import.meta.dirname, f), "utf8"))
+    .join("\0");
+  const params = JSON.stringify({ SEED, GAMES, SAMPLES_PER_GAME, DEEP_KEEP_PROB, ILLEGAL_PER_POSITION, DEEP_POSITIONS_PER_CHUNK });
+  return createHash("sha256").update(sources).update("\0").update(params).digest("hex");
+}
+
+function cachedGenerationIsFresh(fingerprint: string): boolean {
+  if (!existsSync(STAMP_PATH)) return false;
+  try {
+    const stamp = JSON.parse(readFileSync(STAMP_PATH, "utf8"));
+    return stamp.fingerprint === fingerprint && existsSync(resolve(OUT_DIR, "chunk-0.hex"));
+  } catch {
+    return false;
+  }
+}
 
 const CASES_ABI = [
   {
@@ -34,6 +70,9 @@ const CASES_ABI = [
           { name: "castling", type: "uint8" },
           { name: "halfmove", type: "uint16" },
           { name: "ply", type: "uint16" },
+          // Status ChessRules.successor would record for this move played as KIND_NORMAL: PLAYING unless
+          // insufficient material, or the fifty-move/ply cap is hit (draw, or win if it's also checkmate).
+          { name: "status", type: "uint8" },
         ],
       },
       {
@@ -80,10 +119,25 @@ function sample(fens: string[], rand: () => number): string[] {
   return [...picked];
 }
 
+/** The status ChessRules.successor would record after playing this move as KIND_NORMAL from `fen`. */
+function statusAfter(after: Chess, moverWasWhite: boolean): number {
+  if (after.isInsufficientMaterial()) return STATUS.DRAW;
+  const { meta } = encodeFen(after.fen());
+  const halfmove = Number((meta >> 24n) & 0xffffn);
+  const ply = Number((meta >> 40n) & 0xffffn);
+  if (halfmove >= FIFTY_MOVE_HALFMOVES || ply >= MAX_PLY) {
+    // The side that just moved delivered mate and wins outright; otherwise the limit draws the game.
+    if (after.inCheck() && after.moves().length === 0) return moverWasWhite ? STATUS.WHITE_WON : STATUS.BLACK_WON;
+    return STATUS.DRAW;
+  }
+  return STATUS.PLAYING;
+}
+
 function positionCase(fen: string, rand: () => number) {
   const game = new Chess(fen);
   const { board, meta } = encodeFen(fen);
   const moves = game.moves({ verbose: true });
+  const turnIsWhite = game.turn() === "w";
   const legal = moves.map((m) => {
     const after = new Chess(fen);
     after.move({ from: m.from, to: m.to, promotion: m.promotion });
@@ -97,6 +151,7 @@ function positionCase(fen: string, rand: () => number) {
       castling: Number((enc.meta >> 8n) & 0xffn),
       halfmove: Number((enc.meta >> 24n) & 0xffffn),
       ply: Number((enc.meta >> 40n) & 0xffffn),
+      status: statusAfter(after, turnIsWhite),
     };
   });
   const key = (f: number, t: number, p: number) => `${f}-${t}-${p}`;
@@ -109,7 +164,6 @@ function positionCase(fen: string, rand: () => number) {
     if (!legalKeys.has(key(l.from, l.to, variant)) && rand() < 0.2) illegal.push({ from: l.from, to: l.to, promo: variant });
   }
   const ownSquares: number[] = [];
-  const turnIsWhite = game.turn() === "w";
   for (let s = 0; s < 64; s++) {
     const piece = Number((board >> BigInt(s * 4)) & 0xfn);
     if (piece !== 0 && (piece & 8) === (turnIsWhite ? 0 : 8)) ownSquares.push(s);
@@ -133,19 +187,96 @@ function positionCase(fen: string, rand: () => number) {
   };
 }
 
-function main() {
-  const rand = mulberry32(SEED);
+/**
+ * A hand-authored FEN can accidentally describe an impossible position (e.g. the side NOT to move already
+ * in check), which chess.js does not validate on load. Its move generator then offers a "capture" of that
+ * king, a pseudo-move no real ChessRules/chess.js disagreement test should ever see. Catch that here instead
+ * of shipping it as a false differential mismatch.
+ */
+function assertNoCuratedFenCapturesAKing(): void {
+  for (const fen of CURATED_FENS) {
+    const bad = new Chess(fen).moves({ verbose: true }).filter((m) => m.captured === "k" || m.captured === "K");
+    if (bad.length > 0) {
+      throw new Error(`curated FEN describes an impossible position (a king is capturable): ${fen} -> ${bad.map((m) => m.san).join(", ")}`);
+    }
+  }
+}
+
+function collectFens(rand: () => number): string[] {
+  assertNoCuratedFenCapturesAKing();
   const fens = [...CURATED_FENS];
-  for (let g = 0; g < GAMES; g++) fens.push(...sample(randomGameFens(rand), rand));
+  for (let g = 0; g < GAMES; g++) {
+    const gameFens = randomGameFens(rand);
+    if (DEEP && rand() >= DEEP_KEEP_PROB) continue; // deep mode: sample a fraction of games to bound file size
+    fens.push(...sample(gameFens, rand));
+  }
+  return fens;
+}
+
+function writeDefault(cases: ReturnType<typeof positionCase>[]) {
   const chunks: ReturnType<typeof positionCase>[][] = Array.from({ length: CHUNKS }, () => []);
-  fens.forEach((fen, i) => chunks[i % CHUNKS].push(positionCase(fen, rand)));
+  cases.forEach((c, i) => chunks[i % CHUNKS].push(c));
+  chunks.forEach((chunk, i) => writeFileSync(resolve(OUT_DIR, `chunk-${i}.hex`), encodeAbiParameters(CASES_ABI, [chunk])));
+  return chunks.length;
+}
+
+function writeDeep(cases: ReturnType<typeof positionCase>[]) {
+  const chunkCount = Math.max(1, Math.ceil(cases.length / DEEP_POSITIONS_PER_CHUNK));
+  for (let i = 0; i < chunkCount; i++) {
+    const chunk = cases.slice(i * DEEP_POSITIONS_PER_CHUNK, (i + 1) * DEEP_POSITIONS_PER_CHUNK);
+    writeFileSync(resolve(OUT_DIR, `chunk-${i}.hex`), encodeAbiParameters(CASES_ABI, [chunk]));
+  }
+  return chunkCount;
+}
+
+function main() {
+  if (DEEP && !FORCE) {
+    const fingerprint = generationFingerprint();
+    if (cachedGenerationIsFresh(fingerprint)) {
+      const stamp = JSON.parse(readFileSync(STAMP_PATH, "utf8"));
+      console.log(
+        `deep vectors already up to date (cached ${stamp.generatedAt}): ${stamp.positions} positions, ` +
+          `${stamp.moves} move checks, ${stamp.chunks} chunks, ${stamp.bytes} bytes in ${OUT_DIR}. ` +
+          `Pass --force to regenerate.`,
+      );
+      return;
+    }
+  }
+
   mkdirSync(OUT_DIR, { recursive: true });
-  let moves = 0;
-  chunks.forEach((cases, i) => {
-    moves += cases.reduce((n, c) => n + c.legal.length + c.illegal.length, 0);
-    writeFileSync(resolve(OUT_DIR, `chunk-${i}.hex`), encodeAbiParameters(CASES_ABI, [cases]));
-  });
-  console.log(`wrote ${fens.length} positions, ${moves} move checks, ${CHUNKS} chunks to ${OUT_DIR}`);
+  // Clear any stale chunk files from a previous run before writing (deep mode's chunk count is dynamic).
+  for (const f of readdirSync(OUT_DIR)) {
+    if (/^chunk-\d+\.hex$/.test(f)) rmSync(resolve(OUT_DIR, f));
+  }
+
+  const rand = mulberry32(SEED);
+  const fens = collectFens(rand);
+  const cases = fens.map((fen) => positionCase(fen, rand));
+  const chunkCount = DEEP ? writeDeep(cases) : writeDefault(cases);
+  const moves = cases.reduce((n, c) => n + c.legal.length + c.illegal.length, 0);
+  let totalBytes = 0;
+  for (let i = 0; i < chunkCount; i++) totalBytes += statSync(resolve(OUT_DIR, `chunk-${i}.hex`)).size;
+  console.log(
+    `wrote ${fens.length} positions, ${moves} move checks, ${chunkCount} chunks, ${totalBytes} bytes to ${OUT_DIR}`,
+  );
+
+  if (DEEP) {
+    writeFileSync(
+      STAMP_PATH,
+      JSON.stringify(
+        {
+          fingerprint: generationFingerprint(),
+          generatedAt: new Date().toISOString(),
+          positions: fens.length,
+          moves,
+          chunks: chunkCount,
+          bytes: totalBytes,
+        },
+        null,
+        2,
+      ),
+    );
+  }
 }
 
 main();

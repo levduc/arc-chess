@@ -5,6 +5,7 @@ contracts/cache/
 contracts/broadcast/
 contracts/crytic-export/
 contracts/test/vectors/
+contracts/test/vectors-deep/
 contracts/deployments/31337.json
 .superpowers/
 *.db
