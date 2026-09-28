@@ -14,9 +14,17 @@ const FORCE = process.argv.includes("--force");
 const CHUNKS = 10; // must match ChessDifferentialTest's test_chunk0..9
 const GAMES = Number(process.env.VECTOR_GAMES ?? (DEEP ? 20_000 : 60));
 const SAMPLES_PER_GAME = Number(process.env.VECTOR_SAMPLES ?? (DEEP ? 1 : 10));
-// Deep mode samples a fraction of its 20,000 games (biased toward each game's final position) so the
-// vector file stays well under ~50MB. See task-5-report.md for the size/count this produces.
-const DEEP_KEEP_PROB = Number(process.env.VECTOR_KEEP_PROB ?? 0.15);
+// Deep mode samples a large fraction of its 20,000 games (biased toward each game's final position) so it
+// gathers >=10,000 positions in reasonable time; see task-5-report.md for the size/timing this produces and
+// for why this is now well over the tool's earlier ~50MB rule of thumb (flagged there for the controller).
+const DEEP_KEEP_PROB = Number(process.env.VECTOR_KEEP_PROB ?? (DEEP ? 0.55 : 1));
+// Random games almost never end on their own (checkmate/stalemate/insufficient material/repetition/50-move
+// are all rare under uniformly-random move choice) and instead run to this artificial cap. It only bounds how
+// far a *single simulated game* wanders — real on-chain games are still capped at MAX_PLY (300) by ChessRules
+// regardless of this constant. Deep mode uses a much smaller cap than the default/CI set purely for
+// throughput: see task-5-report.md's profiling (chess.js's per-ply legal-move generation, not position
+// analysis, is the dominant cost of `pnpm vectors:deep`, so fewer plies per game is the lever that matters).
+const GAME_PLY_CAP = Number(process.env.VECTOR_MAX_PLIES ?? (DEEP ? 90 : 250));
 const DEEP_POSITIONS_PER_CHUNK = 150;
 const ILLEGAL_PER_POSITION = 12;
 const SEED = Number(process.env.VECTOR_SEED ?? 20260924);
@@ -34,7 +42,15 @@ function generationFingerprint(): string {
   const sources = ["generate.ts", "curated.ts", "encode.ts"]
     .map((f) => readFileSync(resolve(import.meta.dirname, f), "utf8"))
     .join("\0");
-  const params = JSON.stringify({ SEED, GAMES, SAMPLES_PER_GAME, DEEP_KEEP_PROB, ILLEGAL_PER_POSITION, DEEP_POSITIONS_PER_CHUNK });
+  const params = JSON.stringify({
+    SEED,
+    GAMES,
+    SAMPLES_PER_GAME,
+    DEEP_KEEP_PROB,
+    GAME_PLY_CAP,
+    ILLEGAL_PER_POSITION,
+    DEEP_POSITIONS_PER_CHUNK,
+  });
   return createHash("sha256").update(sources).update("\0").update(params).digest("hex");
 }
 
@@ -102,10 +118,14 @@ function mulberry32(seed: number): () => number {
 function randomGameFens(rand: () => number): string[] {
   const game = new Chess();
   const fens = [game.fen()];
-  for (let i = 0; i < 250 && !game.isGameOver(); i++) {
-    const moves = game.moves({ verbose: true });
-    const m = moves[Math.floor(rand() * moves.length)];
-    game.move({ from: m.from, to: m.to, promotion: m.promotion });
+  // `moves()` (SAN strings) is used instead of `moves({ verbose: true })`: chess.js's verbose Move objects
+  // eagerly compute a before/after FEN and long-algebraic form for *every candidate move*, not just the one
+  // played, which measured ~5-6x slower per ply for no benefit here (only the resulting FEN after the played
+  // move is ever used) — see task-5-report.md's profiling.
+  for (let i = 0; i < GAME_PLY_CAP && !game.isGameOver(); i++) {
+    const moves = game.moves();
+    const san = moves[Math.floor(rand() * moves.length)];
+    game.move(san);
     fens.push(game.fen());
   }
   return fens;

@@ -56,8 +56,20 @@ abstract contract ChessDifferentialBase is Test {
         PositionCase[] memory cases = abi.decode(vm.parseBytes(vm.readFile(path)), (PositionCase[]));
         require(cases.length > 0, "empty vector chunk");
         for (uint256 i = 0; i < cases.length; i++) {
-            _checkPosition(cases[i]);
+            // Routed through an external self-call so each position's staticcall return data (applyMove,
+            // successor, ...) lands in a fresh EVM memory space instead of accumulating across every position
+            // in the chunk. EVM memory cost is quadratic in total memory used within one call frame; checking
+            // a large deep-mode chunk (100+ positions, each with dozens of legal/illegal moves) directly in
+            // this loop measurably ran out of gas partway through a chunk even after chunking itself was
+            // fixed to reset memory only between chunks (see ChessDifferentialDeep.t.sol). `this.` is a real
+            // CALL, not a jump, so memory resets per position while assertion/failure state (which forge-std
+            // tracks in contract storage, not call-local memory) still accumulates correctly.
+            this.checkPositionExternal(cases[i]);
         }
+    }
+
+    function checkPositionExternal(PositionCase calldata c) external view {
+        _checkPosition(c);
     }
 
     function _checkPosition(PositionCase memory c) internal view {
