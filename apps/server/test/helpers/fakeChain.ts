@@ -29,6 +29,9 @@ export class FakeChain implements ChainReader {
     return this.hubLimits;
   }
   async genesisHash() { return this.genesis; }
+  /** Canonical block hashes by height, for the indexer's reorg-vs-lag check; unset heights read as null. */
+  hashes = new Map<bigint, Hex>();
+  async blockHash(block: bigint) { return this.hashes.get(block) ?? null; }
 }
 
 export function testConfig(over: Partial<ServerConfig> = {}): ServerConfig {

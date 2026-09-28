@@ -479,6 +479,10 @@ describe("hub scans", () => {
     expect(kinds.at(-1)).toMatch(/Finalized|Reclaimed/);
     const created = events.find((e) => e.kind === "ChannelCreated" && e.channelId === id);
     expect(created && created.kind === "ChannelCreated" && created.params).toEqual(params);
+    // Plan 4.5 Task 10: each event carries its block's hash (the server indexer tells reorgs from a lagging log
+    // index by it).
+    const block = await x.hub.client.getBlock({ blockNumber: created!.blockNumber });
+    expect(created!.blockHash).toBe(block.hash);
 
     const all = await x.hub.disputeEvents(id, 0n);
     expect(all.map((e) => e.kind)).toEqual(["Challenged"]); // Bob never responded

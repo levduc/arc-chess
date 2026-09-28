@@ -23,6 +23,10 @@ export interface ChainReader {
    *  was last opened against). Used at startup to detect a database that belongs to a different chain/deployment
    *  than the one this config points at. */
   genesisHash(): Promise<Hex>;
+  /** The hash of the canonical block at `block` (null if there is none) -- the indexer asks before unwinding an
+   *  event that vanished from `getLogs`, to tell a reorg from a lagging log index. Optional: without it, a
+   *  vanished event is always treated as reorged out. */
+  blockHash?(block: bigint): Promise<Hex | null>;
 }
 
 const NOW_CACHE_MS = 1000;
@@ -93,6 +97,14 @@ export class RpcChainReader implements ChainReader {
 
   hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
     return this.hub.hubEvents(fromBlock, toBlock);
+  }
+
+  async blockHash(block: bigint): Promise<Hex | null> {
+    const b = await this.client.getBlock({ blockNumber: block }).catch((err: unknown) => {
+      if (err instanceof Error && err.name === "BlockNotFoundError") return null;
+      throw err;
+    });
+    return b?.hash ?? null;
   }
 
   /** Immutable once the chain exists, so memoized forever like `timeoutBounds` -- with the same un-stick-on-

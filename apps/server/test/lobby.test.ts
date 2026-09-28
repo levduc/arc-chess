@@ -376,6 +376,9 @@ describe("lobby http", () => {
       saveChannelRow: (row) => real.saveChannelRow(row),
       channelRowsFor: (player) => real.channelRowsFor(player),
       recentChannels: (limit) => real.recentChannels(limit),
+      deleteChannelRow: (id) => real.deleteChannelRow(id),
+      reorgWatch: () => real.reorgWatch(),
+      setReorgWatch: (ids) => real.setReorgWatch(ids),
       close: () => real.close(),
     };
 

@@ -21,13 +21,27 @@ export type ChannelRow = {
   /** The last hub event applied to this row (block, logIndex) -- lets `Indexer.apply` ignore an event it has
    *  already folded in when a partially-processed chunk is re-scanned. Optional so older/hand-built rows
    *  (e.g. the foundation test's literal) still round-trip. */
-  lastEvent?: { block: bigint; logIndex: number };
+  lastEvent?: { block: bigint; logIndex: number; blockHash?: Hex };
+  /** Plan 4.5 Task 10 (reorgs): one entry per event applied inside the indexer's rescan window, oldest first, each
+   *  with this row as it was *before* that event (`null` for `ChannelCreated`: no row before it). If a later scan
+   *  of the window no longer returns one of these events (reorged out), the row is rolled back to that entry's
+   *  `before` and the events the chain still has are re-applied. Entries older than the window are final and
+   *  dropped. */
+  undo?: UndoEntry[];
   /** Set when the indexer applies `Finalized`/`Reclaimed`: the relay's verified latest state and the games count
    *  derived from it, kept so reputation and `/api/channels` survive the relay cache being pruned. */
   games?: number;
   finalState?: SignedState | null;
   /** Wall-clock ms at which the indexer applied `Finalized`/`Reclaimed`; the relay cache is pruned a day later. */
   finalizedAt?: number;
+};
+
+export type UndoEntry = {
+  block: bigint;
+  logIndex: number;
+  blockHash?: Hex;
+  kind: string;
+  before: ChannelRow | null;
 };
 
 export type OfferEntry = { signed: SignedOffer; acceptance: SignedAcceptance | null; match: MatchEvent | null };
@@ -71,6 +85,11 @@ export interface Repo {
   saveChannelRow(row: ChannelRow): void;
   channelRowsFor(player: Address): ChannelRow[];
   recentChannels(limit: number): ChannelRow[];
+  /** Removes a channel's indexer row (its `ChannelCreated` was reorged out: the channel no longer exists). */
+  deleteChannelRow(id: Hex): void;
+  /** The channels whose rows hold `undo` entries (events inside the indexer's rescan window), for reorg checks. */
+  reorgWatch(): Hex[];
+  setReorgWatch(ids: Hex[]): void;
   close(): void;
 }
 
@@ -437,6 +456,19 @@ export class SqliteRepo implements Repo {
     const p = player.toLowerCase();
     const rows = this.db.prepare("SELECT body FROM channels WHERE a = ? OR b = ?").all(p, p) as Array<{ body: string }>;
     return rows.map((r) => fromWire<ChannelRow>(r.body));
+  }
+
+  deleteChannelRow(id: Hex): void {
+    this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(id);
+  }
+
+  reorgWatch(): Hex[] {
+    const v = this.getMeta("reorg_watch");
+    return v === null ? [] : (JSON.parse(v) as Hex[]);
+  }
+
+  setReorgWatch(ids: Hex[]): void {
+    this.setMeta("reorg_watch", JSON.stringify(ids));
   }
 
   recentChannels(limit: number): ChannelRow[] {

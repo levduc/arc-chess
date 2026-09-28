@@ -130,6 +130,93 @@ describe("Indexer.poll and Indexer.apply", () => {
     repo.close();
   });
 
+  describe("Plan 4.5 Task 10: reorgs inside the rescan window", () => {
+    const h = (n: number): Hex => `0x${n.toString(16).padStart(64, "0")}`;
+    function reorgFixture() {
+      const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks: 10, startBlock: 0n } });
+      const repo = new SqliteRepo(":memory:");
+      const chain = new FakeChain();
+      const fx = makeChannelFixture(cfg);
+      const at = (block: bigint, hash: Hex, logIndex = 0) => ({ blockNumber: block, logIndex, channelId: fx.id, blockHash: hash });
+      for (const b of [90n, 91n, 92n, 96n]) chain.hashes.set(b, h(Number(b)));
+      const created: HubEvent = { ...at(90n, h(90)), kind: "ChannelCreated", params: fx.params };
+      const dep0: HubEvent = { ...at(91n, h(91)), kind: "Deposited", player: 0, amount: fx.params.deposit };
+      const dep1: HubEvent = { ...at(92n, h(92)), kind: "Deposited", player: 1, amount: fx.params.deposit };
+      const opened: HubEvent = { ...at(92n, h(92), 1), kind: "Opened" };
+      const challenge = (block: bigint, hash: Hex): HubEvent => ({
+        ...at(block, hash), kind: "Challenged", challenger: 0, turnNum: 1n, deadline: 1_000n,
+        signed: { state: rawStateAt(fx, 1n), sigA: "0x", sigB: "0x" },
+      });
+      chain.events = [created, dep0, dep1, opened, challenge(96n, h(96))];
+      chain.block = 100n;
+      return { cfg, repo, chain, fx, challenge, indexer: new Indexer(repo, chain, cfg, noopLog) };
+    }
+
+    it("a Challenged event reorged out rolls the row back to Open; re-included a block later it counts once", async () => {
+      const { repo, chain, fx, challenge, indexer } = reorgFixture();
+      await indexer.poll();
+      expect(repo.channelRow(fx.id)?.phase).toBe("Challenged");
+      expect(repo.channelRow(fx.id)?.challenges).toEqual([1, 0]);
+
+      // Reorged out: block 96 replaced by an empty one.
+      chain.events = chain.events.filter((e) => e.kind !== "Challenged");
+      chain.hashes.set(96n, h(0x96_01));
+      await indexer.poll();
+      expect(repo.channelRow(fx.id)?.phase).toBe("Open");
+      expect(repo.channelRow(fx.id)?.challenges).toEqual([0, 0]);
+      expect(repo.channelRow(fx.id)?.registered).toBe(null);
+
+      // Re-included: the same transaction mined at block 101. Before the fix this read Challenged with [2, 0].
+      chain.hashes.set(101n, h(101));
+      chain.events = [...chain.events, challenge(101n, h(101))];
+      chain.block = 101n;
+      await indexer.poll();
+      expect(repo.channelRow(fx.id)?.phase).toBe("Challenged");
+      expect(repo.channelRow(fx.id)?.challenges).toEqual([1, 0]);
+      await indexer.poll(); // re-read again: still counted once
+      expect(repo.channelRow(fx.id)?.challenges).toEqual([1, 0]);
+      repo.close();
+    });
+
+    it("an event a lagging log index stops returning is not unwound while its block is still canonical", async () => {
+      const { repo, chain, fx, indexer } = reorgFixture();
+      await indexer.poll();
+      const all = chain.events;
+      chain.events = all.filter((e) => e.kind !== "Challenged"); // block 96 unchanged: only the log index lags
+      await indexer.poll();
+      expect(repo.channelRow(fx.id)?.phase).toBe("Challenged");
+      chain.events = all;
+      await indexer.poll();
+      expect(repo.channelRow(fx.id)?.challenges).toEqual([1, 0]);
+      repo.close();
+    });
+
+    it("a reorg that drops the channel's creation deletes the row; beyond the window nothing is unwound", async () => {
+      const { repo, chain, fx, indexer } = reorgFixture();
+      await indexer.poll();
+      chain.events = [];
+      for (const b of [90n, 91n, 92n, 96n]) chain.hashes.set(b, h(Number(b) + 0x1000));
+      await indexer.poll();
+      expect(repo.channelRow(fx.id)).toBe(null);
+      expect(repo.reorgWatch()).toEqual([]);
+
+      // A second life, then the window moves 40 blocks on: its entries are final and pruned.
+      const again = reorgFixture();
+      await again.indexer.poll();
+      again.chain.block = 140n;
+      await again.indexer.poll(); // the cursor moves to 140
+      await again.indexer.poll(); // this poll's window starts at 109: every entry is behind it
+      expect(again.repo.channelRow(again.fx.id)?.undo).toEqual([]);
+      expect(again.repo.reorgWatch()).toEqual([]);
+      again.chain.events = [];
+      again.chain.block = 141n;
+      await again.indexer.poll();
+      expect(again.repo.channelRow(again.fx.id)?.phase).toBe("Challenged"); // older than the window: final
+      repo.close();
+      again.repo.close();
+    });
+  });
+
   it("counts challenges, answers and a timeout loss", () => {
     const cfg = testConfig();
     const repo = new SqliteRepo(":memory:");

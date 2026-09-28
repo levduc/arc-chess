@@ -39,7 +39,15 @@ export type DisputeEvent = {
 };
 
 /** One hub event, for any channel, decoded from `getContractEvents` with `eventName` omitted (hubEvents). */
-export type HubEvent = { blockNumber: bigint; logIndex: number; channelId: Hex } & (
+export type HubEvent = {
+  blockNumber: bigint;
+  logIndex: number;
+  channelId: Hex;
+  /** The hash of the block the event was read from -- lets an indexer tell a reorg (the block at this height was
+   *  replaced) from a lagging `getLogs` index (the block is still canonical; its logs are just not served yet).
+   *  Optional so hand-built events (tests) need not invent one. */
+  blockHash?: Hex;
+} & (
   | { kind: "ChannelCreated"; params: Params }
   | { kind: "Deposited"; player: PlayerIndex; amount: bigint }
   | { kind: "Opened" }
@@ -285,7 +293,7 @@ export class HubClient {
       const args = log.args as Record<string, unknown>;
       if (typeof args.channelId !== "string") continue;
       const channelId = args.channelId as Hex;
-      const base = { blockNumber: log.blockNumber, logIndex: log.logIndex, channelId };
+      const base = { blockNumber: log.blockNumber, logIndex: log.logIndex, channelId, blockHash: log.blockHash };
       switch (log.eventName) {
         case "ChannelCreated":
           events.push({ ...base, kind: "ChannelCreated", params: decodeParams(args.params as Hex) });
