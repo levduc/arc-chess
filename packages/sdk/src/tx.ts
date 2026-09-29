@@ -1,5 +1,6 @@
 import {
   BaseError,
+  ExecutionRevertedError,
   InsufficientFundsError,
   NonceTooLowError,
   TransactionNotFoundError,
@@ -7,6 +8,7 @@ import {
   createPublicClient,
   createWalletClient,
   http,
+  keccak256,
   type Address,
   type Chain,
   type Hex,
@@ -48,6 +50,12 @@ export interface TxSender {
   /** False if `send` cannot honour the nonce/fee overrides (default: true). */
   readonly supportsReplacement?: boolean;
   send(tx: TxRequest): Promise<Hex>;
+  /** Optional (round 5, I2): signs `tx` (nonce, gas and fees set) without sending it, so a tracking sender knows the
+   *  hash before the send -- a transaction whose send response is lost is still tracked by its hash. Both this and
+   *  `sendRawTransaction`, or neither. */
+  signTransaction?(tx: TxRequest): Promise<Hex>;
+  /** Sends a transaction signed by `signTransaction`; resolves with its hash. */
+  sendRawTransaction?(raw: Hex): Promise<Hex>;
   /** A tracking sender's per-nonce bookkeeping, driven by `waitOrReplace` (see SerialTxSender). */
   readonly tracker?: TxTracker;
 }
@@ -92,6 +100,22 @@ export class LocalKeyTxSender implements TxSender {
 
   get address(): Address {
     return this.account.address;
+  }
+
+  /** Signs locally (round 5, I2). Needs `nonce` and `gas`; fees default to the node's estimate. */
+  async signTransaction(tx: TxRequest): Promise<Hex> {
+    if (tx.nonce === undefined || tx.gas === undefined) throw new Error("signTransaction needs a nonce and a gas limit");
+    const base = { chainId: this.chain.id, to: tx.to, data: tx.data, value: tx.value, gas: tx.gas, nonce: tx.nonce };
+    if (tx.gasPrice !== undefined) return this.account.signTransaction({ ...base, type: "legacy", gasPrice: tx.gasPrice });
+    const fees =
+      tx.maxFeePerGas !== undefined
+        ? { maxFeePerGas: tx.maxFeePerGas, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? 0n }
+        : ((await this.reader.estimateFeesPerGas()) as { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint });
+    return this.account.signTransaction({ ...base, type: "eip1559", ...fees });
+  }
+
+  sendRawTransaction(raw: Hex): Promise<Hex> {
+    return this.wallet.sendRawTransaction({ serializedTransaction: raw });
   }
 
   async send(tx: TxRequest): Promise<Hex> {
@@ -352,19 +376,45 @@ export class SerialTxSender implements TxSender, TxTracker {
     if (feeOf(estimate) > room.balance) throw new TxInsufficientFundsError(this.address);
     const fees = clampFees(estimate, room.cap);
     for (let attempt = 0; ; attempt++) {
-      try {
-        const hash = await this.inner.send({ ...tx, nonce, gas, ...fees });
-        this.entries.set(nonce, { nonce, lastFees: fees, hashes: new Set([hash]), state: "waiting", gas });
-        return hash;
-      } catch (err) {
-        // A pure count race (another sender on this key, a lagging count): retried once, at the next nonce.
-        if (attempt === 0 && isNonceUsedError(err)) {
-          this.markMined(nonce);
-          nonce = Math.max(await next(), nonce + 1);
-          continue;
-        }
-        throw this.classify(err);
+      // Round 5 (I2): recorded before the send, so a transaction the node took although its response was lost is
+      // still tracked (released, at its nonce, with its fees and -- when signed locally -- its hash).
+      const e: Entry = { nonce, lastFees: fees, hashes: new Set(), state: "waiting", gas };
+      this.entries.set(nonce, e);
+      const r = await this.transmit(reader, { ...tx, nonce, gas, ...fees });
+      if (r.hash) e.hashes.add(r.hash);
+      if (r.err === undefined) return r.hash!;
+      const err = r.err;
+      // A pure count race (another sender on this key, a lagging count): retried once, at the next nonce.
+      if (attempt === 0 && isNonceUsedError(err)) {
+        this.entries.delete(nonce);
+        this.markMined(nonce);
+        nonce = Math.max(await next(), nonce + 1);
+        continue;
       }
+      if (isDefinitive(err)) this.entries.delete(nonce); // refused: nothing is pending at that nonce
+      else e.state = "released"; // it may be pending: the next send replaces it
+      throw this.classify(err);
+    }
+  }
+
+  /**
+   * Sends `req` (nonce, gas and fees set). When the inner sender can sign locally, the hash is known before the send
+   * (round 5, I2). A failed send whose transaction the node nevertheless holds (a lost response, or a transport
+   * retry of a send that went through, refused as "nonce too low" / "already known") is a success.
+   */
+  private async transmit(reader: TrackerClient, req: TxRequest): Promise<{ hash?: Hex; err?: unknown }> {
+    const inner = this.inner;
+    let raw: Hex | undefined;
+    let hash: Hex | undefined;
+    if (inner.signTransaction && inner.sendRawTransaction) {
+      raw = await inner.signTransaction(req);
+      hash = keccak256(raw);
+    }
+    try {
+      return { hash: raw ? await inner.sendRawTransaction!(raw) : await inner.send(req) };
+    } catch (err) {
+      if (hash && (await reader.getTransaction({ hash }).then(() => true, () => false))) return { hash };
+      return { hash, err };
     }
   }
 
@@ -385,28 +435,35 @@ export class SerialTxSender implements TxSender, TxTracker {
     else this.affordable(e.nonce, estimate!, room);
     fees = clampFees(fees, bigMin(room.cap, room.balance));
     for (;;) {
-      try {
-        const hash = await this.inner.send({ ...tx, nonce: e.nonce, gas, ...fees });
-        e.hashes.add(hash);
+      const r = await this.transmit(reader, { ...tx, nonce: e.nonce, gas, ...fees });
+      if (r.err === undefined) {
+        e.hashes.add(r.hash!);
         e.lastFees = fees;
         e.state = "waiting";
         e.gas = gas;
-        return hash;
-      } catch (err) {
-        if (isNonceUsedError(err)) {
-          this.entries.delete(e.nonce);
-          this.markMined(e.nonce);
-          throw new TxNonceUsedError(e.nonce, err);
-        }
-        if (!isUnderpriced(err)) throw this.classify(err);
-        // The pool holds a transaction priced above what we know: +50 %, up to the cap.
-        const limit = bigMin(room.cap, room.balance);
-        const raised = clampFees(raise(fees, 3n, 2n), limit);
-        if (feeOf(raised) <= feeOf(fees)) {
-          throw limit < room.cap ? new TxInsufficientFundsError(this.address, err) : new TxFeeCapError(e.nonce, room.cap, undefined, err);
-        }
-        fees = raised;
+        return r.hash!;
       }
+      const err = r.err;
+      if (isNonceUsedError(err)) {
+        this.entries.delete(e.nonce);
+        this.markMined(e.nonce);
+        throw new TxNonceUsedError(e.nonce, err);
+      }
+      if (!isDefinitive(err)) {
+        // Round 5 (I2): it may be pending -- still released, now with this attempt's hash and fees.
+        if (r.hash) e.hashes.add(r.hash);
+        e.lastFees = maxFees(e.lastFees, fees);
+        e.gas = gas;
+        throw err;
+      }
+      if (!isUnderpriced(err)) throw this.classify(err);
+      // The pool holds a transaction priced above what we know: +50 %, up to the cap.
+      const limit = bigMin(room.cap, room.balance);
+      const raised = clampFees(raise(fees, 3n, 2n), limit);
+      if (feeOf(raised) <= feeOf(fees)) {
+        throw limit < room.cap ? new TxInsufficientFundsError(this.address, err) : new TxFeeCapError(e.nonce, room.cap, undefined, err);
+      }
+      fees = raised;
     }
   }
 
@@ -420,16 +477,16 @@ export class SerialTxSender implements TxSender, TxTracker {
     const wanted = hasFees(feesOf(tx)) ? feesOf(tx) : replacementFees(e.lastFees, estimate);
     if (hasFees(e.lastFees)) this.affordable(nonce, bumpFees(e.lastFees), room);
     const fees = clampFees(wanted, bigMin(room.cap, room.balance));
-    try {
-      const hash = await this.inner.send({ ...tx, gas, ...fees });
-      e.hashes.add(hash);
+    const r = await this.transmit(reader, { ...tx, gas, ...fees });
+    if (r.err === undefined || !isDefinitive(r.err)) {
+      // Sent -- or maybe sent (round 5, I2): either way the wait polls it from now on.
+      if (r.hash) e.hashes.add(r.hash);
       e.lastFees = maxFees(e.lastFees, fees);
       e.gas = gas;
-      return hash;
-    } catch (err) {
-      // A used nonce is left to the wait: its receipt re-check tells its own transaction from an earlier intent's.
-      throw this.classify(err);
     }
+    if (r.err === undefined) return r.hash!;
+    // A used nonce is left to the wait: its receipt re-check tells its own transaction from an earlier intent's.
+    throw this.classify(r.err);
   }
 
   /** The fee cap, and the most per gas the balance can pay for this transaction. */
@@ -470,6 +527,19 @@ export function isNonceUsedError(err: unknown): boolean {
 export function isInsufficientFundsError(err: unknown): boolean {
   if (err instanceof BaseError && err.walk((e) => e instanceof InsufficientFundsError)) return true;
   return /insufficient funds/i.test(errorText(err));
+}
+
+/** True for a send the node definitely refused (nothing of it can be pending): a used nonce, underpriced, not
+ *  affordable, or reverted. Anything else (a transport failure, a timeout, an unknown error) may have reached the
+ *  node, so the transaction is treated as possibly pending (round 5, I2). */
+function isDefinitive(err: unknown): boolean {
+  return (
+    isNonceUsedError(err) ||
+    isUnderpriced(err) ||
+    isInsufficientFundsError(err) ||
+    (err instanceof BaseError && err.walk((e) => e instanceof ExecutionRevertedError) !== null) ||
+    /execution reverted/i.test(errorText(err))
+  );
 }
 
 /** True for a replacement refused because it does not outbid the transaction the pool holds at its nonce. */

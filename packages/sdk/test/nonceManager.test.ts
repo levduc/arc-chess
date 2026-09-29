@@ -13,7 +13,7 @@
  * so racing nonces can be expressed exactly. The rest run on the suite's Anvil with automine off.
  */
 import { describe, expect, it } from "vitest";
-import { TransactionNotFoundError, TransactionReceiptNotFoundError, type Hex, type TransactionReceipt } from "viem";
+import { TransactionNotFoundError, TransactionReceiptNotFoundError, keccak256, type Hex, type TransactionReceipt } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import * as sdk from "../src/index.js";
 import {
@@ -48,7 +48,7 @@ type PoolTx = { hash: Hex; nonce: number; to: Hex; data: Hex; value: bigint; gas
 
 /** A stub node with a nonce-keyed pool. `mine()` mines every consecutive pending nonce whose fee meets `market`.
  *  `lostResponse` makes the next send be accepted by the node while its response is lost (a transport error). */
-function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
+function mempool(opts: { balance?: bigint; gas?: bigint; signing?: boolean } = {}) {
   const state = { market: 0n, lostResponse: false, onEstimateGas: undefined as (() => void) | undefined };
   let latest = 0;
   let seq = 1;
@@ -65,12 +65,12 @@ function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
     while (pool.has(n)) n++;
     return n;
   };
-  const inner: TxSender = {
-    address: ADDR,
-    async send(tx: TxRequest) {
+  /** Signed-but-unsent transactions (the `signing` variant): raw -> request. */
+  const signed = new Map<Hex, TxRequest>();
+  const accept = (tx: TxRequest, hash: Hex) => {
       const nonce = tx.nonce ?? pendingCount();
       const t: PoolTx = {
-        hash: hx(seq++),
+        hash,
         nonce,
         to: tx.to,
         data: tx.data,
@@ -92,7 +92,24 @@ function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
         throw new Error("fetch failed: socket hang up"); // the node has it; the response never arrived
       }
       return t.hash;
+  };
+  const inner: TxSender = {
+    address: ADDR,
+    async send(tx: TxRequest) {
+      return accept(tx, hx(seq++));
     },
+    ...(opts.signing
+      ? {
+          async signTransaction(tx: TxRequest) {
+            const raw = hx(0xf000000 + seq++);
+            signed.set(raw, tx);
+            return raw;
+          },
+          async sendRawTransaction(raw: Hex) {
+            return accept(signed.get(raw)!, keccak256(raw));
+          },
+        }
+      : {}),
   };
   const receiptOf = (t: PoolTx) => ({ transactionHash: t.hash, status: "success", blockNumber: 1n }) as unknown as TransactionReceipt;
   const client = {
@@ -540,5 +557,78 @@ describe("round 5, I1: a dropped transaction's old fees never block the key; ses
     expect(n.attempts.some((t) => t.maxFeePerGas > 4_000n)).toBe(true); // above what a wallet (4 x estimate) may pay
     expect(n.attempts.every((t) => t.maxFeePerGas * t.gas + t.value <= 21_000n * 10_000n)).toBe(true);
     expect(last).toBeInstanceOf(TxInsufficientFundsError); // stopped by the balance, never by a fee cap
+  });
+});
+
+describe("round 5, I2: a send whose response is lost is still tracked", () => {
+  it("E4a: the node took it but the response was lost: the entry is recorded (released), and the resend replaces it at its nonce -- one lands", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client);
+    await w.send({ to: to(5), data: "0x01" }); // nonce 0, waiting
+    n.state.lostResponse = true;
+    const lost = await w.send({ to: to(5), data: "0x02" }).catch((e: unknown) => e);
+    expect(lost).toBeInstanceOf(Error);
+    // Before: nothing was recorded for nonce 1, although the node holds a transaction there.
+    expect(w.tracked().find((t) => t.nonce === 1)).toMatchObject({ state: "released", lastFees: { maxFeePerGas: 1_000n } });
+    const again = await w.send({ to: to(5), data: "0x02" }); // the caller's next pass sends it again
+    expect(n.byHash(again).nonce).toBe(1);
+    n.mine();
+    expect(n.landed.filter((t) => t.data === "0x02")).toHaveLength(1);
+  });
+
+  it("a definitive refusal of a fresh send leaves no entry behind", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client);
+    await expect(w.send({ to: to(5), data: "0x", value: 10n ** 30n })).rejects.toBeInstanceOf(TxInsufficientFundsError);
+    const realSend = n.inner.send.bind(n.inner);
+    n.inner.send = async (tx) => {
+      await realSend(tx).catch(() => undefined);
+      throw new Error("nonce too low"); // refused (after the one count-race retry too)
+    };
+    await expect(w.send({ to: to(5), data: "0x" })).rejects.toThrow(/nonce too low/);
+    expect(w.tracked()).toEqual([]);
+  });
+
+  it("a signing sender: a lost response is recovered by the precomputed hash; if the node cannot be asked, the entry keeps that hash", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    n.state.lostResponse = true;
+    const h = await w.send({ to: to(5), data: "0x02" }); // the node holds it: the send succeeds after all
+    expect(h).toBe(n.pool.get(0)!.hash);
+    expect(w.tracked()).toMatchObject([{ nonce: 0, state: "waiting", hashes: [h] }]);
+    n.mine();
+    // Now the node cannot even be asked right after the lost response.
+    const realGet = n.rawClient.getTransaction;
+    n.rawClient.getTransaction = async () => {
+      throw new Error("fetch failed");
+    };
+    n.state.lostResponse = true;
+    await expect(w.send({ to: to(5), data: "0x03" })).rejects.toThrow(/fetch failed/);
+    n.rawClient.getTransaction = realGet;
+    const lostHash = n.pool.get(1)!.hash;
+    expect(w.tracked().find((t) => t.nonce === 1)).toMatchObject({ state: "released", hashes: [lostHash] });
+    n.mine(); // it lands
+    const next = await w.send({ to: to(5), data: "0x04" }); // prune finds its receipt: fresh at nonce 2
+    expect(n.byHash(next).nonce).toBe(2);
+    expect(n.landed.map((t) => t.data)).toEqual(["0x02", "0x03"]);
+  });
+
+  it("a signing sender: a transport retry that reads 'nonce too low' for our own landed transaction is success, not a count race", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    const realRaw = n.inner.sendRawTransaction!.bind(n.inner);
+    let first = true;
+    n.inner.sendRawTransaction = async (raw: Hex) => {
+      if (!first) return realRaw(raw);
+      first = false;
+      await realRaw(raw); // the first try went through and was mined...
+      n.mine();
+      throw new Error("nonce too low"); // ...and the transport's retry of it is refused
+    };
+    const h = await w.send({ to: to(5), data: "0x02", value: 3n });
+    n.mine();
+    // Before: the "count race" retry re-sent it at nonce 1, and it landed twice.
+    expect(n.landed.filter((t) => t.value === 3n)).toHaveLength(1);
+    expect(n.byHash(h).nonce).toBe(0);
   });
 });
