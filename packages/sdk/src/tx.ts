@@ -143,6 +143,7 @@ export async function waitOrReplace(
   const pollMs = opts.pollMs ?? RECEIPT_POLL_MS;
   const maxReplacements = opts.maxReplacements ?? MAX_REPLACEMENTS;
   const hashes: Hex[] = [hash];
+  let lastSendError: unknown;
   const minedOne = async (): Promise<TransactionReceipt | null> => {
     for (const h of hashes) {
       const r = await client.getTransactionReceipt({ hash: h }).catch((err: unknown) => {
@@ -153,7 +154,7 @@ export async function waitOrReplace(
     }
     return null;
   };
-  for (;;) {
+  for (let round = 0; ; round++) {
     const current = hashes[hashes.length - 1];
     // Plan 4.5 Task 10 re-review (M1): one round polls the receipts of every hash sent so far -- the original can
     // still be mined while the wait is on its replacement (viem's waitForTransactionReceipt watches one hash).
@@ -176,7 +177,12 @@ export async function waitOrReplace(
       if (r) return r;
       continue;
     }
-    if (hashes.length > maxReplacements) throw new TxStuckError(hashes);
+    if (round >= maxReplacements) {
+      // A replacement send that failed (e.g. it reverted in gas estimation) explains best why we are stuck; the
+      // caller classifies it (HubClient.write maps an execution revert to HubRevertError, like the original send).
+      if (lastSendError !== undefined) throw lastSendError;
+      throw new TxStuckError(hashes);
+    }
     const estimate = await client.estimateFeesPerGas().catch(() => undefined);
     const replacement: TxRequest =
       pending.maxFeePerGas !== undefined && pending.maxFeePerGas !== null
@@ -193,7 +199,9 @@ export async function waitOrReplace(
       // e.g. "nonce too low": the original was mined after all
       const r = await minedOne();
       if (r) return r;
-      throw err;
+      // Plan 4.5 Task 10 re-review (I1): nothing is mined, so the original is still pending -- keep waiting on the
+      // hashes already sent rather than failing a transaction that may still land.
+      lastSendError = err;
     }
   }
 }

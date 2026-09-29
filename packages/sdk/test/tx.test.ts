@@ -6,6 +6,8 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  BaseError,
+  ExecutionRevertedError,
   HttpRequestError,
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
@@ -258,5 +260,42 @@ describe("waitOrReplace: Task 10 re-review", () => {
     expect(n.sent).toHaveLength(2); // the replacement was sent...
     // ...but the wait noticed the original at once, not only when round 2 ran out (before: ~800 ms).
     expect(Date.now() - t0).toBeLessThan(750);
+  });
+});
+
+describe("waitOrReplace: a failing replacement send (Task 10 re-review I1)", () => {
+  const revert = () =>
+    new ExecutionRevertedError({ cause: new BaseError("execution reverted", { details: "execution reverted: WrongPhase()" }) });
+
+  it("keeps waiting on the original when its replacement's send reverts, and returns the original once mined", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const realSend = n.sender.send.bind(n.sender);
+    let refused = 0;
+    n.sender.send = async (tx) => {
+      if (tx.nonce !== undefined) {
+        refused++;
+        setTimeout(() => n.mined.add(hash), 30); // the original lands shortly after
+        throw revert();
+      }
+      return realSend(tx);
+    };
+    // Before the fix the replacement's revert was thrown at once, for a transaction that was still pending.
+    const r = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 100, pollMs: 5 });
+    expect(r.transactionHash).toBe(hash);
+    expect(refused).toBe(1);
+  });
+
+  it("if it gives up in the end, HubClient.write reports that revert as a HubRevertError, like the original send's", async () => {
+    const n = stubNode();
+    const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
+    const realSend = n.sender.send.bind(n.sender);
+    n.sender.send = async (tx) => {
+      if (tx.nonce !== undefined) throw revert(); // every replacement reverts; the original never lands
+      return realSend(tx);
+    };
+    const hub = new HubClient(TO, client);
+    const err = await hub.timeout(n.sender, h(1), { receiptTimeoutMs: 20 }).catch((e) => e);
+    expect(err).toBeInstanceOf(HubRevertError); // before: the raw ExecutionRevertedError
   });
 });

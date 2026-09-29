@@ -383,7 +383,14 @@ export class HubClient {
       throw err;
     }
     // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
-    const receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs });
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs });
+    } catch (err) {
+      // A replacement send can revert too (Plan 4.5 Task 10 re-review I1): classified like the original send.
+      if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      throw err;
+    }
     if (receipt.status !== "success") throw new HubRevertError(undefined, new Error(`transaction ${hash} reverted`));
     return receipt;
   }
