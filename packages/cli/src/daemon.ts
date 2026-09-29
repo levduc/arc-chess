@@ -116,6 +116,9 @@ export type ChannelHandle = {
   /** Final review C1: `wait()` has already woken for the current `sessionGasLow` episode (so it does not return at
    *  once on every call while the wallet stays empty). */
   sessionGasLowWoken: boolean;
+  /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
+   *  woken for it yet: drives the one-shot `settled` attention. */
+  settledWake: boolean;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -721,6 +724,7 @@ export class ArenaDaemon {
       refills: 0,
       sessionGasLow: null,
       sessionGasLowWoken: false,
+      settledWake: false,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -1259,12 +1263,15 @@ export class ArenaDaemon {
 
   /** Marks a channel settled or retired, persists it, and leaves its relay channel: nothing is sent on it again,
    *  and its slot on the host connection is freed (I2). Idempotent. */
-  private markFinalized(l: ChannelHandle): void {
+  private markFinalized(l: ChannelHandle, phase: string): void {
     // Transient failures no longer matter once the channel is settled -- a failed close submission (the other
     // side's went through), a failed pass or dispute scan -- and a settled channel is never watched again, so
     // nothing else would ever clear them.
     if (/^(close|watch|events):/.test(l.lastError ?? "")) l.lastError = null;
     if (l.record.finalized) return;
+    // Final review m4: an agent waiting after its close (or on a dispute) is woken once by the settlement. A channel
+    // retired without our deposit (None/Funding) never opened: nothing to report.
+    if (phase === "Finalized" || phase === "Reclaimed") l.settledWake = true;
     l.record = { ...l.record, finalized: true };
     this.records.saveChannel(l.record);
     this.opts.relay.leave(l.record.channelId);
@@ -1304,7 +1311,7 @@ export class ArenaDaemon {
       // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
       // ChannelHub.sol) — mark it here, synchronously with our own confirmed tx, instead of only via the
       // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
-      this.markFinalized(l);
+      this.markFinalized(l, "Reclaimed");
     } else if (info.phase === "None" || (info.phase === "Funding" && !info.funded[me])) {
       // I4: the funding window closed and none of our money is in the channel (nobody funded, or only the
       // opponent did — theirs is theirs to reclaim). The channel can never open: retire it (abandoned), so it
@@ -1315,7 +1322,7 @@ export class ArenaDaemon {
       const fresh = await this.hub.channelInfo(id);
       if (!(fresh.phase === "None" || (fresh.phase === "Funding" && !fresh.funded[me]))) return true;
       this.log(`channel ${id}: funding window closed without our deposit; retiring it`);
-      this.markFinalized(l);
+      this.markFinalized(l, fresh.phase);
       await this.refreshChain(l);
       return true;
     }
@@ -1348,7 +1355,7 @@ export class ArenaDaemon {
 
   private async settleCheck(l: ChannelHandle): Promise<void> {
     const after = await this.hub.channelInfo(l.record.channelId);
-    if (after.phase === "Finalized" || after.phase === "Reclaimed") this.markFinalized(l);
+    if (after.phase === "Finalized" || after.phase === "Reclaimed") this.markFinalized(l, after.phase);
     await this.refreshChain(l);
   }
 
@@ -1386,7 +1393,7 @@ export class ArenaDaemon {
       // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:
       // `timeout()` itself only resolves one RPC round trip after Anvil mines the tx and flips the on-chain
       // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
-      this.markFinalized(l);
+      this.markFinalized(l, "Finalized");
     }
     // Final review C1: the dispute pass refills too (after its own transaction, so a respond it can still pay for
     // is never delayed by the refill's receipt wait): the next challenge must find the key able to pay.
@@ -1502,6 +1509,8 @@ export class ArenaDaemon {
           }
           st = this.statusOf(l, { ignoreSessionGasLow: true });
         }
+        // Final review m4: `settled` wakes one wait, then is gone.
+        if (st.attention === "settled") l.settledWake = false;
         if (st.attention) return { channelId: id, reason: st.attention };
       }
       const left = end - Date.now();
@@ -1520,6 +1529,7 @@ export class ArenaDaemon {
       lastProgressAt: l.lastProgressAt,
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
+      settled: l.settledWake,
     });
   }
 

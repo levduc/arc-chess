@@ -308,6 +308,28 @@ describe("ArenaDaemon core", () => {
     await expect(waiting).resolves.toEqual({ channelId: id, reason: "your-turn" });
   });
 
+  it("final review m4: wait() wakes once with reason 'settled' when a channel this player closed settles", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    // Alice's agent waits after its close: it is woken by the settlement (before: only by its own timeout).
+    const waiting = alice.daemon.wait({ timeoutMs: 20_000 });
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "settled" });
+    const st = await alice.daemon.status(id);
+    expect(st.phase).toBe("Finalized");
+    expect(st.attention).toBeNull(); // one wake: consumed
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    // Bob's side shows it in status until a wait takes it.
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "settled", 20_000, "bob sees settled");
+    await expect(bob.daemon.wait({ timeoutMs: 1_000 })).resolves.toEqual({ channelId: id, reason: "settled" });
+    expect((await bob.daemon.status(id)).attention).toBeNull();
+  });
+
   it("R8.4c: wait() resolves control-changed on a handoff even without new attention", async () => {
     const { alice, bob, id } = await matched();
     // Make it bob's turn, so alice has no `attention` for wait() to notice first.

@@ -32,7 +32,8 @@ export type ChannelStatus = {
     | "new-game-proposed"
     | "game-over"
     | "close-requested"
-    | "opponent-silent";
+    | "opponent-silent"
+    | "settled";
   suggestedActions: string[];
   lastError: string | null;
   /** Plan 4.5 Task 11 fix round (C2): the daemon-wide "too many watched offers" (or other subscribe-refusal)
@@ -57,6 +58,8 @@ export type StatusInput = {
   lobbyError?: string | null;
   /** Final review C1: why the session key's dispute gas is low and the wallet could not refill it, or null. */
   sessionGasLow?: string | null;
+  /** Final review m4: the channel settled while the daemon watched it and no `wait()` has woken for it yet. */
+  settled?: boolean;
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -123,6 +126,9 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     else if (opponentWantsToClose && over && !closing && newGame === "none") attention = "close-requested";
     else if (over && !closing && newGame === "none") attention = "game-over";
     else if (silent) attention = "opponent-silent";
+  } else if (input.settled && (phase === "Finalized" || phase === "Reclaimed") && record.controller === "agent") {
+    // Final review m4: one wake for the settlement (e.g. after this player's close), consumed by `wait()`.
+    attention = "settled";
   }
 
   const suggestedActions: string[] = [];
