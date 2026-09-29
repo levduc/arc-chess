@@ -220,12 +220,13 @@ export async function waitOrReplace(
     // Plan 4.5 Task 10 re-review (M1): one round polls the receipts of every hash sent so far -- the original can
     // still be mined while the wait is on its replacement (viem's waitForTransactionReceipt watches one hash).
     const roundEnd = Math.min(Date.now() + timeoutMs, opts.giveUpAt ?? Number.POSITIVE_INFINITY);
-    for (;;) {
+    for (let poll = 0; ; poll++) {
       const mined = await minedOne();
       if (mined) return mined;
       const left = roundEnd - Date.now();
       if (left <= 0) break;
-      await new Promise((r) => setTimeout(r, Math.min(pollMs, left)));
+      // Quick first polls (a transaction is usually mined within a block or two), then every `pollMs`.
+      await new Promise((r) => setTimeout(r, Math.min(pollMs, 50 * 2 ** poll, left)));
     }
     // The newest of our transactions the node still knows (an older one may outlive a dropped replacement).
     let pending: Awaited<ReturnType<typeof lookup>> = null;
