@@ -104,6 +104,7 @@ async function makePlayer(env: Env, key: Hex): Promise<{ proc: DaemonProcess; ho
     sessionGasWei: 10n ** 16n,
     pollMs: 200,
     logChunkBlocks: 50,
+    minChallengeTimeout: 60n, // these tests offer 600 s; the daemon's production floor is 900 s (final review I4)
   };
   initHome(home, config, key);
   const proc = await startDaemonProcess(home, { host: { minBackoffMs: 50, maxBackoffMs: 500 } });

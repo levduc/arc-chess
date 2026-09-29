@@ -510,6 +510,10 @@ export async function startStack(
         String(apiPort),
         "--poll-ms",
         "200",
+        // The suites use the hub's minimum challengeTimeout (60 s) and move chain time with increaseTime; the
+        // daemon's production floor is 900 s (final review I4).
+        "--min-challenge-timeout",
+        "60",
       ],
       home,
     );

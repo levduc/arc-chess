@@ -154,7 +154,8 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   const defaults = {
     deposit: bigint(defaultsRaw, "defaults.deposit", 1_000_000n),
     stakePerGame: bigint(defaultsRaw, "defaults.stakePerGame", 100_000n),
-    challengeTimeout: bigint(defaultsRaw, "defaults.challengeTimeout", 600n),
+    // Final review I4: daemons refuse a challengeTimeout under 900 s by default, so the published default matches.
+    challengeTimeout: bigint(defaultsRaw, "defaults.challengeTimeout", 900n),
   };
 
   const cliCommand = str(obj, "cliCommand", "arena");

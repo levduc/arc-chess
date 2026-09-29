@@ -36,7 +36,7 @@ import {
   type RelayMessage,
   type SignedState,
 } from "@arena/sdk";
-import { arenaPaths, isCanonicalId, DEFAULT_LOG_CHUNK_BLOCKS, type ArenaConfig } from "./config.js";
+import { arenaPaths, isCanonicalId, minChallengeTimeoutOf, DEFAULT_LOG_CHUNK_BLOCKS, type ArenaConfig } from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
@@ -330,6 +330,19 @@ export class ArenaDaemon {
     }
   }
 
+  /** Final review I4: refuses a `challengeTimeout` under this daemon's `minChallengeTimeout`. Missing a challenge
+   *  deadline can cost more than one stake (the challenger may time out on an old state), and a daemon restart, an
+   *  RPC outage or an agent that must move under a challenge can all take longer than the hub's 60 s minimum. */
+  private checkChallengeTimeout(challengeTimeout: bigint): void {
+    const min = minChallengeTimeoutOf(this.opts.config);
+    if (challengeTimeout < min) {
+      throw new DaemonError(
+        400,
+        `challengeTimeout ${challengeTimeout}s is below this daemon's minimum of ${min}s (minChallengeTimeout): a shorter window risks missing a challenge deadline`,
+      );
+    }
+  }
+
   async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
     // Plan 4.5 Task 11 fix round (C2): once the host has refused a subscribe, this connection's match delivery is
     // broken until restart -- a new offer would post fine (200) and then silently never learn of its match if it
@@ -343,6 +356,7 @@ export class ArenaDaemon {
     if (o.challengeTimeout < bounds.min || o.challengeTimeout > bounds.max) {
       throw new DaemonError(400, `challengeTimeout must be between ${bounds.min} and ${bounds.max} seconds`);
     }
+    this.checkChallengeTimeout(o.challengeTimeout);
     await this.checkDepositAllowed(o.deposit);
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
@@ -415,6 +429,8 @@ export class ArenaDaemon {
       if (so.offer.player.toLowerCase() === this.wallet.address.toLowerCase()) {
         throw new DaemonError(400, "cannot accept your own offer");
       }
+      // Final review I4: the offerer picks the timeout; a hostile 60 s one must not be accepted.
+      this.checkChallengeTimeout(so.offer.challengeTimeout);
       // Task 2 (spec §13): before generating a session key or signing anything.
       await this.checkDepositAllowed(so.offer.deposit);
       const sessionKey = generatePrivateKey();
@@ -544,6 +560,14 @@ export class ArenaDaemon {
       });
       if (problem) {
         this.log(`ignoring match for offer ${offerId}: ${problem}`);
+        return release();
+      }
+      // Final review I4: createOffer/acceptOffer refuse a short timeout, but the floor may have been raised since
+      // (a restart with a new config): a match below it is never funded.
+      if (m.params.challengeTimeout < minChallengeTimeoutOf(this.opts.config)) {
+        this.log(
+          `ignoring match for offer ${offerId}: challengeTimeout ${m.params.challengeTimeout}s is below this daemon's minChallengeTimeout (${minChallengeTimeoutOf(this.opts.config)}s)`,
+        );
         return release();
       }
       // Task 2 (spec §13): a match the hub would now refuse to fund (paused, or the offer's deposit is now over

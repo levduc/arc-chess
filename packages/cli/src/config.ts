@@ -22,10 +22,22 @@ export type ArenaConfig = {
   /** Plan 4.5 Task 10 round 4: the fee ceiling per gas of the wallet's sender (session keys have none: round 5). A replacement
    *  never pays more than max(4 x the node's estimate, this); default the SDK's DEFAULT_FEE_CEILING_WEI. */
   feeCeilingWei?: bigint;
+  /** Final review I4: the shortest `challengeTimeout` (seconds) this daemon offers, accepts or funds; default
+   *  `DEFAULT_MIN_CHALLENGE_TIMEOUT`. A missed challenge deadline can roll a channel back to an old state, so a
+   *  window of a minute (the hub's own minimum) is too short for a daemon that may restart or lose its RPC. */
+  minChallengeTimeout?: bigint;
 };
 
 /** I3: default `logChunkBlocks` when a config omits it. */
 export const DEFAULT_LOG_CHUNK_BLOCKS = 1000;
+
+/** Final review I4: default `minChallengeTimeout`, and the `challengeTimeout` an offer gets when none is given. */
+export const DEFAULT_MIN_CHALLENGE_TIMEOUT = 900n;
+
+/** The config's `minChallengeTimeout`, or its default (configs written before it existed lack it). */
+export function minChallengeTimeoutOf(cfg: ArenaConfig): bigint {
+  return cfg.minChallengeTimeout ?? DEFAULT_MIN_CHALLENGE_TIMEOUT;
+}
 
 export function defaultHome(env: NodeJS.ProcessEnv): string {
   return env.ARENA_HOME ?? join(homedir(), ".arena");

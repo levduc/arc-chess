@@ -48,7 +48,7 @@ describe("arena CLI", () => {
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({
       deposit: "1500000",
       stakePerGame: "100000",
-      challengeTimeout: "600",
+      challengeTimeout: "900", // final review I4: the default is the daemon's default minChallengeTimeout
     });
     await runCli(["wait", "--timeout", "30"], t.io);
     expect(t.calls.at(-1)!.url).toBe("http://127.0.0.1:7010/wait?timeout=30");

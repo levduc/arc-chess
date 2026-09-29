@@ -147,6 +147,50 @@ describe("I2: stalled and withheld states escalate instead of looping", () => {
   });
 });
 
+describe("final review I4: a daemon never offers, accepts or funds a challengeTimeout under minChallengeTimeout", () => {
+  it("defaults to 900 s: createOffer and acceptOffer refuse 600 s with 400", async () => {
+    // Alice uses the suite's 60 s floor; Bob has no minChallengeTimeout in his config, so he gets the default.
+    const pair = await startPair({ bobConfig: { minChallengeTimeout: undefined } });
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const refused = (p: Promise<unknown>) =>
+      p.then(
+        () => {
+          throw new Error("expected a refusal");
+        },
+        (e: unknown) => e as DaemonError,
+      );
+    const own = await refused(bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n }));
+    expect(own).toBeInstanceOf(DaemonError);
+    expect(own.code).toBe(400);
+    expect(own.message).toMatch(/challengeTimeout 600s is below this daemon's minimum of 900s/);
+    // A hostile (short) offer from someone else is refused too, before anything is signed or recorded.
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const accepted = await refused(bob.daemon.acceptOffer(offerId));
+    expect(accepted.code).toBe(400);
+    expect(accepted.message).toMatch(/below this daemon's minimum of 900s/);
+    expect(bob.client.watched()).not.toContain(offerId);
+    // At the floor it is fine.
+    await expect(bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 900n })).resolves.toHaveProperty("offerId");
+  });
+
+  it("ignores a match whose challengeTimeout is under the floor (the floor was raised after the offer was accepted)", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const logs: string[] = [];
+    const bobInternals = bob.daemon as unknown as { opts: { config: { minChallengeTimeout?: bigint }; log?: (l: string) => void } };
+    bobInternals.opts.log = (l) => logs.push(l);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    // The in-memory host delivers the match on a later macrotask: raise Bob's floor before it arrives.
+    bobInternals.opts.config.minChallengeTimeout = 900n;
+    await waitFor(() => alice.daemon.channelIds().length === 1, 20_000, "alice's channel");
+    await waitFor(() => logs.some((l) => /challengeTimeout 600s is below this daemon's minChallengeTimeout \(900s\)/.test(l)), 5_000, "bob's refusal");
+    expect(bob.daemon.channelIds()).toEqual([]);
+  });
+});
+
 describe("I4: never-fundable offers and never-funded channels", () => {
   it("createOffer rejects offers the hub could never fund with 400", async () => {
     const pair = await startPair();

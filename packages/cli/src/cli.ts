@@ -1,5 +1,13 @@
 import { parseUnits, type Address, type Hex } from "viem";
-import { defaultHome, initHome, loadConfig, loadToken, DEFAULT_LOG_CHUNK_BLOCKS, type ArenaConfig } from "./config.js";
+import {
+  defaultHome,
+  initHome,
+  loadConfig,
+  loadToken,
+  DEFAULT_LOG_CHUNK_BLOCKS,
+  DEFAULT_MIN_CHALLENGE_TIMEOUT,
+  type ArenaConfig,
+} from "./config.js";
 import { startDaemonProcess } from "./run.js";
 
 export type CliIo = {
@@ -12,10 +20,11 @@ export type CliIo = {
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--max-fee N] [--session-gas-wei N] [--poll-ms N] [--log-chunk-blocks N] [--fee-ceiling-wei N]
+       [--min-challenge-timeout SECONDS]
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
-  offers | offer --deposit USDC --stake USDC [--timeout SECONDS] | accept <offerId>
+  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default 900)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
   resign | accept-draw | next-game | close | challenge | reclaim  [--channel ID]
@@ -189,6 +198,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         pollMs: Number(flag("poll-ms") ?? "2000"),
         logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
         ...(flag("fee-ceiling-wei") !== undefined ? { feeCeilingWei: BigInt(flag("fee-ceiling-wei")!) } : {}),
+        ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
       const { privateKeyToAccount } = await import("viem/accounts");
@@ -243,7 +253,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           body: {
             deposit: usdcAmount("deposit"),
             stakePerGame: usdcAmount("stake"),
-            challengeTimeout: flag("timeout") ?? "600",
+            challengeTimeout: flag("timeout") ?? DEFAULT_MIN_CHALLENGE_TIMEOUT.toString(),
           },
         };
         break;
