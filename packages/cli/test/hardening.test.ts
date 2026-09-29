@@ -1060,6 +1060,11 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       lobby: alice.client.lobby,
       relay: alice.client.relay,
     });
+    // start() fires one tick() of its own (fire-and-forget, regardless of pollMs), which would otherwise race
+    // this test's own manual sweep() call below for the very record it is about to queue-sweep automatically
+    // (full protection against that race for a real caller is fix round I1/I5's single-flight/busy-wait, not this
+    // commit's) -- stubbed out here so this test is solely about the manual sweep() path.
+    (restarted as unknown as { sweepQueuePass(): Promise<void> }).sweepQueuePass = () => Promise.resolve();
     cleanups.push(() => restarted.stop());
     await restarted.start();
     expect(restarted.channelIds()).toEqual([]); // finalized: never re-opened (existing I1 behaviour)
@@ -1080,6 +1085,40 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
 
     // A second sweep finds nothing left to do (swept is no longer unset).
     expect(await restarted.sweep()).toEqual([]);
+  });
+
+  it("fix round I2: the periodic main pass sweeps a finalized-but-unswept record found at start() on its own -- no `arena sweep` needed", async () => {
+    const { alice, bob, id } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    await settleWithSweepDisabled(alice, bob, id); // never re-enabled: settles unswept, like a legacy record
+    expect(d.handle(id).record.swept).toBeUndefined();
+
+    await d.stop();
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home), // the harness's normal (fast) pollMs: the periodic timer must do the work
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    expect(restarted.channelIds()).toEqual([]); // never re-opened into `live`
+
+    // No explicit sweep() call: the queued record sweeps on its own over the next few periodic passes.
+    await waitFor(() => new RecordStore(alice.home).channel(id)?.swept === true, 20_000, "auto-swept from the queue");
+    const record = new RecordStore(alice.home).channel(id)!;
+    expect(record.sweptAmount).toBeGreaterThan(0n);
+    expect(await restarted.client.getBalance({ address: session })).toBeLessThan(record.sweptAmount!);
+
+    // status()/channels() show the outcome (I2), and the settled-index cache (populated at start(), before the
+    // sweep ran) was refreshed in place rather than left stale.
+    const status = await restarted.status(id);
+    expect(status.swept).toBe(true);
+    expect(status.sweptAmount).toBe(record.sweptAmount!.toString());
+    const listed = (await restarted.channels()).find((c) => c.channelId === id) as { swept?: unknown } | undefined;
+    expect(listed?.swept).toBe(true);
   });
 });
 

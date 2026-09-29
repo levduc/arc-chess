@@ -1247,6 +1247,38 @@ export class ArenaDaemon {
     l.record = result.record;
   }
 
+  /** Plan 5 fix round (I2): the sweep queue -- finalized-but-unswept records found at start() (a restart, or a
+   *  record written before this feature existed), never opened into `live`. Removed once swept. A separate,
+   *  protected method (like `sweepChannel`) so a test can stub it out, e.g. to keep a manual `sweep()` call from
+   *  racing the periodic main pass's own processing of the very record it is about to sweep. */
+  protected async sweepQueuePass(): Promise<void> {
+    for (const [qid, entry] of [...this.sweepQueue]) {
+      if (this.stopped) break;
+      if (entry.busy) continue;
+      entry.busy = true;
+      try {
+        const result = await this.runSweepAttempt(entry.record, entry.sender, entry.sweep, (r) => this.records.saveChannel(r));
+        entry.record = result.record;
+        if (entry.record.swept !== undefined) {
+          this.sweepQueue.delete(qid);
+          // The settled index cached a status for this record at start() (before it was swept); refresh it in
+          // place so `status`/`channels()` show the outcome without waiting for a restart.
+          const cached = this.settled.get(qid);
+          if (cached) {
+            cached.status = {
+              ...cached.status,
+              swept: entry.record.swept ?? null,
+              sweptAmount: entry.record.sweptAmount?.toString() ?? null,
+              sweptTx: entry.record.sweptTx ?? null,
+            };
+          }
+        }
+      } finally {
+        entry.busy = false;
+      }
+    }
+  }
+
   /**
    * `arena sweep` / `POST /sweep`: sweeps every settled channel whose record has `swept` unset -- live ones (using
    * their existing session sender/back-off) and legacy ones no longer in `live` (a fresh sender built from the
@@ -1262,14 +1294,22 @@ export class ArenaDaemon {
     const results: Array<{ channelId: Hex; swept: string }> = [];
     for (const record of targets) {
       const l = this.live.get(record.channelId);
+      // Fix round I2: a queued (restart-time) record shares the queue's own sender/back-off, rather than a fresh
+      // `SerialTxSender` on the same key that knows nothing of what the queue's own pass may have already sent.
+      const queued = this.sweepQueue.get(record.channelId);
       const sender =
         l?.sessionSender ??
+        queued?.sender ??
         new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
           feeCeiling: NO_FEE_CEILING,
         });
-      const backoff = l?.sweep ?? { blockedUntil: 0, backoffMs: 0, attempts: 0 };
+      const backoff = l?.sweep ?? queued?.sweep ?? { blockedUntil: 0, backoffMs: 0, attempts: 0 };
       const result = await this.runSweepAttempt(record, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
       if (l) l.record = result.record;
+      if (queued) {
+        queued.record = result.record;
+        if (queued.record.swept !== undefined) this.sweepQueue.delete(record.channelId);
+      }
       results.push(this.sweepResultToString(record.channelId, result));
     }
     return results;
@@ -1609,6 +1649,7 @@ export class ArenaDaemon {
           l.mainBusy = false;
         }
       }
+      await this.sweepQueuePass();
       if (!this.stopped) await this.evictSettled();
     } finally {
       this.mainTicking = false;
