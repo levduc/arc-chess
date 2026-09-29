@@ -790,3 +790,38 @@ describe("Plan 4.5 Task 10 review: the close retry backs off after a revert", ()
     expect(bob.daemon.handle(id).lastError).toMatch(/^close: hub reverted: BadSignature/);
   });
 });
+
+describe("Plan 4.5 Task 10 re-review (C1): the timer is armed before the first round", () => {
+  it("a daemon restarted while its main pass stalls still answers a challenge that arrives afterwards", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn");
+    const stale = bob.daemon.handle(id).session.challengeProof(); // turn 2
+    await alice.daemon.move(id, "Nf3", { actor: "agent" }); // alice holds turn 3
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 3n, 5_000, "bob holds turn 3");
+    const bobSession = bob.daemon.handle(id).sessionSender;
+    await bob.daemon.stop();
+    await alice.daemon.stop();
+
+    // Alice restarts, and her main pass stalls from the very first round (as in a receipt wait).
+    const restarted = new ArenaDaemon({ home: alice.home, config: loadConfig(alice.home), walletKey: alice.walletKey, lobby: alice.client.lobby, relay: alice.client.relay });
+    let release: () => void = () => undefined;
+    const stalled = new Promise<void>((r) => (release = r));
+    (restarted as unknown as { watch: () => Promise<boolean> }).watch = async () => {
+      await stalled;
+      return true;
+    };
+    cleanups.push(async () => {
+      release();
+      await restarted.stop();
+    });
+    void restarted.start(); // before the fix this never resolved: it awaited the stalled first round
+    await new Promise((r) => setTimeout(r, 500));
+    await restarted.hub.challenge(bobSession, stale);
+    // Before the fix no timer was armed yet, so no dispute pass ever ran after the challenge.
+    await waitFor(async () => (await restarted.hub.channelInfo(id)).phase === "Open", 10_000, "the restarted daemon responds");
+    expect((await restarted.hub.registeredState(id)).turnNum).toBe(3n);
+  });
+});

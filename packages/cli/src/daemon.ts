@@ -198,14 +198,23 @@ export class ArenaDaemon {
     if (!this.stopped) await this.pruneOffers();
     // Replays match events for offers this daemon posted/accepted while it was down.
     this.opts.lobby.watch(this.records.offers().map((o) => o.offerId));
-    // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see
-    // attention right after a restart instead of waiting up to pollMs for the first periodic tick.
-    if (!this.stopped) await this.tick();
+    if (this.stopped) return;
+    // Plan 4.5 Task 10 re-review (C1): the timer is armed before anything else can wait. start() used to await a
+    // first full tick first -- so a main pass stalled on a receipt wait right after a restart held back every
+    // dispute pass (and start() itself, with the API behind it) until it finished.
     // The two passes are started independently: a dispute pass never waits for a main pass still in flight.
     this.timer = setInterval(() => {
       void this.disputePass();
       void this.mainPass();
     }, this.opts.config.pollMs);
+    // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see attention
+    // right after a restart instead of waiting up to pollMs -- with reads only, never a transaction.
+    for (const l of this.live.values()) {
+      if (this.stopped) return;
+      await this.refreshChain(l).catch((err: unknown) => this.log(`channel ${l.record.channelId}: first refresh failed: ${errorText(err)}`));
+    }
+    // The first round starts now, without start() waiting for it.
+    if (!this.stopped) void this.tick();
   }
 
   async stop(): Promise<void> {

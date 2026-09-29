@@ -141,8 +141,7 @@ describe("I4: relay joins never hold up the watchtower", () => {
     const timeout = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 5_000));
     expect(await Promise.race([started, timeout])).toBe("started");
     expect(joins).toBe(1);
-    expect(restarted.handle(id).passes).toBeGreaterThan(0); // start()'s own first tick already watched it
-    expect(restarted.handle(id).chain?.phase).toBe("Open");
+    expect(restarted.handle(id).chain?.phase).toBe("Open"); // start() already refreshed it (R8.3)
   });
 });
 
