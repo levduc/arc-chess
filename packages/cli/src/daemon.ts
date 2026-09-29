@@ -148,7 +148,7 @@ export type ChannelHandle = {
    *  the refill back-off's shape (wall-clock ms; 0 = no episode); `attempts` counts consecutive failures and
    *  drives `SWEEP_ABANDON_ATTEMPTS`. Passed by reference to `runSweepAttempt`, shared with the sweep queue's
    *  identically-shaped per-entry state (see `SweepQueueEntry`). */
-  sweep: { blockedUntil: number; backoffMs: number; attempts: number };
+  sweep: SweepBackoff;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -161,11 +161,18 @@ export type DegradedChannel = { channelId: string; degraded: true; error: string
 type SweepQueueEntry = {
   record: ChannelRecord;
   sender: SerialTxSender;
-  sweep: { blockedUntil: number; backoffMs: number; attempts: number };
+  sweep: SweepBackoff;
   /** True while either the queue's own pass or a manual `sweep()` call is working on this entry, so the two never
    *  send at once (I1's busy-wait pattern, mirrored from `reclaim()`/`l.mainBusy`). */
   busy: boolean;
 };
+
+/** Shared shape of a channel's (or sweep-queue entry's) sweep back-off state. `pendingTx` (fix round 2, minor 2)
+ *  is set when a sweep attempt's own `waitOrReplace` threw `TxReceiptMissingError`: the node stopped serving that
+ *  transaction's receipt after treating it as mined, so the *next* attempt reads that hash's receipt first --
+ *  before doing anything else -- and recovers a swept amount/tx from it rather than losing track of money that
+ *  already arrived (and, worse, sending again or recording a spurious "dust"). */
+type SweepBackoff = { blockedUntil: number; backoffMs: number; attempts: number; pendingTx?: Hex };
 
 /** Plan 5 fix round: what one sweep attempt on a session key resolved to. `"skipped"` covers every reason the
  *  attempt never actually ran (not yet confirmed settled on-chain, a concurrent send in flight, back-off still in
@@ -1255,10 +1262,27 @@ export class ArenaDaemon {
   private async runSweepAttempt(
     record: ChannelRecord,
     sender: SerialTxSender,
-    backoff: { blockedUntil: number; backoffMs: number; attempts: number },
+    backoff: SweepBackoff,
     save: (r: ChannelRecord) => void,
     opts: { force?: boolean } = {},
   ): Promise<SweepAttemptResult> {
+    // Fix round 2, minor 2: a receipt this daemon lost track of (`TxReceiptMissingError`) from a *previous*
+    // attempt is checked first, before anything else below -- including the back-off gate just past this block --
+    // since the transaction may already have landed and there is nothing to gain by waiting the back-off out
+    // before finding that out.
+    if (backoff.pendingTx !== undefined && record.swept === undefined) {
+      const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
+      if (recovered === "pending") return { kind: "skipped", record };
+      backoff.pendingTx = undefined;
+      if (recovered !== "failed") {
+        const updated: ChannelRecord = { ...record, swept: true, sweptAmount: recovered.amount, sweptTx: recovered.hash };
+        save(updated);
+        this.endSweepBackoff(record.channelId, backoff);
+        return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
+      }
+      // Confirmed not a success (reverted, or never mined at all): nothing to recover -- fall through below for a
+      // fresh attempt, same as any other failure.
+    }
     // Fix round 2, important 1: a manual sweep (force) on an "abandoned" channel gets a fresh episode -- I8's
     // own write-off must never be permanent for `arena sweep`/`POST /sweep`, or every bulk sweep just reports
     // every abandoned channel as "not sweepable yet" forever.
@@ -1289,6 +1313,11 @@ export class ArenaDaemon {
         this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
         return { kind: "skipped", record };
       }
+      if (err instanceof TxReceiptMissingError) {
+        // Minor 2: remember this hash so the very next attempt (see the top of this method) checks it before
+        // trying anything else -- the transaction is most likely already mined; only the receipt went missing.
+        backoff.pendingTx = err.hash;
+      }
       this.log(`channel ${record.channelId}: sweep failed (retried with back-off): ${errorText(err)}`);
       backoff.attempts++;
       if (backoff.attempts >= SWEEP_ABANDON_ATTEMPTS) {
@@ -1305,12 +1334,29 @@ export class ArenaDaemon {
     }
   }
 
-  private endSweepBackoff(channelId: Hex, backoff: { blockedUntil: number; backoffMs: number; attempts: number }): void {
+  private endSweepBackoff(channelId: Hex, backoff: SweepBackoff): void {
     const wasBackedOff = backoff.backoffMs !== 0;
     backoff.backoffMs = 0;
     backoff.blockedUntil = 0;
     backoff.attempts = 0;
+    backoff.pendingTx = undefined;
     if (wasBackedOff) this.log(`channel ${channelId}: sweep back-off ended`);
+  }
+
+  /** Fix round 2, minor 2: looks up a transaction this daemon lost track of (its receipt went missing after
+   *  `waitOrReplace` treated it as mined). Returns `"pending"` if the receipt still cannot be read at all (try
+   *  again next attempt), `"failed"` if it can be read but did not succeed (nothing to recover), or the amount and
+   *  hash to record as swept if it did. */
+  private async recoverPendingSweepTx(hash: Hex): Promise<"pending" | "failed" | { amount: bigint; hash: Hex }> {
+    let receipt: { status: "success" | "reverted" };
+    try {
+      receipt = await this.client.getTransactionReceipt({ hash });
+    } catch {
+      return "pending";
+    }
+    if (receipt.status !== "success") return "failed";
+    const tx = await this.client.getTransaction({ hash });
+    return { amount: tx.value, hash };
   }
 
   /** Fix round 2 (important 3 + minors 1/6): merges only `swept`/`sweptAmount`/`sweptTx` from `updated` onto a

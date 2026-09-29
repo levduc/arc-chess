@@ -12,6 +12,7 @@ import {
   TxDroppedError,
   TxInsufficientFundsError,
   TxNonceUsedError,
+  TxReceiptMissingError,
   NO_FEE_CEILING,
   DEFAULT_FEE_CEILING_WEI,
   buildParams,
@@ -1530,6 +1531,45 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     } finally {
       internals.performSweep = realPerformSweep;
     }
+  });
+
+  it("fix round 2, minor 2: a sweep whose receipt lagged (TxReceiptMissingError) is recovered on the next attempt, not resent", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+
+    // A real, sweep-shaped transaction, sent and mined directly (bypassing performSweep) -- a genuine landed
+    // transaction whose receipt the daemon is then made to "lose track of".
+    const balance = await d.client.getBalance({ address: sender.address });
+    const gas = 21_000n;
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const value = balance - gas * ((maxFeePerGas * 13n + 9n) / 10n);
+    const req = { to: alice.address, data: "0x" as Hex, value, gas };
+    const hash = await sender.send(req);
+    await d.client.waitForTransactionReceipt({ hash });
+    // The real waitOrReplace would have called tracker.settle(hash) right before throwing TxReceiptMissingError
+    // (tx.ts); simulated here since this test drives the error directly rather than the slow lagging-round path.
+    sender.tracker?.settle(hash);
+
+    const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    internals.performSweep = () => Promise.reject(new TxReceiptMissingError(hash, 0n));
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx === hash, 10_000, "the hash is remembered for the next attempt");
+    expect(l.record.swept).toBeUndefined(); // not yet recorded: this attempt only remembered the hash
+    internals.performSweep = realPerformSweep; // the recovery path below must not need it at all
+
+    const walletBefore = await d.client.getBalance({ address: alice.address });
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptAmount).toBe(value);
+    expect(l.record.sweptTx).toBe(hash);
+    expect(l.sweep.pendingTx).toBeUndefined();
+    // No new transaction was sent: the wallet's balance is unchanged by this recovery (its money already arrived
+    // with the first, real send above).
+    expect(await d.client.getBalance({ address: alice.address })).toBe(walletBefore);
   });
 });
 
