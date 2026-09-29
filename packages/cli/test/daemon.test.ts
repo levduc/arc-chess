@@ -104,6 +104,33 @@ describe("ArenaDaemon core", () => {
     await expect(pair.alice.daemon.acceptOffer(secondOfferId)).rejects.toThrow(/too many watched offers/);
   });
 
+  it("I1 (Plan 4.5 Task 11 fix round): channels()/status() never refresh a Finalized channel from chain again", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "finalized");
+
+    const find = async () => {
+      const c = (await alice.daemon.channels()).find((c) => c.channelId === id);
+      if (!c || !("phase" in c)) throw new Error("expected a ChannelStatus for the finalized channel");
+      return c;
+    };
+    expect((await find()).phase).toBe("Finalized");
+    // `refreshChain` always replaces `ChannelHandle.chain` with a fresh object; if `channels()` skips it for a
+    // Finalized channel (the fix), the reference itself never changes -- a direct, black-box-proof check, unlike
+    // comparing ChannelStatus fields (cooldown is floor-clamped at 0 once past due, so a second, real chain read
+    // would not visibly change the API response even if it happened).
+    const chainBefore = alice.daemon.handle(id).chain;
+    await increaseTime(3600);
+    await find();
+    expect(alice.daemon.handle(id).chain).toBe(chainBefore);
+  });
+
   it("relays moves between daemons and enforces turn order", async () => {
     const { alice, bob, id } = await matched();
     await expect(bob.daemon.move(undefined, "e7e5", { actor: "agent" })).rejects.toThrow(DaemonError);

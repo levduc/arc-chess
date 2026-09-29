@@ -179,6 +179,11 @@ export class ArenaDaemon {
   private readonly aborter = new AbortController();
   /** Plan 4.5 Task 10 re-review (M5): failed attempts to open a recorded channel, by channel id. */
   private readonly openFailures = new Map<Hex, number>();
+  /** Plan 4.5 Task 11 fix round (I1/M4): offerId (canonical lower-case) -> channelId, maintained on save
+   *  (start()'s initial scan, and onMatch's new-record write) so `channelForOffer` never has to re-scan every
+   *  record.json on disk -- that scan ran twice per match and once per acceptOffer, and its cost grows with the
+   *  daemon's lifetime channel count. */
+  private readonly offerIdIndex = new Map<Hex, Hex>();
   /** Plan 4.5 Task 11 fix round (C2): the most recent "too many watched offers" (or other subscribe-refusal)
    *  message from the host, if any. Sticky until this process restarts: only a restart clears the underlying
    *  cause (the host connection's watch-slot cap was hit), so there is nothing to un-set it. Exposed via
@@ -235,6 +240,11 @@ export class ArenaDaemon {
         this.markDegraded(entry.channelId, entry.error);
         continue;
       }
+      // I1/M4: indexed regardless of `finalized` -- channelForOffer must still find a settled channel (the
+      // dedup check in onMatch relies on it), it just never needs opening again.
+      if (typeof entry.record.offerId === "string") {
+        this.offerIdIndex.set(entry.record.offerId.toLowerCase() as Hex, entry.record.channelId);
+      }
       if (entry.record.finalized) continue;
       try {
         await this.openChannel(entry.record);
@@ -260,9 +270,13 @@ export class ArenaDaemon {
     this.opts.lobby.watch(this.records.offers().map((o) => o.offerId));
     if (this.stopped) return;
     // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see attention
-    // right after a restart instead of waiting up to pollMs -- with reads only, never a transaction.
+    // right after a restart instead of waiting up to pollMs -- with reads only, never a transaction. I1: skips
+    // Finalized/Reclaimed channels -- their on-chain state is terminal and was already captured before they were
+    // marked finalized (see settleCheck), so refreshing them again here is a pure cost that grows with a
+    // long-lived daemon's lifetime channel count.
     for (const l of this.live.values()) {
       if (this.stopped) return;
+      if (l.record.finalized) continue;
       await this.refreshChain(l).catch((err: unknown) => this.log(`channel ${l.record.channelId}: first refresh failed: ${errorText(err)}`));
     }
     // The first round starts now, without start() waiting for it.
@@ -558,6 +572,7 @@ export class ArenaDaemon {
         finalized: false,
       };
       this.records.saveChannel(record);
+      this.offerIdIndex.set(offerId, record.channelId);
       this.records.removeOffer(offerId);
       // The offer record is gone and a channel record carries this offerId: a duplicate match event now bails at
       // `!rec` or `channelForOffer` above, so the claim can be released.
@@ -573,12 +588,11 @@ export class ArenaDaemon {
     }
   }
 
-  /** C1: the id of a channel (live, or recorded on disk) that was opened for `offerId`, if any. */
+  /** C1: the id of a channel (live, or recorded on disk) that was opened for `offerId`, if any. Plan 4.5 Task 11
+   *  fix round (I1/M4): an in-memory lookup (`offerIdIndex`), not a synchronous full disk scan -- see the index's
+   *  docstring. */
   private channelForOffer(offerId: Hex): Hex | null {
-    const same = (r: ChannelRecord) => typeof r.offerId === "string" && r.offerId.toLowerCase() === offerId;
-    for (const l of this.live.values()) if (same(l.record)) return l.record.channelId;
-    for (const e of this.records.scanChannels()) if (e.record && same(e.record)) return e.record.channelId;
-    return null;
+    return this.offerIdIndex.get(offerId.toLowerCase() as Hex) ?? null;
   }
 
   /** Plan 4.5 Task 11 fix round (C2): throws if a prior subscribe refusal means this connection can no longer be
@@ -1286,15 +1300,24 @@ export class ArenaDaemon {
 
   async status(ref?: string): Promise<ChannelStatus> {
     const l = this.pick(ref);
-    await this.refreshChain(l);
+    // I1: a Finalized/Reclaimed channel's on-chain state is terminal and was already captured (see settleCheck)
+    // before it was marked finalized -- refreshing it again on every status call is a pure, avoidable RPC cost.
+    if (!l.record.finalized) await this.refreshChain(l);
     return this.statusOf(l);
   }
 
-  /** Every live channel's status, followed by the channels that could not be loaded (I1). */
+  /** Every live channel's status, followed by the channels that could not be loaded (I1). Plan 4.5 Task 11 fix
+   *  round: skips the chain refresh entirely for Finalized/Reclaimed channels (see `status`'s comment), and reads
+   *  the current block once for the whole call rather than once per channel -- both used to make this call's
+   *  cost grow with the daemon's *lifetime* channel count, not just its currently-open ones. */
   async channels(): Promise<Array<ChannelStatus | DegradedChannel>> {
     const out: Array<ChannelStatus | DegradedChannel> = [];
+    let now: bigint | undefined;
     for (const l of this.live.values()) {
-      await this.refreshChain(l);
+      if (!l.record.finalized) {
+        now ??= (await this.client.getBlock()).timestamp;
+        await this.refreshChain(l, now);
+      }
       out.push(this.statusOf(l));
     }
     for (const [channelId, error] of this.degraded) out.push({ channelId, degraded: true, error });
@@ -1339,9 +1362,21 @@ export class ArenaDaemon {
     });
   }
 
-  private async refreshChain(l: ChannelHandle): Promise<void> {
+  /** `now`, when given, is a block timestamp already read by the caller this call, so this channel's read skips
+   *  its own `getBlock()` (Plan 4.5 Task 11 fix round I1: `channels()` reads it once for every channel it
+   *  refreshes, not once each). */
+  private async refreshChain(l: ChannelHandle, now?: bigint): Promise<void> {
     const id = l.record.channelId;
-    const [info, block] = await Promise.all([this.hub.channelInfo(id), this.client.getBlock()]);
+    let info: Awaited<ReturnType<HubClient["channelInfo"]>>;
+    let blockNow: bigint;
+    if (now !== undefined) {
+      info = await this.hub.channelInfo(id);
+      blockNow = now;
+    } else {
+      const [i, block] = await Promise.all([this.hub.channelInfo(id), this.client.getBlock()]);
+      info = i;
+      blockNow = block.timestamp;
+    }
     const registeredTurn = info.hasRegistered ? (await this.hub.registeredState(id)).turnNum : null;
     l.chain = {
       phase: info.phase,
@@ -1350,7 +1385,7 @@ export class ArenaDaemon {
       challenger: info.challenger,
       registeredTurn,
       cooldownUntil: info.cooldownUntil,
-      now: block.timestamp,
+      now: blockNow,
     };
     // I2: progress is any change to the states and signatures held (our move, a received move, a checkpoint
     // proposed or completed, a Close signature either way, an on-chain adoption) or to the phase (the channel
@@ -1368,7 +1403,7 @@ export class ArenaDaemon {
     ].join("|");
     if (key !== l.progressKey) {
       l.progressKey = key;
-      l.lastProgressAt = block.timestamp;
+      l.lastProgressAt = blockNow;
     }
   }
 
