@@ -3,7 +3,7 @@ import { erc20Abi, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, HubRevertError, LocalKeyTxSender, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
-import { DaemonError, type ArenaDaemon } from "../src/index.js";
+import { ArenaDaemon, DaemonError, SETTLED_GRACE_SECONDS, loadConfig } from "../src/index.js";
 import { CHAIN, RPC, increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
@@ -163,9 +163,63 @@ describe("ArenaDaemon core", () => {
     // comparing ChannelStatus fields (cooldown is floor-clamped at 0 once past due, so a second, real chain read
     // would not visibly change the API response even if it happened).
     const chainBefore = alice.daemon.handle(id).chain;
-    await increaseTime(3600);
+    // Within the settled-channel grace period (final review I3: evicted from live after SETTLED_GRACE_SECONDS).
+    await increaseTime(300);
     await find();
     expect(alice.daemon.handle(id).chain).toBe(chainBefore);
+  });
+
+  it("final review I3: settled channels leave live after the grace period; status and channels still serve them", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob } = pair;
+    const ids: Hex[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await bob.daemon.acceptOffer(offerId);
+      const id = await waitFor(() => alice.daemon.channelIds().find((c) => !ids.includes(c)), 20_000, `match ${i}`);
+      await waitFor(() => bob.daemon.channelIds().includes(id), 20_000, `bob's match ${i}`);
+      await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, `open ${i}`);
+      await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+      await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+      await bob.daemon.acceptDraw(id, "agent");
+      await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+      await alice.daemon.close(id, "agent");
+      await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+      await bob.daemon.close(id, "agent");
+      await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
+      await alice.daemon.idle();
+      await alice.daemon.tick(); // a pass that sees it settled (the grace period starts)
+      expect(alice.daemon.channelIds()).toEqual([id]); // kept for the grace period
+      await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+      await waitFor(() => alice.daemon.channelIds().length === 0, 10_000, `eviction ${i}`); // before: live kept every one
+      ids.push(id);
+    }
+    // Still served, from the cached final status.
+    for (const id of ids) expect((await alice.daemon.status(id)).phase).toBe("Finalized");
+    const listed = await alice.daemon.channels();
+    expect(listed.map((c) => c.channelId).sort()).toEqual([...ids].sort());
+    expect(listed.every((c) => "phase" in c && c.phase === "Finalized")).toBe(true);
+    await expect(alice.daemon.move(ids[0], "e4", { actor: "agent" })).rejects.toThrow(/is settled/);
+    // After a restart (nothing cached, settled channels are never loaded), status is served from disk.
+    await alice.daemon.stop();
+    const again = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanup = async () => {
+      await again.stop();
+      await pair.cleanup();
+    };
+    await again.start();
+    expect(again.channelIds()).toEqual([]);
+    const fromDisk = await again.status(ids[1]);
+    expect(fromDisk.phase).toBe("Finalized");
+    expect(fromDisk.channelId).toBe(ids[1]);
+    expect(fromDisk.gameStatus).toBe("draw");
   });
 
   it("relays moves between daemons and enforces turn order", async () => {

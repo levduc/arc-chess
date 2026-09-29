@@ -18,6 +18,10 @@ export type ChannelRecord = {
   finalized: boolean;
   /** I3: last block whose dispute events have all been ingested; absent = none scanned yet. */
   scannedBlock?: bigint;
+  /** Final review I3: the on-chain phase the channel was retired in (Finalized, Reclaimed, or None/Funding for a
+   *  channel that never opened), recorded with `finalized`, so its status can still be served from disk once the
+   *  daemon has let go of it. Absent in records written before it existed. */
+  finalPhase?: string;
 };
 
 /** One entry of `channels/`: its record, or why it could not be read. */

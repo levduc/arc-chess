@@ -8,6 +8,7 @@ import {
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
+  MemoryStore,
   NO_FEE_CEILING,
   RECEIPT_TIMEOUT_MS,
   SerialTxSender,
@@ -119,6 +120,9 @@ export type ChannelHandle = {
   /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
    *  woken for it yet: drives the one-shot `settled` attention. */
   settledWake: boolean;
+  /** Final review I3: chain time at which the main pass first saw this channel settled; it is evicted from `live`
+   *  `SETTLED_GRACE_SECONDS` later. */
+  settledAt: bigint | null;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -161,6 +165,16 @@ export const CLOSE_RETRY_BACKOFF_MS = 30_000;
  *  answers 409 (the main pass may be in a bounded receipt wait on that channel). */
 export const RECLAIM_BUSY_WAIT_MS = 2_000;
 
+/** Final review I3: a settled (Finalized, Reclaimed or retired) channel stays in `live` -- with its session, its
+ *  senders and their clients -- this long in chain time after the main pass first sees it settled, then only its
+ *  final status is kept (`settled`), so a long-lived daemon's memory does not grow with every channel it has ever
+ *  settled. */
+export const SETTLED_GRACE_SECONDS = 600n;
+
+/** Final review I3: at most this many evicted channels' final statuses are kept in memory; older ones are served
+ *  from disk (`status`), and no longer listed by `channels()`. */
+export const SETTLED_CACHE_MAX = 1000;
+
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
@@ -177,6 +191,9 @@ export class ArenaDaemon {
   protected readonly domain: ArenaDomain;
   protected readonly records: RecordStore;
   protected readonly live = new Map<Hex, ChannelHandle>();
+  /** Final review I3: the final status of each settled channel evicted from `live`, oldest first (capped at
+   *  `SETTLED_CACHE_MAX`). */
+  protected readonly settled = new Map<Hex, ChannelStatus>();
   /** I1: channel entries that could not be loaded at start(), by directory name, with the reason. Never watched or picked. */
   protected readonly degraded = new Map<string, string>();
   protected readonly changes = new EventEmitter();
@@ -725,6 +742,7 @@ export class ArenaDaemon {
       sessionGasLow: null,
       sessionGasLowWoken: false,
       settledWake: false,
+      settledAt: null,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -1204,10 +1222,82 @@ export class ArenaDaemon {
         this.retryMatches.delete(m.offerId);
         await this.onMatch(m);
       }
+      if (!this.stopped) await this.evictSettled();
     } finally {
       this.mainTicking = false;
       if (!this.stopped) this.notify();
     }
+  }
+
+  /**
+   * Final review I3: drops settled channels from `live` once they have been settled for `SETTLED_GRACE_SECONDS` of
+   * chain time, keeping only their final status. Every handle holds a session, two senders and their viem clients,
+   * so without this a long-lived daemon's memory grew with every channel it had ever settled. A channel something is
+   * still working on is left for a later pass.
+   */
+  private async evictSettled(): Promise<void> {
+    const done = [...this.live.values()].filter((l) => l.record.finalized);
+    if (done.length === 0) return;
+    let now: bigint;
+    try {
+      now = (await this.client.getBlock()).timestamp;
+    } catch (err) {
+      this.log(`settled-channel eviction skipped (retried on the next pass): ${errorText(err)}`);
+      return;
+    }
+    for (const l of done) {
+      if (l.settledAt === null) {
+        l.settledAt = now;
+        continue;
+      }
+      if (now - l.settledAt < SETTLED_GRACE_SECONDS) continue;
+      if (l.disputeBusy || l.mainBusy || l.autoPlaying || l.submittingClose || l.refilling) continue;
+      const id = l.record.channelId;
+      // An unconsumed `settled` wake is dropped with the handle: an agent that has not waited in ten minutes of chain
+      // time reads the final phase from status.
+      this.settled.set(id, { ...this.statusOf(l), attention: null });
+      this.live.delete(id);
+      while (this.settled.size > SETTLED_CACHE_MAX) this.settled.delete(this.settled.keys().next().value!);
+    }
+  }
+
+  /** Final review I3: the status of a settled channel no longer in `live` -- its cached final status, or, for one
+   *  evicted before this process started (or pushed out of the cache), rebuilt from its files on disk. */
+  private async settledStatus(ref: string): Promise<ChannelStatus | null> {
+    const want = ref.toLowerCase();
+    const cached = [...this.settled.values()].filter((st) => st.channelId.toLowerCase().startsWith(want));
+    if (cached.length === 1) return cached[0];
+    if (cached.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+    const recs = this.records.channels().filter((r) => r.finalized && r.channelId.toLowerCase().startsWith(want));
+    if (recs.length !== 1) {
+      if (recs.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+      return null;
+    }
+    const record = recs[0];
+    // Read only: restored into a memory store (open() would create a session file if there were none).
+    const snapshot = await new FileSessionStore(arenaPaths(this.opts.home).channelSession(record.channelId)).load();
+    if (!snapshot) return null;
+    let session: ChannelSession;
+    try {
+      session = ChannelSession.restore(
+        { params: record.params, me: record.me, sessionKey: record.sessionKey, domain: this.domain, store: new MemoryStore() },
+        snapshot,
+      );
+    } catch {
+      return null; // a record for another hub or chain (see openChannel)
+    }
+    const chain: ChainView | null = record.finalPhase
+      ? {
+          phase: record.finalPhase,
+          funded: [false, false],
+          deadline: 0n,
+          challenger: 0,
+          registeredTurn: null,
+          cooldownUntil: [0n, 0n],
+          now: 0n,
+        }
+      : null;
+    return buildStatus({ record, snapshot: session.snapshot(), myTurn: session.isMyTurn(), chain, lastError: null });
   }
 
   /** Runs one pass over one channel. `pass` resolves true when it did that channel's full work for its phase. */
@@ -1272,7 +1362,7 @@ export class ArenaDaemon {
     // Final review m4: an agent waiting after its close (or on a dispute) is woken once by the settlement. A channel
     // retired without our deposit (None/Funding) never opened: nothing to report.
     if (phase === "Finalized" || phase === "Reclaimed") l.settledWake = true;
-    l.record = { ...l.record, finalized: true };
+    l.record = { ...l.record, finalized: true, finalPhase: phase };
     this.records.saveChannel(l.record);
     this.opts.relay.leave(l.record.channelId);
   }
@@ -1457,7 +1547,17 @@ export class ArenaDaemon {
   // ------------------------------------------------------------------ status
 
   async status(ref?: string): Promise<ChannelStatus> {
-    const l = this.pick(ref);
+    let l: ChannelHandle;
+    try {
+      l = this.pick(ref);
+    } catch (err) {
+      // Final review I3: a settled channel no longer watched is still served (from its cached final status or disk).
+      if (ref && err instanceof DaemonError && (err.code === 404 || err.code === 409)) {
+        const st = await this.settledStatus(ref);
+        if (st) return st;
+      }
+      throw err;
+    }
     // I1: a Finalized/Reclaimed channel's on-chain state is terminal and was already captured (see settleCheck)
     // before it was marked finalized -- refreshing it again on every status call is a pure, avoidable RPC cost.
     if (!l.record.finalized) await this.refreshChain(l);
@@ -1478,6 +1578,8 @@ export class ArenaDaemon {
       }
       out.push(this.statusOf(l));
     }
+    // Final review I3: settled channels no longer watched, from their cached final status.
+    for (const st of this.settled.values()) out.push(st);
     for (const [channelId, error] of this.degraded) out.push({ channelId, degraded: true, error });
     return out;
   }
@@ -1600,6 +1702,9 @@ export class ArenaDaemon {
       // I1: degraded channels are never picked, but naming one explains why instead of "unknown channel".
       const broken = hits.length === 0 ? [...this.degraded].filter(([id]) => id.toLowerCase().startsWith(ref.toLowerCase())) : [];
       if (broken.length === 1) throw new DaemonError(409, `channel ${broken[0][0]} could not be loaded: ${broken[0][1]}`);
+      // Final review I3: a settled channel the daemon has let go of (status still serves it).
+      const done = hits.length === 0 ? [...this.settled.values()].filter((st) => st.channelId.toLowerCase().startsWith(ref.toLowerCase())) : [];
+      if (done.length === 1) throw new DaemonError(409, `channel ${done[0].channelId} is settled (${done[0].phase}): nothing more can be done on it`);
       throw new DaemonError(hits.length === 0 ? 404 : 400, hits.length === 0 ? `unknown channel ${ref}` : `ambiguous channel ${ref}`);
     }
     if (active.length === 1) return active[0];
