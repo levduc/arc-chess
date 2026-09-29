@@ -1040,8 +1040,9 @@ describe("malicious opponent (SDK-only peer on the real relay)", () => {
       // The later stale challenge: without the refills, the key could no longer pay for this respond.
       await forceRespond(6n, 7n, 3);
       await expectNoErrors(alice);
-      const refills = alice.logs().split("\n").filter((l) => /refilled the session key's dispute gas/.test(l));
-      expect(refills.length).toBeGreaterThanOrEqual(3);
+      // The daemon logs each refill once its receipt wait returns, which can trail the balance the test reads.
+      const refills = () => alice.logs().split("\n").filter((l) => /refilled the session key's dispute gas/.test(l)).length;
+      await waitFor(() => refills() >= 3, 10_000, "three refill log lines");
     },
   );
 });
