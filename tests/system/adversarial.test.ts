@@ -45,7 +45,7 @@ import {
   type State,
 } from "@arena/sdk";
 import { loadWalletKey, readJson } from "@arena/cli";
-import { artifact, runCli, startStack, usdcBalanceOf, type Player, type Stack } from "./harness.js";
+import { artifact, runCli, startStack, usdcBalanceOf, type Player, type PlayerOptions, type Stack } from "./harness.js";
 import { playLine, waitStatus, type Status } from "./bot.js";
 import { startMitm, type Mitm, type MitmHooks, type WsConn } from "./mitm.js";
 import { MaliciousPeer } from "./peer.js";
@@ -57,6 +57,13 @@ const STAKE = 100_000n;
 const START = 10_000_000n;
 const FEE = 5_000n;
 const TIMEOUT = 60; // the hub's MIN_TIMEOUT
+/**
+ * Scenario 7 (final review C1): Alice's session-key dispute gas target, and her refill floor (the same: any spend is
+ * refilled). Measured on this harness's Anvil: one respond is admitted at about 2.1-2.7e14 wei (gas limit x
+ * maxFeePerGas, at most about 4.4e14 at Anvil's starting base fee) and costs about 2.0-2.4e14. So 5e14 pays for the
+ * first respond, and without refills the key could not be admitted for the third.
+ */
+const SESSION_GAS = 5n * 10n ** 14n;
 const FUNDING_WINDOW = 3600; // the harness server config's fundingWindow
 
 let stack: Stack | undefined;
@@ -656,8 +663,12 @@ describe("malicious relay/host (MITM proxy between the daemon and the real serve
 
 /** Alice (an honest daemon) offers; the malicious peer accepts through the real lobby, both fund, the peer joins the
  *  real relay. Alice is participants[0] (white in game 0); the peer is participants[1]. */
-async function peerMatch(s: Stack, aliceServerUrl?: string): Promise<{ alice: Player; peer: MaliciousPeer; id: Hex }> {
-  const alice = await s.player("alice", undefined, aliceServerUrl ? { serverUrl: aliceServerUrl } : {});
+async function peerMatch(
+  s: Stack,
+  aliceServerUrl?: string,
+  aliceOptions: PlayerOptions = {},
+): Promise<{ alice: Player; peer: MaliciousPeer; id: Hex }> {
+  const alice = await s.player("alice", undefined, { ...aliceOptions, ...(aliceServerUrl ? { serverUrl: aliceServerUrl } : {}) });
   const peer = await MaliciousPeer.create(s);
   peers.push(peer);
   const offerId = await postOffer(alice);
@@ -984,6 +995,53 @@ describe("malicious opponent (SDK-only peer on the real relay)", () => {
       await closeWithPeer(alice, peer, id, hub);
       await expectAliceWonGame0(stack, alice, peer);
       await expectNoErrors(alice);
+    },
+  );
+
+  timed(
+    "7. final review C1: forced responds drain Alice's session key; it is refilled each time, and a later stale challenge is still answered",
+    async () => {
+      stack = await startStack();
+      const { hub, pub } = hubOf(stack);
+      const { alice, peer, id } = await peerMatch(stack, undefined, { sessionGasWei: SESSION_GAS, sessionGasFloor: SESSION_GAS });
+      const aliceSession = (await hub.channelParams(id)).signers[0];
+      const sessionBalance = () => pub.getBalance({ address: aliceSession });
+      await waitFor(async () => (await sessionBalance()) === SESSION_GAS, 20_000, "the funding top-up");
+      await aliceMoves(alice, peer, id, "e2e4");
+      await peerMoves(alice, peer, id, "e7e5");
+      await aliceMoves(alice, peer, id, "d1h5"); // Alice holds turn 3; the peer is on move
+
+      const forceRespond = async (staleTurn: bigint, answeredTurn: bigint, round: number) => {
+        const latest = peer.sent.find((x) => x.state.turnNum === staleTurn)!;
+        const prev = peer.received(staleTurn - 1n)!;
+        await peer.challenge({ hasPrev: true, prev, latest });
+        await waitPhase(hub, id, "Open", 30_000);
+        expect((await hub.registeredState(id)).turnNum).toBe(answeredTurn);
+        const responded = (await hub.disputeEvents(id)).filter((e) => e.kind === "Responded");
+        expect(responded).toHaveLength(round);
+        const tx = await pub.getTransaction({ hash: responded[round - 1].transactionHash });
+        const receipt = await pub.getTransactionReceipt({ hash: responded[round - 1].transactionHash });
+        expect(tx.from.toLowerCase()).toBe(aliceSession.toLowerCase());
+        console.log(
+          `[adversarial] C1 round ${round}: respond gas limit ${tx.gas}, maxFeePerGas ${tx.maxFeePerGas}, gasUsed ${receipt.gasUsed}, effectiveGasPrice ${receipt.effectiveGasPrice}, admission ${tx.gas * (tx.maxFeePerGas ?? 0n)}, cost ${receipt.gasUsed * receipt.effectiveGasPrice}`,
+        );
+        // The respond spent from the key; Alice's watchtower refills it back to exactly sessionGasWei.
+        await waitFor(async () => (await sessionBalance()) === SESSION_GAS, 20_000, `the refill after round ${round}`);
+      };
+
+      await forceRespond(2n, 3n, 1);
+      await stack.increaseTime(TIMEOUT + 1); // the peer's cooldown
+      await peerMoves(alice, peer, id, "b8c6");
+      await aliceMoves(alice, peer, id, "f1c4");
+      await forceRespond(4n, 5n, 2);
+      await stack.increaseTime(TIMEOUT + 1);
+      await peerMoves(alice, peer, id, "g8f6");
+      await aliceMoves(alice, peer, id, "e1e2");
+      // The later stale challenge: without the refills, the key could no longer pay for this respond.
+      await forceRespond(6n, 7n, 3);
+      await expectNoErrors(alice);
+      const refills = alice.logs().split("\n").filter((l) => /refilled the session key's dispute gas/.test(l));
+      expect(refills.length).toBeGreaterThanOrEqual(3);
     },
   );
 });
