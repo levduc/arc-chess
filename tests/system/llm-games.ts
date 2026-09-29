@@ -12,9 +12,10 @@
  * This spends real Claude usage: cap runs at 3 total (see the Task 12 report) and keep `--minutes` reasonable.
  */
 import { type ChildProcess, spawn } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createPublicClient, http, type Address, type Hex, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -31,24 +32,13 @@ const CLAUDE_BIN = join(homedir(), ".local/bin/claude");
  *  default ever changes. */
 const START_USDC = 10_000_000n;
 
-/** skill.md wording fixes (apps/server/src/docs.ts's `skillMd`) applied before Run 1, kept here so the report
- *  states them directly rather than pointing at git history. Both are clarity-only -- no behaviour change. */
-const SKILL_FIXES = [
-  'Step 2 ("`arena daemon`") now tells a non-interactive/headless agent to background it with its own tool\'s ' +
-    "background-execution feature, not a shell `&`/`nohup` -- confirmed by hand that Claude Code's Bash tool " +
-    "denies a bare `&` (\"defers execution past approval-time safety checks\") under --permission-prompts none, " +
-    "while its native background-run mode is unaffected.",
-  'The play loop now explains `wait`\'s "timeout" reason with no channel id: normal before a match, not an error ' +
-    "-- re-run `wait` (and check `offers`). Previously the loop only documented the channel-carrying reasons.",
-];
-
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // -------------------------------------------------------------------------------------------------------- args
 
-type Args = { agents: number; games: number; minutes: number; model?: string };
+export type Args = { agents: number; games: number; minutes: number; model?: string };
 
-function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: string[]): Args {
   const str = (name: string): string | undefined => {
     const i = argv.indexOf(`--${name}`);
     return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1] : undefined;
@@ -80,6 +70,13 @@ function writeArenaWrapper(dir: string): void {
 
 type AgentHome = {
   name: string;
+  /** This agent's own unpredictable tmp parent directory (`home` and `workDir` both live under it) -- removed
+   *  entirely after the run. Deliberately *not* named after the agent (no "-alice-"/"-bob-" in the path): a fixed,
+   *  predictable naming scheme would let one agent's own path tell it exactly how to construct the other's, glob
+   *  or not. Each root's only shared substring with its sibling is the generic "arena-llm-" prefix every run uses
+   *  for its own cleanup/debugging -- the part that actually distinguishes and isolates the two is mkdtemp's own
+   *  random suffix. */
+  root: string;
   home: string;
   workDir: string;
   address: Address;
@@ -94,15 +91,28 @@ async function initAgentHome(stack: Stack, name: string): Promise<AgentHome> {
   const key = generatePrivateKey();
   const address = privateKeyToAccount(key).address;
   await stack.fund(address, START_USDC);
-  const home = mkdtempSync(join(tmpdir(), `arena-llm-home-${name}-`));
-  const workDir = mkdtempSync(join(tmpdir(), `arena-llm-work-${name}-`));
+  const root = mkdtempSync(join(tmpdir(), "arena-llm-"));
+  const home = join(root, "home");
+  const workDir = join(root, "work");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(workDir, { recursive: true });
   const apiPort = await freeTcpPort();
   const init = await runCli(
     ["init", "--server", stack.serverUrl, "--wallet-key", key, "--port", String(apiPort), "--poll-ms", "200"],
     home,
   );
   if (init.status !== 0) throw new Error(`arena init failed for "${name}":\n${init.stderr || init.stdout}`);
-  return { name, home, workDir, address, apiPort, token: loadToken(home) };
+  return { name, root, home, workDir, address, apiPort, token: loadToken(home) };
+}
+
+/** Best-effort removal of `agent`'s tmp root (see `AgentHome.root`'s docstring) after a run -- this script's own
+ *  cleanup, distinct from `stack.stop()`'s (the stack's own tmp dir). */
+function cleanupAgentHome(agent: AgentHome): void {
+  try {
+    rmSync(agent.root, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
 }
 
 /** A read-only GET against `agent`'s own daemon API -- the same local HTTP surface `arena` itself talks to (see
@@ -125,27 +135,64 @@ type Session = {
   startedAt: number;
   endedAt?: number;
   exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
 };
 
-/** Launches one headless agent. Tools are as narrow as the brief allows: `arena` (via the wrapper on PATH), `curl`
- *  and `cat` to read the local website, nothing else -- `--permission-prompts none` means anything outside that
- *  allowlist is denied automatically rather than hanging on a prompt nobody can answer. `--setting-sources ""`,
- *  `--strict-mcp-config` and `--disable-slash-commands` strip this machine's own CLAUDE.md/plugins/MCP servers out
- *  of the session, so it behaves like the clean agent the product is meant for (and costs far less per turn). */
+/** The handful of flag prefixes real curl invocations are likely to use before the URL -- not because the flags
+ *  themselves matter (they don't: every variant below is still hard-pinned to the same origin, so none of them
+ *  widens what host can be reached), but because Claude Code's Bash allow rules are plain command-*prefix* matches
+ *  (confirmed by hand: a rule's text before its wildcard must be a literal prefix of the real command, so
+ *  `Bash(curl <origin>/*)` does NOT match `curl -s <origin>/...` -- the `-s` breaks the prefix). `""` and `"-s"`
+ *  were the only two shapes either agent actually typed across Runs 1-2 (`grep`ped from their logs); the rest are
+ *  defensive headroom against a third run's session picking a different common combination, since a rule-syntax
+ *  miss here can only be diagnosed by spending one of the three budgeted runs. */
+const CURL_FLAG_PREFIXES = ["", "-s", "-sS", "-sL", "-sSL", "-fsSL", "-L"];
+
+/** The exact `--allowedTools` patterns for one session, as a pure function of the server's URL so it can be unit
+ *  tested without spawning anything. Deliberately minimal:
+ *  - `Bash(arena *)` -- the CLI, via the wrapper on PATH.
+ *  - `Bash(curl <flags> <origin>/*)` for each of `CURL_FLAG_PREFIXES`, pinned to this stack's own server origin --
+ *    never a bare `Bash(curl *)`. Confirmed by hand that this pin actually restricts the origin, not just the
+ *    flags: the same rule denies `curl -s http://example.com/`.
+ *  - No `Bash(cat *)` (Task 12 review: too wide -- nothing in the play loop needs it) and no Write/Edit/Read at all.
+ *  `--permission-prompts none` means anything outside this list is denied automatically rather than hanging on a
+ *  prompt nobody can answer. */
+export function buildAllowedTools(serverUrl: string): string[] {
+  const origin = new URL(serverUrl).origin;
+  return ["Bash(arena *)", ...CURL_FLAG_PREFIXES.map((flags) => `Bash(curl ${flags ? `${flags} ` : ""}${origin}/*)`)];
+}
+
+/** The exact environment for one session, as a pure function so it can be unit tested without spawning anything.
+ *  Task 12 review: the orchestrator's *entire* environment must not be forwarded into the agent's sandbox. Empirically
+ *  confirmed by hand (`env -i HOME=... PATH=... claude -p ...`, every other variable cleared) that `claude -p` needs
+ *  nothing beyond `PATH` (to resolve `node`/`sh`/`curl`/the `arena` wrapper) and `HOME` (its on-disk auth/config
+ *  live under `~/.claude`; `apiKeySource` was `"none"` in every smoke test here, so no `ANTHROPIC_API_KEY` or
+ *  similar is required) to run and authenticate -- `ARENA_HOME` is the one variable the `arena` CLI itself needs,
+ *  not `claude`. This is the complete env; nothing else from the orchestrator's process leaks into the agent's
+ *  sandbox. Throws rather than silently omitting `HOME` if it's unset in this process, since a session that can't
+ *  authenticate is a much worse failure mode than a fast, clear error here. */
+export function buildClaudeEnv(arenaHome: string, binDir: string): NodeJS.ProcessEnv {
+  const home = process.env.HOME;
+  if (!home) throw new Error("HOME is not set in this process's environment -- required for the claude CLI's auth/config");
+  return { PATH: `${binDir}:${process.env.PATH ?? ""}`, HOME: home, ARENA_HOME: arenaHome };
+}
+
+/** Launches one headless agent. `--setting-sources ""`, `--strict-mcp-config` and `--disable-slash-commands` strip
+ *  this machine's own CLAUDE.md/plugins/MCP servers out of the session, so it behaves like the clean agent the
+ *  product is meant for (and costs far less per turn). */
 function spawnClaudeAgent(agent: AgentHome, binDir: string, serverUrl: string, games: number, model?: string): Session {
   mkdirSync(LOG_DIR, { recursive: true });
   const logPath = join(LOG_DIR, `${agent.name}.log`);
   writeFileSync(logPath, "");
   const prompt =
     `Read ${serverUrl}/skill.md and play chess against another agent. Play ${games} games, then close the channel. ` +
-    `Your wallet key is in ARENA_HOME already.`;
+    `Your wallet key is in ARENA_HOME already. Start \`arena daemon\` as a background task using your own tool's ` +
+    `background-execution feature (not a shell \`&\`/\`nohup\` -- this session denies those automatically).`;
   const args = [
     "-p",
     prompt,
     "--allowedTools",
-    "Bash(arena *)",
-    "Bash(curl *)",
-    "Bash(cat *)",
+    ...buildAllowedTools(serverUrl),
     "--permission-mode",
     "manual",
     "--permission-prompts",
@@ -166,14 +213,15 @@ function spawnClaudeAgent(agent: AgentHome, binDir: string, serverUrl: string, g
   ];
   const child = spawn(CLAUDE_BIN, args, {
     cwd: agent.workDir,
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, ARENA_HOME: agent.home },
+    env: buildClaudeEnv(agent.home, binDir),
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.on("data", (c: Buffer) => appendFileSync(logPath, c));
   child.stderr.on("data", (c: Buffer) => appendFileSync(logPath, c));
-  const session: Session = { name: agent.name, child, logPath, startedAt: Date.now(), exitCode: null };
-  child.once("exit", (code) => {
+  const session: Session = { name: agent.name, child, logPath, startedAt: Date.now(), exitCode: null, exitSignal: null };
+  child.once("exit", (code, signal) => {
     session.exitCode = code;
+    session.exitSignal = signal;
     session.endedAt = Date.now();
   });
   return session;
@@ -410,9 +458,6 @@ type RunSummary = {
   costB?: number;
   agentA: AgentHome;
   agentB: AgentHome;
-  /** skill.md wording fixes in effect for this run (see docs.ts), for the report's own record -- kept as data
-   *  here rather than "see git log", since that is what the brief asks the report to state directly. */
-  skillFixes: string[];
 };
 
 function fmtUsdc(n: bigint): string {
@@ -424,7 +469,7 @@ function fmtUsdc(n: bigint): string {
 }
 
 function writeReport(summary: RunSummary): void {
-  const { args, result, durationMs, sessions, costA, costB, skillFixes } = summary;
+  const { args, result, durationMs, sessions, costA, costB } = summary;
   const pass = isPass(result);
   const existing = existsSync(REPORT_PATH) ? readFileSync(REPORT_PATH, "utf8") : "";
   const runNumber = (existing.match(/^## Run \d+/gm) ?? []).length + 1;
@@ -446,7 +491,8 @@ function writeReport(summary: RunSummary): void {
         : !gotResult
           ? "killed by this script's cleanup (SIGTERM/SIGKILL) before it emitted a final result -- likely mid a long `arena wait`; cost unknown for this session"
           : `exit code ${s.exitCode}`;
-    lines.push(`- ${s.name}: exit=${s.exitCode ?? "n/a"}, duration=${dur} min (${note})`);
+    const signalNote = s.exitSignal ? `, signal=${s.exitSignal}` : "";
+    lines.push(`- ${s.name}: exit=${s.exitCode ?? "n/a"}${signalNote}, duration=${dur} min (${note})`);
   }
   lines.push(`- Channel: ${result.channelId ?? "none discovered"}`);
   lines.push(`- Finalized: ${result.finalized}`);
@@ -475,17 +521,18 @@ function writeReport(summary: RunSummary): void {
     lines.push(`- ${s.name}:`);
     for (const q of quotes) lines.push(`  - "${q}"`);
     if (denials.length > 0) {
-      lines.push(`  - allowlist denials (from the session's own \`permission_denials\`, none arena-level -- all outside the deliberately narrow Bash(arena/curl/cat) + no-Write allowlist):`);
+      lines.push(`  - allowlist denials (from the session's own \`permission_denials\`, none arena-level -- all outside this run's allowlist, built by \`buildAllowedTools\` -- \`arena\` plus \`curl\` pinned to this stack's own server origin, nothing else):`);
       for (const d of denials) lines.push(`    - \`${d}\``);
     }
   }
-  lines.push("", "### skill.md wording fixes in effect for this run", "");
-  if (skillFixes.length === 0) {
-    lines.push("(none -- this run used the same skill.md text as the previous run)", "");
-  } else {
-    for (const f of skillFixes) lines.push(`- ${f}`);
-    lines.push("");
-  }
+  lines.push(
+    "",
+    "### skill.md text this run used",
+    "",
+    "Not duplicated here (a copy here would silently go stale the next time `apps/server/src/docs.ts` changes) --" +
+      " see that file's `skillMd`/`chessSkillMd` at this run's commit for the exact wording.",
+    "",
+  );
 
   writeFileSync(REPORT_PATH, existing + lines.join("\n") + "\n");
 }
@@ -539,7 +586,7 @@ async function main(): Promise<void> {
     const durationMs = Date.now() - startedAt;
     const costA = extractCost(sessions[0].logPath);
     const costB = extractCost(sessions[1].logPath);
-    writeReport({ args, result, durationMs, sessions, costA, costB, agentA, agentB, skillFixes: SKILL_FIXES });
+    writeReport({ args, result, durationMs, sessions, costA, costB, agentA, agentB });
 
     const pass = isPass(result);
     console.log(`[llm-games] ${pass ? "PASS" : "FAIL"} -- see tests/system/LLM-GAMES.md`);
@@ -548,11 +595,22 @@ async function main(): Promise<void> {
     await Promise.all(sessions.map((s) => killSession(s).catch(() => {})));
     if (agentA) await killDaemon(agentA).catch(() => {});
     if (agentB) await killDaemon(agentB).catch(() => {});
+    if (agentA) cleanupAgentHome(agentA);
+    if (agentB) cleanupAgentHome(agentB);
+    try {
+      rmSync(binDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
     await stack.stop();
   }
 }
 
-main().catch((err) => {
-  console.error("[llm-games] fatal:", err);
-  process.exitCode = 1;
-});
+// Only run when executed directly (`tsx tests/system/llm-games.ts` / `pnpm llm-games`), not when imported for its
+// pure builder functions by llm-games.test.ts -- importing this module must never start a stack or spawn `claude`.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch((err) => {
+    console.error("[llm-games] fatal:", err);
+    process.exitCode = 1;
+  });
+}
