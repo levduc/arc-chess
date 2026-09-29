@@ -8,6 +8,7 @@ import {
   ChannelSession,
   HubRevertError,
   LocalKeyTxSender,
+  TxDroppedError,
   buildParams,
   hashState,
   offerId as computeOfferId,
@@ -823,5 +824,56 @@ describe("Plan 4.5 Task 10 re-review (C1): the timer is armed before the first r
     // Before the fix no timer was armed yet, so no dispute pass ever ran after the challenge.
     await waitFor(async () => (await restarted.hub.channelInfo(id)).phase === "Open", 10_000, "the restarted daemon responds");
     expect((await restarted.hub.registeredState(id)).turnNum).toBe(3n);
+  });
+});
+
+describe("Plan 4.5 Task 10 re-review (I3): a transaction reported dropped is resent at its nonce", () => {
+  const hash = `0x${"ab".repeat(32)}` as Hex;
+
+  it("the deposit's resend goes out at the dropped attempt's nonce", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const hub = alice.daemon.hub;
+    const real = hub.deposit.bind(hub);
+    const nonces: Array<number | undefined> = [];
+    hub.deposit = async (sender, p, opts) => {
+      nonces.push(opts?.nonce);
+      if (nonces.length === 1) throw new TxDroppedError(hash, 42); // reported dropped at nonce 42
+      return real(sender, p, { ...opts, nonce: undefined }); // (sent for real at the live nonce: 42 is made up)
+    };
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "match");
+    await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 20_000, "open");
+    expect(nonces.slice(0, 2)).toEqual([undefined, 42]); // before: [undefined, undefined] -- a fresh nonce
+    expect(alice.daemon.handle(id).droppedNonces.size).toBe(0);
+  });
+
+  it("the session-gas top-up goes through the same path and is never paid twice when the 'dropped' one had landed", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const wallet = alice.daemon.wallet;
+    const real = wallet.sendWithNonce.bind(wallet);
+    const topUps: Array<number | undefined> = [];
+    let sessionAddr: string | undefined;
+    wallet.sendWithNonce = async (tx) => {
+      if (tx.value === undefined || tx.data !== "0x") return real(tx);
+      topUps.push(tx.nonce);
+      sessionAddr = tx.to;
+      const sent = await real({ ...tx, nonce: undefined });
+      if (topUps.length === 1) {
+        await alice.daemon.client.waitForTransactionReceipt({ hash: sent.hash });
+        throw new TxDroppedError(sent.hash, sent.nonce); // it landed, but was reported dropped
+      }
+      return sent;
+    };
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
+    expect(topUps).toHaveLength(1); // the balance is re-read first: the landed top-up is not paid again
+    expect(await alice.daemon.client.getBalance({ address: sessionAddr as Hex })).toBe(pair.config.sessionGasWei);
   });
 });
