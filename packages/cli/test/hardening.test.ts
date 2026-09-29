@@ -6,6 +6,7 @@ import { TransactionReceiptNotFoundError, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
+  HubClient,
   HubRevertError,
   LocalKeyTxSender,
   TxDroppedError,
@@ -1045,5 +1046,45 @@ describe("Plan 4.5 Task 10 re-review 2 (minor 5): stop() aborts receipt waits", 
     const t0 = Date.now();
     await alice.daemon.stop();
     expect(Date.now() - t0).toBeLessThan(3_000); // before: stop() waited for the pass, i.e. the rest of the round
+  });
+});
+
+describe("Plan 4.5 Task 10 re-review 2 (minor 7): the timer is armed before offer pruning", () => {
+  it("a restart whose offer pruning hangs (a slow RPC) still answers a challenge", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn");
+    const stale = bob.daemon.handle(id).session.challengeProof(); // turn 2
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 3n, 5_000, "bob holds turn 3");
+    const bobSession = bob.daemon.handle(id).sessionSender;
+    await bob.daemon.stop();
+    await alice.daemon.stop();
+
+    const restarted = new ArenaDaemon({ home: alice.home, config: loadConfig(alice.home), walletKey: alice.walletKey, lobby: alice.client.lobby, relay: alice.client.relay });
+    // Offer pruning hangs the first time (start()'s own call); the periodic passes' calls go through.
+    let release: () => void = () => undefined;
+    const hung = new Promise<void>((r) => (release = r));
+    const d = restarted as unknown as { pruneOffers: () => Promise<void> };
+    const realPrune = d.pruneOffers.bind(restarted);
+    let first = true;
+    d.pruneOffers = async () => {
+      if (first) {
+        first = false;
+        await hung;
+      }
+      return realPrune();
+    };
+    cleanups.push(async () => {
+      release();
+      await restarted.stop();
+    });
+    void restarted.start(); // hangs in pruneOffers
+    await new Promise((r) => setTimeout(r, 500));
+    await new HubClient(restarted.hub.hub, restarted.client).challenge(bobSession, stale);
+    // Before the fix start() armed the timer only after pruning: no dispute pass ran.
+    await waitFor(async () => (await restarted.hub.channelInfo(id)).phase === "Open", 10_000, "the restarted daemon responds");
   });
 });
