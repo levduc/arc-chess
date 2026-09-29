@@ -10,7 +10,7 @@
  * :8545/:8080) -- it never kills another process to make room. Ctrl-C tears down everything it started.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
@@ -29,6 +29,12 @@ const DEFAULT_DEV_DIR = join(REPO_ROOT, ".arena-dev");
 const OWNER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as const;
 
 const PLAYER_NAMES = ["alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi"];
+
+// Plan 5 Task 1 (mainnet gates: `dev-up --dir` guard): dev-up wipes `--dir` at the start of every run (see
+// `main()`) -- fine for its own gitignored state, but a caller who points `--dir` at something else by mistake
+// (or forgets a previous, unrelated use of that path) would otherwise have it silently deleted. This marker,
+// written on a run's first successful use of a directory, is the only thing that makes wiping it safe next time.
+const DEV_DIR_MARKER = ".arena-dev-marker";
 
 function parseArgs(argv: string[]): { port: number; anvilPort: number; players: number; dir: string } {
   const flags = new Map<string, string>();
@@ -145,6 +151,17 @@ async function shutdown(signal: string): Promise<void> {
 async function main(): Promise<void> {
   const { port: serverPort, anvilPort, players: numPlayers, dir: DEV_DIR } = parseArgs(process.argv.slice(2));
 
+  // Plan 5 Task 1: refuse a non-empty --dir that carries no marker from a previous dev-up run -- before the port
+  // checks (this refusal needs no ports) and before the wipe below, so nothing of a caller's own directory is ever
+  // touched. A directory dev-up itself created keeps the marker across runs (it is never wiped).
+  if (existsSync(DEV_DIR) && readdirSync(DEV_DIR).length > 0 && !existsSync(join(DEV_DIR, DEV_DIR_MARKER))) {
+    process.stderr.write(
+      `dev-up: refusing to start -- --dir ${DEV_DIR} is non-empty and was not created by a previous dev-up run ` +
+        `(no ${DEV_DIR_MARKER} file). Pass an empty or new --dir, or delete it yourself if you are sure. Nothing was started or touched.\n`,
+    );
+    process.exit(1);
+  }
+
   if (!(await isPortFree(anvilPort))) {
     process.stderr.write(
       `dev-up: refusing to start -- port ${anvilPort} is already in use (the demo stack, or a previous dev-up?). ` +
@@ -168,6 +185,7 @@ async function main(): Promise<void> {
   // dev-up avoids ever hitting that refusal by not reusing stale state in the first place.
   rmSync(DEV_DIR, { recursive: true, force: true });
   mkdirSync(DEV_DIR, { recursive: true });
+  writeFileSync(join(DEV_DIR, DEV_DIR_MARKER), `${new Date().toISOString()}\n`);
   const playersDir = join(DEV_DIR, "players");
   mkdirSync(playersDir, { recursive: true });
 
