@@ -1126,6 +1126,26 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     }
   });
 
+  it("fix round 2, important 1: arena sweep retries an abandoned channel instead of reporting \"not sweepable yet\"", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    // Force straight to "abandoned" (bypassing the real 12-attempt back-off, for speed) -- the same end state
+    // the first fix round's own abandonment test drives to more slowly. Persisted too: sweep() reads records
+    // from disk, like a real abandonment would have written.
+    l.record = { ...l.record, swept: "abandoned" };
+    l.sweep.attempts = SWEEP_ABANDON_ATTEMPTS;
+    new RecordStore(alice.home).saveChannel(l.record);
+
+    const legacy = await d.sweep(id);
+    expect(legacy.results[0].swept).toMatch(/^retried: 0x[0-9a-f]+$/);
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptAmount).toBeGreaterThan(0n);
+    expect(l.sweep.attempts).toBe(0); // reset: a fresh episode, not still counting toward the old abandonment
+  });
+
   it("never sweeps while a refill or the dispute pass is working the same session key (rule 1)", async () => {
     const { alice, bob, id } = await matched();
     const original = await settleWithSweepDisabled(alice, bob, id);

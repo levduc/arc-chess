@@ -1205,7 +1205,12 @@ export class ArenaDaemon {
     save: (r: ChannelRecord) => void,
     opts: { force?: boolean } = {},
   ): Promise<SweepAttemptResult> {
-    if (this.stopped || record.swept !== undefined) return { kind: "skipped", record };
+    // Fix round 2, important 1: a manual sweep (force) on an "abandoned" channel gets a fresh episode -- I8's
+    // own write-off must never be permanent for `arena sweep`/`POST /sweep`, or every bulk sweep just reports
+    // every abandoned channel as "not sweepable yet" forever.
+    const retryingAbandoned = opts.force === true && record.swept === "abandoned";
+    if (retryingAbandoned) backoff.attempts = 0;
+    if (this.stopped || (record.swept !== undefined && !retryingAbandoned)) return { kind: "skipped", record };
     if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
     // Rule 1: never beside a transaction actively being waited on elsewhere on this same session key.
     if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
@@ -1348,6 +1353,7 @@ export class ArenaDaemon {
    *  record's own `busy` flag, so a manual sweep and the periodic pass never send on the same key at once. */
   private async sweepOneNow(record: ChannelRecord): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
     const id = record.channelId;
+    const wasAbandoned = record.swept === "abandoned";
     const l = this.live.get(id);
     if (l) {
       const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
@@ -1357,7 +1363,7 @@ export class ArenaDaemon {
       try {
         const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(r), { force: true });
         l.record = result.record;
-        return this.sweepResultWithHash(id, result);
+        return this.sweepResultWithHash(id, result, wasAbandoned);
       } finally {
         l.mainBusy = false;
       }
@@ -1372,7 +1378,7 @@ export class ArenaDaemon {
         const result = await this.runSweepAttempt(queued.record, queued.sender, queued.sweep, (r) => this.records.saveChannel(r), { force: true });
         queued.record = result.record;
         if (queued.record.swept !== undefined) this.sweepQueue.delete(id);
-        return this.sweepResultWithHash(id, result);
+        return this.sweepResultWithHash(id, result, wasAbandoned);
       } finally {
         queued.busy = false;
       }
@@ -1384,24 +1390,27 @@ export class ArenaDaemon {
     });
     const backoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
     const result = await this.runSweepAttempt(record, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
-    return this.sweepResultWithHash(id, result);
+    return this.sweepResultWithHash(id, result, wasAbandoned);
   }
 
-  private sweepResultWithHash(id: Hex, result: SweepAttemptResult): { channelId: Hex; swept: string; hash?: Hex } {
-    const base = this.sweepResultToString(id, result);
+  private sweepResultWithHash(id: Hex, result: SweepAttemptResult, wasAbandoned = false): { channelId: Hex; swept: string; hash?: Hex } {
+    const base = this.sweepResultToString(id, result, wasAbandoned);
     return result.kind === "swept" ? { ...base, hash: result.hash } : base;
   }
 
-  private sweepResultToString(id: Hex, result: SweepAttemptResult): { channelId: Hex; swept: string } {
+  private sweepResultToString(id: Hex, result: SweepAttemptResult, wasAbandoned = false): { channelId: Hex; swept: string } {
+    // Fix round 2, important 1: a manual retry of a previously-"abandoned" channel gets its own distinct result
+    // string, so `arena sweep`'s output tells that case apart from an ordinary first-time sweep.
+    const prefix = wasAbandoned ? "retried: " : "";
     switch (result.kind) {
       case "swept":
-        return { channelId: id, swept: `0x${result.amount.toString(16)}` };
+        return { channelId: id, swept: `${prefix}0x${result.amount.toString(16)}` };
       case "dust":
-        return { channelId: id, swept: "dust" };
+        return { channelId: id, swept: `${prefix}dust` };
       case "abandoned":
         return { channelId: id, swept: "abandoned" };
       case "error":
-        return { channelId: id, swept: `error: ${errorText(result.error)}` };
+        return { channelId: id, swept: `${prefix}error: ${errorText(result.error)}` };
       case "skipped":
         return {
           channelId: id,
