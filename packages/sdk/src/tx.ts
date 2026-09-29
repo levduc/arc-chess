@@ -1,6 +1,7 @@
 import {
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
+  createPublicClient,
   createWalletClient,
   http,
   type Address,
@@ -24,10 +25,24 @@ export type TxRequest = {
   gasPrice?: bigint;
 };
 
-/** Sends a transaction from some wallet (spec §3.1). Implementations: local key (v1), Circle CLI (Plan 6). */
+/** A sent transaction and, when the sender knows it, the nonce it was sent at. */
+export type SentTx = { hash: Hex; nonce?: number };
+
+/**
+ * Sends a transaction from some wallet (spec §3.1). Implementations: local key (v1), Circle CLI (Plan 6).
+ *
+ * Contract (Plan 4.5 Task 10 re-review I3): `send` MUST honour `TxRequest.nonce` and the fee overrides -- a stuck
+ * transaction is replaced by sending again at its nonce with higher fees, and a dropped one is resent at the same
+ * nonce. A sender that cannot MUST declare `supportsReplacement = false`: `waitOrReplace` then never replaces its
+ * transactions, it only waits (bounded) and reports.
+ */
 export interface TxSender {
   readonly address: Address;
+  /** False if `send` cannot honour the nonce/fee overrides (default: true). */
+  readonly supportsReplacement?: boolean;
   send(tx: TxRequest): Promise<Hex>;
+  /** Like `send`, but also reports the nonce used, so a dropped transaction can be resent at the same nonce. */
+  sendWithNonce?(tx: TxRequest): Promise<SentTx>;
 }
 
 /**
@@ -37,10 +52,18 @@ export interface TxSender {
 export class LocalKeyTxSender implements TxSender {
   private readonly account: PrivateKeyAccount;
   private readonly wallet: WalletClient;
+  private readonly reader: PublicClient;
 
   constructor(privateKey: Hex, rpcUrl: string, private readonly chain: Chain) {
     this.account = privateKeyToAccount(privateKey);
     this.wallet = createWalletClient({ account: this.account, chain, transport: http(rpcUrl) });
+    this.reader = createPublicClient({ chain, transport: http(rpcUrl) }) as PublicClient;
+  }
+
+  /** Picks the nonce itself (the account's pending count, unless `tx.nonce` is given) and reports it. */
+  async sendWithNonce(tx: TxRequest): Promise<SentTx> {
+    const nonce = tx.nonce ?? (await this.reader.getTransactionCount({ address: this.account.address, blockTag: "pending" }));
+    return { hash: await this.send({ ...tx, nonce }), nonce };
   }
 
   get address(): Address {
@@ -76,8 +99,18 @@ export class SerialTxSender implements TxSender {
   get address(): Address {
     return this.inner.address;
   }
+  get supportsReplacement(): boolean | undefined {
+    return this.inner.supportsReplacement;
+  }
   send(tx: TxRequest): Promise<Hex> {
     const run = this.tail.then(() => this.inner.send(tx));
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+  /** Serialized like `send`, so the nonce the inner sender picks is never picked twice. */
+  sendWithNonce(tx: TxRequest): Promise<SentTx> {
+    const inner = this.inner;
+    const run = this.tail.then(() => (inner.sendWithNonce ? inner.sendWithNonce(tx) : inner.send(tx).then((hash) => ({ hash }))));
     this.tail = run.catch(() => undefined);
     return run;
   }
@@ -95,8 +128,13 @@ export const RECEIPT_POLL_MS = 1_000;
 /** The transaction is no longer known to the node (dropped from the mempool, or reorged out and discarded) and was
  *  never mined: the caller should re-evaluate and, if still needed, send it again. */
 export class TxDroppedError extends Error {
-  constructor(readonly hash: Hex) {
-    super(`transaction ${hash} was dropped before it was mined`);
+  /** `nonce`: the nonce it was sent at, when known -- resend the same logical transaction at it, so that if it was
+   *  not really dropped (a lagging or load-balanced node), at most one of the two can land. */
+  constructor(
+    readonly hash: Hex,
+    readonly nonce?: number,
+  ) {
+    super(`transaction ${hash} was dropped before it was mined${nonce !== undefined ? ` (nonce ${nonce})` : ""}`);
     this.name = "TxDroppedError";
   }
 }
@@ -137,13 +175,20 @@ export async function waitOrReplace(
   sender: TxSender,
   req: TxRequest,
   hash: Hex,
-  opts: { timeoutMs?: number; maxReplacements?: number; pollMs?: number } = {},
+  opts: { timeoutMs?: number; maxReplacements?: number; pollMs?: number; nonce?: number } = {},
 ): Promise<TransactionReceipt> {
   const timeoutMs = opts.timeoutMs ?? RECEIPT_TIMEOUT_MS;
   const pollMs = opts.pollMs ?? RECEIPT_POLL_MS;
   const maxReplacements = opts.maxReplacements ?? MAX_REPLACEMENTS;
   const hashes: Hex[] = [hash];
   let lastSendError: unknown;
+  let nonce = opts.nonce;
+  const canReplace = sender.supportsReplacement !== false;
+  const lookup = (h: Hex) =>
+    client.getTransaction({ hash: h }).catch((err: unknown) => {
+      if (err instanceof TransactionNotFoundError) return null;
+      throw err;
+    });
   const minedOne = async (): Promise<TransactionReceipt | null> => {
     for (const h of hashes) {
       const r = await client.getTransactionReceipt({ hash: h }).catch((err: unknown) => {
@@ -166,16 +211,30 @@ export async function waitOrReplace(
       if (left <= 0) break;
       await new Promise((r) => setTimeout(r, Math.min(pollMs, left)));
     }
-    const pending = await client.getTransaction({ hash: current }).catch((err: unknown) => {
-      if (err instanceof TransactionNotFoundError) return null;
-      throw err;
-    });
-    if (!pending) throw new TxDroppedError(current);
+    // The newest of our transactions the node still knows (an older one may outlive a dropped replacement).
+    let pending: Awaited<ReturnType<typeof lookup>> = null;
+    for (const h of [...hashes].reverse()) {
+      pending = await lookup(h);
+      if (pending) break;
+    }
+    if (!pending) {
+      // Plan 4.5 Task 10 re-review (I3): one more receipt check right before reporting a drop -- a transaction mined
+      // between the two reads above is not dropped, and resending it would pay twice.
+      const late = await minedOne();
+      if (late) return late;
+      throw new TxDroppedError(current, nonce);
+    }
+    nonce ??= pending.nonce;
     if (pending.blockNumber !== null) {
       // mined between the two reads: its receipt is there now
       const r = await minedOne();
       if (r) return r;
       continue;
+    }
+    if (!canReplace) {
+      // A sender that cannot honour nonce/fee overrides: never replace, only wait (bounded) and report.
+      if (round < maxReplacements) continue;
+      throw new TxStuckError(hashes);
     }
     if (round >= maxReplacements) {
       // A replacement send that failed (e.g. it reverted in gas estimation) explains best why we are stuck; the

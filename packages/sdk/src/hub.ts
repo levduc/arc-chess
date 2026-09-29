@@ -124,7 +124,12 @@ function isSendRevert(err: unknown): boolean {
 
 /** Per-write options. `receiptTimeoutMs` bounds each receipt wait (default `RECEIPT_TIMEOUT_MS`, 30 s); a dispute
  *  write passes less when its deadline is closer (see `waitOrReplace`). */
-export type WriteOptions = { receiptTimeoutMs?: number };
+export type WriteOptions = {
+  receiptTimeoutMs?: number;
+  /** Send at this nonce: the resend of a transaction reported dropped (`TxDroppedError.nonce`), so that if it was not
+   *  really dropped at most one of the two lands (Plan 4.5 Task 10 re-review I3). */
+  nonce?: number;
+};
 
 export class HubClient {
   constructor(
@@ -375,8 +380,11 @@ export class HubClient {
       throw err;
     }
     let hash: Hex;
+    let nonce: number | undefined;
     try {
-      hash = await sender.send({ to, data });
+      // The nonce is recorded at send time: a TxDroppedError carries it, for the caller's resend.
+      const req = { to, data, ...(opts.nonce !== undefined ? { nonce: opts.nonce } : {}) };
+      ({ hash, nonce } = sender.sendWithNonce ? await sender.sendWithNonce(req) : { hash: await sender.send(req), nonce: opts.nonce });
     } catch (err) {
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
       // not a revert (RPC down, nonce, gas allowance, a non-viem sender's own failure): the caller sees it unchanged
@@ -385,7 +393,7 @@ export class HubClient {
     // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
     let receipt: TransactionReceipt;
     try {
-      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs });
+      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs, nonce });
     } catch (err) {
       // A replacement send can revert too (Plan 4.5 Task 10 re-review I1): classified like the original send.
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);

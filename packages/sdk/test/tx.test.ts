@@ -299,3 +299,76 @@ describe("waitOrReplace: a failing replacement send (Task 10 re-review I1)", () 
     expect(err).toBeInstanceOf(HubRevertError); // before: the raw ExecutionRevertedError
   });
 });
+
+describe("waitOrReplace: drops, nonces and the replacement contract (Task 10 re-review I3)", () => {
+  it("re-checks the receipts right before reporting a drop: a transaction mined meanwhile is returned, not 'dropped'", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    n.pool.delete(hash); // the node's pool no longer lists it...
+    const realLookup = n.client.getTransaction;
+    n.client.getTransaction = (async (args: { hash: Hex }) => {
+      try {
+        return await realLookup(args);
+      } finally {
+        n.mined.add(hash); // ...because it was just mined (seen by the next receipt read)
+      }
+    }) as typeof realLookup;
+    // Before the fix: TxDroppedError, and the caller would pay a second time.
+    const r = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 10, pollMs: 5 });
+    expect(r.transactionHash).toBe(hash);
+  });
+
+  it("TxDroppedError carries the nonce the transaction was sent at", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x", nonce: 9 });
+    n.pool.delete(hash);
+    const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 10, pollMs: 5, nonce: 9 }).catch((e) => e);
+    expect(err).toBeInstanceOf(TxDroppedError);
+    expect((err as TxDroppedError).nonce).toBe(9);
+  });
+
+  it("HubClient.write records the nonce at send time and sends at a nonce it is given", async () => {
+    const n = stubNode();
+    const seen: Array<number | undefined> = [];
+    const sender: TxSender = {
+      address: n.sender.address,
+      send: n.sender.send,
+      async sendWithNonce(tx) {
+        seen.push(tx.nonce);
+        const nonce = tx.nonce ?? 11;
+        const hash = await n.sender.send({ ...tx, nonce });
+        n.pool.delete(hash); // dropped at once
+        return { hash, nonce };
+      },
+    };
+    const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
+    const hub = new HubClient(TO, client);
+    const first = await hub.timeout(sender, h(1), { receiptTimeoutMs: 10 }).catch((e) => e);
+    expect(first).toBeInstanceOf(TxDroppedError);
+    expect((first as TxDroppedError).nonce).toBe(11); // before: undefined -- the resend would take a fresh nonce
+    await hub.timeout(sender, h(1), { receiptTimeoutMs: 10, nonce: (first as TxDroppedError).nonce }).catch(() => undefined);
+    expect(seen).toEqual([undefined, 11]);
+  });
+
+  it("a sender that declares supportsReplacement = false is never replaced: it only waits, bounded, then reports", async () => {
+    const n = stubNode({ supportsReplacement: false });
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 10, pollMs: 5 }).catch((e) => e);
+    expect(err).toBeInstanceOf(TxStuckError);
+    expect(n.sent).toHaveLength(1); // before the fix: 3 replacements it could not honour
+  });
+
+  it("SerialTxSender(LocalKeyTxSender).sendWithNonce picks the pending nonce and honours a given one (Anvil)", async () => {
+    const key = generatePrivateKey();
+    const address = privateKeyToAccount(key).address;
+    await setEthBalance(address, 10n ** 18n);
+    const sender = new SerialTxSender(new LocalKeyTxSender(key, RPC, CHAIN));
+    const pub = publicClient();
+    const a = await sender.sendWithNonce({ to: TO, data: "0x", value: 1n });
+    expect(a.nonce).toBe(0);
+    expect((await pub.getTransaction({ hash: a.hash })).nonce).toBe(0);
+    const b = await sender.sendWithNonce({ to: TO, data: "0x", value: 1n });
+    expect(b.nonce).toBe(1);
+    await expect(sender.sendWithNonce({ to: TO, data: "0x", value: 1n, nonce: 1 })).rejects.toThrow(/nonce/i); // used
+  });
+});
