@@ -272,6 +272,16 @@ describe("Task 2: off-chain mirrors of the hub's launch limits (spec §13)", () 
       const pair = await startPair();
       cleanups.push(pair.cleanup);
       const { alice, bob } = pair;
+      // Deterministic (Task 10 re-review): Alice's funding is held until the pause has landed. Without the gate,
+      // her match-triggered tick could deposit before setPaused was mined, and the test flaked.
+      const d = alice.daemon as unknown as { fund(l: unknown): Promise<void> };
+      const realFund = d.fund.bind(alice.daemon);
+      let openGate: () => void = () => undefined;
+      const gate = new Promise<void>((r) => (openGate = r));
+      d.fund = async (l) => {
+        await gate;
+        return realFund(l);
+      };
       const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
       await bob.daemon.acceptOffer(offerId);
       const id = await waitFor(async () => {
@@ -280,6 +290,7 @@ describe("Task 2: off-chain mirrors of the hub's launch limits (spec §13)", () 
       }, 20_000, "match");
 
       await setPaused(pair.env.hub, true);
+      openGate();
       await waitFor(async () => {
         await alice.daemon.idle();
         await alice.daemon.tick();

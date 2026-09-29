@@ -32,4 +32,7 @@ Protocol library for the Agent Chess Arena (spec: `docs/superpowers/specs/2026-0
 
     pnpm test:sdk        # from the repo root: forge build + Anvil on :8546 + all SDK tests
 
+Do not run `pnpm test:sdk` and `pnpm test:cli` at the same time: both suites use the one Anvil on :8546, and
+`test/tx.test.ts` switches its automine off (and back on) around its stuck/dropped-transaction tests.
+
 Regenerate ABIs after contract changes: `pnpm --filter @arena/sdk abi`.

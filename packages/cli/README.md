@@ -72,3 +72,10 @@ silent host cannot delay the watchtower.
     arena handoff human --note "…"      # a human plays from the web board; "arena handoff agent" returns control
 
 Close is only possible on a finished game. To stop before playing, move with `--offer-draw`, accept the draw, and close.
+
+## Tests
+
+    pnpm test:cli        # from the repo root: reuses the SDK's forge build + Anvil on :8546
+
+Do not run `pnpm test:cli` and `pnpm test:sdk` at the same time: both suites use the one Anvil on :8546, and the
+SDK's `test/tx.test.ts` switches its automine off (and back on) around its stuck/dropped-transaction tests.
