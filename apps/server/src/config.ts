@@ -6,9 +6,16 @@ export type Limits = {
   maxOpenOffersPerIp: number; maxWatchedOffers: number; maxJoinsPerConnection: number;
 };
 
+/**
+ * Final review m8: `wsFrameBurst`/`wsFramePerSec` are per connection, and one daemon sends every channel's relay
+ * traffic (moves, re-sends after each join, close signatures) over its one connection. At the old 200 / 20 a busy
+ * daemon tripped the limit, and the server closes the socket on a trip (1008), so the reconnect-and-re-send cycle
+ * turned into a reconnect storm that blacked out match delivery (Task 11 soak). The soak needed 2000 / 200; the
+ * defaults are twice that. The per-IP caps (`wsPerIp`, the HTTP buckets, `maxOpenOffersPerIp`) are unchanged.
+ */
 export const DEFAULT_LIMITS: Limits = {
   httpPostBurst: 30, httpPostPerSec: 1, httpGetBurst: 120, httpGetPerSec: 10,
-  wsPerIp: 16, wsFrameBurst: 200, wsFramePerSec: 20, maxFrameBytes: 64 * 1024,
+  wsPerIp: 16, wsFrameBurst: 4000, wsFramePerSec: 400, maxFrameBytes: 64 * 1024,
   maxOpenOffersPerIp: 5, maxWatchedOffers: 256, maxJoinsPerConnection: 64,
 };
 

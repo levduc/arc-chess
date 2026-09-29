@@ -575,6 +575,20 @@ describe("lobby over /ws", () => {
     expect(closeEvent.code).toBe(1008);
   });
 
+  it("final review m8: the default frame limits sustain a busy daemon (a 2000-frame burst is not closed)", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const c = await wsConnect(server.url);
+    let closed = false;
+    void c.closed.then(() => (closed = true));
+    for (let i = 0; i < 2000; i++) c.ws.send(toWire({ type: "subscribe", offerIds: [] }));
+    await new Promise((r) => setTimeout(r, 500));
+    expect(closed).toBe(false); // before: closed with 1008 after the 200th frame
+    // The soak needed 2000 burst / 200 per s per connection (Task 11 report); the defaults carry a 2x margin.
+    expect(DEFAULT_LIMITS.wsFrameBurst).toBe(4000);
+    expect(DEFAULT_LIMITS.wsFramePerSec).toBe(400);
+  });
+
   it("refuses more than wsPerIp connections from one IP, and frees the slot once one closes", async () => {
     const chain = new FakeChain();
     server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, wsPerIp: 2 } }), { chain });
