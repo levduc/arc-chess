@@ -37,6 +37,13 @@ const WATCHDOG_MS = 10_000;
 const STALL_MS = 2 * 60_000;
 const WARMUP_MS = 3 * 60_000;
 const RSS_GROWTH_LIMIT_PCT = 50;
+/** The per-step wait budget for every daemon-API poll in the cycle loop (open, play, next-game, close). Found too
+ *  short at 20-30s during the Task 11 soak run: with several channel slots hammering a shared daemon continuously,
+ *  Node's single-threaded event loop can lag several seconds to tens of seconds behind on CPU-bound work (mostly
+ *  signature verification) before it gets to deliver an async event (a lobby match, a relayed move) -- not a hang,
+ *  just legitimate scheduling delay under a synthetic load far heavier than any real deployment. Comfortably under
+ *  STALL_MS, so a genuine stall is still caught by the watchdog rather than by a step timing out first. */
+const OP_TIMEOUT_MS = 90_000;
 /** Every daemon a top-up so a long run of many cycles (each permanently burning 2*FEE) never runs the wallet dry;
  *  the mock USDC has no real value, so this is generous on purpose. */
 const TOPUP = 2_000_000_000n;
@@ -97,18 +104,18 @@ async function findChannelByOffer(p: Player, offerId: Hex): Promise<Hex> {
       if (rec && rec.offerId.toLowerCase() === offerId.toLowerCase()) return c.channelId;
     }
     return undefined;
-  }, 30_000, `${p.name}'s channel for offer ${offerId}`);
+  }, OP_TIMEOUT_MS, `${p.name}'s channel for offer ${offerId}`);
 }
 
 async function closeBoth(a: Player, b: Player, id: Hex, hub: HubClient): Promise<void> {
   const aStatus = (await a.api("GET", `/status?channel=${id}`)) as Status;
-  await waitStatus(b, (s) => s.turnNum === aStatus.turnNum, 30_000, id);
+  await waitStatus(b, (s) => s.turnNum === aStatus.turnNum, OP_TIMEOUT_MS, id);
   await a.api("POST", "/close", { channel: id });
-  await waitStatus(b, (s) => s.opponentWantsToClose === true, 30_000, id);
+  await waitStatus(b, (s) => s.opponentWantsToClose === true, OP_TIMEOUT_MS, id);
   await b.api("POST", "/close", { channel: id });
-  await waitFor(async () => (await hub.channelInfo(id)).phase === "Finalized", 30_000, `channel ${id} Finalized`);
-  await waitStatus(a, (s) => s.phase === "Finalized", 20_000, id);
-  await waitStatus(b, (s) => s.phase === "Finalized", 20_000, id);
+  await waitFor(async () => (await hub.channelInfo(id)).phase === "Finalized", OP_TIMEOUT_MS, `channel ${id} Finalized`);
+  await waitStatus(a, (s) => s.phase === "Finalized", OP_TIMEOUT_MS, id);
+  await waitStatus(b, (s) => s.phase === "Finalized", OP_TIMEOUT_MS, id);
 }
 
 // ------------------------------------------------------------------------------------------------------ /proc
@@ -291,14 +298,14 @@ async function main(): Promise<void> {
         const id = await findChannelByOffer(slot.accepter, offerId);
         slot.channelId = id;
         slot.lastProgressAt = Date.now();
-        await waitStatus(slot.offerer, (s) => s.phase === "Open", 30_000, id);
+        await waitStatus(slot.offerer, (s) => s.phase === "Open", OP_TIMEOUT_MS, id);
         const matchLatencyMs = Date.now() - matchStart;
         slot.maxMatchLatencyMs = Math.max(slot.maxMatchLatencyMs, matchLatencyMs);
         if (matchLatencyMs > MATCH_LATENCY_WARN_MS) {
           slot.slowMatches++;
           console.log(`[soak] slot ${slot.idx}: offerer took ${matchLatencyMs}ms to learn of the match on channel ${id}`);
         }
-        await waitStatus(slot.accepter, (s) => s.phase === "Open", 30_000, id);
+        await waitStatus(slot.accepter, (s) => s.phase === "Open", OP_TIMEOUT_MS, id);
         slot.lastProgressAt = Date.now();
 
         const rounds = 1 + Math.floor(slot.rand() * 3); // 1..3 games per channel
@@ -313,8 +320,8 @@ async function main(): Promise<void> {
             break;
           }
           const seed = ((slot.idx + 1) * 1_000_003 + cycle * 97 + g * 13) >>> 0;
-          await playRandomGameCapped(slot.offerer, slot.accepter, { channelId: id, seed, maxMoves: PLY_CAP, ms: 20_000 });
-          await waitStatus(slot.offerer, (s) => s.gameStatus !== "playing" && s.gameStatus !== "draw_offered", 20_000, id);
+          await playRandomGameCapped(slot.offerer, slot.accepter, { channelId: id, seed, maxMoves: PLY_CAP, ms: OP_TIMEOUT_MS });
+          await waitStatus(slot.offerer, (s) => s.gameStatus !== "playing" && s.gameStatus !== "draw_offered", OP_TIMEOUT_MS, id);
           slot.gamesCompleted++;
           slot.lastProgressAt = Date.now();
           if (g < rounds - 1) {
@@ -323,9 +330,9 @@ async function main(): Promise<void> {
               break;
             }
             await slot.offerer.api("POST", "/next-game", { channel: id });
-            await waitStatus(slot.accepter, (s) => s.attention === "new-game-proposed", 15_000, id);
+            await waitStatus(slot.accepter, (s) => s.attention === "new-game-proposed", OP_TIMEOUT_MS, id);
             await slot.accepter.api("POST", "/next-game", { channel: id });
-            await waitStatus(slot.offerer, (s) => s.gameIndex === g + 1 && s.newGame === "none", 15_000, id);
+            await waitStatus(slot.offerer, (s) => s.gameIndex === g + 1 && s.newGame === "none", OP_TIMEOUT_MS, id);
             slot.lastProgressAt = Date.now();
           }
         }
