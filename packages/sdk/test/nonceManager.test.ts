@@ -392,6 +392,9 @@ describe("invariant 5: every wait is bounded", () => {
     );
     expect(r).not.toBe("timeout"); // before the fix: a tight loop past giveUpAt
     expect(Date.now() - t0).toBeLessThan(1_000);
+    // Round 5 (m1): the node says it was mined -- reported as such, not as stuck.
+    expect((r as { e: unknown }).e).toBeInstanceOf(TxReceiptMissingError);
+    expect(wallet.tracked()).toEqual([]);
   });
 
   it("a lagging receipt index respects the abort signal", async () => {
@@ -630,5 +633,55 @@ describe("round 5, I2: a send whose response is lost is still tracked", () => {
     // Before: the "count race" retry re-sent it at nonce 1, and it landed twice.
     expect(n.landed.filter((t) => t.value === 3n)).toHaveLength(1);
     expect(n.byHash(h).nonce).toBe(0);
+  });
+});
+
+describe("round 5, minor fixes", () => {
+  it("m2: an entry released while a fresh send is being prepared is replaced by that send, not queued behind", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client);
+    const a = await w.send({ to: to(1), data: "0x01" }); // nonce 0, its wait active
+    n.state.onEstimateGas = () => {
+      n.state.onEstimateGas = undefined;
+      w.release(a); // a's wait gives up while b is being prepared (after b's released-entry check)
+    };
+    const b = await w.send({ to: to(2), data: "0x02" });
+    expect(n.byHash(b).nonce).toBe(0); // before: 1, behind the stuck nonce 0
+  });
+
+  it("m4: a send at an explicit nonce nobody tracks is capped too", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n }); // cap 4000
+    await w.send({ to: to(1), data: "0x", nonce: 0, gas: 21_000n, maxFeePerGas: 1_000_000n, maxPriorityFeePerGas: 1_000_000n });
+    expect(n.attempts[0].maxFeePerGas).toBeLessThanOrEqual(4_000n); // before: 1000000
+    expect(n.attempts[0].maxPriorityFeePerGas).toBeLessThanOrEqual(4_000n);
+  });
+
+  it("m5: the wait's replacement is raised to at least bump(lastFees) before the cap, whatever fees it asked for", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client);
+    const a = await w.send({ to: to(1), data: "0x" });
+    w.observed(a, { maxFeePerGas: 3_000n, maxPriorityFeePerGas: 300n }); // the node reports it higher
+    n.pool.get(0)!.maxFeePerGas = 3_000n;
+    n.pool.get(0)!.maxPriorityFeePerGas = 300n;
+    await w.send({ to: to(1), data: "0x", nonce: 0, maxFeePerGas: 1_000n, maxPriorityFeePerGas: 10n }); // asks too little
+    const t = n.attempts.at(-1)!;
+    expect(t.maxFeePerGas).toBeGreaterThanOrEqual(3_375n); // before: 1000, refused as underpriced
+    expect(t.maxPriorityFeePerGas).toBeGreaterThanOrEqual(338n);
+    expect(n.pool.get(0)!.hash).toBe(t.hash);
+  });
+
+  it("m7: a failed fee estimate keeps the last known market for the cap instead of collapsing it to 0", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n });
+    const a = await w.send({ to: to(1), data: "0x" }); // the estimate (1000) is known from here
+    await waitOrReplace(n.client, w, { to: to(1), data: "0x" }, a, { timeoutMs: 5, pollMs: 5, maxReplacements: 0 }).catch(() => undefined);
+    n.rawClient.estimateFeesPerGas = async () => {
+      throw new Error("fetch failed");
+    };
+    const b = await w.send({ to: to(2), data: "0x" }).catch((e: unknown) => e); // before: TxFeeCapError (cap 0)
+    expect(typeof b).toBe("string");
+    expect(n.byHash(b as Hex).maxFeePerGas).toBeGreaterThanOrEqual(1_125n);
+    expect(n.byHash(b as Hex).maxFeePerGas).toBeLessThanOrEqual(4_000n);
   });
 });

@@ -371,11 +371,15 @@ export class SerialTxSender implements TxSender, TxTracker {
     let nonce = await next();
     // Against pending: a new intent may depend on one of ours still pending (a deposit on its approve).
     const gas = tx.gas ?? (await this.estimateGas(reader, tx, "pending"));
-    const estimate = await estimateFees(reader);
+    const estimate = this.noted(await estimateFees(reader));
     const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
     if (feeOf(estimate) > room.balance) throw new TxInsufficientFundsError(this.address);
     const fees = clampFees(estimate, room.cap);
     for (let attempt = 0; ; attempt++) {
+      // Round 5 (m2): a wait may have released an entry while this send was being prepared (its release runs outside
+      // this mutex): replace that one instead of going fresh behind it.
+      const released = this.lowestReleased();
+      if (released) return this.replaceReleased(reader, tx, released);
       // Round 5 (I2): recorded before the send, so a transaction the node took although its response was lost is
       // still tracked (released, at its nonce, with its fees and -- when signed locally -- its hash).
       const e: Entry = { nonce, lastFees: fees, hashes: new Set(), state: "waiting", gas };
@@ -426,7 +430,7 @@ export class SerialTxSender implements TxSender, TxTracker {
    */
   private async replaceReleased(reader: TrackerClient, tx: TxRequest, e: Entry): Promise<Hex> {
     const known = hasFees(e.lastFees);
-    const estimate = known ? await estimateLike(reader, e.lastFees) : await estimateFees(reader);
+    const estimate = this.noted(known ? await estimateLike(reader, e.lastFees) : await estimateFees(reader));
     // New calldata: estimated against latest (the pending state holds the transaction being replaced).
     const gas = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
     const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
@@ -470,11 +474,20 @@ export class SerialTxSender implements TxSender, TxTracker {
   /** `waitOrReplace` replacing its own transaction (the same intent, at the same nonce), capped. */
   private async replaceOwn(reader: TrackerClient, tx: TxRequest, nonce: number): Promise<Hex> {
     const e = this.entries.get(nonce);
-    if (!e) return this.inner.send(tx); // a nonce nobody tracks: sent as asked
-    const estimate = await estimateLike(reader, e.lastFees);
+    if (!e) {
+      // A nonce nobody tracks: sent as asked, but capped too (round 5, m4).
+      const est = this.noted(await estimateLike(reader, feesOf(tx)));
+      const g = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
+      const r = await this.room(reader, est, g, tx.value ?? 0n);
+      const asked = hasFees(feesOf(tx)) ? feesOf(tx) : (est ?? {});
+      return this.inner.send({ ...tx, gas: g, ...clampFees(asked, bigMin(r.cap, r.balance)) });
+    }
+    const estimate = this.noted(await estimateLike(reader, e.lastFees));
     const gas = tx.gas ?? e.gas ?? (await this.estimateGas(reader, tx, "latest"));
     const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
-    const wanted = hasFees(feesOf(tx)) ? feesOf(tx) : replacementFees(e.lastFees, estimate);
+    const asked = hasFees(feesOf(tx)) ? feesOf(tx) : replacementFees(e.lastFees, estimate);
+    // Round 5 (m5): never below bump(lastFees), whatever the wait asked for -- the pool would refuse it.
+    const wanted = hasFees(e.lastFees) ? maxFees(asked, bumpFees(e.lastFees)) : asked;
     if (hasFees(e.lastFees)) this.affordable(nonce, bumpFees(e.lastFees), room);
     const fees = clampFees(wanted, bigMin(room.cap, room.balance));
     const r = await this.transmit(reader, { ...tx, gas, ...fees });
@@ -489,10 +502,19 @@ export class SerialTxSender implements TxSender, TxTracker {
     throw this.classify(r.err);
   }
 
+  /** The last fee estimate the node gave this sender (round 5, m7). */
+  private lastEstimate: Fees | undefined;
+  private noted<T extends Fees | undefined>(estimate: T): T {
+    if (estimate && hasFees(estimate)) this.lastEstimate = estimate;
+    return estimate;
+  }
+
   /** The fee cap, and the most per gas the balance can pay for this transaction. */
   private async room(reader: TrackerClient, estimate: Fees | undefined, gas: bigint, value: bigint): Promise<{ cap: bigint; balance: bigint }> {
-    const market = estimate ? feeOf(estimate) : 0n;
-    const cap = bigMax(market * FEE_CAP_MULTIPLIER, this.feeCeiling);
+    // Round 5 (m7): a failed estimate falls back to the last one this sender saw; with none at all, no market cap
+    // applies to this attempt (the balance bound still does).
+    const known = estimate ?? this.lastEstimate;
+    const cap = known ? bigMax(feeOf(known) * FEE_CAP_MULTIPLIER, this.feeCeiling) : NO_FEE_CEILING;
     const funds = await reader.getBalance({ address: this.address });
     const balance = funds > value && gas > 0n ? (funds - value) / gas : 0n;
     return { cap, balance };
@@ -851,8 +873,8 @@ export async function waitOrReplace(
         const r = await minedOne();
         if (r) return r;
         if (aborted()) throw new TxWaitAbortedError(hashes, nonce, lastFees);
-        if (pastGiveUp()) throw new TxStuckError(hashes, true, nonce, lastFees);
-        if (lagging >= LAGGING_RECEIPT_ROUNDS) {
+        // Round 5 (m1): at its give-up time too, a transaction the node reports mined is treated as mined.
+        if (lagging >= LAGGING_RECEIPT_ROUNDS || pastGiveUp()) {
           tracker?.settle(hash); // treated as mined: the caller re-reads the chain on its next pass
           throw new TxReceiptMissingError(pending.hash, pending.blockNumber, nonce);
         }
