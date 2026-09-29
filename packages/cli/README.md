@@ -27,6 +27,19 @@ the RPC decides what your watchtower sees. Verify them against a source you trus
 explicitly, in which case `init` makes no network call. Preferably use your own RPC. A non-loopback `http://`
 server gets a warning on stderr, since anyone on the path could rewrite its answer.
 
+Other `init` settings:
+
+- `--session-gas-wei N`: the native balance (wei; on Arc, native gas is USDC) each channel's session key is kept at
+  for dispute transactions. By default `init` derives it from the chain: 4 × 2.1M gas × max(the fee ceiling, 4 × the
+  RPC's `eth_gasPrice`), and prints it. `--session-gas-floor N` (default half of it) is the balance below which the
+  daemon refills a key while its channel is Open or Challenged.
+- `--min-challenge-timeout SECONDS` (default 900): the daemon refuses to offer, accept or fund a channel with a
+  shorter `challengeTimeout`. A missed challenge deadline can cost more than one stake, and a restart or an RPC
+  outage can take longer than the hub's 60 s minimum.
+- `init` warns loudly (`WARNING: hub … is not the canonical …`) when the hub, rules or USDC address differs from the
+  canonical deployment of a known chain (`KNOWN_DEPLOYMENTS` in `src/config.ts`; empty until the Arc mainnet
+  deployment is added).
+
 `ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json`, `daemon.lock` and
 `channels/<id>/`. All of these files are mode 0600.
 
@@ -36,6 +49,13 @@ did not send, it adopts that nonce and replaces the transaction with its own (Pl
 from the same key with another wallet can be replaced and never land. `--fee-ceiling-wei` sets the most the wallet
 pays per gas for a replacement (at least 4x the node's estimate; default 100 gwei); session keys have no ceiling
 and are bounded only by their balance.
+
+**What the wallet pays for.** On Arc, native gas is USDC, so the wallet needs USDC for, per channel: the deposit
+and the host fee; `sessionGasWei` for the session key (topped up at funding, and refilled whenever an opponent's
+challenges drain it below the floor); and gas for `approve`, `deposit` and the top-ups. The daemon approves exactly
+`deposit + fee` before each deposit, never an unlimited allowance. Leftover session-key gas is not swept back after a
+channel settles (planned); each session key's private key stays in `ARENA_HOME/channels/<id>/record.json`. If the
+wallet cannot refill a session key, `status` raises the `session-gas-low` attention: fund the wallet.
 
 ## Running the daemon
 
@@ -67,11 +87,44 @@ the on-chain `challenge` stays the fallback. Settled channels are left, and expi
 neither accumulates against the host's per-connection limits. The daemon never waits on the relay: a slow or
 silent host cannot delay the watchtower.
 
+### Keep it running (supervisor)
+
+The watchtower only protects you while the daemon runs: a challenge left unanswered past its deadline can cost the
+channel, not just one game. Run it under a supervisor that restarts it if it exits. A restart is safe: the daemon
+reloads every channel from `ARENA_HOME`, rescans the chain from each channel's cursor, and adopts any transaction its
+previous run left pending.
+
+A systemd user unit, `~/.config/systemd/user/arena.service`:
+
+    [Unit]
+    Description=arena player daemon
+    After=network-online.target
+
+    [Service]
+    Environment=ARENA_HOME=%h/.arena
+    ExecStart=/usr/bin/env arena daemon
+    Restart=always
+    RestartSec=5
+
+    [Install]
+    WantedBy=default.target
+
+Then `systemctl --user daemon-reload && systemctl --user enable --now arena` (and `loginctl enable-linger $USER` so
+it keeps running after you log out). Logs: `journalctl --user -u arena -f`.
+
+Without systemd, a restart loop does the same:
+
+    nohup sh -c 'while true; do arena daemon; echo "arena daemon exited ($?), restarting" >&2; sleep 5; done' \
+      >> ~/.arena/daemon.log 2>&1 &
+
+The daemon's memory stays flat over its lifetime: a settled channel is dropped from memory 10 minutes (chain time)
+after it settles. `arena status --channel <id>` still answers for it, and `arena channels` lists the latest 1,000.
+
 ## Playing (agent loop)
 
     arena offers                        # open offers in the lobby
-    arena offer --deposit 1 --stake 0.1 # or accept one: arena accept <offerId>
-    arena wait --timeout 60             # blocks until a channel needs you
+    arena offer --deposit 1 --stake 0.1 # or accept one: arena accept <offerId>; --timeout defaults to 900 s
+    arena wait --timeout 60             # blocks until a channel needs you (reason: your-turn, game-over, settled, ...)
     arena status                        # FEN, ASCII board, legal moves (SAN), balances, suggested actions
     arena move e4 [--offer-draw]
     arena resign | accept-draw | next-game | close
@@ -79,6 +132,11 @@ silent host cannot delay the watchtower.
     arena handoff human --note "…"      # a human plays from the web board; "arena handoff agent" returns control
 
 Close is only possible on a finished game. To stop before playing, move with `--offer-draw`, accept the draw, and close.
+
+`wait` returns one of these reasons: `your-turn`, `new-game-proposed`, `game-over`, `close-requested`,
+`opponent-silent`, `control-changed`, `settled` (a channel settled; returned once, e.g. after your close), and
+`session-gas-low` (returned once per episode; `status` keeps showing it until the wallet is funded and the key is
+refilled), or `timeout`.
 
 ## Tests
 

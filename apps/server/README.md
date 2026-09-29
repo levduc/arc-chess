@@ -62,7 +62,7 @@ Example `server.json` for a local Anvil deployment (`anvil --port 8545` plus a `
   "dbPath": "arena.sqlite",
   "fundingWindow": 3600,
   "offerMaxLifetime": 86400,
-  "defaults": { "deposit": "1000000", "stakePerGame": "100000", "challengeTimeout": "600" },
+  "defaults": { "deposit": "1000000", "stakePerGame": "100000", "challengeTimeout": "900" },
   "cliCommand": "arena",
   "audit": "unaudited (development build)",
   "indexer": { "pollMs": 2000, "chunkBlocks": 1000, "startBlock": 0 },
@@ -79,6 +79,11 @@ at startup when it runs in memory. A database written by an older version is mig
 handed to agents in `/templates` when it differs from the RPC endpoint this process itself uses. Amounts
 (`fundingWindow`, `offerMaxLifetime`, `defaults.*`) accept either a JSON number or a decimal string, since some
 values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
+
+`audit` is published in `/templates`. It defaults to `"unaudited (development build)"` only on a local Anvil chain
+(chain id 31337). On any other chain it is required and may not be that development string: state the truth, e.g.
+`"unaudited; guarded launch, caps 10 USDC per player and 1,000 USDC in total"`. `defaults.challengeTimeout` defaults
+to 900 s, the daemons' default `minChallengeTimeout`: daemons refuse shorter offers.
 
 ## Routes
 
@@ -192,11 +197,18 @@ Every "per IP" limit below is keyed on the client address:
 | `httpPostBurst` / `httpPostPerSec` | 30 / 1 | Per-IP token bucket for POST requests. |
 | `httpGetBurst` / `httpGetPerSec` | 120 / 10 | Per-IP token bucket for GET requests. |
 | `wsPerIp` | 16 | Max concurrent `/ws` connections from one IP. |
-| `wsFrameBurst` / `wsFramePerSec` | 200 / 20 | Per-connection token bucket for inbound WebSocket frames. |
+| `wsFrameBurst` / `wsFramePerSec` | 4000 / 400 | Per-connection token bucket for inbound WebSocket frames. See below. |
 | `maxFrameBytes` | 65536 | Max WebSocket frame size (`ws`'s `maxPayload`). |
 | `maxOpenOffersPerIp` | 5 | Max open (unmatched, unexpired) offers per IP. |
 | `maxWatchedOffers` | 256 | Max offer ids one `/ws` connection may `subscribe` to. |
 | `maxJoinsPerConnection` | 64 | Max relay channels one `/ws` connection may `join`. |
+
+Why the WebSocket frame limits are high: they are per connection, and one daemon sends every channel's relay
+traffic over its one connection (moves, a re-send of its latest state and Close signature after every join, the
+re-joins after a reconnect). A trip closes the connection (1008), and the daemon's reconnect, re-join and re-send
+then trips it again: at the old 200 / 20, a busy daemon fell into a reconnect storm that blacked out its match
+delivery for over a minute (Plan 4.5 Task 11 soak). The soak needed 2000 / 200; the defaults are twice that. The
+per-IP caps above (`wsPerIp`, the HTTP buckets, `maxOpenOffersPerIp`) are what bound one client's total load.
 
 ## Metrics (`GET /metrics`, Prometheus text exposition)
 

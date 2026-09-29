@@ -96,15 +96,22 @@ deposits or existing channels, and the hub stays non-upgradeable:
   always settle, and a half-funded channel is still refunded by `reclaim` after its funding deadline.
 
 The worst an owner (or a compromised owner key) can do is refuse new business; it can never move escrowed
-funds, alter an existing channel's terms, or block an exit.
+funds, alter an existing channel's terms, or block an exit. One side effect of the pause: it blocks the second
+deposit too, so a player who has already funded a new channel stays locked until that channel's `fundingDeadline`
+(at most `MAX_FUNDING_WINDOW`, 1 day, on-chain; at most 2 hours through an honest host) and then reclaims.
+
+**Never renounce ownership** (`Ownable.renounceOwnership` is inherited): renouncing while paused freezes new
+business forever. Funds are unaffected, but the hub could never be unpaused or have its caps raised again.
 
 **Residual risk: first-come squatting of `maxCommittedEscrow`.** `params.fundingDeadline` is bounded to at
 most `block.timestamp + MAX_FUNDING_WINDOW` (a constant, 1 day) by `_validateNewParams` — without this, a
 self-dealing attacker could set an unbounded deadline, fund only their own side, and hold that reservation
-against the cap forever at roughly gas cost, since `reclaim` only becomes callable after the deadline
-passes. With the bound, any such reservation is reclaimable (by anyone) within one day, but an attacker can
-still occupy the cap for up to that window before it frees up. The owner's response to this, as to any other
-capacity pressure, is to raise `maxCommittedEscrow`.
+against the cap forever, since `reclaim` only becomes callable after the deadline passes. With the bound, any such
+half-funded reservation is reclaimable (by anyone) within one day. It is not free: the squatter locks its own side
+(`deposit + feePerPlayer`) for that window. The worse case is not bounded by the window: a self-dealing channel
+funded on **both** sides and left Open holds its reservation indefinitely, at a cost of the reservation's capital
+(locked) plus `2 * feePerPlayer` per channel. The owner's response to this, as to any other capacity pressure, is to
+raise `maxCommittedEscrow`; monitor `committedEscrow` against real game activity.
 
 ## External entry points and Circle CLI
 
