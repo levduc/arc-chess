@@ -108,7 +108,8 @@ export function decodeRevert(err: unknown): string | undefined {
 }
 
 /**
- * True if an error thrown by `TxSender.send` is an execution revert, as opposed to a failure of the send itself.
+ * True if an error thrown by `TxSender.send` (or by the simulating `eth_call` before it) is an execution revert, as
+ * opposed to a failure of the send itself.
  * Decodable revert data settles it. Without data, only the node's own message counts, and only if it says
  * "execution reverted": viem also classifies "gas required exceeds allowance" (the sender cannot pay for gas, not
  * a hub revert) as an ExecutionRevertedError, and its top-level message reads "Execution reverted with reason:
@@ -367,7 +368,11 @@ export class HubClient {
     try {
       await this.client.call({ account: sender.address, to, data });
     } catch (err) {
-      throw new HubRevertError(decodeRevert(err), err);
+      // Plan 4.5 Task 10 review: only an execution revert is a HubRevertError. A transport failure (HTTP 500, a
+      // reset, a JSON-RPC error from an overloaded node) carries no revert data and is rethrown unchanged -- the
+      // caller must not read "the hub refused this" into "the RPC is down".
+      if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      throw err;
     }
     let hash: Hex;
     try {

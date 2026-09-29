@@ -6,14 +6,18 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  HttpRequestError,
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
   WaitForTransactionReceiptTimeoutError,
   type Hex,
+  type PublicClient,
   type TransactionReceipt,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
+  HubClient,
+  HubRevertError,
   LocalKeyTxSender,
   MAX_REPLACEMENTS,
   SerialTxSender,
@@ -24,7 +28,7 @@ import {
   type TxRequest,
   type TxSender,
 } from "../src/index.js";
-import { CHAIN, RPC, publicClient, setEthBalance } from "./helpers/chain.js";
+import { CHAIN, RPC, deployArena, publicClient, setEthBalance } from "./helpers/chain.js";
 
 const h = (n: number): Hex => `0x${n.toString(16).padStart(64, "0")}`;
 const TO = "0x00000000000000000000000000000000000000aa" as const;
@@ -190,5 +194,31 @@ describe("waitOrReplace against Anvil (automine off for the test)", () => {
     } finally {
       await anvil("evm_setAutomine", [true]);
     }
+  });
+});
+
+describe("HubClient.write: simulate failures (Plan 4.5 Task 10 review)", () => {
+  it("rethrows a transport failure of the simulating eth_call unchanged, not as a HubRevertError", async () => {
+    const real = publicClient();
+    const failure = new HttpRequestError({ url: RPC, status: 500, details: "Internal Server Error" });
+    const stub = { ...real, call: async () => { throw failure; } } as unknown as PublicClient;
+    const hub = new HubClient(TO, stub);
+    const err = await hub.timeout(new LocalKeyTxSender(generatePrivateKey(), RPC, CHAIN), h(1)).catch((e) => e);
+    expect(err).toBe(failure); // before the fix: HubRevertError("hub call failed: HTTP request failed ...")
+    expect(err).not.toBeInstanceOf(HubRevertError);
+  });
+
+  it("still reports a revert without data (no decodable reason) as a HubRevertError", async () => {
+    const real = publicClient();
+    // Any call is turned into garbage calldata to a contract with no fallback: an execution revert with empty data.
+    const env = await deployArena();
+    const stub = {
+      ...real,
+      call: (args: Parameters<PublicClient["call"]>[0]) => real.call({ ...args, data: "0xdeadbeef" }),
+    } as unknown as PublicClient;
+    const hub = new HubClient(env.hub, stub);
+    const err = await hub.timeout(new LocalKeyTxSender(generatePrivateKey(), RPC, CHAIN), h(1)).catch((e) => e);
+    expect(err).toBeInstanceOf(HubRevertError);
+    expect((err as HubRevertError).errorName).toBeUndefined();
   });
 });
