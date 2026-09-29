@@ -8,6 +8,7 @@ import {
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
+  RECEIPT_TIMEOUT_MS,
   SerialTxSender,
   ZERO_HASH,
   channelId as computeChannelId,
@@ -20,6 +21,7 @@ import {
   outcome,
   signAcceptance,
   signOffer,
+  waitOrReplace,
   type ArenaDomain,
   type LobbyClient,
   type MatchEvent,
@@ -62,7 +64,7 @@ export type ChannelHandle = {
   processedEvents: number;
   chain: ChainView | null;
   lastError: string | null;
-  /** R9/3b: counts every `watch()` attempt for this channel — lets tests confirm an explicit `tick()` actually ran a pass (as opposed to being swallowed by the concurrent-tick guard) instead of just assuming it. */
+  /** R9/3b: counts every watchtower pass attempt (dispute or main) for this channel — lets tests confirm an explicit `tick()` actually ran a pass (as opposed to being swallowed by the concurrent-tick guard) instead of just assuming it. */
   passes: number;
   /** I2: chain time of the last observed progress on this channel (in memory only; set on the first refresh after start). */
   lastProgressAt: bigint | null;
@@ -127,7 +129,13 @@ export class ArenaDaemon {
   protected readonly changes = new EventEmitter();
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
-  private ticking = false;
+  /** Plan 4.5 Task 10 review: the watchtower runs as two independent passes, each with its own in-flight guard
+   *  (see `disputePass` / `mainPass`), so a stall in one never delays the other. */
+  private disputeTicking = false;
+  private mainTicking = false;
+  private get ticking(): boolean {
+    return this.disputeTicking || this.mainTicking;
+  }
   /** M1: set by stop(); every handler checks this before any side effect (open/join/fund) it hasn't started yet. */
   private stopped = false;
   /** I3: offerIds currently being turned into a channel — guards against two match events racing the same offer. */
@@ -186,7 +194,11 @@ export class ArenaDaemon {
     // R8.3: populate `chain` for restored channels immediately, so status()/channels()/wait() can see
     // attention right after a restart instead of waiting up to pollMs for the first periodic tick.
     if (!this.stopped) await this.tick();
-    this.timer = setInterval(() => void this.tick(), this.opts.config.pollMs);
+    // The two passes are started independently: a dispute pass never waits for a main pass still in flight.
+    this.timer = setInterval(() => {
+      void this.disputePass();
+      void this.mainPass();
+    }, this.opts.config.pollMs);
   }
 
   async stop(): Promise<void> {
@@ -571,12 +583,10 @@ export class ArenaDaemon {
       const balance = await this.client.getBalance({ address: l.sessionSender.address });
       if (balance < this.opts.config.sessionGasWei) {
         if (this.stopped) return;
-        const hash = await this.wallet.send({
-          to: l.sessionSender.address,
-          data: "0x",
-          value: this.opts.config.sessionGasWei - balance,
-        });
-        await this.client.waitForTransactionReceipt({ hash });
+        const req = { to: l.sessionSender.address, data: "0x" as Hex, value: this.opts.config.sessionGasWei - balance };
+        const hash = await this.wallet.send(req);
+        // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
+        await waitOrReplace(this.client, this.wallet, req, hash);
       }
     }
     if (this.stopped) return;
@@ -663,8 +673,11 @@ export class ArenaDaemon {
     if (info.phase !== "Challenged") return;
     const registered = await this.hub.registeredState(id);
     if (l.session.latest.state.turnNum <= registered.turnNum) return;
+    const now = (await this.client.getBlock()).timestamp;
     try {
-      await this.hub.respond(l.sessionSender, l.session.challengeProof());
+      await this.hub.respond(l.sessionSender, l.session.challengeProof(), {
+        receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
+      });
     } catch (err) {
       // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
       // challenger's own watchtower once the relay delivers that move), and the loser's respond reverts because the
@@ -799,36 +812,78 @@ export class ArenaDaemon {
 
   // ------------------------------------------------------------------ watchtower (Task 6)
 
+  /** One full watchtower round: the dispute pass, then the main pass (an explicit call, e.g. from a test, runs both
+   *  in order; the periodic timer starts them independently). */
   async tick(): Promise<void> {
-    if (this.stopped || this.ticking) return;
-    this.ticking = true;
+    await this.disputePass();
+    await this.mainPass();
+  }
+
+  /**
+   * Plan 4.5 Task 10 review -- pass 1, dispute work first: respond, timeout and autoPlay for every channel whose
+   * on-chain phase is Challenged, and nothing else. It has its own in-flight guard and is started on its own by the
+   * timer, so a main pass stalled on a slow funding or close transaction (up to its bounded receipt wait) never
+   * delays answering a challenge on another channel before its deadline.
+   */
+  async disputePass(): Promise<void> {
+    if (this.stopped || this.disputeTicking) return;
+    this.disputeTicking = true;
+    try {
+      for (const l of this.live.values()) {
+        if (this.stopped) break;
+        if (l.record.finalized) continue;
+        await this.runWatch(l, () => this.watchDispute(l));
+      }
+    } finally {
+      this.disputeTicking = false;
+      if (!this.stopped) this.notify();
+    }
+  }
+
+  /** Pass 2: everything else -- offer pruning, funding, reclaim, dispute scans and self-heal for channels that are not
+   *  Challenged, the cooperative-close retry -- then the match retries. */
+  async mainPass(): Promise<void> {
+    if (this.stopped || this.mainTicking) return;
+    this.mainTicking = true;
     try {
       await this.pruneOffers();
+      for (const l of this.live.values()) {
+        if (this.stopped) break;
+        if (l.record.finalized) continue;
+        await this.runWatch(l, () => this.watch(l));
+      }
       for (const m of [...this.retryMatches.values()]) {
         if (this.stopped) break;
         this.retryMatches.delete(m.offerId);
         await this.onMatch(m);
       }
-      for (const l of this.live.values()) {
-        if (this.stopped) break;
-        if (l.record.finalized) continue;
-        l.passes++;
-        try {
-          await this.watch(l);
-          // Plan 4.5 Task 10: a pass that got all the way through means an earlier pass's failure (an RPC blip)
-          // no longer applies. Without this, a quiet channel kept that error in lastError indefinitely.
-          if (l.lastError?.startsWith("watch:")) l.lastError = null;
-        } catch (err) {
-          // A pass that settled the channel and then failed on its final bookkeeping read (refreshChain) leaves
-          // nothing to retry: the channel is never watched again, so the error would stick. Logged instead.
-          if (l.record.finalized) this.log(`channel ${l.record.channelId}: settled; a read after settling failed: ${errorText(err)}`);
-          else l.lastError = `watch: ${errorText(err)}`;
-        }
-      }
     } finally {
-      this.ticking = false;
+      this.mainTicking = false;
       if (!this.stopped) this.notify();
     }
+  }
+
+  /** Runs one pass over one channel. `pass` resolves true when it did that channel's full work for its phase. */
+  private async runWatch(l: ChannelHandle, pass: () => Promise<boolean>): Promise<void> {
+    l.passes++;
+    try {
+      // Plan 4.5 Task 10: a pass that got all the way through means an earlier pass's failure (an RPC blip) no
+      // longer applies. Without this, a quiet channel kept that error in lastError indefinitely.
+      if ((await pass()) && l.lastError?.startsWith("watch:")) l.lastError = null;
+    } catch (err) {
+      // A pass that settled the channel and then failed on its final bookkeeping read (refreshChain) leaves
+      // nothing to retry: the channel is never watched again, so the error would stick. Logged instead.
+      if (l.record.finalized) this.log(`channel ${l.record.channelId}: settled; a read after settling failed: ${errorText(err)}`);
+      else l.lastError = `watch: ${errorText(err)}`;
+    }
+  }
+
+  /** Plan 4.5 Task 10 review: how long a dispute transaction may wait for its receipt before `waitOrReplace` checks
+   *  whether it was dropped or must be replaced -- min(30 s, a third of the time left to the deadline), never under
+   *  10 s -- so a stuck respond still gets replaced with higher fees in time. */
+  private disputeReceiptTimeoutMs(deadline: bigint, now: bigint): number {
+    const leftMs = Number(deadline > now ? deadline - now : 0n) * 1000;
+    return Math.max(10_000, Math.min(RECEIPT_TIMEOUT_MS, Math.floor(leftMs / 3)));
   }
 
   /**
@@ -862,11 +917,17 @@ export class ArenaDaemon {
     this.opts.relay.leave(l.record.channelId);
   }
 
-  /** One watchtower pass for one channel (spec §6.3). Runs regardless of the controller. */
-  protected async watch(l: ChannelHandle): Promise<void> {
+  /** The main pass for one channel (spec §6.3), regardless of the controller. A Challenged channel belongs to the
+   *  dispute pass (`watchDispute`); here it only gets the cooperative-close retry. Resolves true when it did the
+   *  channel's full work. */
+  protected async watch(l: ChannelHandle): Promise<boolean> {
     const id = l.record.channelId;
     const p = l.record.params;
     const info = await this.hub.channelInfo(id);
+    if (info.phase === "Challenged") {
+      if (l.session.closeTransaction()) await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`
+      return false;
+    }
     const now = (await this.client.getBlock()).timestamp;
     const me = l.record.me;
 
@@ -880,7 +941,7 @@ export class ArenaDaemon {
       const fundBlocked = l.fundBlockedUntil !== null && now < l.fundBlockedUntil;
       if (wantsToFund && !fundBlocked) await this.fund(l);
     } else if (info.phase === "Funding" && info.funded[me]) {
-      if (this.stopped) return;
+      if (this.stopped) return true;
       // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
       await this.hub.reclaim(l.sessionSender, id);
       // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
@@ -893,65 +954,86 @@ export class ArenaDaemon {
       // stops being polled and leaves pick()'s active set. `info` was read before `now`, so confirm on a fresh
       // read taken after the deadline (no deposit can land after it) that ours really is not in — a retired
       // channel is never reclaimed by this daemon.
-      if (this.stopped) return;
+      if (this.stopped) return true;
       const fresh = await this.hub.channelInfo(id);
-      if (!(fresh.phase === "None" || (fresh.phase === "Funding" && !fresh.funded[me]))) return;
+      if (!(fresh.phase === "None" || (fresh.phase === "Funding" && !fresh.funded[me]))) return true;
       this.log(`channel ${id}: funding window closed without our deposit; retiring it`);
       this.markFinalized(l);
       await this.refreshChain(l);
-      return;
+      return true;
     }
 
     // 2. Adopt on-chain states from dispute events (I3): scan forward from the persisted cursor in bounded chunks
     // (real RPCs cap getLogs ranges), ingest in order, and never move the cursor past an event that failed to
     // ingest. ingestOnChain ignores states it already holds, so re-reading a partly ingested block is harmless.
-    if (this.stopped) return;
+    if (this.stopped) return true;
     await this.scanDisputes(l);
 
-    // 3. Disputes (spec §6.3).
-    if (this.stopped) return;
+    // 3. Self-heal (the Challenged branch is the dispute pass's).
+    if (this.stopped) return true;
     if (info.phase === "Open") {
       // M-c: self-heal a crash between receiving a mating (or stalemating) move and answering it — the relay
       // path that normally calls autoPlay will not see that move again.
       await this.autoPlay(l);
-    } else if (info.phase === "Challenged") {
-      const registered = await this.hub.registeredState(id);
-      const latest = l.session.latest.state;
-      if (now < info.deadline && latest.turnNum > registered.turnNum) {
-        // Stale challenge, and there is still time to answer it: we hold a newer supported state.
-        await this.respondIfChallenged(l);
-      } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
-        // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
-        // otherwise leave it for the controller (status shows mustMove).
-        await this.autoPlay(l);
-      } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
-        // R9/I2: past the deadline, a newer state we hold is no longer answerable (respond would revert
-        // DeadlinePassed), so this is the fallback once the respond branch above is no longer available.
-        // Never call timeout while we are on move in the registered state — that would forfeit our own
-        // stake — so this only fires when the opponent is on move there, or the registered game is over.
-        if (this.stopped) return;
-        // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
-        await this.hub.timeout(l.sessionSender, id);
-        // Bug fix (Task 6 review): timeout() always finalizes in the same transaction (see ChannelHub.sol) —
-        // mark it here, synchronously with our own confirmed tx, rather than waiting for the next tick's
-        // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:
-        // `timeout()` itself only resolves one RPC round trip after Anvil mines the tx and flips the on-chain
-        // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
-        this.markFinalized(l);
-      }
     }
 
     // Plan 4.5 Task 10: a fully co-signed close whose submission failed earlier is retried here.
-    if (this.stopped) return;
-    if ((info.phase === "Open" || info.phase === "Challenged") && l.session.closeTransaction()) {
+    if (this.stopped) return true;
+    if (info.phase === "Open" && l.session.closeTransaction()) {
       await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`; retried on the next pass
     }
 
     // 4. Settled channels are done.
-    if (this.stopped) return;
-    const after = await this.hub.channelInfo(id);
+    if (this.stopped) return true;
+    await this.settleCheck(l);
+    return true;
+  }
+
+  private async settleCheck(l: ChannelHandle): Promise<void> {
+    const after = await this.hub.channelInfo(l.record.channelId);
     if (after.phase === "Finalized" || after.phase === "Reclaimed") this.markFinalized(l);
     await this.refreshChain(l);
+  }
+
+  /** The dispute pass for one channel (spec §6.3): only a Challenged channel -- adopt on-chain states, then respond,
+   *  auto-resign/claim, or time out a silent opponent. Resolves false (and does nothing) for any other phase. */
+  protected async watchDispute(l: ChannelHandle): Promise<boolean> {
+    const id = l.record.channelId;
+    const info = await this.hub.channelInfo(id);
+    if (info.phase !== "Challenged") return false;
+    const now = (await this.client.getBlock()).timestamp;
+    const me = l.record.me;
+    // The challenge may register a state this player has not seen (e.g. the opponent's move relayed nowhere else).
+    if (this.stopped) return true;
+    await this.scanDisputes(l);
+    if (this.stopped) return true;
+    const registered = await this.hub.registeredState(id);
+    const latest = l.session.latest.state;
+    if (now < info.deadline && latest.turnNum > registered.turnNum) {
+      // Stale challenge, and there is still time to answer it: we hold a newer supported state.
+      await this.respondIfChallenged(l);
+    } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
+      // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
+      // otherwise leave it for the controller (status shows mustMove).
+      await this.autoPlay(l);
+    } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
+      // R9/I2: past the deadline, a newer state we hold is no longer answerable (respond would revert
+      // DeadlinePassed), so this is the fallback once the respond branch above is no longer available.
+      // Never call timeout while we are on move in the registered state — that would forfeit our own
+      // stake — so this only fires when the opponent is on move there, or the registered game is over.
+      if (this.stopped) return true;
+      // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
+      await this.hub.timeout(l.sessionSender, id, { receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now) });
+      // Bug fix (Task 6 review): timeout() always finalizes in the same transaction (see ChannelHub.sol) —
+      // mark it here, synchronously with our own confirmed tx, rather than waiting for the next tick's
+      // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:
+      // `timeout()` itself only resolves one RPC round trip after Anvil mines the tx and flips the on-chain
+      // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
+      this.markFinalized(l);
+    }
+    if (this.stopped) return true;
+    await this.settleCheck(l);
+    return true;
   }
 
   /**

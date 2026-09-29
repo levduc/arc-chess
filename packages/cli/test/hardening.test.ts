@@ -503,17 +503,19 @@ describe("Plan 4.5 Task 10: transient RPC failures", () => {
     const { alice, id } = await matched();
     const hub = alice.daemon.hub;
     const real = hub.channelInfo.bind(hub);
-    let fail = true;
+    // The RPC is down for 600 ms: every pass in that window fails (both the dispute and the main pass read it).
+    let failures = 0;
+    const downUntil = Date.now() + 600;
     hub.channelInfo = async (c) => {
-      if (fail) {
-        fail = false;
+      if (Date.now() < downUntil) {
+        failures++;
         throw new Error("HTTP request failed.");
       }
       return real(c);
     };
-    // Whichever periodic pass hits the failure records it ("watch: …" after the fix)...
+    // The failing passes record it ("watch: …" after the fix)...
     await waitFor(() => /HTTP request failed/.test(alice.daemon.handle(id).lastError ?? ""), 5_000, "the failed pass");
-    expect(fail).toBe(false);
+    expect(failures).toBeGreaterThan(0);
     // ...and the next good pass clears it. Before the fix it stayed until a relay message happened to arrive.
     await waitFor(() => alice.daemon.handle(id).lastError === null, 5_000, "a good pass to clear it");
     expect(alice.daemon.handle(id).passes).toBeGreaterThan(1);
@@ -630,7 +632,7 @@ describe("Plan 4.5 Task 10: a settled channel keeps no transient error", () => {
     };
     alice.daemon.handle(id).lastError = "watch: HTTP request failed."; // from an earlier failed pass
     await alice.daemon.idle();
-    await alice.daemon.tick();
+    await alice.daemon.mainPass(); // the main pass alone (the dispute pass would take the first read)
     expect(call).toBe(3);
     expect(alice.daemon.handle(id).record.finalized).toBe(true);
     // Before the fix: "watch: HTTP request failed." for good.
@@ -666,5 +668,70 @@ describe("Plan 4.5 Task 10: a close that went through is not reported as failed"
     await waitFor(() => alice.daemon.handle(id).record.finalized, 5_000, "alice settled");
     expect(bob.daemon.handle(id).lastError).toBeNull();
     expect(alice.daemon.handle(id).lastError).toBeNull();
+  });
+});
+
+describe("Plan 4.5 Task 10 review: dispute work first", () => {
+  it("bounds a dispute transaction's receipt wait by min(30 s, a third of the time left), never under 10 s", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const f = (deadline: bigint, now: bigint) =>
+      (pair.alice.daemon as unknown as { disputeReceiptTimeoutMs(d: bigint, n: bigint): number }).disputeReceiptTimeoutMs(deadline, now);
+    expect(f(1_600n, 1_000n)).toBe(30_000); // 600 s left
+    expect(f(1_045n, 1_000n)).toBe(15_000); // 45 s left: a third
+    expect(f(1_012n, 1_000n)).toBe(10_000); // 12 s left: the floor
+    expect(f(900n, 1_000n)).toBe(10_000); // past the deadline (a timeout transaction)
+  });
+
+  it("the respond the dispute pass sends carries that bound", async () => {
+    const { alice, bob, id } = await matched(); // challengeTimeout 600: 30 s
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    const stale = alice.daemon.handle(id).session.challengeProof(); // turn 1
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 2n, 5_000, "alice holds turn 2");
+    await alice.daemon.stop();
+    const seen: Array<number | undefined> = [];
+    const hub = bob.daemon.hub;
+    const real = hub.respond.bind(hub);
+    hub.respond = async (sender, proof, opts) => {
+      seen.push(opts?.receiptTimeoutMs);
+      return real(sender, proof, opts);
+    };
+    await hub.challenge(alice.daemon.handle(id).sessionSender, stale);
+    await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 10_000, "bob responds");
+    expect(seen[0]).toBe(30_000);
+  });
+
+  it("a stalled main pass (e.g. a funding or close receipt wait) never delays answering a challenge", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn");
+    const stale = bob.daemon.handle(id).session.challengeProof(); // turn 2
+    await alice.daemon.move(id, "Nf3", { actor: "agent" }); // alice now holds turn 3
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 3n, 5_000, "bob holds turn 3");
+    await bob.daemon.stop(); // only alice's watchtower may answer
+
+    // Alice's main pass hangs from now on, as if stuck in a receipt wait for another channel's transaction.
+    let release: () => void = () => undefined;
+    const stalled = new Promise<void>((r) => (release = r));
+    let mainPassesEntered = 0;
+    (alice.daemon as unknown as { watch: () => Promise<boolean> }).watch = async () => {
+      mainPassesEntered++;
+      await stalled;
+      return true;
+    };
+    try {
+      await waitFor(() => mainPassesEntered > 0, 5_000, "the main pass to stall");
+      await alice.daemon.hub.challenge(bob.daemon.handle(id).sessionSender, stale);
+      // Before the fix the dispute branch ran inside that same stalled pass: the challenge went unanswered.
+      await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 10_000, "alice's dispute pass responds");
+      expect((await alice.daemon.hub.registeredState(id)).turnNum).toBe(3n);
+      expect(mainPassesEntered).toBe(1); // still the same stalled main pass
+    } finally {
+      release();
+    }
   });
 });

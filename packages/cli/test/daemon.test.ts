@@ -242,6 +242,9 @@ describe("watchtower", () => {
     await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
     await alice.daemon.challenge(undefined, "agent"); // Bob must move
     await alice.daemon.stop(); // only Bob's daemon from here, so each race below is the one the test stages
+    // Bob's own dispute pass would answer the challenge concurrently with his move (it runs independently of the
+    // main pass since the Task 10 review): switched off so the race each test stages is the only one.
+    (bob.daemon as unknown as { watchDispute: () => Promise<boolean> }).watchDispute = async () => false;
     const hub = bob.daemon.hub;
     hub.respond = patch(hub.respond.bind(hub));
     const logs: string[] = [];
