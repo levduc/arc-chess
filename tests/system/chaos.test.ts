@@ -796,6 +796,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         }
         expect(aliceRpc.stats.lagged + bobRpc.stats.lagged + serverRpc.stats.lagged).toBeGreaterThan(0);
         await equivocation.finish();
+        expect(equivocation.log.counts.bySource.mitm ?? 0).toBeGreaterThan(0); // the relayed frames were covered
         expect(lastErrors.size).toBeGreaterThan(0); // the faults reached the daemons, not just viem's retries
       } catch (err) {
         console.error(`[chaos] rpc-fault failed with CHAOS_SEED=${seed}\n--- alice ---\n${alice.logs().slice(-6000)}\n--- bob ---\n${bob.logs().slice(-6000)}`);
@@ -1011,10 +1012,11 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       await moveOnce(alice, carol, idB, "d1h5"); // Alice holds turn 3
       await carol.kill("SIGKILL"); // only Alice's watchtower may answer
 
-      // From here the chain mines a block every second, and the first deposit Alice's wallet sends (channel A's) is
-      // removed from the mempool while her watchtower waits for its receipt.
+      // From here nothing is mined on its own until the drop (Task 10 re-review I4: interval mining could mine the
+      // deposit before the dropper saw it). The dropper mines by hand whatever is pending while the pool holds no
+      // deposit from Alice; the first one to appear (channel A's) is removed from the mempool while her watchtower
+      // waits for its receipt, and only then does the chain mine a block every second.
       await rpc(s.rpcUrl, "evm_setAutomine", [false]);
-      await rpc(s.rpcUrl, "evm_setIntervalMining", [1]);
       const restoreMining = async () => {
         await rpc(s.rpcUrl, "evm_setIntervalMining", [0]).catch(() => undefined);
         await rpc(s.rpcUrl, "evm_setAutomine", [true]).catch(() => undefined);
@@ -1022,6 +1024,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       cleanups.push(restoreMining);
       let dropped: Hex | undefined;
       let dropping = true;
+      let minedByHand = 0;
       const dropper = (async () => {
         while (dropping && !dropped) {
           const pool = await rpc<{ pending: Record<string, Record<string, { hash: Hex; input: Hex }>> }>(s.rpcUrl, "txpool_content", []);
@@ -1030,6 +1033,10 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
           if (deposit) {
             await rpc(s.rpcUrl, "anvil_dropTransaction", [deposit.hash]);
             dropped = deposit.hash;
+            await rpc(s.rpcUrl, "evm_setIntervalMining", [1]);
+          } else if (Object.keys(pool.pending).length > 0) {
+            await rpc(s.rpcUrl, "evm_mine", []);
+            minedByHand++;
           }
           await sleep(20);
         }
@@ -1041,6 +1048,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       const idA = await channelOf(bob, 30_000);
       const eqA = await watchEquivocation(s, [alice, bob], idA);
       await waitFor(() => dropped, 30_000, "alice's deposit for channel A (dropped from the mempool)");
+      console.log(`[chaos] dispute-first: ${minedByHand} block(s) mined by hand before the drop`);
       const tDrop = Date.now();
 
       // Carol challenges B with the stale turn-2 proof, straight from her session key.
