@@ -1379,6 +1379,71 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const listed = (await restarted.channels()).find((c) => c.channelId === id) as { swept?: unknown } | undefined;
     expect(listed?.swept).toBe(true);
   });
+
+  it("fix round 2, minor 1: status()/channels() reflect a queued record swept via arena sweep, not only the automatic queue pass", async () => {
+    const { alice, bob, id } = await matched();
+    await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await d.stop();
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: { ...loadConfig(alice.home), pollMs: 3_600_000 }, // nothing auto-processes the queue during this test
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    // start() fires one tick() of its own (fire-and-forget, regardless of pollMs), which would otherwise race
+    // this test's own sweep(id) call for the very record it is about to queue-sweep automatically -- and since
+    // that path (sweepQueuePass) already refreshes the cache correctly, letting it win would test nothing.
+    (restarted as unknown as { sweepQueuePass(): Promise<void> }).sweepQueuePass = () => Promise.resolve();
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    expect(restarted.channelIds()).toEqual([]);
+
+    const before = await restarted.status(id);
+    expect(before.swept).toBeNull(); // the index cached a pre-sweep status at start()
+
+    await restarted.sweep(id); // sweepOneNow's *queued* branch: the record is in the sweep queue, not live
+
+    const record = new RecordStore(alice.home).channel(id)!;
+    expect(record.swept).toBe(true);
+    const after = await restarted.status(id);
+    expect(after.swept).toBe(true); // the settled-index cache was refreshed here too, not just by sweepQueuePass
+    expect(after.sweptAmount).toBe(record.sweptAmount!.toString());
+  });
+
+  it("fix round 2, important 3: a stale snapshot passed into sweepOneNow never overwrites a record the queue pass already swept", async () => {
+    const { alice, bob, id } = await matched();
+    await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await d.stop();
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: { ...loadConfig(alice.home), pollMs: 3_600_000 },
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    // sweep()'s bulk loop would have snapshotted every record once, right here, before doing any real work.
+    const staleRecord = new RecordStore(alice.home).channel(id)!;
+    expect(staleRecord.swept).toBeUndefined();
+
+    // The main pass's own queue processing sweeps (and dequeues) the record first -- as it would while a bulk
+    // sweep() call's loop was still iterating toward this same record.
+    await (restarted as unknown as { sweepQueuePass(): Promise<void> }).sweepQueuePass();
+    const afterQueue = new RecordStore(alice.home).channel(id)!;
+    expect(afterQueue.swept).toBe(true);
+
+    // sweep()'s bulk loop now reaches this record with its stale (pre-sweep) snapshot.
+    const result = await (restarted as unknown as { sweepOneNow(r: unknown): Promise<{ swept: string }> }).sweepOneNow(staleRecord);
+    expect(result.swept).toBe("already");
+    const record = new RecordStore(alice.home).channel(id)!;
+    expect(record.swept).toBe(true); // not overwritten with "dust"
+    expect(record.sweptTx).toBe(afterQueue.sweptTx);
+    expect(record.sweptAmount).toBe(afterQueue.sweptAmount);
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {

@@ -177,6 +177,13 @@ type SweepAttemptResult =
   | { kind: "skipped"; record: ChannelRecord }
   | { kind: "error"; record: ChannelRecord; error: unknown };
 
+/** True once a record's sweep is done (either way). Wrapped in a function (fix round 2, important 3) rather than
+ *  an inline `swept === true || swept === "dust"` so re-checking it a second time, after an `await`, is never
+ *  narrowed by TypeScript against the first check -- `l.record`/`queued.record` really can change in between. */
+function isSweptDone(swept: ChannelRecord["swept"]): boolean {
+  return swept === true || swept === "dust";
+}
+
 export type DaemonOptions = {
   home: string;
   config: ArenaConfig;
@@ -1259,6 +1266,28 @@ export class ArenaDaemon {
     if (wasBackedOff) this.log(`channel ${channelId}: sweep back-off ended`);
   }
 
+  /** Fix round 2 (important 3 + minors 1/6): merges only `swept`/`sweptAmount`/`sweptTx` from `updated` onto a
+   *  fresh copy of `current`, so a concurrent change to anything else on the record (a `handoff()`, most notably)
+   *  while the sweep's own async work was in flight is never clobbered by the sweep's -- possibly stale -- copy
+   *  of the rest of it. */
+  private applySweptFields(current: ChannelRecord, updated: ChannelRecord): ChannelRecord {
+    return { ...current, swept: updated.swept, sweptAmount: updated.sweptAmount, sweptTx: updated.sweptTx };
+  }
+
+  /** Fix round 2, minor 1: refreshes the settled-index cache entry for `id` (if any) with `record`'s current
+   *  swept fields -- called at every site that dequeues a swept record from `this.sweepQueue`, so `status()`/
+   *  `channels()` never keep serving the pre-sweep status `start()` cached for it. */
+  private refreshSettledCache(id: Hex, record: ChannelRecord): void {
+    const cached = this.settled.get(id);
+    if (!cached) return;
+    cached.status = {
+      ...cached.status,
+      swept: record.swept ?? null,
+      sweptAmount: record.sweptAmount?.toString() ?? null,
+      sweptTx: record.sweptTx ?? null,
+    };
+  }
+
   /** The main pass's own sweep of one live, finalized, not-yet-swept channel -- never sets `lastError` (the
    *  channel is already settled; nothing would ever clear it again -- see `markFinalized`'s own note on the same
    *  point). Rule 1: skipped (no attempt, no back-off charged) while a refill or the dispute pass is still
@@ -1266,8 +1295,8 @@ export class ArenaDaemon {
   protected async sweepChannel(l: ChannelHandle): Promise<void> {
     if (this.stopped || l.record.swept !== undefined) return;
     if (l.refilling || l.disputeBusy) return;
-    const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(r));
-    l.record = result.record;
+    const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(this.applySweptFields(l.record, r)));
+    l.record = this.applySweptFields(l.record, result.record);
   }
 
   /** Plan 5 fix round (I2): the sweep queue -- finalized-but-unswept records found at start() (a restart, or a
@@ -1280,21 +1309,16 @@ export class ArenaDaemon {
       if (entry.busy) continue;
       entry.busy = true;
       try {
-        const result = await this.runSweepAttempt(entry.record, entry.sender, entry.sweep, (r) => this.records.saveChannel(r));
-        entry.record = result.record;
+        const result = await this.runSweepAttempt(entry.record, entry.sender, entry.sweep, (r) => {
+          entry.record = this.applySweptFields(entry.record, r);
+          this.records.saveChannel(entry.record);
+        });
+        entry.record = this.applySweptFields(entry.record, result.record);
         if (entry.record.swept !== undefined) {
           this.sweepQueue.delete(qid);
           // The settled index cached a status for this record at start() (before it was swept); refresh it in
           // place so `status`/`channels()` show the outcome without waiting for a restart.
-          const cached = this.settled.get(qid);
-          if (cached) {
-            cached.status = {
-              ...cached.status,
-              swept: entry.record.swept ?? null,
-              sweptAmount: entry.record.sweptAmount?.toString() ?? null,
-              sweptTx: entry.record.sweptTx ?? null,
-            };
-          }
+          this.refreshSettledCache(qid, entry.record);
         }
       } finally {
         entry.busy = false;
@@ -1328,7 +1352,7 @@ export class ArenaDaemon {
         if (matches.length === 0) throw new DaemonError(404, `no settled channel matches ${ref}`);
         if (matches.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
         const record = matches[0];
-        if (record.swept === true || record.swept === "dust") {
+        if (isSweptDone(record.swept)) {
           return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
         }
         return { results: [await this.sweepOneNow(record)], remaining: 0 };
@@ -1348,25 +1372,38 @@ export class ArenaDaemon {
     }
   }
 
-  /** One record's sweep, right now (`force`, bypassing the back-off's own timing) -- guarded by the same
-   *  busy-wait pattern `reclaim()` uses against the main pass (**I1**): a live channel's `mainBusy`, or a queued
-   *  record's own `busy` flag, so a manual sweep and the periodic pass never send on the same key at once. */
+  /**
+   * One record's sweep, right now (`force`, bypassing the back-off's own timing) -- guarded by the same
+   * busy-wait pattern `reclaim()` uses against the main pass (**I1**): a live channel's `mainBusy` (and, fix
+   * round 2 important 2, `refilling`/`disputeBusy` -- the same rule-1 guards `sweepChannel` applies, which this
+   * method must honour too since it calls `runSweepAttempt` directly), or a queued record's own `busy` flag, so
+   * a manual sweep and the periodic pass never send on the same key at once.
+   *
+   * Fix round 2, important 3: `record` (the caller's snapshot -- `sweep()`'s bulk loop reads every record once
+   * at the top) can go stale if the main pass's own queue/watch sweeps this same record before reaching it here,
+   * including *during* the busy-wait below. For a live or queued record, `l.record`/`queued.record` -- the
+   * shared, mutable copy the main pass itself updates in place -- is checked instead of `record`, both before
+   * and after the wait; an orphan record (tracked in neither) is re-read from disk, since nothing else could be
+   * racing it (another `sweep()` call cannot: this method is only ever reached while `sweep()` holds its own
+   * single-flight lock).
+   */
   private async sweepOneNow(record: ChannelRecord): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
     const id = record.channelId;
-    const wasAbandoned = record.swept === "abandoned";
     const l = this.live.get(id);
     if (l) {
-      // Fix round 2, important 2: the manual path must honour rule 1 too -- a refill or the dispute pass working
-      // this same session key is exactly the case rule 1 exists to keep the sweep away from, and `sweepOneNow`
-      // calls `runSweepAttempt` directly (not through `sweepChannel`, which already checks this).
+      if (isSweptDone(l.record.swept)) return { channelId: id, swept: "already" };
+      const wasAbandoned = l.record.swept === "abandoned";
       const busy = () => l.mainBusy || l.refilling || l.disputeBusy;
       const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
       while (busy() && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
       if (busy()) return { channelId: id, swept: "error: the watchtower is working on this channel: retry shortly" };
+      if (isSweptDone(l.record.swept)) return { channelId: id, swept: "already" }; // settled while we waited
       l.mainBusy = true;
       try {
-        const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(r), { force: true });
-        l.record = result.record;
+        const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(this.applySweptFields(l.record, r)), {
+          force: true,
+        });
+        l.record = this.applySweptFields(l.record, result.record);
         return this.sweepResultWithHash(id, result, wasAbandoned);
       } finally {
         l.mainBusy = false;
@@ -1374,26 +1411,44 @@ export class ArenaDaemon {
     }
     const queued = this.sweepQueue.get(id);
     if (queued) {
+      if (isSweptDone(queued.record.swept)) return { channelId: id, swept: "already" };
+      const wasAbandoned = queued.record.swept === "abandoned";
       const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
       while (queued.busy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
       if (queued.busy) return { channelId: id, swept: "error: a sweep pass is already working on this channel: retry shortly" };
+      if (isSweptDone(queued.record.swept)) return { channelId: id, swept: "already" }; // settled while we waited
       queued.busy = true;
       try {
-        const result = await this.runSweepAttempt(queued.record, queued.sender, queued.sweep, (r) => this.records.saveChannel(r), { force: true });
-        queued.record = result.record;
-        if (queued.record.swept !== undefined) this.sweepQueue.delete(id);
+        const result = await this.runSweepAttempt(
+          queued.record,
+          queued.sender,
+          queued.sweep,
+          (r) => {
+            queued.record = this.applySweptFields(queued.record, r);
+            this.records.saveChannel(queued.record);
+          },
+          { force: true },
+        );
+        queued.record = this.applySweptFields(queued.record, result.record);
+        if (queued.record.swept !== undefined) {
+          this.sweepQueue.delete(id);
+          this.refreshSettledCache(id, queued.record);
+        }
         return this.sweepResultWithHash(id, result, wasAbandoned);
       } finally {
         queued.busy = false;
       }
     }
     // Not tracked anywhere in memory (a record from another process, or predating this daemon's own start()): a
-    // fresh, one-shot sender and back-off.
-    const sender = new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
+    // fresh disk read, and a fresh, one-shot sender and back-off.
+    const fresh = this.records.channel(id) ?? record;
+    if (isSweptDone(fresh.swept)) return { channelId: id, swept: "already" };
+    const wasAbandoned = fresh.swept === "abandoned";
+    const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
       feeCeiling: NO_FEE_CEILING,
     });
     const backoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
-    const result = await this.runSweepAttempt(record, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
+    const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
     return this.sweepResultWithHash(id, result, wasAbandoned);
   }
 
