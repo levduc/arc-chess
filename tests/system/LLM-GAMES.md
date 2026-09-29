@@ -62,3 +62,41 @@ Live games between two headless Claude Code agents, driven only by `skill.md` an
   re-run `wait` (and check `offers`). Also applied proactively before Run 1; neither agent showed confusion about
   an early `timeout`.
 
+## Run 2 -- 2026-09-29T10:21:39.273Z
+
+- Result: **PASS**
+- Args: --agents 2 --games 2 --minutes 30
+- Duration: 12.4 min
+- alice: exit=0, duration=12.3 min (ended its own turn)
+- bob: exit=0, duration=11.3 min (ended its own turn)
+- Channel: 0x1b3c71b95ae01405bfe31beabb523d8f52a33121631f5296b7c27539427acb9e
+- Finalized: true
+- Games played (server-reported): 2
+- Conserved balances: true
+  - before: A=10.000000 B=10.000000 host=0.000000 USDC
+  - after: A=9.995000 B=9.995000 host=0.010000 USDC
+- Cost: alice=$1.7401, bob=$3.2066, total=$4.9468
+
+### Notable agent confusions
+
+- alice:
+  - "I played both games and closed the channel. Both games were draws, so no money changed hands: each side still has 1.00 USDC in the channel, and the host's per-channel fee is separate from that. The channel shows as `Fina"
+  - allowlist denials (from the session's own `permission_denials`, none arena-level -- all outside the deliberately narrow Bash(arena/curl/cat) + no-Write allowlist):
+    - `Bash: curl -s http://127.0.0.1:40977/skill.md; echo; echo $ARENA_HOME; ls -la $ARENA_HOME`
+    - `Bash: which arena; env | grep -i arena; curl -s http://127.0.0.1:40977/templates/chess/skill.md`
+    - `Write: (no command)`
+    - `Bash: chmod +x /tmp/arena-llm-work-alice-rZdYVl/play.sh; python3 -c "import chess; print('ok')"`
+- bob:
+  - "Can't write helper scripts, so I'll keep playing with direct commands."
+  - "I played both games and closed the channel. It's now finalized and settled on-chain. - **Game 1 (I was black):** I accepted the opponent's open offer (1 USDC deposit, 0.1 USDC per game). We played an Italian Game, trade"
+  - allowlist denials (from the session's own `permission_denials`, none arena-level -- all outside the deliberately narrow Bash(arena/curl/cat) + no-Write allowlist):
+    - `Bash: curl -s http://127.0.0.1:40977/templates/chess/skill.md; echo; curl -s http://127.0.0.1:40977/templates; echo; echo $ARENA_HOME; ls $ARENA_HOME; which arena`
+    - `Bash: env | grep -i arena`
+    - `Bash: which stockfish; python3 -c "import chess; print(chess.__version__)"`
+    - `Write: (no command)`
+
+### skill.md wording fixes in effect for this run
+
+- Step 2 ("`arena daemon`") now tells a non-interactive/headless agent to background it with its own tool's background-execution feature, not a shell `&`/`nohup` -- confirmed by hand that Claude Code's Bash tool denies a bare `&` ("defers execution past approval-time safety checks") under --permission-prompts none, while its native background-run mode is unaffected.
+- The play loop now explains `wait`'s "timeout" reason with no channel id: normal before a match, not an error -- re-run `wait` (and check `offers`). Previously the loop only documented the channel-carrying reasons.
+
