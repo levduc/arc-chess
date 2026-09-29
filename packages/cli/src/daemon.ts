@@ -114,6 +114,16 @@ export type ChannelHandle = {
   /** Final review C1: set while the session key is below `sessionGasFloor` and the wallet could not refill it
    *  (the reason); drives the `session-gas-low` attention. Null otherwise. */
   sessionGasLow: string | null;
+  /** Plan 5 Task 1 (mainnet gates: refill back-off): wall-clock ms before which `ensureSessionGas` does not retry
+   *  a refill for this channel, set after a failed refill. 0 = no back-off in effect. */
+  refillBlockedUntil: number;
+  /** Plan 5 Task 1: the current refill back-off episode's duration in ms (0 = no episode): 30s on the first
+   *  failure, doubled on each one after, capped at 5 minutes; reset to 0 on a successful refill or once the
+   *  wallet's balance rises above `refillLastWalletBalance`. */
+  refillBackoffMs: number;
+  /** Plan 5 Task 1: the wallet's native balance as last observed by the refill back-off gate, or null before the
+   *  first observation -- a rise above this ends the back-off early (the wallet may have just been funded). */
+  refillLastWalletBalance: bigint | null;
   /** Final review C1: `wait()` has already woken for the current `sessionGasLow` episode (so it does not return at
    *  once on every call while the wallet stays empty). */
   sessionGasLowWoken: boolean;
@@ -174,6 +184,12 @@ export const SETTLED_GRACE_SECONDS = 600n;
 /** Final review I3: at most this many evicted channels' final statuses are kept in memory; older ones are served
  *  from disk (`status`), and no longer listed by `channels()`. */
 export const SETTLED_CACHE_MAX = 1000;
+
+/** Plan 5 Task 1 (mainnet gates: refill and sweep back-off): the first back-off, in wall-clock ms, after a failed
+ *  refill or sweep -- doubled on each further failure, up to `BACKOFF_MAX_MS`. */
+export const BACKOFF_START_MS = 30_000;
+/** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
+export const BACKOFF_MAX_MS = 300_000;
 
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
@@ -744,6 +760,9 @@ export class ArenaDaemon {
       refilling: null,
       refills: 0,
       sessionGasLow: null,
+      refillBlockedUntil: 0,
+      refillBackoffMs: 0,
+      refillLastWalletBalance: null,
       sessionGasLowWoken: false,
       settledWake: false,
       settledAt: null,
@@ -886,6 +905,10 @@ export class ArenaDaemon {
    */
   protected async ensureSessionGas(l: ChannelHandle): Promise<void> {
     if (this.opts.config.sessionGasWei <= 0n || this.stopped || l.record.finalized) return;
+    // Plan 5 Task 1 (mainnet gates: refill back-off): back off retrying a channel whose refills keep failing,
+    // unless the wallet's own balance has just risen (it may have just been funded) -- checked before the shared
+    // top-up below so a blocked channel costs nothing beyond one balance read per pass.
+    if (!(await this.refillBackoffGate(l))) return;
     // (A funding top-up in flight that fails is fund()'s to report, not this caller's.)
     await this.sharedTopUp(l, async () => {
       const floor = sessionGasFloorOf(this.opts.config);
@@ -898,6 +921,7 @@ export class ArenaDaemon {
       }
       if (balance >= floor) {
         this.clearSessionGasLow(l);
+        this.endRefillBackoff(l);
         return;
       }
       try {
@@ -906,6 +930,7 @@ export class ArenaDaemon {
           this.log(`channel ${l.record.channelId}: refilled the session key's dispute gas (it was at ${balance} wei, floor ${floor})`);
         }
         this.clearSessionGasLow(l);
+        this.endRefillBackoff(l);
       } catch (err) {
         if (this.stopped) return;
         // Plan 5 Task 1 (mainnet gates: session-gas-low precision): raised only when the wallet itself cannot pay
@@ -925,8 +950,42 @@ export class ArenaDaemon {
           const name = err instanceof Error ? err.name : "Error";
           this.log(`channel ${l.record.channelId}: refill failed, ${name}: ${errorText(err)} (re-evaluated on the next pass)`);
         }
+        this.startOrBumpRefillBackoff(l);
       }
     }).catch(() => undefined);
+  }
+
+  /** Plan 5 Task 1: true if `ensureSessionGas` may attempt a refill for `l` right now. False while a prior
+   *  failure's back-off has not yet elapsed -- unless the wallet's own balance has risen since it was last
+   *  observed, which ends the back-off early (the wallet may have just been topped up). A failed balance read
+   *  never blocks the attempt (the back-off is about the refill itself, not about reading the wallet). */
+  private async refillBackoffGate(l: ChannelHandle): Promise<boolean> {
+    const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
+    if (balance !== null) {
+      if (l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance) this.endRefillBackoff(l);
+      l.refillLastWalletBalance = balance;
+    }
+    return !(l.refillBlockedUntil > 0 && Date.now() < l.refillBlockedUntil);
+  }
+
+  /** Plan 5 Task 1: starts (30 s) or doubles (up to 5 min) this channel's refill back-off; logs once, on the
+   *  episode's first failure. */
+  private startOrBumpRefillBackoff(l: ChannelHandle): void {
+    const starting = l.refillBackoffMs === 0;
+    l.refillBackoffMs = starting ? BACKOFF_START_MS : Math.min(l.refillBackoffMs * 2, BACKOFF_MAX_MS);
+    l.refillBlockedUntil = Date.now() + l.refillBackoffMs;
+    if (starting) {
+      this.log(`channel ${l.record.channelId}: refill back-off started (retrying in ${l.refillBackoffMs / 1000}s)`);
+    }
+  }
+
+  /** Plan 5 Task 1: ends this channel's refill back-off episode, if one is running (a successful refill, a
+   *  balance already at/above the floor, or the wallet's balance rising); logs once, when it actually ends. */
+  private endRefillBackoff(l: ChannelHandle): void {
+    if (l.refillBackoffMs === 0) return;
+    l.refillBackoffMs = 0;
+    l.refillBlockedUntil = 0;
+    this.log(`channel ${l.record.channelId}: refill back-off ended`);
   }
 
   private clearSessionGasLow(l: ChannelHandle): void {

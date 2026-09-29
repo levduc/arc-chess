@@ -10,6 +10,7 @@ import {
   HubRevertError,
   LocalKeyTxSender,
   TxDroppedError,
+  TxInsufficientFundsError,
   TxNonceUsedError,
   NO_FEE_CEILING,
   DEFAULT_FEE_CEILING_WEI,
@@ -249,6 +250,55 @@ describe("final review C1: the session key's dispute gas is refilled while the c
     expect(logs.some((l) => /TxNonceUsedError/.test(l))).toBe(true);
     expect(d.handle(id).sessionGasLow).toBeNull();
     expect((await d.status(id)).attention).not.toBe("session-gas-low");
+  });
+
+  it("Plan 5 Task 1: refill back-off bounds attempts, logs once per episode, and resets (with an immediate retry) once the wallet's balance rises", async () => {
+    const { alice, id, config } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    const logs: string[] = [];
+    (d as unknown as { opts: { log?: (l: string) => void } }).opts.log = (l) => logs.push(l);
+    const internals = d as unknown as { topUpSession(l: unknown): Promise<boolean> };
+    const original = internals.topUpSession.bind(d);
+    let attempts = 0;
+    internals.topUpSession = () => {
+      attempts++;
+      return Promise.reject(new TxInsufficientFundsError(alice.address));
+    };
+    try {
+      await setEthBalance(alice.address, 1_000n); // the wallet genuinely cannot pay: the stub matches reality
+      await setEthBalance(session, target / 10n); // below the floor
+      for (let i = 0; i < 20; i++) {
+        await d.idle();
+        await d.tick();
+      }
+      // Bounded: back-off after the first failure (30 s) comfortably outlasts 20 fast ticks.
+      expect(attempts).toBe(1);
+      expect(logs.filter((l) => /refill back-off started/.test(l))).toHaveLength(1);
+      expect(d.handle(id).sessionGasLow).not.toBeNull();
+
+      // The wallet's balance rising ends the back-off and allows an immediate retry, even though it still fails.
+      await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
+      await d.idle();
+      await d.tick();
+      expect(attempts).toBe(2);
+      expect(logs.filter((l) => /refill back-off ended/.test(l))).toHaveLength(1);
+      // That immediate retry failed too (still stubbed), so a fresh back-off episode is already running -- rising
+      // the balance again ends that one too, so the real refill below is not left waiting out its 30 s.
+      internals.topUpSession = original;
+      await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE * 2n);
+      for (let i = 0; i < 20 && d.handle(id).sessionGasLow !== null; i++) {
+        await d.idle();
+        await d.tick();
+      }
+      expect(d.handle(id).sessionGasLow).toBeNull();
+      expect(d.handle(id).refills).toBe(1);
+      expect(logs.filter((l) => /refill back-off ended/.test(l))).toHaveLength(2);
+    } finally {
+      internals.topUpSession = original;
+      await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
+    }
   });
 });
 
