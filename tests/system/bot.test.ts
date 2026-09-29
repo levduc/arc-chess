@@ -137,4 +137,76 @@ describe("playRandomGameCapped resolves a decisive result that races ahead of a 
     expect(acceptDrawCalls).toBe(0); // already decisive: no draw to accept
     expect(Date.now() - started).toBeLessThan(1_000); // must not have waited out the ms budget
   });
+
+  it("M2 (Task 11 review): tolerates an accept-draw failure if the game became terminal in the meantime", async () => {
+    // A narrower version of the same race: `other` is genuinely seen at "draw_offered" (unlike the test above,
+    // where it never was), but its own daemon auto-resigns a mate *between* that poll and the accept-draw call
+    // landing. The accept-draw then fails, but the game already reached an equally valid terminal state.
+    const channelId = "0xabc" as Hex;
+    const state = { turnNum: "0", whiteTurn: true };
+    let blackGameStatus: Status["gameStatus"] = "playing";
+    let acceptDrawAttempted = false;
+    const statusFor = (color: "white" | "black"): Status => ({
+      channelId,
+      phase: "Open",
+      myTurn: color === "white" ? state.whiteTurn : !state.whiteTurn,
+      turnNum: state.turnNum,
+      gameStatus: color === "white" ? "draw_offered" : blackGameStatus,
+      legalMoves: ["a2a3"],
+      attention: null,
+    });
+    const white = fakePlayer(async (method, path) => {
+      if (method === "GET") return statusFor("white");
+      if (method === "POST" && path === "/move") {
+        state.turnNum = "1";
+        state.whiteTurn = false;
+        blackGameStatus = "draw_offered"; // other genuinely sees the draw offer this time
+        return statusFor("white");
+      }
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    });
+    const black = fakePlayer(async (method, path) => {
+      if (method === "GET") return statusFor("black");
+      if (method === "POST" && path === "/accept-draw") {
+        acceptDrawAttempted = true;
+        blackGameStatus = "black_won"; // races ahead: black's own tick auto-resigned first
+        throw new Error("POST /accept-draw -> 409: can only accept a draw offer");
+      }
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    });
+
+    const result = await playRandomGameCapped(white, black, { channelId, maxMoves: 1, ms: 5_000 });
+    expect(acceptDrawAttempted).toBe(true);
+    expect(result.gameStatus).toBe("black_won"); // tolerated, not rethrown
+  });
+
+  it("M2: still rethrows an accept-draw failure when the game did not actually become terminal", async () => {
+    const channelId = "0xabc" as Hex;
+    const state = { turnNum: "0", whiteTurn: true };
+    const statusFor = (color: "white" | "black"): Status => ({
+      channelId,
+      phase: "Open",
+      myTurn: color === "white" ? state.whiteTurn : !state.whiteTurn,
+      turnNum: state.turnNum,
+      gameStatus: "draw_offered",
+      legalMoves: ["a2a3"],
+      attention: null,
+    });
+    const white = fakePlayer(async (method, path) => {
+      if (method === "GET") return statusFor("white");
+      if (method === "POST" && path === "/move") {
+        state.turnNum = "1";
+        state.whiteTurn = false;
+        return statusFor("white");
+      }
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    });
+    const black = fakePlayer(async (method, path) => {
+      if (method === "GET") return statusFor("black"); // still "draw_offered": no race happened
+      if (method === "POST" && path === "/accept-draw") throw new Error("POST /accept-draw -> 500: internal");
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    });
+
+    await expect(playRandomGameCapped(white, black, { channelId, maxMoves: 1, ms: 5_000 })).rejects.toThrow(/500: internal/);
+  });
 });

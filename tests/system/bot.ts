@@ -167,7 +167,18 @@ export async function playRandomGameCapped(
       // specifically "draw_offered": a decisive result here is a real terminal state too, and needs no draw.
       const otherStatus = await waitStatus(other, (s) => s.gameStatus !== "playing", ms, opts.channelId);
       if (otherStatus.gameStatus !== "draw_offered") return otherStatus;
-      await other.api("POST", "/accept-draw", { channel: opts.channelId });
+      try {
+        await other.api("POST", "/accept-draw", { channel: opts.channelId });
+      } catch (err) {
+        // M2 (Task 11 review): a narrower version of the same race the comment above already handles -- `other`'s
+        // own daemon tick can auto-resign/claim *between* the poll that saw "draw_offered" and this call landing,
+        // if the position was actually mate/stalemate all along. The accept-draw then fails, but the game already
+        // reached an equally valid terminal state, so only swallow the error if that is actually what happened;
+        // anything else (a real failure) still fails the caller.
+        const now = (await other.api("GET", statusPath(opts.channelId))) as Status;
+        if (now.gameStatus === "playing" || now.gameStatus === "draw_offered") throw err;
+        return now;
+      }
       return await waitStatus(mover, (s) => s.gameStatus === "draw", ms, opts.channelId);
     }
   }
