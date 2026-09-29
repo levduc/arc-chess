@@ -696,13 +696,18 @@ describe("Plan 4.5 Task 10 review: dispute work first", () => {
     const seen: Array<number | undefined> = [];
     const hub = bob.daemon.hub;
     const real = hub.respond.bind(hub);
+    const giveUps: Array<number | undefined> = [];
     hub.respond = async (sender, proof, opts) => {
       seen.push(opts?.receiptTimeoutMs);
+      giveUps.push(opts?.giveUpAt);
       return real(sender, proof, opts);
     };
     await hub.challenge(alice.daemon.handle(id).sessionSender, stale);
     await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 10_000, "bob responds");
     expect(seen[0]).toBe(30_000);
+    // Task 10 re-review (I2): the wait gives up at the deadline (600 s out), never later.
+    expect(giveUps[0]).toBeGreaterThan(Date.now() + 590_000);
+    expect(giveUps[0]).toBeLessThanOrEqual(Date.now() + 600_000);
   });
 
   it("a stalled main pass (e.g. a funding or close receipt wait) never delays answering a challenge", async () => {
@@ -875,5 +880,60 @@ describe("Plan 4.5 Task 10 re-review (I3): a transaction reported dropped is res
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
     expect(topUps).toHaveLength(1); // the balance is re-read first: the landed top-up is not paid again
     expect(await alice.daemon.client.getBalance({ address: sessionAddr as Hex })).toBe(pair.config.sessionGasWei);
+  });
+});
+
+describe("Plan 4.5 Task 10 re-review (I2): challenged channels are handled concurrently", () => {
+  it("two channels challenged at once on one daemon: one's respond is stuck, the other is still answered", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const ids: Hex[] = [];
+    for (let i = 0; i < 2; i++) {
+      const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await bob.daemon.acceptOffer(offerId);
+      ids.push(
+        await waitFor(() => bob.daemon.channelIds().find((c) => !ids.includes(c)) ?? null, 10_000, `match ${i}`),
+      );
+    }
+    for (const id of ids) await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
+    const stale = new Map<Hex, ReturnType<ChannelSession["challengeProof"]>>();
+    for (const id of ids) {
+      await alice.daemon.move(id, "e4", { actor: "agent" });
+      await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+      await bob.daemon.move(id, "e5", { actor: "agent" });
+      await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn");
+      stale.set(id, bob.daemon.handle(id).session.challengeProof()); // turn 2
+      await alice.daemon.move(id, "Nf3", { actor: "agent" }); // alice holds turn 3
+      await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 3n, 5_000, "bob holds turn 3");
+    }
+    const senders = ids.map((id) => bob.daemon.handle(id).sessionSender);
+    await bob.daemon.stop();
+
+    // Alice's first respond (whichever channel it is for) hangs, as a transaction stuck in the mempool would.
+    const hub = alice.daemon.hub;
+    const real = hub.respond.bind(hub);
+    let release: () => void = () => undefined;
+    const stuck = new Promise<void>((r) => (release = r));
+    let stuckOn: Hex | undefined;
+    hub.respond = async (sender, proof, opts) => {
+      if (stuckOn === undefined || stuckOn === proof.latest.state.channelId) {
+        stuckOn = proof.latest.state.channelId;
+        await stuck;
+      }
+      return real(sender, proof, opts);
+    };
+    try {
+      await Promise.all(ids.map((id, i) => hub.challenge(senders[i], stale.get(id)!)));
+      // Before the fix one dispute pass walked the channels in turn: the stuck respond held the other one back.
+      await waitFor(async () => {
+        const phases = await Promise.all(ids.map(async (id) => (await hub.channelInfo(id)).phase));
+        return phases.filter((p) => p === "Open").length === 1;
+      }, 10_000, "the other channel answered while the first respond is stuck");
+      expect((await hub.channelInfo(stuckOn!)).phase).toBe("Challenged");
+    } finally {
+      release();
+    }
+    for (const id of ids) await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 20_000, "both answered");
   });
 });

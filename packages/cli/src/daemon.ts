@@ -87,6 +87,8 @@ export type ChannelHandle = {
    *  the nonce of an attempt reported dropped -- the next attempt is sent at it, so that if the first was not
    *  really dropped, at most one of the two lands. */
   droppedNonces: Map<string, number>;
+  /** Plan 4.5 Task 10 re-review (I2): set while this channel's dispute work runs, so it never runs twice at once. */
+  disputeBusy: boolean;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -149,10 +151,9 @@ export class ArenaDaemon {
   private unsubscribers: Array<() => void> = [];
   /** Plan 4.5 Task 10 review: the watchtower runs as two independent passes, each with its own in-flight guard
    *  (see `disputePass` / `mainPass`), so a stall in one never delays the other. */
-  private disputeTicking = false;
   private mainTicking = false;
   private get ticking(): boolean {
-    return this.disputeTicking || this.mainTicking;
+    return this.mainTicking || [...this.live.values()].some((l) => l.disputeBusy);
   }
   /** M1: set by stop(); every handler checks this before any side effect (open/join/fund) it hasn't started yet. */
   private stopped = false;
@@ -547,6 +548,7 @@ export class ArenaDaemon {
       submittingClose: false,
       closeRetryAt: 0,
       droppedNonces: new Map(),
+      disputeBusy: false,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -719,11 +721,14 @@ export class ArenaDaemon {
     const registered = await this.hub.registeredState(id);
     if (l.session.latest.state.turnNum <= registered.turnNum) return;
     const now = (await this.client.getBlock()).timestamp;
+    // Plan 4.5 Task 10 re-review (I2): past the deadline a respond can no longer help, so its wait stops there.
+    const giveUpAt = Date.now() + Number(info.deadline > now ? info.deadline - now : 0n) * 1000;
     try {
       await this.logicalTx(l, "respond", (nonce) =>
         this.hub.respond(l.sessionSender, l.session.challengeProof(), {
           receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
           nonce,
+          giveUpAt,
         }),
       );
     } catch (err) {
@@ -871,23 +876,27 @@ export class ArenaDaemon {
 
   /**
    * Plan 4.5 Task 10 review -- pass 1, dispute work first: respond, timeout and autoPlay for every channel whose
-   * on-chain phase is Challenged, and nothing else. It has its own in-flight guard and is started on its own by the
-   * timer, so a main pass stalled on a slow funding or close transaction (up to its bounded receipt wait) never
-   * delays answering a challenge on another channel before its deadline.
+   * on-chain phase is Challenged, and nothing else. It is started on its own by the timer and guarded per channel,
+   * so neither a main pass stalled on a slow funding or close transaction (up to its bounded receipt wait) nor
+   * another channel's stuck respond delays answering a challenge before its deadline.
    */
   async disputePass(): Promise<void> {
-    if (this.stopped || this.disputeTicking) return;
-    this.disputeTicking = true;
-    try {
-      for (const l of this.live.values()) {
-        if (this.stopped) break;
-        if (l.record.finalized) continue;
-        await this.runWatch(l, () => this.watchDispute(l));
-      }
-    } finally {
-      this.disputeTicking = false;
-      if (!this.stopped) this.notify();
+    if (this.stopped) return;
+    // Plan 4.5 Task 10 re-review (I2): channels are handled concurrently -- each has its own session-key sender
+    // (its own nonces), so one channel's stuck respond never delays another's -- and there is no pass-wide guard:
+    // a channel still busy from an earlier pass is skipped (its per-channel flag), every other one starts now.
+    const started: Array<Promise<void>> = [];
+    for (const l of this.live.values()) {
+      if (l.record.finalized || l.disputeBusy) continue;
+      l.disputeBusy = true;
+      started.push(
+        this.runWatch(l, () => this.watchDispute(l)).finally(() => {
+          l.disputeBusy = false;
+        }),
+      );
     }
+    await Promise.all(started);
+    if (!this.stopped) this.notify();
   }
 
   /** Pass 2: everything else -- offer pruning, funding, reclaim, dispute scans and self-heal for channels that are not
