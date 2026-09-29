@@ -223,6 +223,36 @@ describe("ArenaDaemon core", () => {
     expect(fromDisk.gameStatus).toBe("draw");
   });
 
+  it("Plan 5 Task 1: wait({ ref }) on an evicted settled channel resolves 'settled' at once, not a 409", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
+    await alice.daemon.idle();
+    await alice.daemon.tick(); // a pass that sees it settled: the grace period starts
+    await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+    await waitFor(() => alice.daemon.channelIds().length === 0, 10_000, "evicted");
+
+    // Before the fix: pick() throws 409 ("is settled"), and wait() never catches it -- the API would answer 409
+    // instead of the 200 `{ channelId, reason: "settled" }` a client polling `wait` expects.
+    const t0 = Date.now();
+    await expect(alice.daemon.wait({ ref: id, timeoutMs: 5_000 })).resolves.toEqual({ channelId: id, reason: "settled" });
+    expect(Date.now() - t0).toBeLessThan(1_000); // resolves at once, not after the timeout
+    // An unknown (never-existed) ref is still a real 404, unaffected by this fix.
+    await expect(alice.daemon.wait({ ref: `0x${"ab".repeat(32)}`, timeoutMs: 300 })).rejects.toThrow(/unknown channel/);
+  });
+
   it("relays moves between daemons and enforces turn order", async () => {
     const { alice, bob, id } = await matched();
     await expect(bob.daemon.move(undefined, "e7e5", { actor: "agent" })).rejects.toThrow(DaemonError);

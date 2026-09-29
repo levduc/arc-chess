@@ -1843,7 +1843,24 @@ export class ArenaDaemon {
     // trips a spurious control-changed, but a real change on any watched channel does.
     const controllers = new Map<Hex, Controller>();
     for (;;) {
-      const targets = opts.ref ? [this.pick(opts.ref)] : [...this.live.values()];
+      let targets: ChannelHandle[];
+      if (opts.ref) {
+        try {
+          targets = [this.pick(opts.ref)];
+        } catch (err) {
+          // Plan 5 Task 1 (mainnet gates: wait on evicted channels): a settled channel this daemon has already
+          // let go of (evicted from `live` after SETTLED_GRACE_SECONDS) is not an error to wait for -- it
+          // resolves with reason "settled" at once, the same way status()/channels() already serve it, instead
+          // of surfacing pick()'s 409. Re-checked inside the loop: a channel can be evicted mid-wait too.
+          if (err instanceof DaemonError && (err.code === 404 || err.code === 409)) {
+            const st = await this.settledStatus(opts.ref);
+            if (st) return { channelId: st.channelId, reason: "settled" };
+          }
+          throw err;
+        }
+      } else {
+        targets = [...this.live.values()];
+      }
       for (const l of targets) {
         const id = l.record.channelId;
         const prev = controllers.get(id);
