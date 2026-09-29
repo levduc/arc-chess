@@ -38,7 +38,10 @@ import { CHAIN, RPC, deployArena, mintUsdc, publicClient, setEthBalance } from "
 
 const h = (n: number): Hex => `0x${n.toString(16).padStart(64, "0")}`;
 const TO = "0x00000000000000000000000000000000000000aa" as const;
-const receiptOf = (hash: Hex) => ({ transactionHash: hash, status: "success" }) as unknown as TransactionReceipt;
+/** Hashes whose (stub) receipt says the transaction reverted. */
+const revertedHashes = new Set<Hex>();
+const receiptOf = (hash: Hex) =>
+  ({ transactionHash: hash, status: revertedHashes.has(hash) ? "reverted" : "success" }) as unknown as TransactionReceipt;
 
 const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -631,5 +634,26 @@ describe("waitOrReplace: an earlier replacement's failure is forgotten once a la
     const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 10, pollMs: 5 }).catch((e) => e);
     expect(replacements).toBe(3);
     expect(err).toBeInstanceOf(TxStuckError); // before: the stale revert of replacement 1
+  });
+});
+
+describe("HubClient.write reports the transaction that actually reverted (re-review 2, minor 6)", () => {
+  it("a mined replacement that reverted is named by its own hash, not the original's", async () => {
+    const n = stubNode();
+    const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
+    const realSend = n.sender.send.bind(n.sender);
+    let replacement: Hex | undefined;
+    n.sender.send = async (tx) => {
+      const r = await realSend(tx);
+      if (tx.nonce !== undefined) {
+        replacement = r;
+        revertedHashes.add(r);
+        n.mined.add(r); // the replacement is mined -- and reverted
+      }
+      return r;
+    };
+    const err = await new HubClient(TO, client).timeout(n.sender, h(1), { receiptTimeoutMs: 10 }).catch((e) => e);
+    expect(err).toBeInstanceOf(HubRevertError);
+    expect(String((err as Error).message)).toContain(replacement!); // before: the original's hash
   });
 });

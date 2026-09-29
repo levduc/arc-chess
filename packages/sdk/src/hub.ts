@@ -401,7 +401,10 @@ export class HubClient {
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
       throw err;
     }
-    if (receipt.status !== "success") throw new HubRevertError(undefined, new Error(`transaction ${hash} reverted`));
+    // The mined transaction may be a replacement of the one first sent: report the one that actually reverted.
+    if (receipt.status !== "success") {
+      throw new HubRevertError(undefined, new Error(`transaction ${receipt.transactionHash} reverted`));
+    }
     return receipt;
   }
 }

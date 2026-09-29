@@ -15,8 +15,10 @@ import {
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 
-/** A transaction to send. `nonce` and the fee fields are overrides, used to replace a stuck transaction at the same
- *  nonce with higher fees (`waitOrReplace`); a sender that cannot honour them may ignore them. */
+/** A transaction to send. `nonce`, the fee fields and `gas` are overrides, used to replace a stuck transaction at the
+ *  same nonce with higher fees (`waitOrReplace`, and a tracking `SerialTxSender`'s next send). A `TxSender` MUST
+ *  honour them; one that cannot MUST declare `supportsReplacement = false` (see `TxSender`), and is then never asked
+ *  to replace anything. */
 export type TxRequest = {
   to: Address;
   data: Hex;
