@@ -209,7 +209,19 @@ async function main(): Promise<void> {
     // soak run's *sustained* POST rate (2 lobby POSTs per channel cycle, times every channel slot, continuously)
     // exceeds the default 1/s once enough channels are churning, which the raised burst alone only postpones --
     // the Task 11 report has the run that found this the hard way (a `POST /offers -> 500: rate limited`).
-    serverOverrides: { limits: { wsPerIp: 128, maxOpenOffersPerIp: 128, httpPostBurst: 400, httpPostPerSec: 50 } },
+    //
+    // wsFrameBurst/wsFramePerSec are the same idea for the per-connection *websocket* frame limit (default burst
+    // 200, 20/s): one soak daemon holds several channels at once (4-5 here), each sending every move and its
+    // dispute-check traffic over its one socket, where a real production daemon holds one or two. The default
+    // limit is per *connection*, not per channel, so it trips well before any single real daemon would ever
+    // approach it -- and tripping it matters more than a dropped frame: the server closes the socket outright
+    // (`ws.close(1008, "rate limited")`, ws.ts), and the reconnect backoff only resets after 30s stable
+    // (`stableAfterMs`, host.ts), so repeated trips turn into a growing-backoff reconnect storm that can black out
+    // *all* traffic on that socket -- including new-match delivery -- for well over a minute. The Task 11 report's
+    // first 15-minute run found this the hard way (>90s waits for a match, `unknown channel` from the offerer).
+    serverOverrides: {
+      limits: { wsPerIp: 128, maxOpenOffersPerIp: 128, httpPostBurst: 400, httpPostPerSec: 50, wsFrameBurst: 2000, wsFramePerSec: 200 },
+    },
   });
 
   // Override the harness's own SIGINT/SIGTERM handlers (they kill everything and exit immediately, with no chance
@@ -386,8 +398,19 @@ async function main(): Promise<void> {
               stopping = true;
               exitCode = 1;
             }
-          } catch {
-            // transient (daemon mid-restart, request timeout): the next tick tries again
+          } catch (err) {
+            // A request error (most commonly the offerer's transient "unknown channel" 404 right after a match --
+            // see bot.ts's waitStatus) is not progress either. Bug fixed here: this used to be silently ignored
+            // every tick forever, which meant a channel stuck erroring past STALL_MS was invisible to this
+            // watchdog -- exactly the failure mode the required 15-minute soak run hit (a slot's own `waitStatus`
+            // eventually timed out on its own, tighter budget, but the watchdog never would have caught it).
+            if (Date.now() - slot.lastProgressAt > STALL_MS) {
+              const msg = `slot ${slot.idx} (channel ${slot.channelId}) made no progress for over ${STALL_MS / 60_000} minutes (last error: ${String(err)})`;
+              console.log(`[soak] ${msg}`);
+              failures.push(msg);
+              stopping = true;
+              exitCode = 1;
+            }
           }
         }
       })();
