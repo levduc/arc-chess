@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { freeTcpPort, isPortFree } from "./harness.js";
@@ -12,11 +13,15 @@ const DEV_UP_SCRIPT = join(REPO_ROOT, "scripts/dev-up.ts");
 // documented trade-off of using `forge script` for dev-up -- see the harness, which deploys through viem instead
 // to avoid exactly this), so the test snapshots and restores it to leave no trace on the machine.
 const DEPLOYMENT_31337 = join(REPO_ROOT, "contracts/deployments/31337.json");
+// The repo's own dev-up state (gitignored). dev-up wipes its state dir on every run, so the test must point it at a
+// temporary one (`--dir`) and never touch this one (final review m12: a test run deleted it).
+const REPO_DEV_DIR = join(REPO_ROOT, ".arena-dev");
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 let child: ChildProcess | undefined;
 let deploymentSnapshot: string | null | undefined;
+let devDir: string | undefined;
 
 afterEach(async () => {
   if (child && child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
@@ -27,6 +32,8 @@ afterEach(async () => {
     }
   }
   child = undefined;
+  if (devDir) rmSync(devDir, { recursive: true, force: true });
+  devDir = undefined;
   if (deploymentSnapshot !== undefined) {
     if (deploymentSnapshot === null) rmSync(DEPLOYMENT_31337, { force: true });
     else writeFileSync(DEPLOYMENT_31337, deploymentSnapshot);
@@ -72,6 +79,8 @@ describe("pnpm dev:up", () => {
     "starts anvil + server on free ports, prints a ready line, and Ctrl-C frees both ports",
     async () => {
       deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+      const repoDevDirBefore = existsSync(REPO_DEV_DIR) ? statSync(REPO_DEV_DIR).ctimeMs : null;
 
       const anvilPort = await freeTcpPort();
       const serverPort = await freeTcpPort();
@@ -80,13 +89,18 @@ describe("pnpm dev:up", () => {
 
       child = spawn(
         TSX_BIN,
-        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--players", "2"],
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--players", "2", "--dir", devDir],
         { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
       );
 
       const ready = await waitForJsonLine(child, (o) => o.ready === true, 60_000);
       expect(ready.anvilPort).toBe(anvilPort);
       expect(ready.serverPort).toBe(serverPort);
+      // m12: every file went to the --dir given, and the repo's own .arena-dev was left exactly as it was.
+      expect(ready.dir).toBe(devDir);
+      expect(existsSync(join(devDir, "server.json"))).toBe(true);
+      expect(existsSync(join(devDir, "players", "alice", "config.json"))).toBe(true);
+      expect(existsSync(REPO_DEV_DIR) ? statSync(REPO_DEV_DIR).ctimeMs : null).toBe(repoDevDirBefore);
 
       // Both services are actually reachable, not just "the script said so".
       const rpcRes = await fetch(`http://127.0.0.1:${anvilPort}`, {

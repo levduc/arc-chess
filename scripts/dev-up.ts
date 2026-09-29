@@ -1,9 +1,9 @@
 /**
- * `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 2]`
+ * `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 2] [--dir PATH]`
  *
  * Brings up a local Agent Chess Arena stack for manual play: Anvil, a contract deployment (via `forge script`),
- * the host server, and one funded ARENA_HOME per player (via `arena init`) -- everything under `.arena-dev/`
- * (gitignored). It does not start the players' daemons itself; it prints the exact command to start each one, so
+ * the host server, and one funded ARENA_HOME per player (via `arena init`) -- everything under `--dir` (default
+ * `.arena-dev/`, gitignored). That directory is wiped at the start of every run. It does not start the players' daemons itself; it prints the exact command to start each one, so
  * you can run them in separate terminals (or as separate agents) and watch them play.
  *
  * Refuses cleanly if the requested Anvil or server port is already busy (e.g. the on-machine demo stack on
@@ -12,7 +12,7 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
@@ -21,7 +21,7 @@ const REPO_ROOT = join(import.meta.dirname, "..");
 const CONTRACTS_DIR = join(REPO_ROOT, "contracts");
 const CLI_BIN = join(REPO_ROOT, "packages/cli/bin/arena.mjs");
 const SERVER_BIN = join(REPO_ROOT, "apps/server/bin/arena-server.mjs");
-const DEV_DIR = join(REPO_ROOT, ".arena-dev");
+const DEFAULT_DEV_DIR = join(REPO_ROOT, ".arena-dev");
 
 // Anvil's well-known default account 0, derived from its built-in test mnemonic ("test test test test test test
 // test test test test test junk"). Anvil pre-funds it with ETH at startup. Local-dev only: never use this key
@@ -30,7 +30,7 @@ const OWNER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f
 
 const PLAYER_NAMES = ["alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi"];
 
-function parseArgs(argv: string[]): { port: number; anvilPort: number; players: number } {
+function parseArgs(argv: string[]): { port: number; anvilPort: number; players: number; dir: string } {
   const flags = new Map<string, string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -44,6 +44,9 @@ function parseArgs(argv: string[]): { port: number; anvilPort: number; players: 
     port: Number(flags.get("port") ?? "8080"),
     anvilPort: Number(flags.get("anvil-port") ?? "8545"),
     players: Number(flags.get("players") ?? "2"),
+    // Final review m12: a caller (the dev-up test) passes its own temporary directory, so running the test suite
+    // never wipes the repo's .arena-dev.
+    dir: resolve(flags.get("dir") ?? DEFAULT_DEV_DIR),
   };
 }
 
@@ -140,7 +143,7 @@ async function shutdown(signal: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const { port: serverPort, anvilPort, players: numPlayers } = parseArgs(process.argv.slice(2));
+  const { port: serverPort, anvilPort, players: numPlayers, dir: DEV_DIR } = parseArgs(process.argv.slice(2));
 
   if (!(await isPortFree(anvilPort))) {
     process.stderr.write(
@@ -288,7 +291,7 @@ async function main(): Promise<void> {
   process.stderr.write("\n  Ctrl-C here tears down anvil and the server.\n\n");
 
   // One machine-readable line, last, so tooling (and this task's own dev-up test) can wait for it deterministically.
-  console.log(JSON.stringify({ ready: true, anvilPort, serverPort, rpcUrl, serverUrl, players: numPlayers }));
+  console.log(JSON.stringify({ ready: true, anvilPort, serverPort, rpcUrl, serverUrl, players: numPlayers, dir: DEV_DIR }));
 
   await new Promise<void>(() => {}); // keep running until Ctrl-C
 }
