@@ -1444,6 +1444,33 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(record.sweptTx).toBe(afterQueue.sweptTx);
     expect(record.sweptAmount).toBe(afterQueue.sweptAmount);
   });
+
+  it("fix round 2, minor 6: a concurrent handoff() is not lost by the sweep's own record update", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    // The handoff races the sweep's own in-flight attempt: performSweep's very first action is an RPC round
+    // trip (getBalance), a real await gap during which l.record can change underneath runSweepAttempt's own,
+    // by-then-stale snapshot of it.
+    const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    internals.performSweep = async (...args: unknown[]) => {
+      await d.handoff(id, "human", "reviewing");
+      return realPerformSweep(...(args as [unknown]));
+    };
+    try {
+      (d as unknown as SweepableDaemon).sweepChannel = original;
+      await waitFor(() => l.record.swept !== undefined, 20_000, "swept despite the concurrent handoff");
+      expect(l.record.swept).toBe(true);
+      expect(l.record.sweptAmount).toBeGreaterThan(0n);
+      expect(l.record.controller).toBe("human"); // the handoff's change was not clobbered
+      expect(l.record.note).toBe("reviewing");
+      expect(new RecordStore(alice.home).channel(id)!.controller).toBe("human"); // and it was persisted, not just in memory
+    } finally {
+      internals.performSweep = realPerformSweep;
+    }
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {
