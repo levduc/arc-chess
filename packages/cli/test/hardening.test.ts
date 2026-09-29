@@ -1064,7 +1064,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(receipt.to?.toLowerCase()).toBe(alice.address.toLowerCase());
   });
 
-  it("scenario B (reviewer repro): replacing a released (not dropped) tracked entry produces a real, verifiable sweep -- never a false success", async () => {
+  it("fix round 2, important 4 (scenario B, B1 shape): replacing a released entry at its own nonce -- the stand-in never mines, the replacement does", async () => {
     const { alice, bob, id } = await matched();
     const original = await settleWithSweepDisabled(alice, bob, id);
     const d = alice.daemon;
@@ -1072,32 +1072,48 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const sender = l.sessionSender;
     const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
     await testClient.setAutomine(false);
-    let standInHash: Hex;
     try {
       // A stand-in for a stuck respond that is still sitting in the node's mempool (unlike scenario A's dropped
       // one) when the sweep runs -- the old bug waited on *this* hash directly and reported its receipt (to
       // itself, not the wallet) as a successful sweep.
-      standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      const standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
       const ac = new AbortController();
       ac.abort();
       await waitOrReplace(d.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, { signal: ac.signal }).catch(
         () => undefined,
       );
       expect(sender.tracked().map((t) => t.state)).toEqual(["released"]);
+      const standInNonce = sender.tracked()[0].nonce;
+
+      const walletBefore = await d.client.getBalance({ address: alice.address });
+      (d as unknown as SweepableDaemon).sweepChannel = original;
+      // Automine stays OFF: the periodic timer's own tick drives sweepChannel -> runSweepAttempt -> performSweep
+      // -> sender.send(req), which must find the released entry and replace it at its own nonce (rule 2) for
+      // anything to ever land -- this is the actual replacement path, not a fresh send that automine would let
+      // slip in ahead of it.
+      await waitFor(() => sender.tracked()[0]?.hashes.length === 2, 10_000, "the sweep replaced the stand-in at its nonce");
+      const entry = sender.tracked()[0];
+      expect(entry.nonce).toBe(standInNonce); // same nonce: a replacement, not a fresh send queued behind it
+      const replacementHash = entry.hashes.find((h) => h !== standInHash);
+      expect(replacementHash).toBeDefined();
+
+      await testClient.mine({ blocks: 1 }); // now let the replacement (and only the replacement) land
+      await waitFor(() => l.record.swept === true, 20_000, "swept");
+
+      const record = l.record;
+      expect(record.sweptTx).toBe(replacementHash); // the replacement is what actually landed and was recorded
+      expect(record.sweptTx).not.toBe(standInHash);
+      await expect(d.client.getTransactionReceipt({ hash: standInHash })).rejects.toThrow(); // the stand-in never mined
+
+      const walletAfter = await d.client.getBalance({ address: alice.address });
+      expect(walletAfter - walletBefore).toBe(record.sweptAmount); // the wallet genuinely received the funds
+      const receipt = await d.client.getTransactionReceipt({ hash: record.sweptTx! });
+      expect(receipt.status).toBe("success");
+      expect(receipt.to?.toLowerCase()).toBe(alice.address.toLowerCase());
+      expect(sender.tracked()).toEqual([]); // settled: no dangling entry
     } finally {
-      await testClient.setAutomine(true); // back to normal: the real sweep's replacement mines like any other tx
+      await testClient.setAutomine(true);
     }
-    const walletBefore = await d.client.getBalance({ address: alice.address });
-    (d as unknown as SweepableDaemon).sweepChannel = original;
-    await waitFor(() => l.record.swept === true, 20_000, "swept");
-    const record = l.record;
-    const walletAfter = await d.client.getBalance({ address: alice.address });
-    expect(walletAfter - walletBefore).toBe(record.sweptAmount); // the wallet genuinely received the funds
-    expect(record.sweptTx).not.toBe(standInHash); // never reported the stale entry's own hash as the sweep
-    const receipt = await d.client.getTransactionReceipt({ hash: record.sweptTx! });
-    expect(receipt.status).toBe("success");
-    expect(receipt.to?.toLowerCase()).toBe(alice.address.toLowerCase());
-    expect(sender.tracked()).toEqual([]); // the replaced entry is gone, not left dangling
   });
 
   it("sweeps a retired (never funded past its deadline) channel's session gas too, not just Finalized/Reclaimed", async () => {
