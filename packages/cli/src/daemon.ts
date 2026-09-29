@@ -37,7 +37,14 @@ import {
   type RelayMessage,
   type SignedState,
 } from "@arena/sdk";
-import { arenaPaths, isCanonicalId, minChallengeTimeoutOf, DEFAULT_LOG_CHUNK_BLOCKS, type ArenaConfig } from "./config.js";
+import {
+  arenaPaths,
+  isCanonicalId,
+  minChallengeTimeoutOf,
+  sessionGasFloorOf,
+  DEFAULT_LOG_CHUNK_BLOCKS,
+  type ArenaConfig,
+} from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
@@ -98,6 +105,17 @@ export type ChannelHandle = {
   /** Plan 4.5 Task 10 round 4: set while the main pass or the reclaim API works on this channel, so a reclaim is
    *  never sent by both at once. */
   mainBusy: boolean;
+  /** Final review C1: the session-key refill in flight, if any -- shared by the main pass, the dispute pass and
+   *  funding, so two of them never both see a low balance and both send a refill. */
+  refilling: Promise<void> | null;
+  /** Final review C1: session-key refills sent for this channel after funding (for logs, tests and tooling). */
+  refills: number;
+  /** Final review C1: set while the session key is below `sessionGasFloor` and the wallet could not refill it
+   *  (the reason); drives the `session-gas-low` attention. Null otherwise. */
+  sessionGasLow: string | null;
+  /** Final review C1: `wait()` has already woken for the current `sessionGasLow` episode (so it does not return at
+   *  once on every call while the wallet stays empty). */
+  sessionGasLowWoken: boolean;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -699,6 +717,10 @@ export class ArenaDaemon {
       closeRetryAt: 0,
       disputeBusy: false,
       mainBusy: false,
+      refilling: null,
+      refills: 0,
+      sessionGasLow: null,
+      sessionGasLowWoken: false,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -773,23 +795,10 @@ export class ArenaDaemon {
       await this.hub.approve(this.wallet, this.opts.config.usdc, p.deposit + p.feePerPlayer);
     }
     if (this.stopped) return;
-    if (this.opts.config.sessionGasWei > 0n) {
-      // I1: top up only the shortfall, and only while the session key is actually below the target — otherwise
-      // a deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever.
-      // Read afresh on every attempt, a resend after a reported drop included: a top-up that landed after all is
-      // never paid twice (and a resend replaces the dropped attempt at its nonce).
-      const balance = await this.client.getBalance({ address: l.sessionSender.address });
-      if (balance < this.opts.config.sessionGasWei) {
-        if (this.stopped) return;
-        const req = { to: l.sessionSender.address, data: "0x" as Hex, value: this.opts.config.sessionGasWei - balance };
-        // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
-        // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
-        // paid at most once.
-        const hash = await this.wallet.send(req);
-        // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
-        await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
-      }
-    }
+    // I1: top up only the shortfall, and only while the session key is actually below the target -- otherwise a
+    // deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever. Shared
+    // with the refill (final review C1), so the two never both send one.
+    await this.sharedTopUp(l, () => this.topUpSession(l));
     if (this.stopped) return;
     try {
       await this.hub.deposit(this.wallet, p);
@@ -807,6 +816,85 @@ export class ArenaDaemon {
     }
     l.fundBlockedUntil = null;
     if (l.lastError?.startsWith("funding:")) l.lastError = null;
+  }
+
+  /** Runs `work` as this channel's one session-key top-up at a time (final review C1): a caller that finds one in
+   *  flight waits for it instead of starting its own. */
+  private sharedTopUp(l: ChannelHandle, work: () => Promise<unknown>): Promise<void> {
+    if (!l.refilling) {
+      l.refilling = work()
+        .then(() => undefined)
+        .finally(() => {
+          l.refilling = null;
+        });
+    }
+    return l.refilling;
+  }
+
+  /**
+   * Sends the session key the shortfall up to `sessionGasWei` from the wallet, if it is below it. The balance is read
+   * afresh right before the send (a resend after a reported drop included), so a top-up that landed after all is
+   * never paid twice, and a resend replaces the dropped attempt at its nonce. Resolves true if it sent one.
+   */
+  private async topUpSession(l: ChannelHandle): Promise<boolean> {
+    const target = this.opts.config.sessionGasWei;
+    if (target <= 0n || this.stopped) return false;
+    const balance = await this.client.getBalance({ address: l.sessionSender.address });
+    if (balance >= target || this.stopped) return false;
+    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance };
+    // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
+    // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
+    // paid at most once.
+    const hash = await this.wallet.send(req);
+    // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
+    await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
+    return true;
+  }
+
+  /**
+   * Final review C1: keeps the session key able to pay for dispute transactions. The key is funded once at funding,
+   * and every respond an opponent forces spends from it; a key that can no longer pay cannot answer a stale
+   * challenge, and an unanswered one lets the challenger time out on an old state (every game since erased, plus a
+   * forfeit). So while the channel is Open or Challenged, a balance below `sessionGasFloor` is refilled from the
+   * wallet up to `sessionGasWei`. If the wallet cannot, the channel raises `session-gas-low`. Never throws.
+   */
+  protected async ensureSessionGas(l: ChannelHandle): Promise<void> {
+    if (this.opts.config.sessionGasWei <= 0n || this.stopped || l.record.finalized) return;
+    // (A funding top-up in flight that fails is fund()'s to report, not this caller's.)
+    await this.sharedTopUp(l, async () => {
+      const floor = sessionGasFloorOf(this.opts.config);
+      let balance: bigint;
+      try {
+        balance = await this.client.getBalance({ address: l.sessionSender.address });
+      } catch (err) {
+        this.log(`channel ${l.record.channelId}: session gas check failed (retried on the next pass): ${errorText(err)}`);
+        return;
+      }
+      if (balance >= floor) {
+        this.clearSessionGasLow(l);
+        return;
+      }
+      try {
+        if (await this.topUpSession(l)) {
+          l.refills++;
+          this.log(`channel ${l.record.channelId}: refilled the session key's dispute gas (it was at ${balance} wei, floor ${floor})`);
+        }
+        this.clearSessionGasLow(l);
+      } catch (err) {
+        if (this.stopped) return;
+        const first = l.sessionGasLow === null;
+        l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
+        this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
+        if (first) this.notify();
+      }
+    }).catch(() => undefined);
+  }
+
+  private clearSessionGasLow(l: ChannelHandle): void {
+    if (l.sessionGasLow === null) return;
+    l.sessionGasLow = null;
+    l.sessionGasLowWoken = false;
+    this.notify();
   }
 
   // ------------------------------------------------------------------ relay
@@ -1089,6 +1177,12 @@ export class ArenaDaemon {
     if (this.stopped || this.mainTicking) return;
     this.mainTicking = true;
     try {
+      // Final review C1: a Challenged channel's session key is refilled first, ahead of all other main-pass work
+      // (its respond may be waiting on it). `chain` is the phase as last read; `watch` checks every channel again.
+      for (const l of this.live.values()) {
+        if (this.stopped) break;
+        if (!l.record.finalized && l.chain?.phase === "Challenged") await this.ensureSessionGas(l);
+      }
       await this.pruneOffers();
       for (const l of this.live.values()) {
         if (this.stopped) break;
@@ -1183,6 +1277,8 @@ export class ArenaDaemon {
     const id = l.record.channelId;
     const p = l.record.params;
     const info = await this.hub.channelInfo(id);
+    // Final review C1: dispute gas first, whenever the channel can still be disputed.
+    if (info.phase === "Open" || info.phase === "Challenged") await this.ensureSessionGas(l);
     if (info.phase === "Challenged") {
       if (l.session.closeTransaction() && Date.now() >= l.closeRetryAt) {
         await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`
@@ -1292,6 +1388,10 @@ export class ArenaDaemon {
       // phase, so a direct on-chain read can still observe "Finalized" fractionally before this line runs.
       this.markFinalized(l);
     }
+    // Final review C1: the dispute pass refills too (after its own transaction, so a respond it can still pay for
+    // is never delayed by the refill's receipt wait): the next challenge must find the key able to pay.
+    if (this.stopped) return true;
+    if (!l.record.finalized) await this.ensureSessionGas(l);
     if (this.stopped) return true;
     await this.settleCheck(l);
     return true;
@@ -1392,7 +1492,16 @@ export class ArenaDaemon {
         const prev = controllers.get(id);
         if (prev === undefined) controllers.set(id, l.record.controller);
         else if (prev !== l.record.controller) return { channelId: id, reason: "control-changed" };
-        const st = this.statusOf(l);
+        let st = this.statusOf(l);
+        if (st.attention === "session-gas-low") {
+          // Final review C1: one wake per low-gas episode. While the wallet stays empty, later waits see the
+          // channel's other attention instead of returning at once on every call (status keeps showing it).
+          if (!l.sessionGasLowWoken) {
+            l.sessionGasLowWoken = true;
+            return { channelId: id, reason: st.attention };
+          }
+          st = this.statusOf(l, { ignoreSessionGasLow: true });
+        }
         if (st.attention) return { channelId: id, reason: st.attention };
       }
       const left = end - Date.now();
@@ -1401,7 +1510,7 @@ export class ArenaDaemon {
     }
   }
 
-  private statusOf(l: ChannelHandle): ChannelStatus {
+  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean } = {}): ChannelStatus {
     return buildStatus({
       record: l.record,
       snapshot: l.session.snapshot(),
@@ -1410,6 +1519,7 @@ export class ArenaDaemon {
       lastError: l.lastError,
       lastProgressAt: l.lastProgressAt,
       lobbyError: this.lobbyError,
+      sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
     });
   }
 

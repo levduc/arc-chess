@@ -21,7 +21,7 @@ import {
   type SignedAcceptance,
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
-import { CHAIN, RPC, increaseTime, now, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
+import { CHAIN, RPC, increaseTime, now, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
 import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -144,6 +144,89 @@ describe("I2: stalled and withheld states escalate instead of looping", () => {
     const after = await alice.daemon.status(id);
     expect(after.phase).toBe("Challenged");
     expect(after.attention).toBeNull();
+  });
+});
+
+describe("final review C1: the session key's dispute gas is refilled while the channel is Open or Challenged", () => {
+  const ANVIL_DEFAULT_BALANCE = 10n ** 22n; // Anvil's 10000 ETH per default account, restored after each test
+  const balanceOf = (d: ArenaDaemon, a: Hex) => d.client.getBalance({ address: a });
+
+  it("the main pass refills a drained session key back to sessionGasWei, and leaves one above the floor alone", async () => {
+    const { alice, id, config } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    expect(await balanceOf(d, session)).toBe(target); // topped up at funding
+    // An opponent's forced responds drained it below the floor (half of sessionGasWei).
+    await setEthBalance(session, target / 10n);
+    await waitFor(async () => (await balanceOf(d, session)) === target, 10_000, "refill"); // before: never refilled
+    await d.idle(); // the refill's receipt wait may still be finishing
+    expect(d.handle(id).refills).toBe(1);
+    // Above the floor: not refilled (one top-up per drain, not per spend).
+    await setEthBalance(session, target / 2n + 1n);
+    await d.idle();
+    await d.tick();
+    await d.tick();
+    expect(await balanceOf(d, session)).toBe(target / 2n + 1n);
+    expect(d.handle(id).refills).toBe(1);
+  });
+
+  it("a Challenged channel is refilled by the dispute pass alone, and concurrent passes never refill twice", async () => {
+    const { alice, bob, id, config } = await matched();
+    const d = alice.daemon;
+    await d.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 1n, 5_000, "bob has e4");
+    await bob.daemon.challenge(id, "agent"); // Bob challenges at turn 1: Bob is on move, Alice has nothing to answer
+    await waitFor(async () => (await d.hub.channelInfo(id)).phase === "Challenged", 5_000, "Challenged");
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    // Only the dispute pass runs: the main pass is switched off for this part.
+    const mainPass = d.mainPass.bind(d);
+    (d as unknown as { mainPass: () => Promise<void> }).mainPass = async () => undefined;
+    try {
+      await setEthBalance(session, target / 10n);
+      await waitFor(async () => (await balanceOf(d, session)) === target, 10_000, "dispute-pass refill");
+      await d.idle();
+      expect(d.handle(id).refills).toBe(1);
+    } finally {
+      (d as unknown as { mainPass: () => Promise<void> }).mainPass = mainPass;
+    }
+    // Both passes at once on a drained key (plus the timer's own): one refill, to exactly the target.
+    await setEthBalance(session, target / 10n);
+    const refills = d.handle(id).refills;
+    await Promise.all([d.disputePass(), d.mainPass(), d.disputePass()]);
+    await waitFor(async () => (await balanceOf(d, session)) >= target, 10_000, "refill");
+    await d.idle();
+    expect(await balanceOf(d, session)).toBe(target);
+    expect(d.handle(id).refills).toBe(refills + 1);
+  });
+
+  it("session-gas-low: raised when the wallet cannot refill, wakes wait() once, and clears once the wallet is funded", async () => {
+    const { alice, bob, id, config } = await matched();
+    const d = alice.daemon;
+    await d.move(id, "e4", { actor: "agent" }); // Bob's turn: Alice's channel needs nothing else from her
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 1n, 5_000, "bob has e4");
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    try {
+      await setEthBalance(alice.address, 1_000n); // the wallet cannot pay for a refill
+      await setEthBalance(session, target / 10n);
+      const st = await waitFor(async () => {
+        const s = await d.status(id);
+        return s.attention === "session-gas-low" ? s : null;
+      }, 10_000, "session-gas-low");
+      expect(st.suggestedActions[0]).toMatch(new RegExp(`^fund your wallet: dispute gas for channel ${id} is low`));
+      // wait() wakes for it once; while it lasts, later waits fall back to the channel's other attention (none here).
+      await expect(d.wait({ timeoutMs: 5_000 })).resolves.toEqual({ channelId: id, reason: "session-gas-low" });
+      await expect(d.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+      expect((await d.status(id)).attention).toBe("session-gas-low"); // still shown in status
+      // Funded again: the next pass refills and the attention clears.
+      await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
+      await waitFor(async () => (await balanceOf(d, session)) === target, 10_000, "refill");
+      await waitFor(async () => (await d.status(id)).attention === null, 10_000, "attention cleared");
+    } finally {
+      await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
+    }
   });
 });
 
@@ -671,6 +754,9 @@ describe("Plan 4.5 Task 10: a match whose handling fails on an RPC error is retr
     cleanups.push(pair.cleanup);
     const { alice, bob } = pair;
     const hub = alice.daemon.hub;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    // Installed after createOffer (which reads the fee itself for the escrow-cap check): the read that fails is the
+    // one at match time.
     const real = hub.feeConfig.bind(hub);
     let failed = false;
     hub.feeConfig = async () => {
@@ -680,7 +766,6 @@ describe("Plan 4.5 Task 10: a match whose handling fails on an RPC error is retr
       }
       return real();
     };
-    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await bob.daemon.acceptOffer(offerId);
     // Before the fix the host's one match event was lost to the failed read: alice never opened (or funded) it.
     const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "alice handles the match");

@@ -25,7 +25,14 @@ export type ChannelStatus = {
   closing: boolean;
   opponentWantsToClose: boolean;
   challenge: null | { deadline: string; secondsLeft: number; mustMove: boolean; challenger: "me" | "opponent" };
-  attention: null | "your-turn" | "new-game-proposed" | "game-over" | "close-requested" | "opponent-silent";
+  attention:
+    | null
+    | "session-gas-low"
+    | "your-turn"
+    | "new-game-proposed"
+    | "game-over"
+    | "close-requested"
+    | "opponent-silent";
   suggestedActions: string[];
   lastError: string | null;
   /** Plan 4.5 Task 11 fix round (C2): the daemon-wide "too many watched offers" (or other subscribe-refusal)
@@ -48,6 +55,8 @@ export type StatusInput = {
   lastProgressAt?: bigint | null;
   /** Plan 4.5 Task 11 fix round (C2): see ChannelStatus.lobbyError. */
   lobbyError?: string | null;
+  /** Final review C1: why the session key's dispute gas is low and the wallet could not refill it, or null. */
+  sessionGasLow?: string | null;
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -103,7 +112,11 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     waitingOnOpponent && chain !== null && lastProgressAt !== null && chain.now - lastProgressAt > record.params.challengeTimeout;
 
   let attention: ChannelStatus["attention"] = null;
-  if (live && record.controller === "agent") {
+  // Final review C1: first, and whoever controls the channel -- a session key that cannot pay cannot answer a
+  // challenge, and an unanswered one can roll the channel back.
+  const gasLow = live && input.sessionGasLow ? input.sessionGasLow : null;
+  if (gasLow) attention = "session-gas-low";
+  else if (live && record.controller === "agent") {
     if (myTurn) attention = "your-turn";
     else if (newGame === "proposed_by_opponent" && !closing) attention = "new-game-proposed";
     // I2: only a request we can honour — `arena close` works only on a finished game with no proposal pending.
@@ -158,6 +171,11 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   }
   if (input.lobbyError) {
     suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
+  }
+  if (gasLow) {
+    suggestedActions.unshift(
+      `fund your wallet: dispute gas for channel ${record.channelId} is low (${gasLow}); the daemon refills it on its next pass`,
+    );
   }
 
   return {
