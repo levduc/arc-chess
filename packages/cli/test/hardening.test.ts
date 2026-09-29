@@ -275,6 +275,31 @@ describe("Task 2: off-chain mirrors of the hub's launch limits (spec §13)", () 
     expect(bob.daemon.channelIds()).toEqual([]);
   });
 
+  it("final review I1/m9: createOffer and acceptOffer mirror the escrow cap: committedEscrow + 2*(deposit + fee) <= maxCommittedEscrow", async () => {
+    const { alice, bob, env } = await matched(); // one open channel: committedEscrow = 2 * (1_000_000 + 5_000)
+    const committed = (await alice.daemon.hub.limits()).committedEscrow;
+    expect(committed).toBe(2_010_000n);
+    const offer = { deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n };
+    // One base unit short of room for another such channel: both sides refuse, before anything is posted or signed.
+    await setLimits(env.hub, 10_000_000n, committed + 2_010_000n - 1n);
+    const own = await alice.daemon.createOffer(offer).catch((e: unknown) => e as DaemonError);
+    expect(own).toBeInstanceOf(DaemonError);
+    expect(own.code).toBe(409);
+    expect(own.message).toMatch(/escrow cap/);
+    // Bob posts his offer while there is room; the cap is lowered again before Alice accepts it.
+    await setLimits(env.hub, 10_000_000n, 10n ** 12n);
+    const { offerId } = await bob.daemon.createOffer(offer);
+    await setLimits(env.hub, 10_000_000n, committed + 2_010_000n - 1n);
+    const acc = await alice.daemon.acceptOffer(offerId).catch((e: unknown) => e as DaemonError);
+    expect(acc).toBeInstanceOf(DaemonError);
+    expect(acc.code).toBe(409);
+    expect(acc.message).toMatch(/escrow cap/);
+    expect(new RecordStore(alice.home).offer(offerId)).toBeNull();
+    // Exactly enough room: accepted.
+    await setLimits(env.hub, 10_000_000n, committed + 2_010_000n);
+    await expect(alice.daemon.acceptOffer(offerId)).resolves.toBeUndefined();
+  });
+
   it("createOffer rejects while the hub is paused, with a clear cause", async () => {
     const pair = await startPair();
     cleanups.push(pair.cleanup);

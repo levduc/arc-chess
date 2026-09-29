@@ -318,9 +318,14 @@ export class ArenaDaemon {
   /**
    * Task 2 (spec §13): refuses a deposit the hub would refuse right now -- paused (checked first, mirroring
    * `ChannelHub.deposit`'s own check order) or over `maxDepositPerPlayer` -- before any funds move or any
-   * signature is produced. Shared by `createOffer` and `acceptOffer`.
+   * signature is produced. Shared by `createOffer`, `acceptOffer` and `onMatch`.
+   *
+   * Final review I1/m9: with `escrow`, also the total commitment cap -- `committedEscrow + 2 * (deposit + fee)` must
+   * fit under `maxCommittedEscrow`, where `fee` is the hub's current `feePerPlayer`. Only `createOffer` and
+   * `acceptOffer` pass it: the commitment changes with every channel on the hub, so at match time the hub itself
+   * decides (a refused deposit backs off, see `fund`).
    */
-  private async checkDepositAllowed(deposit: bigint): Promise<void> {
+  private async checkDepositAllowed(deposit: bigint, opts: { escrow?: boolean } = {}): Promise<void> {
     const limits = await this.hub.limits();
     if (limits.paused) throw new DaemonError(409, "the hub is paused: no new channels");
     if (deposit > limits.maxDepositPerPlayer) {
@@ -328,6 +333,18 @@ export class ArenaDaemon {
         400,
         `deposit exceeds the hub's per-player cap of ${limits.maxDepositPerPlayer} base units`,
       );
+    }
+    if (opts.escrow) {
+      const { feePerPlayer } = await this.hub.feeConfig();
+      const needed = 2n * (deposit + feePerPlayer);
+      if (limits.committedEscrow + needed > limits.maxCommittedEscrow) {
+        throw new DaemonError(
+          409,
+          `the hub's escrow cap is reached: this channel would commit ${needed} base units, and only ${
+            limits.maxCommittedEscrow > limits.committedEscrow ? limits.maxCommittedEscrow - limits.committedEscrow : 0n
+          } of the ${limits.maxCommittedEscrow} cap are free`,
+        );
+      }
     }
   }
 
@@ -358,7 +375,7 @@ export class ArenaDaemon {
       throw new DaemonError(400, `challengeTimeout must be between ${bounds.min} and ${bounds.max} seconds`);
     }
     this.checkChallengeTimeout(o.challengeTimeout);
-    await this.checkDepositAllowed(o.deposit);
+    await this.checkDepositAllowed(o.deposit, { escrow: true });
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
     // (the chain's block timestamp), not wall-clock Date.now() — a test (or a real deployment) that has moved
@@ -439,7 +456,7 @@ export class ArenaDaemon {
       // Final review I4: the offerer picks the timeout; a hostile 60 s one must not be accepted.
       this.checkChallengeTimeout(so.offer.challengeTimeout);
       // Task 2 (spec §13): before generating a session key or signing anything.
-      await this.checkDepositAllowed(so.offer.deposit);
+      await this.checkDepositAllowed(so.offer.deposit, { escrow: true });
       const sessionKey = generatePrivateKey();
       const acceptance = {
         offerId,
