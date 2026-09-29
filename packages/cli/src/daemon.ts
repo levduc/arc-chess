@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { BaseError, NonceTooLowError, createPublicClient, defineChain, erc20Abi, http, maxUint256, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, http, maxUint256, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -86,10 +86,6 @@ export type ChannelHandle = {
   /** Plan 4.5 Task 10 review: wall-clock ms before which the watchtower does not retry the cooperative close,
    *  set after a submission reverted (the same close would most likely revert again). 0 = no back-off. */
   closeRetryAt: number;
-  /** Plan 4.5 Task 10 re-review (I3): per logical transaction of this channel ("deposit", "topup", "respond", ...),
-   *  the nonce of an attempt reported dropped -- the next attempt is sent at it, so that if the first was not
-   *  really dropped, at most one of the two lands. */
-  droppedNonces: Map<string, number>;
   /** Plan 4.5 Task 10 re-review (I2): set while this channel's dispute work runs, so it never runs twice at once. */
   disputeBusy: boolean;
 };
@@ -108,11 +104,6 @@ export type DaemonOptions = {
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
 
-/** True for a send refused because its nonce is already used (viem's NonceTooLowError, or the node's own words). */
-function isNonceUsed(err: unknown): boolean {
-  if (err instanceof BaseError && err.walk((e) => e instanceof NonceTooLowError)) return true;
-  return /nonce too low|nonce (has )?already (been )?used|lower than the current nonce/i.test(err instanceof Error ? err.message : String(err));
-}
 
 /**
  * I3: on every scan, re-read this many blocks behind the persisted cursor, not just forward from it. A
@@ -185,7 +176,8 @@ export class ArenaDaemon {
     });
     this.client = createPublicClient({ chain: this.chain, transport: http(c.rpcUrl) });
     this.hub = new HubClient(c.hub, this.client);
-    this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain));
+    // Tracking senders (Plan 4.5 Task 10 re-review 2): each knows its outstanding transaction, read via this.client.
+    this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client);
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
@@ -554,6 +546,7 @@ export class ArenaDaemon {
     if (this.stopped || this.live.has(record.channelId)) return;
     const sessionSender = new SerialTxSender(
       new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
+      this.client,
     );
     const signer = privateKeyToAccount(record.sessionKey);
     const l: ChannelHandle = {
@@ -571,7 +564,6 @@ export class ArenaDaemon {
       fundBlockedUntil: null,
       submittingClose: false,
       closeRetryAt: 0,
-      droppedNonces: new Map(),
       disputeBusy: false,
     };
     this.live.set(record.channelId, l);
@@ -641,7 +633,7 @@ export class ArenaDaemon {
     });
     if (allowance < p.deposit + p.feePerPlayer) {
       if (this.stopped) return;
-      await this.logicalTx(l, "approve", (nonce) => this.hub.approve(this.wallet, this.opts.config.usdc, maxUint256, { nonce }));
+      await this.hub.approve(this.wallet, this.opts.config.usdc, maxUint256);
     }
     if (this.stopped) return;
     if (this.opts.config.sessionGasWei > 0n) {
@@ -653,16 +645,16 @@ export class ArenaDaemon {
       if (balance < this.opts.config.sessionGasWei) {
         if (this.stopped) return;
         const req = { to: l.sessionSender.address, data: "0x" as Hex, value: this.opts.config.sessionGasWei - balance };
-        await this.logicalTx(l, "topup", async (nonce) => {
-          const sent = await this.wallet.sendWithNonce({ ...req, ...(nonce !== undefined ? { nonce } : {}) });
-          // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
-          return waitOrReplace(this.client, this.wallet, req, sent.hash, { nonce: sent.nonce });
-        });
+        // The wallet's sender tracks its outstanding transaction: a top-up re-sent after an earlier one was reported
+        // dropped or ended stuck replaces it at its nonce (Plan 4.5 Task 10 re-review 2), so it is paid at most once.
+        const sent = await this.wallet.sendWithNonce(req);
+        // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
+        await waitOrReplace(this.client, this.wallet, req, sent.hash, { nonce: sent.nonce });
       }
     }
     if (this.stopped) return;
     try {
-      await this.logicalTx(l, "deposit", (nonce) => this.hub.deposit(this.wallet, p, { nonce }));
+      await this.hub.deposit(this.wallet, p);
     } catch (err) {
       // Task 2 (spec §13): a revert caused by a launch limit is not a bug -- it can resolve itself (the owner
       // raises a cap or unpauses) or never resolve (reclaim after the deadline). Either way, retrying it on every
@@ -748,13 +740,12 @@ export class ArenaDaemon {
     // Plan 4.5 Task 10 re-review (I2): past the deadline a respond can no longer help, so its wait stops there.
     const giveUpAt = Date.now() + Number(info.deadline > now ? info.deadline - now : 0n) * 1000;
     try {
-      await this.logicalTx(l, "respond", (nonce) =>
-        this.hub.respond(l.sessionSender, l.session.challengeProof(), {
-          receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
-          nonce,
-          giveUpAt,
-        }),
-      );
+      // A respond that ended stuck stays outstanding in the session key's sender: the next dispute transaction
+      // (this respond again, or a timeout) replaces it at its nonce with higher fees (Plan 4.5 Task 10 re-review 2).
+      await this.hub.respond(l.sessionSender, l.session.challengeProof(), {
+        receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
+        giveUpAt,
+      });
     } catch (err) {
       // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
       // challenger's own watchtower once the relay delivers that move), and the loser's respond reverts because the
@@ -763,7 +754,10 @@ export class ArenaDaemon {
       // it is always logged, with both turns, because the registered state can legitimately be older than ours
       // (the winner answered with the state it held), which also means a genuinely bad proof of ours would only
       // show up here. A failure that is not a hub revert (transport, our own gas) is always this daemon's problem.
-      const after = err instanceof HubRevertError ? await this.hub.channelInfo(id).catch(() => null) : null;
+      // A respond reported dropped may have been replaced by another respond of ours at its nonce (the move path and
+      // the dispute pass racing on one session key) -- the same check applies.
+      const after =
+        err instanceof HubRevertError || err instanceof TxDroppedError ? await this.hub.channelInfo(id).catch(() => null) : null;
       if (after?.phase !== "Open") {
         l.lastError = `respond: ${errorText(err)}`;
         return;
@@ -810,7 +804,7 @@ export class ArenaDaemon {
     const info = await this.hub.channelInfo(l.record.channelId);
     if (info.phase !== "Open" && info.phase !== "Challenged") return;
     try {
-      await this.logicalTx(l, "close", (nonce) => this.hub.closeCooperative(this.wallet, tx, { nonce }));
+      await this.hub.closeCooperative(this.wallet, tx);
     } catch (err) {
       // Both sides race to submit the same cooperative close once they hold both signatures (each one's own
       // call, and the other's relayed close message, land within the same window). The loser's simulate can
@@ -961,25 +955,6 @@ export class ArenaDaemon {
     }
   }
 
-  /**
-   * Plan 4.5 Task 10 re-review (I3): runs one logical transaction `op` of channel `l`. If an earlier attempt was
-   * reported dropped (`TxDroppedError`), this attempt goes out at that attempt's nonce: should the first not really
-   * have been dropped (a lagging or load-balanced node), the two compete for one nonce and at most one lands. Once
-   * that nonce is used by something else ("nonce too low"), it is forgotten and the next attempt takes a fresh one.
-   */
-  private async logicalTx<T>(l: ChannelHandle, op: string, run: (nonce: number | undefined) => Promise<T>): Promise<T> {
-    const nonce = l.droppedNonces.get(op);
-    try {
-      const result = await run(nonce);
-      l.droppedNonces.delete(op);
-      return result;
-    } catch (err) {
-      if (err instanceof TxDroppedError && err.nonce !== undefined) l.droppedNonces.set(op, err.nonce);
-      else if (nonce !== undefined && isNonceUsed(err)) l.droppedNonces.delete(op);
-      throw err;
-    }
-  }
-
   /** Plan 4.5 Task 10 review: how long a dispute transaction may wait for its receipt before `waitOrReplace` checks
    *  whether it was dropped or must be replaced -- min(30 s, a third of the time left to the deadline), never under
    *  10 s -- so a stuck respond still gets replaced with higher fees in time. */
@@ -1047,7 +1022,7 @@ export class ArenaDaemon {
     } else if (info.phase === "Funding" && info.funded[me]) {
       if (this.stopped) return true;
       // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
-      await this.logicalTx(l, "reclaim", (nonce) => this.hub.reclaim(l.sessionSender, id, { nonce }));
+      await this.hub.reclaim(l.sessionSender, id);
       // Bug fix (Task 6 review): reclaim() always finalizes to "Reclaimed" in the same transaction (see
       // ChannelHub.sol) — mark it here, synchronously with our own confirmed tx, instead of only via the
       // "after" re-read below, which loses a race against a test's own direct-RPC poll under load.
@@ -1127,9 +1102,7 @@ export class ArenaDaemon {
       // stake — so this only fires when the opponent is on move there, or the registered game is over.
       if (this.stopped) return true;
       // R9/I1: dispute operations go through the session key (spec §3.1), not the wallet.
-      await this.logicalTx(l, "timeout", (nonce) =>
-        this.hub.timeout(l.sessionSender, id, { receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now), nonce }),
-      );
+      await this.hub.timeout(l.sessionSender, id, { receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now) });
       // Bug fix (Task 6 review): timeout() always finalizes in the same transaction (see ChannelHub.sol) —
       // mark it here, synchronously with our own confirmed tx, rather than waiting for the next tick's
       // re-read below. This narrows, but cannot close, the window for a caller polling the chain directly:

@@ -843,30 +843,8 @@ describe("Plan 4.5 Task 10 re-review (C1): the timer is armed before the first r
   });
 });
 
-describe("Plan 4.5 Task 10 re-review (I3): a transaction reported dropped is resent at its nonce", () => {
-  const hash = `0x${"ab".repeat(32)}` as Hex;
-
-  it("the deposit's resend goes out at the dropped attempt's nonce", async () => {
-    const pair = await startPair();
-    cleanups.push(pair.cleanup);
-    const { alice, bob } = pair;
-    const hub = alice.daemon.hub;
-    const real = hub.deposit.bind(hub);
-    const nonces: Array<number | undefined> = [];
-    hub.deposit = async (sender, p, opts) => {
-      nonces.push(opts?.nonce);
-      if (nonces.length === 1) throw new TxDroppedError(hash, 42); // reported dropped at nonce 42
-      return real(sender, p, { ...opts, nonce: undefined }); // (sent for real at the live nonce: 42 is made up)
-    };
-    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
-    await bob.daemon.acceptOffer(offerId);
-    const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "match");
-    await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 20_000, "open");
-    expect(nonces.slice(0, 2)).toEqual([undefined, 42]); // before: [undefined, undefined] -- a fresh nonce
-    expect(alice.daemon.handle(id).droppedNonces.size).toBe(0);
-  });
-
-  it("the session-gas top-up goes through the same path and is never paid twice when the 'dropped' one had landed", async () => {
+describe("Plan 4.5 Task 10 re-review (I3): the session-gas top-up is never paid twice", () => {
+  it("a top-up reported dropped that had in fact landed is not paid again (the balance is re-read first)", async () => {
     const pair = await startPair();
     cleanups.push(pair.cleanup);
     const { alice, bob } = pair;
@@ -992,5 +970,61 @@ describe("Plan 4.5 Task 10 re-review (M5): a channel that never opens is degrade
     const settled = attempts;
     await new Promise((r) => setTimeout(r, 1_000)); // ~10 more ticks at pollMs 100
     expect(attempts).toBe(settled); // before the fix: one more attempt on every tick, forever
+  });
+});
+
+describe("Plan 4.5 Task 10 re-review 2: a stuck respond is replaced by the next dispute send", () => {
+  async function anvil<T = unknown>(method: string, params: unknown[]): Promise<T> {
+    const res = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    return ((await res.json()) as { result: T }).result;
+  }
+  async function pooled(address: string): Promise<Record<string, { hash: Hex; maxFeePerGas: Hex }>> {
+    const c = await anvil<{ pending: Record<string, Record<string, { hash: Hex; maxFeePerGas: Hex }>> }>("txpool_content", []);
+    return Object.entries(c.pending).find(([a]) => a.toLowerCase() === address.toLowerCase())?.[1] ?? {};
+  }
+
+  it("after the respond's wait gives up, the next respond goes out at the same nonce with higher fees, and lands once", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn");
+    const stale = bob.daemon.handle(id).session.challengeProof(); // turn 2
+    await alice.daemon.move(id, "Nf3", { actor: "agent" }); // alice holds turn 3
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 3n, 5_000, "bob holds turn 3");
+    const bobSession = bob.daemon.handle(id).sessionSender;
+    await bob.daemon.stop();
+    // Alice's dispute waits give up fast (each respond: 4 rounds of 300 ms), so "the next dispute send" comes soon.
+    (alice.daemon as unknown as { disputeReceiptTimeoutMs: () => number }).disputeReceiptTimeoutMs = () => 300;
+    const aliceSession = alice.daemon.handle(id).sessionSender.address;
+
+    await anvil("evm_setAutomine", [false]);
+    try {
+      // Bob's challenge is mined by hand; after it, nothing is mined: Alice's respond is stuck.
+      const challenging = alice.daemon.hub.challenge(bobSession, stale);
+      await waitFor(async () => Object.keys(await pooled(bobSession.address)).length > 0, 5_000, "bob's challenge pending");
+      await anvil("evm_mine", []);
+      await challenging;
+      await waitFor(async () => Object.keys(await pooled(aliceSession)).length > 0, 5_000, "alice's respond pending");
+      const first = Object.values(await pooled(aliceSession))[0];
+      // Several give-ups later (each followed by a new respond from the dispute pass) ...
+      await waitFor(() => /still pending/.test(alice.daemon.handle(id).lastError ?? ""), 10_000, "a respond wait gave up");
+      await new Promise((r) => setTimeout(r, 1_500));
+      // ... everything Alice's session key has pending is still one nonce, now at a higher fee. Before the fix the
+      // next respond took a fresh nonce and queued behind the stuck one, whose fee stayed frozen.
+      const pool = await pooled(aliceSession);
+      expect(Object.keys(pool)).toEqual(["0"]);
+      expect(BigInt(pool["0"].maxFeePerGas)).toBeGreaterThan(BigInt(first.maxFeePerGas));
+      await anvil("evm_mine", []);
+      await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 10_000, "the respond lands");
+    } finally {
+      await anvil("evm_setAutomine", [true]);
+    }
+    expect((await alice.daemon.hub.registeredState(id)).turnNum).toBe(3n);
+    expect((await alice.daemon.hub.disputeEvents(id)).filter((e) => e.kind === "Responded")).toHaveLength(1);
   });
 });
