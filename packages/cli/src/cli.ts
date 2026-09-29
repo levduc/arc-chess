@@ -11,7 +11,7 @@ export type CliIo = {
 
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
-       [--max-fee N] [--session-gas-wei N] [--poll-ms N] [--log-chunk-blocks N]
+       [--max-fee N] [--session-gas-wei N] [--poll-ms N] [--log-chunk-blocks N] [--fee-ceiling-wei N]
        (missing chain settings are filled from the server's /templates and checked over the RPC)
   daemon [start]
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS] | accept <offerId>
@@ -187,6 +187,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         sessionGasWei: BigInt(flag("session-gas-wei") ?? "10000000000000000"),
         pollMs: Number(flag("poll-ms") ?? "2000"),
         logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
+        ...(flag("fee-ceiling-wei") !== undefined ? { feeCeilingWei: BigInt(flag("fee-ceiling-wei")!) } : {}),
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
       const { privateKeyToAccount } = await import("viem/accounts");

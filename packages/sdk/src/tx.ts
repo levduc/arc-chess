@@ -122,7 +122,7 @@ export class LocalKeyTxSender implements TxSender {
 /** The reads a tracking `SerialTxSender` needs. */
 export type TrackerClient = Pick<
   PublicClient,
-  "getTransactionReceipt" | "getTransaction" | "getTransactionCount" | "estimateFeesPerGas" | "estimateGas"
+  "getTransactionReceipt" | "getTransaction" | "getTransactionCount" | "estimateFeesPerGas" | "estimateGas" | "getBalance"
 >;
 
 // ------------------------------------------------------------------------------------ errors
@@ -140,6 +140,22 @@ export class TxNonceUsedError extends Error {
   }
 }
 
+/** The fee needed to replace a transaction is over the sender's fee cap: nothing was sent. */
+export class TxFeeCapError extends Error {
+  constructor(
+    readonly nonce: number,
+    readonly cap: bigint,
+    readonly needed?: bigint,
+    cause?: unknown,
+  ) {
+    super(
+      `replacing the transaction at nonce ${nonce} needs a fee over the cap of ${cap} wei per gas${needed !== undefined ? ` (needs ${needed})` : ""}: not sent`,
+      { cause },
+    );
+    this.name = "TxFeeCapError";
+  }
+}
+
 /** The sender's balance cannot pay for the transaction (value plus gas at the fee it needs): nothing was sent. */
 export class TxInsufficientFundsError extends Error {
   constructor(
@@ -150,6 +166,18 @@ export class TxInsufficientFundsError extends Error {
     this.name = "TxInsufficientFundsError";
   }
 }
+
+// ------------------------------------------------------------------------------------ fee cap
+
+/** A replacement's fee is capped at this multiple of the node's current estimate (or the ceiling, if higher). */
+export const FEE_CAP_MULTIPLIER = 4n;
+/** Default `feeCeiling` (per gas): the cap is never below it, so a quiet chain still leaves room to bump. */
+export const DEFAULT_FEE_CEILING_WEI = 100n * 10n ** 9n;
+
+export type SerialTxSenderOptions = {
+  /** The cap is max(FEE_CAP_MULTIPLIER x the current estimate, feeCeiling) per gas, on both fee fields. */
+  feeCeiling?: bigint;
+};
 
 type Entry = { nonce: number; lastFees: Fees; hashes: Set<Hex>; state: "waiting" | "released"; gas?: bigint };
 
@@ -163,6 +191,8 @@ type Entry = { nonce: number; lastFees: Fees; hashes: Set<Hex>; state: "waiting"
  *   queueing behind it, and a re-sent top-up replaces its own stuck copy.
  * - **At most once.** A replacement that finds its nonce used throws `TxNonceUsedError` and is never re-sent at a
  *   fresh nonce: whatever was at that nonce landed, and the caller re-reads the chain first.
+ * - **Bounded fees.** No transaction goes over max(4 x the current estimate, `feeCeiling`) per gas, nor over what
+ *   the balance can pay (`(balance - value) / gas`). A replacement that would need more is not sent.
  * - **Restart.** A fresh sender that finds a pending transaction on its key (none tracked, pending count above the
  *   confirmed one) adopts the lowest such nonce as released and replaces it.
  *
@@ -173,12 +203,15 @@ export class SerialTxSender implements TxSender, TxTracker {
   private tail: Promise<unknown> = Promise.resolve();
   private readonly entries = new Map<number, Entry>();
   private readonly reader: TrackerClient | undefined;
+  private readonly feeCeiling: bigint;
 
   constructor(
     private readonly inner: TxSender,
     reader?: TrackerClient,
+    opts: SerialTxSenderOptions = {},
   ) {
     this.reader = reader ?? (inner as { reader?: TrackerClient }).reader;
+    this.feeCeiling = opts.feeCeiling ?? DEFAULT_FEE_CEILING_WEI;
   }
 
   get address(): Address {
@@ -280,7 +313,10 @@ export class SerialTxSender implements TxSender, TxTracker {
     let nonce = await next();
     // Against pending: a new intent may depend on one of ours still pending (a deposit on its approve).
     const gas = tx.gas ?? (await this.estimateGas(reader, tx, "pending"));
-    const fees = await estimateFees(reader);
+    const estimate = await estimateFees(reader);
+    const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
+    if (feeOf(estimate) > room.balance) throw new TxInsufficientFundsError(this.address);
+    const fees = clampFees(estimate, room.cap);
     for (let attempt = 0; ; attempt++) {
       try {
         const hash = await this.inner.send({ ...tx, nonce, gas, ...fees });
@@ -300,7 +336,7 @@ export class SerialTxSender implements TxSender, TxTracker {
   /**
    * A new intent replacing a released entry at its nonce. Priced over its last fees (bump) and at least the node's
    * estimate -- or, for an adopted entry whose fees are unknown, at 2x the estimate, raised 50 % on each
-   * "underpriced" (at most MAX_UNDERPRICED_RETRIES times). A nonce-used error deletes the entry: `TxNonceUsedError`, nothing more is
+   * "underpriced" -- never over the cap. A nonce-used error deletes the entry: `TxNonceUsedError`, nothing more is
    * sent.
    */
   private async replaceReleased(reader: TrackerClient, tx: TxRequest, e: Entry): Promise<Hex> {
@@ -308,8 +344,12 @@ export class SerialTxSender implements TxSender, TxTracker {
     const estimate = known ? await estimateLike(reader, e.lastFees) : await estimateFees(reader);
     // New calldata: estimated against latest (the pending state holds the transaction being replaced).
     const gas = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
+    const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
     let fees = known ? replacementFees(e.lastFees, estimate) : doubled(estimate!);
-    for (let attempt = 0; ; attempt++) {
+    if (known) this.affordable(e.nonce, bumpFees(e.lastFees), room);
+    else this.affordable(e.nonce, estimate!, room);
+    fees = clampFees(fees, bigMin(room.cap, room.balance));
+    for (;;) {
       try {
         const hash = await this.inner.send({ ...tx, nonce: e.nonce, gas, ...fees });
         e.hashes.add(hash);
@@ -322,20 +362,28 @@ export class SerialTxSender implements TxSender, TxTracker {
           this.entries.delete(e.nonce);
           throw new TxNonceUsedError(e.nonce, err);
         }
-        if (!isUnderpriced(err) || attempt >= MAX_UNDERPRICED_RETRIES) throw this.classify(err);
-        // The pool holds a transaction priced above what we know: +50 %.
-        fees = raise(fees, 3n, 2n);
+        if (!isUnderpriced(err)) throw this.classify(err);
+        // The pool holds a transaction priced above what we know: +50 %, up to the cap.
+        const limit = bigMin(room.cap, room.balance);
+        const raised = clampFees(raise(fees, 3n, 2n), limit);
+        if (feeOf(raised) <= feeOf(fees)) {
+          throw limit < room.cap ? new TxInsufficientFundsError(this.address, err) : new TxFeeCapError(e.nonce, room.cap, undefined, err);
+        }
+        fees = raised;
       }
     }
   }
 
-  /** `waitOrReplace` replacing its own transaction (the same intent, at the same nonce). */
+  /** `waitOrReplace` replacing its own transaction (the same intent, at the same nonce), capped. */
   private async replaceOwn(reader: TrackerClient, tx: TxRequest, nonce: number): Promise<Hex> {
     const e = this.entries.get(nonce);
     if (!e) return this.inner.send(tx); // a nonce nobody tracks: sent as asked
     const estimate = await estimateLike(reader, e.lastFees);
     const gas = tx.gas ?? e.gas ?? (await this.estimateGas(reader, tx, "latest"));
-    const fees = hasFees(feesOf(tx)) ? feesOf(tx) : replacementFees(e.lastFees, estimate);
+    const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
+    const wanted = hasFees(feesOf(tx)) ? feesOf(tx) : replacementFees(e.lastFees, estimate);
+    if (hasFees(e.lastFees)) this.affordable(nonce, bumpFees(e.lastFees), room);
+    const fees = clampFees(wanted, bigMin(room.cap, room.balance));
     try {
       const hash = await this.inner.send({ ...tx, gas, ...fees });
       e.hashes.add(hash);
@@ -346,6 +394,22 @@ export class SerialTxSender implements TxSender, TxTracker {
       // A used nonce is left to the wait: its receipt re-check tells its own transaction from an earlier intent's.
       throw this.classify(err);
     }
+  }
+
+  /** The fee cap, and the most per gas the balance can pay for this transaction. */
+  private async room(reader: TrackerClient, estimate: Fees | undefined, gas: bigint, value: bigint): Promise<{ cap: bigint; balance: bigint }> {
+    const market = estimate ? feeOf(estimate) : 0n;
+    const cap = bigMax(market * FEE_CAP_MULTIPLIER, this.feeCeiling);
+    const funds = await reader.getBalance({ address: this.address });
+    const balance = funds > value && gas > 0n ? (funds - value) / gas : 0n;
+    return { cap, balance };
+  }
+
+  /** Throws unless `needed` fits under the cap (TxFeeCapError) and the balance (TxInsufficientFundsError). */
+  private affordable(nonce: number, needed: Fees, room: { cap: bigint; balance: bigint }): void {
+    const fee = feeOf(needed);
+    if (fee > room.cap) throw new TxFeeCapError(nonce, room.cap, fee);
+    if (fee > room.balance) throw new TxInsufficientFundsError(this.address);
   }
 
   private estimateGas(reader: TrackerClient, tx: TxRequest, blockTag: "latest" | "pending"): Promise<bigint> {
@@ -390,7 +454,10 @@ function feesOf(x: Fees): Fees {
 }
 
 const hasFees = (f: Fees) => f.maxFeePerGas !== undefined || f.gasPrice !== undefined;
+/** The fee per gas a transaction may pay at most (maxFeePerGas, or a legacy gasPrice). */
+const feeOf = (f: Fees) => f.maxFeePerGas ?? f.gasPrice ?? 0n;
 const bigMax = (a: bigint, b: bigint) => (a > b ? a : b);
+const bigMin = (a: bigint, b: bigint) => (a < b ? a : b);
 
 /** The node's current fee estimate in the same style (EIP-1559 or legacy) as `like`; undefined if it fails. */
 async function estimateLike(client: Pick<PublicClient, "estimateFeesPerGas">, like: Fees): Promise<Fees | undefined> {
@@ -417,6 +484,12 @@ function bump(x: bigint): bigint {
 
 const max = (a: bigint, b: bigint | undefined) => (b !== undefined && b > a ? b : a);
 
+/** The least a same-nonce replacement must pay over `last`. */
+function bumpFees(last: Fees): Fees {
+  if (last.maxFeePerGas !== undefined) return { maxFeePerGas: bump(last.maxFeePerGas), maxPriorityFeePerGas: bump(last.maxPriorityFeePerGas ?? 0n) };
+  return last.gasPrice !== undefined ? { gasPrice: bump(last.gasPrice) } : {};
+}
+
 /** Fees for a same-nonce replacement: each raised by at least 12.5 % over `last`, and at least to `estimate`. */
 function replacementFees(last: Fees, estimate: Fees | undefined): Fees {
   if (last.maxFeePerGas !== undefined) {
@@ -442,6 +515,15 @@ function raise(f: Fees, num: bigint, den: bigint): Fees {
 
 const doubled = (f: Fees) => raise(f, 2n, 1n);
 
+/** `f` with every field at most `cap` (and the priority fee at most the max fee). */
+function clampFees(f: Fees, cap: bigint): Fees {
+  if (f.maxFeePerGas !== undefined) {
+    const m = bigMin(f.maxFeePerGas, cap);
+    return { maxFeePerGas: m, maxPriorityFeePerGas: bigMin(bigMin(f.maxPriorityFeePerGas ?? 0n, cap), m) };
+  }
+  return f.gasPrice !== undefined ? { gasPrice: bigMin(f.gasPrice, cap) } : {};
+}
+
 /** The higher of two fee sets, field by field (in `a`'s style when both are known). */
 function maxFees(a: Fees, b: Fees): Fees {
   if (!hasFees(a)) return feesOf(b);
@@ -466,8 +548,6 @@ export const MAX_REPLACEMENTS = 3;
 export const RECEIPT_POLL_MS = 1_000;
 /** A transaction the node reports mined whose receipt stays unreadable this many rounds is treated as mined. */
 export const LAGGING_RECEIPT_ROUNDS = 3;
-/** A replacement of a released transaction refused as "underpriced" is re-priced +50 % at most this many times. */
-export const MAX_UNDERPRICED_RETRIES = 3;
 
 /** The transaction is no longer known to the node (dropped from the mempool, or reorged out and discarded) and was
  *  never mined: the caller should re-evaluate and, if still needed, send it again. */
@@ -543,6 +623,7 @@ export type ReceiptClient = Pick<
  * - if the node no longer knows the transaction, `TxDroppedError` (the caller re-evaluates and resends);
  * - if it is still pending, it is replaced at the same nonce with fees raised by at least 12.5 % (and at least to
  *   the node's current estimate), through the same `sender` -- up to `maxReplacements` times, then `TxStuckError`.
+ *   A tracking sender caps the fee: a replacement it cannot afford is not sent, and the wait goes on.
  *
  * Round 4: with a tracking sender, the wait owns its entry for its whole duration. It deletes it on success and
  * releases it on every other exit, so the next send from that key replaces it (never queues behind it). Every exit
@@ -697,6 +778,8 @@ export async function waitOrReplace(
         known.add(sent);
         lastSendError = undefined; // a later replacement went out: an earlier one's failure no longer explains anything
       } catch (err) {
+        // Round 4: the replacement would go over the fee cap or the balance: nothing was sent; keep waiting.
+        if (err instanceof TxFeeCapError || err instanceof TxInsufficientFundsError) continue;
         // e.g. "nonce too low": the original (or an earlier intent at this nonce) was mined after all
         const r = await minedOne();
         if (r) return r;

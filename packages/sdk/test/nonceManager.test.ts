@@ -19,6 +19,7 @@ import {
   LocalKeyTxSender,
   SerialTxSender,
   TxDroppedError,
+  TxFeeCapError,
   TxInsufficientFundsError,
   TxNonceUsedError,
   TxReceiptMissingError,
@@ -276,7 +277,49 @@ describe("invariant 3: a stuck transaction is never abandoned", () => {
   });
 });
 
-describe("insufficient funds", () => {
+describe("invariant 4: bounded fees", () => {
+  it("repeated give-ups stop at the cap: TxFeeCapError, and nothing is sent", async () => {
+    const n = mempool();
+    // cap = max(4 x the estimate (1000), the ceiling) = 4000
+    const wallet = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n });
+    const req: TxRequest = { to: to(0x01), data: "0x" };
+    let last: unknown;
+    for (let i = 0; i < 30 && !(last instanceof TxFeeCapError); i++) {
+      const before = n.attempts.length;
+      last = await wallet.send(req).catch((e: unknown) => e);
+      if (last instanceof TxFeeCapError) {
+        expect(n.attempts.length).toBe(before); // nothing sent
+        break;
+      }
+      await waitOrReplace(n.client, wallet, req, last as Hex, { timeoutMs: 5, pollMs: 5, maxReplacements: 0 }).catch(() => undefined);
+    }
+    expect(n.attempts.every((t) => t.maxFeePerGas <= 4_000n && t.maxPriorityFeePerGas <= 4_000n)).toBe(true);
+    expect(last).toBeInstanceOf(TxFeeCapError);
+    expect(wallet.tracked()).toMatchObject([{ nonce: 0, state: "released" }]); // left as it was
+  });
+
+  it("a wait at the cap sends no replacement and ends TxStuckError after its rounds", async () => {
+    const n = mempool();
+    const wallet = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n });
+    const req: TxRequest = { to: to(0x01), data: "0x" };
+    const h = await wallet.send(req);
+    const err = await waitOrReplace(n.client, wallet, req, h, { timeoutMs: 5, pollMs: 5, maxReplacements: 20 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TxStuckError);
+    expect(n.attempts.length).toBeLessThan(21); // stopped replacing at the cap
+    expect(n.attempts.every((t) => t.maxFeePerGas <= 4_000n)).toBe(true);
+  });
+
+  it("a sender without enough balance never sends a transaction it cannot pay for", async () => {
+    // Gas 21000 at 1500 wei is all it has: the balance bounds the fee under the cap (4000).
+    const n = mempool({ balance: 21_000n * 1_500n });
+    const session = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n });
+    const req: TxRequest = { to: to(0x01), data: "0x" };
+    const h = await session.send(req);
+    await waitOrReplace(n.client, session, req, h, { timeoutMs: 5, pollMs: 5, maxReplacements: 6 }).catch(() => undefined);
+    await session.send(req).catch(() => undefined);
+    expect(n.attempts.every((t) => t.maxFeePerGas * t.gas + t.value <= 21_000n * 1_500n)).toBe(true);
+  });
+
   it("a send the node refuses for insufficient funds is TxInsufficientFundsError, and the entries are left as they were", async () => {
     const n = mempool();
     const wallet = new SerialTxSender(n.inner, n.client);
@@ -402,5 +445,16 @@ describe("restart adoption (Anvil, automine off)", () => {
     } finally {
       await anvil("evm_setAutomine", [true]);
     }
+  });
+
+  it("an adopted transaction priced above the cap is not replaced: TxFeeCapError, nothing sent", async () => {
+    const n = mempool();
+    // Left from before the restart, at a fee far over any cap this sender will pay.
+    await n.inner.send({ to: to(0x01), data: "0x", maxFeePerGas: 1_000_000n, maxPriorityFeePerGas: 1_000_000n });
+    const wallet = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n });
+    const err = await wallet.send({ to: to(0x02), data: "0x" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TxFeeCapError);
+    expect(n.attempts.slice(1).every((t) => t.maxFeePerGas <= 4_000n)).toBe(true);
+    expect(n.pool.get(0)?.to).toBe(to(0x01));
   });
 });

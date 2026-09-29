@@ -179,7 +179,10 @@ export class ArenaDaemon {
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
-    this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client);
+    // Round 4: every replacement is capped at max(4 x the node's estimate, feeCeilingWei) and what the key can pay.
+    this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client, {
+      feeCeiling: c.feeCeilingWei,
+    });
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
@@ -553,6 +556,7 @@ export class ArenaDaemon {
     const sessionSender = new SerialTxSender(
       new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
       this.client,
+      { feeCeiling: this.opts.config.feeCeilingWei },
     );
     const signer = privateKeyToAccount(record.sessionKey);
     const l: ChannelHandle = {
