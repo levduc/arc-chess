@@ -203,6 +203,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         }
         sessionGasWei = defaultSessionGasWei(feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI, BigInt(price));
       }
+      // Plan 5 Task 1: a floor above the target would refill to a target the check itself never sees as "enough".
+      const sessionGasFloor = flag("session-gas-floor") !== undefined ? BigInt(flag("session-gas-floor")!) : undefined;
+      if (sessionGasFloor !== undefined && sessionGasFloor > sessionGasWei) {
+        throw new UsageError(`--session-gas-floor (${sessionGasFloor}) must not exceed --session-gas-wei (${sessionGasWei})`);
+      }
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,
@@ -213,7 +218,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         port: Number(flag("port") ?? "7070"),
         maxFeePerPlayer: BigInt(flag("max-fee") ?? "10000"),
         sessionGasWei,
-        ...(flag("session-gas-floor") !== undefined ? { sessionGasFloor: BigInt(flag("session-gas-floor")!) } : {}),
+        ...(sessionGasFloor !== undefined ? { sessionGasFloor } : {}),
         pollMs: Number(flag("poll-ms") ?? "2000"),
         logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
         ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),

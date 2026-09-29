@@ -155,6 +155,25 @@ describe("arena init --server", () => {
     expect(quiet.cfg.sessionGasFloor).toBeUndefined(); // the daemon defaults it to half of sessionGasWei
   });
 
+  it("Plan 5 Task 1: refuses --session-gas-floor greater than sessionGasWei", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub } = stubFetch();
+    const err: string[] = [];
+    const code = await runCli(
+      ["init", "--server", "http://host.test", "--session-gas-wei", "1000", "--session-gas-floor", "1001"],
+      { env: { ARENA_HOME: home }, fetch: fetchStub, out: () => undefined, err: (s) => err.push(s) },
+    );
+    expect(code).not.toBe(0);
+    expect(err.join("\n")).toMatch(/--session-gas-floor \(1001\) must not exceed --session-gas-wei \(1000\)/);
+    expect(() => loadConfig(home)).toThrow(); // nothing written
+    // Equal is fine.
+    const ok = await runCli(
+      ["init", "--server", "http://host.test", "--session-gas-wei", "1000", "--session-gas-floor", "1000"],
+      { env: { ARENA_HOME: home }, fetch: fetchStub, out: () => undefined, err: () => undefined },
+    );
+    expect(ok).toBe(0);
+  });
+
   it("fails when the adopted RPC serves another chain id", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-init-"));
     const { fetchStub } = stubFetch({ chainId: 1 });
