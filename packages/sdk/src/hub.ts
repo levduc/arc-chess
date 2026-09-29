@@ -11,7 +11,7 @@ import {
 } from "viem";
 import { channelHubAbi, mockUsdcAbi } from "./abi.js";
 import { decodeParams, decodeSignedState, encodeParams, encodeProof, encodeSignedState } from "./abiCodec.js";
-import type { TxSender } from "./tx.js";
+import { waitOrReplace, type TxSender } from "./tx.js";
 import type { CloseTransaction, Params, PlayerIndex, Proof, SignedState, State } from "./types.js";
 
 export const PHASE = ["None", "Funding", "Open", "Challenged", "Finalized", "Reclaimed"] as const;
@@ -121,48 +121,53 @@ function isSendRevert(err: unknown): boolean {
   return reverted !== null && /execution reverted/i.test(reverted.details ?? "");
 }
 
+/** Per-write options. `receiptTimeoutMs` bounds each receipt wait (default `RECEIPT_TIMEOUT_MS`, 30 s); a dispute
+ *  write passes less when its deadline is closer (see `waitOrReplace`). */
+export type WriteOptions = { receiptTimeoutMs?: number };
+
 export class HubClient {
   constructor(
     readonly hub: Address,
     readonly client: PublicClient,
   ) {}
 
-  approve(sender: TxSender, token: Address, amount: bigint): Promise<TransactionReceipt> {
-    return this.write(sender, token, encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.hub, amount] }));
+  approve(sender: TxSender, token: Address, amount: bigint, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.write(sender, token, encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.hub, amount] }), opts);
   }
 
-  deposit(sender: TxSender, p: Params): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "deposit", args: [encodeParams(p)] }));
+  deposit(sender: TxSender, p: Params, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "deposit", args: [encodeParams(p)] }), opts);
   }
 
   /** Submits a cooperative close. Takes only a `CloseTransaction` (see `ChannelSession.closeTransaction()`). */
-  closeCooperative(sender: TxSender, tx: CloseTransaction): Promise<TransactionReceipt> {
+  closeCooperative(sender: TxSender, tx: CloseTransaction, opts?: WriteOptions): Promise<TransactionReceipt> {
     if (tx.kind !== "close") throw new TypeError('closeCooperative needs a CloseTransaction (kind: "close")');
     const ss = { state: tx.state, sigA: tx.sigA, sigB: tx.sigB }; // strip `kind` before ABI encoding
     return this.call(
       sender,
       encodeFunctionData({ abi: channelHubAbi, functionName: "closeCooperative", args: [encodeSignedState(ss)] }),
+      opts,
     );
   }
 
-  challenge(sender: TxSender, proof: Proof): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "challenge", args: [encodeProof(proof)] }));
+  challenge(sender: TxSender, proof: Proof, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "challenge", args: [encodeProof(proof)] }), opts);
   }
 
-  respond(sender: TxSender, proof: Proof): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "respond", args: [encodeProof(proof)] }));
+  respond(sender: TxSender, proof: Proof, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "respond", args: [encodeProof(proof)] }), opts);
   }
 
-  timeout(sender: TxSender, id: Hex): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "timeout", args: [id] }));
+  timeout(sender: TxSender, id: Hex, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "timeout", args: [id] }), opts);
   }
 
-  reclaim(sender: TxSender, id: Hex): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "reclaim", args: [id] }));
+  reclaim(sender: TxSender, id: Hex, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "reclaim", args: [id] }), opts);
   }
 
-  claim(sender: TxSender, to: Address): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim", args: [to] }));
+  claim(sender: TxSender, to: Address, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim", args: [to] }), opts);
   }
 
   async channelInfo(id: Hex): Promise<ChannelInfo> {
@@ -349,8 +354,8 @@ export class HubClient {
     );
   }
 
-  private call(sender: TxSender, data: Hex): Promise<TransactionReceipt> {
-    return this.write(sender, this.hub, data);
+  private call(sender: TxSender, data: Hex, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.write(sender, this.hub, data, opts);
   }
 
   /**
@@ -358,7 +363,7 @@ export class HubClient {
    * between the simulate and the send (e.g. two players racing the same cooperative close): a revert the sender's
    * own gas estimate hits is reported as a HubRevertError too, named when decodable, never as a raw viem error.
    */
-  private async write(sender: TxSender, to: Address, data: Hex): Promise<TransactionReceipt> {
+  private async write(sender: TxSender, to: Address, data: Hex, opts: WriteOptions = {}): Promise<TransactionReceipt> {
     try {
       await this.client.call({ account: sender.address, to, data });
     } catch (err) {
@@ -372,7 +377,8 @@ export class HubClient {
       // not a revert (RPC down, nonce, gas allowance, a non-viem sender's own failure): the caller sees it unchanged
       throw err;
     }
-    const receipt = await this.client.waitForTransactionReceipt({ hash });
+    // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
+    const receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs });
     if (receipt.status !== "success") throw new HubRevertError(undefined, new Error(`transaction ${hash} reverted`));
     return receipt;
   }
