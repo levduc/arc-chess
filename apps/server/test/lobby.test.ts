@@ -511,23 +511,58 @@ describe("lobby over /ws", () => {
     server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, maxWatchedOffers: 3 } }), { chain });
 
     const ids: Hex[] = [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 4; i++) {
       const { offer, so } = await makeOffer(chain, { nonce: randomNonce() });
       await postOffer(server, so);
       ids.push(computeOfferId(offer));
     }
-    // one offer inside the cap and one beyond it get matched *before* the subscribe, to prove which ones replay
-    const { sa: saIn } = await makeAcceptance(ids[0]);
-    await acceptOffer(server, ids[0], saIn);
-    const { sa: saOut } = await makeAcceptance(ids[4]);
-    await acceptOffer(server, ids[4], saOut);
 
     const c = await wsConnect(server.url);
-    c.send({ type: "subscribe", offerIds: ids });
+    // The first 3, all genuinely unmatched, fill the cap.
+    c.send({ type: "subscribe", offerIds: ids.slice(0, 3) });
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/); // room for all 3
+
+    // A 4th unmatched offer is refused: the cap is full.
+    c.send({ type: "subscribe", offerIds: [ids[3]] });
     expect((await c.next((f) => f.type === "error")).error).toMatch(/too many watched offers/);
-    const replay = await c.next((f) => f.type === "match");
-    expect(replay.event.offerId).toBe(ids[0]);
-    await expect(c.next((f) => f.type === "match", 300)).rejects.toThrow(/no matching frame/); // ids[4] was never added
+  });
+
+  it("Plan 4.5 Task 11 fix round (C2, server-side eviction): a match always replays and never occupies a watch " +
+    "slot, even once the cap is full or the id was refused before it matched", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, maxWatchedOffers: 3 } }), { chain });
+
+    const ids: Hex[] = [];
+    for (let i = 0; i < 4; i++) {
+      const { offer, so } = await makeOffer(chain, { nonce: randomNonce() });
+      await postOffer(server, so);
+      ids.push(computeOfferId(offer));
+    }
+
+    const c = await wsConnect(server.url);
+    c.send({ type: "subscribe", offerIds: ids.slice(0, 3) }); // fills the cap (3/3)
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/);
+    c.send({ type: "subscribe", offerIds: [ids[3]] }); // refused: the cap is full
+    expect((await c.next((f) => f.type === "error")).error).toMatch(/too many watched offers/);
+
+    // Match the refused offer, then subscribe to it again: it must always replay, exactly like the daemon's own
+    // `onHello` re-subscribe would send after a reconnect -- a match must never be silently dropped just because
+    // the connection's watch slots were full when it happened, or are still full now.
+    const { sa } = await makeAcceptance(ids[3]);
+    await acceptOffer(server, ids[3], sa);
+    c.send({ type: "subscribe", offerIds: [ids[3]] });
+    expect((await c.next((f) => f.type === "match")).event.offerId).toBe(ids[3]);
+
+    // Matching one of the 3 that *did* occupy a slot frees it immediately (the eviction fix), without needing a
+    // fresh subscribe to notice: the push itself is what frees it.
+    const { sa: sa0 } = await makeAcceptance(ids[0]);
+    await acceptOffer(server, ids[0], sa0);
+    expect((await c.next((f) => f.type === "match")).event.offerId).toBe(ids[0]);
+    const { offer: offer4, so: so4 } = await makeOffer(chain, { nonce: randomNonce() });
+    await postOffer(server, so4);
+    const id4 = computeOfferId(offer4);
+    c.send({ type: "subscribe", offerIds: [id4] });
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/); // room again
   });
 
   it("closes a connection that exceeds the frame rate (1008)", async () => {

@@ -106,14 +106,24 @@ export function attachWs(
     if (!ids) return;
     // ids are accepted case-insensitively and normalized to canonical lower-case (offerIdsOf)
     for (const id of ids) {
+      // Plan 4.5 Task 11 fix round (C2, server-side defense): an offer matches at most once, ever, so an id that
+      // has already matched will never need a watch slot again -- replay it (this connection may have missed the
+      // live push, e.g. it was not yet connected, or a reconnect happened right after) without ever occupying
+      // one. This also protects a daemon that has not (yet) picked up the client-side fix: `onHello` re-subscribes
+      // every id it still thinks it is watching, including stale, already-matched ones, and without this check
+      // those would otherwise take up slots ahead of any genuinely open offer in the same batch.
+      const already = lobby.matchFor(id);
+      if (already) {
+        state.watched.delete(id); // in case a stale re-subscribe still had it occupying a slot
+        send(ws, { type: "match", event: already });
+        continue;
+      }
       if (state.watched.has(id)) continue;
       if (state.watched.size >= cfg.limits.maxWatchedOffers) {
         send(ws, { type: "error", error: "too many watched offers" });
         break;
       }
       state.watched.add(id);
-      const m = lobby.matchFor(id);
-      if (m) send(ws, { type: "match", event: m }); // replay: this connection missed the push
     }
   }
 
@@ -241,7 +251,11 @@ export function attachWs(
 
   const unsubscribe = lobby.onMatch((event) => {
     for (const [ws, state] of states) {
-      if (state.watched.has(event.offerId)) send(ws, { type: "match", event });
+      // Plan 4.5 Task 11 fix round (C2, server-side defense): free the watch slot as soon as its match is
+      // pushed -- an offer matches at most once, ever, so there is nothing left to watch it for. This is the
+      // server-side backstop for a daemon that never unwatches on its own (the client-side fix is the load-bearing
+      // one; this bounds the damage for daemons that have not picked it up yet).
+      if (state.watched.delete(event.offerId)) send(ws, { type: "match", event });
     }
   });
 
