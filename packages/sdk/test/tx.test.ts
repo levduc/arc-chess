@@ -34,38 +34,61 @@ const h = (n: number): Hex => `0x${n.toString(16).padStart(64, "0")}`;
 const TO = "0x00000000000000000000000000000000000000aa" as const;
 const receiptOf = (hash: Hex) => ({ transactionHash: hash, status: "success" }) as unknown as TransactionReceipt;
 
-/** A stub node: `mined` holds the hashes that have a receipt, `pool` the pending ones (hash -> nonce/fees). */
-function stubNode() {
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A stub node. `mined` holds the hashes that have a receipt, `pool` the pending ones (hash -> nonce/fees); a hash in
+ * neither is unknown (dropped). `waitForTransactionReceipt` behaves like viem's: it watches one hash until its
+ * timeout. `legacy` makes the sender's transactions pre-EIP-1559 (gasPrice only).
+ */
+function stubNode(opts: { legacy?: boolean; supportsReplacement?: boolean } = {}) {
   const mined = new Set<Hex>();
-  const pool = new Map<Hex, { nonce: number; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }>();
+  type PoolTx = { nonce: number; maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint; gasPrice?: bigint };
+  const pool = new Map<Hex, PoolTx>();
   const sent: TxRequest[] = [];
+  const estimates: string[] = [];
   let next = 100;
-  const client: ReceiptClient = {
-    waitForTransactionReceipt: (async ({ hash }: { hash: Hex }) => {
-      if (mined.has(hash)) return receiptOf(hash);
-      throw new WaitForTransactionReceiptTimeoutError({ hash });
-    }) as ReceiptClient["waitForTransactionReceipt"],
+  // `waitForTransactionReceipt` is kept (viem-like) so a regression can be run against the previous implementation.
+  const client = {
+    waitForTransactionReceipt: (async ({ hash, timeout }: { hash: Hex; timeout?: number }) => {
+      const end = Date.now() + (timeout ?? 180_000);
+      for (;;) {
+        if (mined.has(hash)) return receiptOf(hash);
+        if (Date.now() >= end) throw new WaitForTransactionReceiptTimeoutError({ hash });
+        await nap(2);
+      }
+    }),
     getTransactionReceipt: (async ({ hash }: { hash: Hex }) => {
       if (mined.has(hash)) return receiptOf(hash);
       throw new TransactionReceiptNotFoundError({ hash });
     }) as ReceiptClient["getTransactionReceipt"],
     getTransaction: (async ({ hash }: { hash: Hex }) => {
+      if (mined.has(hash)) return { hash, blockNumber: 1n, nonce: 7 };
       const p = pool.get(hash);
       if (!p) throw new TransactionNotFoundError({ hash });
       return { hash, blockNumber: null, ...p };
     }) as unknown as ReceiptClient["getTransaction"],
-    estimateFeesPerGas: (async () => ({ maxFeePerGas: 1_000n, maxPriorityFeePerGas: 10n })) as ReceiptClient["estimateFeesPerGas"],
-  };
+    estimateFeesPerGas: (async (args?: { type?: string }) => {
+      estimates.push(args?.type ?? "eip1559");
+      return args?.type === "legacy" ? { gasPrice: 3_000n } : { maxFeePerGas: 1_000n, maxPriorityFeePerGas: 10n };
+    }) as unknown as ReceiptClient["estimateFeesPerGas"],
+  } as unknown as ReceiptClient;
   const sender: TxSender = {
     address: "0x00000000000000000000000000000000000000bb",
+    ...(opts.supportsReplacement === false ? { supportsReplacement: false } : {}),
     async send(tx: TxRequest) {
       sent.push(tx);
       const hash = h(next++);
-      pool.set(hash, { nonce: tx.nonce ?? 7, maxFeePerGas: tx.maxFeePerGas ?? 2_000n, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? 100n });
+      pool.set(
+        hash,
+        opts.legacy
+          ? { nonce: tx.nonce ?? 7, gasPrice: tx.gasPrice ?? 2_000n }
+          : { nonce: tx.nonce ?? 7, maxFeePerGas: tx.maxFeePerGas ?? 2_000n, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? 100n },
+      );
       return hash;
     },
   };
-  return { client, sender, mined, pool, sent };
+  return { client, sender, mined, pool, sent, estimates };
 }
 
 describe("waitOrReplace (stubbed node)", () => {
@@ -220,5 +243,20 @@ describe("HubClient.write: simulate failures (Plan 4.5 Task 10 review)", () => {
     const err = await hub.timeout(new LocalKeyTxSender(generatePrivateKey(), RPC, CHAIN), h(1)).catch((e) => e);
     expect(err).toBeInstanceOf(HubRevertError);
     expect((err as HubRevertError).errorName).toBeUndefined();
+  });
+});
+
+describe("waitOrReplace: Task 10 re-review", () => {
+  it("M1: an original mined while the wait is on its replacement is returned within that round", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const t0 = Date.now();
+    // Round 1 (400 ms) ends with a replacement; the original lands 150 ms into round 2.
+    setTimeout(() => n.mined.add(hash), 550);
+    const r = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 400, pollMs: 20 });
+    expect(r.transactionHash).toBe(hash);
+    expect(n.sent).toHaveLength(2); // the replacement was sent...
+    // ...but the wait noticed the original at once, not only when round 2 ran out (before: ~800 ms).
+    expect(Date.now() - t0).toBeLessThan(750);
   });
 });

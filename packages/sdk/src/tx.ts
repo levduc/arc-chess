@@ -1,7 +1,6 @@
 import {
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
-  WaitForTransactionReceiptTimeoutError,
   createWalletClient,
   http,
   type Address,
@@ -90,6 +89,8 @@ export class SerialTxSender implements TxSender {
 export const RECEIPT_TIMEOUT_MS = 30_000;
 /** At most this many same-nonce replacements of one stuck transaction before `TxStuckError`. */
 export const MAX_REPLACEMENTS = 3;
+/** How often a receipt wait polls the receipts of the transactions it has sent. */
+export const RECEIPT_POLL_MS = 1_000;
 
 /** The transaction is no longer known to the node (dropped from the mempool, or reorged out and discarded) and was
  *  never mined: the caller should re-evaluate and, if still needed, send it again. */
@@ -111,7 +112,7 @@ export class TxStuckError extends Error {
 /** The subset of a viem PublicClient `waitOrReplace` uses (tests pass a stub). */
 export type ReceiptClient = Pick<
   PublicClient,
-  "waitForTransactionReceipt" | "getTransaction" | "getTransactionReceipt" | "estimateFeesPerGas"
+  "getTransaction" | "getTransactionReceipt" | "estimateFeesPerGas"
 >;
 
 /** `x` raised by at least 12.5 % (and by at least 1 wei), rounded up. */
@@ -136,9 +137,10 @@ export async function waitOrReplace(
   sender: TxSender,
   req: TxRequest,
   hash: Hex,
-  opts: { timeoutMs?: number; maxReplacements?: number } = {},
+  opts: { timeoutMs?: number; maxReplacements?: number; pollMs?: number } = {},
 ): Promise<TransactionReceipt> {
   const timeoutMs = opts.timeoutMs ?? RECEIPT_TIMEOUT_MS;
+  const pollMs = opts.pollMs ?? RECEIPT_POLL_MS;
   const maxReplacements = opts.maxReplacements ?? MAX_REPLACEMENTS;
   const hashes: Hex[] = [hash];
   const minedOne = async (): Promise<TransactionReceipt | null> => {
@@ -153,13 +155,16 @@ export async function waitOrReplace(
   };
   for (;;) {
     const current = hashes[hashes.length - 1];
-    try {
-      return await client.waitForTransactionReceipt({ hash: current, timeout: timeoutMs });
-    } catch (err) {
-      if (!(err instanceof WaitForTransactionReceiptTimeoutError)) throw err;
+    // Plan 4.5 Task 10 re-review (M1): one round polls the receipts of every hash sent so far -- the original can
+    // still be mined while the wait is on its replacement (viem's waitForTransactionReceipt watches one hash).
+    const roundEnd = Date.now() + timeoutMs;
+    for (;;) {
+      const mined = await minedOne();
+      if (mined) return mined;
+      const left = roundEnd - Date.now();
+      if (left <= 0) break;
+      await new Promise((r) => setTimeout(r, Math.min(pollMs, left)));
     }
-    const mined = await minedOne();
-    if (mined) return mined;
     const pending = await client.getTransaction({ hash: current }).catch((err: unknown) => {
       if (err instanceof TransactionNotFoundError) return null;
       throw err;
