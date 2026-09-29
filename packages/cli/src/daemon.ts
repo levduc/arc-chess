@@ -134,6 +134,10 @@ export const FUND_BACKOFF_SECONDS = 30n;
  *  retrying it (the close API and the relay path still submit at once). */
 export const CLOSE_RETRY_BACKOFF_MS = 30_000;
 
+/** Plan 4.5 Task 10 round 4: how long the reclaim API waits for the main pass to release a channel before it
+ *  answers 409 (the main pass may be in a bounded receipt wait on that channel). */
+export const RECLAIM_BUSY_WAIT_MS = 2_000;
+
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
@@ -911,7 +915,10 @@ export class ArenaDaemon {
 
   async reclaim(ref: string | undefined): Promise<void> {
     const l = this.pick(ref);
-    // Plan 4.5 Task 10 round 4: never beside the main pass (which reclaims after the funding deadline itself).
+    // Plan 4.5 Task 10 round 4: never beside the main pass (which reclaims after the funding deadline itself). A main
+    // pass visits every channel briefly, so the API waits for it a little before refusing.
+    const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
+    while (l.mainBusy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
     if (l.mainBusy) throw new DaemonError(409, "the watchtower is working on this channel: retry shortly");
     l.mainBusy = true;
     try {

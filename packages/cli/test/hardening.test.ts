@@ -1171,15 +1171,15 @@ describe("Plan 4.5 Task 10 round 4: one respond and one reclaim per channel at a
       throw new HubRevertError("WrongPhase", new Error("reverted"));
     };
     const api = alice.daemon.reclaim(id).catch((e: unknown) => e); // holds the channel while its reclaim waits
-    await new Promise((r) => setTimeout(r, 100));
+    await waitFor(() => reclaims === 1, 5_000, "the API's reclaim is in flight"); // it waited out any main pass
     const m0 = h.mainPasses;
     await new Promise((r) => setTimeout(r, 600)); // ~6 timer ticks at pollMs 100
     expect(h.mainPasses).toBe(m0); // before the fix: the main pass ran on the channel meanwhile
-    // A second reclaim while the first is in flight is refused, not sent.
+    // A second reclaim while the first is in flight is refused (after RECLAIM_BUSY_WAIT_MS), not sent.
     await expect(alice.daemon.reclaim(id)).rejects.toMatchObject({ code: 409 });
     expect(reclaims).toBe(1);
     release();
-    await api;
+    expect(await api).toMatchObject({ code: 409, message: expect.stringMatching(/WrongPhase/) }); // its own revert
     await waitFor(() => h.mainPasses > m0, 5_000, "the main pass resumes");
   });
 

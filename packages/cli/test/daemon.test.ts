@@ -246,6 +246,9 @@ describe("watchtower", () => {
     // Bob's own dispute pass would answer the challenge concurrently with his move (it runs independently of the
     // main pass since the Task 10 review): switched off so the race each test stages is the only one.
     (bob.daemon as unknown as { watchDispute: () => Promise<boolean> }).watchDispute = async () => false;
+    // A dispute pass already in flight when it was switched off still holds the channel, and the move path's respond
+    // skips a channel the dispute pass holds (Plan 4.5 Task 10 round 4): let it finish first.
+    await waitFor(() => !bob.daemon.handle(id).disputeBusy, 10_000, "bob's dispute pass in flight finishes");
     const hub = bob.daemon.hub;
     hub.respond = patch(hub.respond.bind(hub));
     const logs: string[] = [];
