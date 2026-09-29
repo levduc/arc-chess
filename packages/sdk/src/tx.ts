@@ -141,8 +141,16 @@ export class TxDroppedError extends Error {
 
 /** The transaction stayed pending through `MAX_REPLACEMENTS` fee-bumped replacements. */
 export class TxStuckError extends Error {
-  constructor(readonly hashes: Hex[]) {
-    super(`transaction still pending after ${hashes.length - 1} fee-bumped replacements (${hashes.at(-1)})`);
+  /** `atDeadline`: the wait stopped at its give-up time (a dispute deadline), not after its replacements. */
+  constructor(
+    readonly hashes: Hex[],
+    readonly atDeadline = false,
+  ) {
+    super(
+      atDeadline
+        ? `transaction still pending at its give-up time (${hashes.at(-1)})`
+        : `transaction still pending after ${hashes.length - 1} fee-bumped replacements (${hashes.at(-1)})`,
+    );
     this.name = "TxStuckError";
   }
 }
@@ -175,7 +183,15 @@ export async function waitOrReplace(
   sender: TxSender,
   req: TxRequest,
   hash: Hex,
-  opts: { timeoutMs?: number; maxReplacements?: number; pollMs?: number; nonce?: number } = {},
+  opts: {
+    timeoutMs?: number;
+    maxReplacements?: number;
+    pollMs?: number;
+    nonce?: number;
+    /** Wall-clock ms (Plan 4.5 Task 10 re-review I2): no replacement is sent and no wait runs past it -- e.g. a
+     *  respond's dispute deadline, after which the transaction can no longer help. */
+    giveUpAt?: number;
+  } = {},
 ): Promise<TransactionReceipt> {
   const timeoutMs = opts.timeoutMs ?? RECEIPT_TIMEOUT_MS;
   const pollMs = opts.pollMs ?? RECEIPT_POLL_MS;
@@ -203,7 +219,7 @@ export async function waitOrReplace(
     const current = hashes[hashes.length - 1];
     // Plan 4.5 Task 10 re-review (M1): one round polls the receipts of every hash sent so far -- the original can
     // still be mined while the wait is on its replacement (viem's waitForTransactionReceipt watches one hash).
-    const roundEnd = Date.now() + timeoutMs;
+    const roundEnd = Math.min(Date.now() + timeoutMs, opts.giveUpAt ?? Number.POSITIVE_INFINITY);
     for (;;) {
       const mined = await minedOne();
       if (mined) return mined;
@@ -231,6 +247,7 @@ export async function waitOrReplace(
       if (r) return r;
       continue;
     }
+    if (opts.giveUpAt !== undefined && Date.now() >= opts.giveUpAt) throw new TxStuckError(hashes, true);
     if (!canReplace) {
       // A sender that cannot honour nonce/fee overrides: never replace, only wait (bounded) and report.
       if (round < maxReplacements) continue;

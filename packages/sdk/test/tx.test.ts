@@ -372,3 +372,31 @@ describe("waitOrReplace: drops, nonces and the replacement contract (Task 10 re-
     await expect(sender.sendWithNonce({ to: TO, data: "0x", value: 1n, nonce: 1 })).rejects.toThrow(/nonce/i); // used
   });
 });
+
+describe("waitOrReplace: a give-up time (Task 10 re-review I2)", () => {
+  it("neither replaces nor waits past giveUpAt: a stuck transaction is reported at that time", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const t0 = Date.now();
+    const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, {
+      timeoutMs: 1_000,
+      pollMs: 10,
+      giveUpAt: t0 + 150,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(TxStuckError);
+    expect((err as TxStuckError).atDeadline).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(600); // before: a full 1 s round, then a replacement and more rounds
+    expect(n.sent).toHaveLength(1);
+  });
+
+  it("HubClient.write passes giveUpAt through", async () => {
+    const n = stubNode();
+    const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
+    const t0 = Date.now();
+    const err = await new HubClient(TO, client)
+      .timeout(n.sender, h(1), { receiptTimeoutMs: 1_000, giveUpAt: t0 + 150 })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(TxStuckError);
+    expect(Date.now() - t0).toBeLessThan(1_200);
+  });
+});

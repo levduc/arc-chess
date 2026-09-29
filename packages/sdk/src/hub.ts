@@ -129,6 +129,8 @@ export type WriteOptions = {
   /** Send at this nonce: the resend of a transaction reported dropped (`TxDroppedError.nonce`), so that if it was not
    *  really dropped at most one of the two lands (Plan 4.5 Task 10 re-review I3). */
   nonce?: number;
+  /** Wall-clock ms past which the receipt wait neither replaces nor waits (a dispute deadline; see waitOrReplace). */
+  giveUpAt?: number;
 };
 
 export class HubClient {
@@ -393,7 +395,7 @@ export class HubClient {
     // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
     let receipt: TransactionReceipt;
     try {
-      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs, nonce });
+      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs, nonce, giveUpAt: opts.giveUpAt });
     } catch (err) {
       // A replacement send can revert too (Plan 4.5 Task 10 re-review I1): classified like the original send.
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
