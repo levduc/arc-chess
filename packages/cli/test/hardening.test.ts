@@ -6,6 +6,7 @@ import type { Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
+  HubRevertError,
   LocalKeyTxSender,
   buildParams,
   hashState,
@@ -758,5 +759,34 @@ describe("Plan 4.5 Task 10 review: a retried match opens a recorded channel that
     expect(failed).toBe(true);
     expect(new RecordStore(alice.home).channel(id)?.offerId).toBe(offerId);
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "funded and open");
+  });
+});
+
+describe("Plan 4.5 Task 10 review: the close retry backs off after a revert", () => {
+  it("a co-signed close whose submission reverts is retried by the watchtower at most once per 30 s", async () => {
+    const { alice, bob, id } = await matched();
+    for (const m of SCHOLARS_MATE) {
+      const [mover, other] = alice.daemon.handle(id).session.isMyTurn() ? [alice, bob] : [bob, alice];
+      await mover.daemon.move(id, m, { actor: "agent" });
+      const turn = mover.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => other.daemon.handle(id).session.latest.state.turnNum >= turn, 5_000, `relay ${m}`);
+    }
+    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 8n, 5_000, "bob's auto-resign");
+    const calls = { alice: 0, bob: 0 };
+    for (const [name, p] of [["alice", alice], ["bob", bob]] as const) {
+      p.daemon.hub.closeCooperative = async () => {
+        calls[name]++;
+        throw new HubRevertError("BadSignature", new Error("stubbed revert"));
+      };
+    }
+    await alice.daemon.close(id, "agent");
+    await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
+    await expect(bob.daemon.close(id, "agent")).rejects.toThrow(/BadSignature/);
+    await new Promise((r) => setTimeout(r, 2_000)); // ~20 watchtower passes at pollMs 100
+    // One submission each from the close API / relay path, and no watchtower retry inside the back-off window.
+    // Before the fix both watchtowers retried the same revert on every pass.
+    expect(calls.alice).toBeLessThanOrEqual(1);
+    expect(calls.bob).toBeLessThanOrEqual(1);
+    expect(bob.daemon.handle(id).lastError).toMatch(/^close: hub reverted: BadSignature/);
   });
 });

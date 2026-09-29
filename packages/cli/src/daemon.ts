@@ -79,6 +79,9 @@ export type ChannelHandle = {
   /** Plan 4.5 Task 10: set while a cooperative-close submission runs, so the relay path, the close API and the
    *  watchtower's retry never submit the same close twice at once. */
   submittingClose: boolean;
+  /** Plan 4.5 Task 10 review: wall-clock ms before which the watchtower does not retry the cooperative close,
+   *  set after a submission reverted (the same close would most likely revert again). 0 = no back-off. */
+  closeRetryAt: number;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -111,6 +114,10 @@ export const MAX_FUNDING_WINDOW = 7200n;
 /** Task 2 (spec §13): once `fund()` reverts for one of these reasons, `watch()` backs off funding this channel
  *  for at least this many seconds of chain time, instead of retrying the same revert on every tick. */
 export const FUND_BACKOFF_SECONDS = 30n;
+
+/** Plan 4.5 Task 10 review: after a cooperative-close submission reverts, the watchtower waits this long before
+ *  retrying it (the close API and the relay path still submit at once). */
+export const CLOSE_RETRY_BACKOFF_MS = 30_000;
 
 /** The hub error names that mean "this deposit cannot go through right now because of a launch limit" (spec §13),
  *  as opposed to a bug or an unrelated chain error. */
@@ -518,6 +525,7 @@ export class ArenaDaemon {
       autoPlaying: false,
       fundBlockedUntil: null,
       submittingClose: false,
+      closeRetryAt: 0,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -726,8 +734,10 @@ export class ArenaDaemon {
     l.submittingClose = true;
     try {
       await this.submitClose(l);
+      l.closeRetryAt = 0;
       if (l.lastError?.startsWith("close:")) l.lastError = null;
     } catch (err) {
+      if (err instanceof HubRevertError) l.closeRetryAt = Date.now() + CLOSE_RETRY_BACKOFF_MS;
       // Once settled (the watchtower may have marked it meanwhile), nothing would ever clear the error again.
       if (!l.record.finalized) l.lastError = `close: ${errorText(err)}`;
       this.log(`channel ${l.record.channelId}: submitting the cooperative close failed (the watchtower retries): ${errorText(err)}`);
@@ -937,7 +947,9 @@ export class ArenaDaemon {
     const p = l.record.params;
     const info = await this.hub.channelInfo(id);
     if (info.phase === "Challenged") {
-      if (l.session.closeTransaction()) await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`
+      if (l.session.closeTransaction() && Date.now() >= l.closeRetryAt) {
+        await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`
+      }
       return false;
     }
     const now = (await this.client.getBlock()).timestamp;
@@ -991,7 +1003,7 @@ export class ArenaDaemon {
 
     // Plan 4.5 Task 10: a fully co-signed close whose submission failed earlier is retried here.
     if (this.stopped) return true;
-    if (info.phase === "Open" && l.session.closeTransaction()) {
+    if (info.phase === "Open" && l.session.closeTransaction() && Date.now() >= l.closeRetryAt) {
       await this.trySubmitClose(l).catch(() => undefined); // recorded as `close:`; retried on the next pass
     }
 
