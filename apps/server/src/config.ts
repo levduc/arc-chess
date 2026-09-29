@@ -40,6 +40,10 @@ export type ServerConfig = {
   trustProxy: boolean;
 };
 
+/** Anvil's chain id: the only chain where the development `audit` default is allowed. */
+const ANVIL_CHAIN_ID = 31337;
+const DEV_AUDIT = "unaudited (development build)";
+
 // the daemons refuse funding deadlines further out than 7200s (maxFundingWindow); see hub.ts checkMatchParams
 const MAX_FUNDING_WINDOW = 7200n;
 const MIN_FUNDING_WINDOW = 60n;
@@ -166,7 +170,11 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   };
 
   const cliCommand = str(obj, "cliCommand", "arena");
-  const audit = str(obj, "audit", "unaudited (development build)");
+  // Final review m21: `audit` is published in /templates. Outside a local Anvil chain it must be set, and must not be
+  // the development default: the mainnet value states the truth (e.g. "unaudited; guarded launch, caps X/Y").
+  const local = chainId === ANVIL_CHAIN_ID;
+  const audit = str(obj, "audit", local ? DEV_AUDIT : undefined);
+  if (!local && audit === DEV_AUDIT) fail("audit", `must describe this deployment, not the development default "${DEV_AUDIT}"`);
 
   const indexerRaw = obj.indexer === undefined ? {} : asRecord(obj.indexer);
   const indexer = {

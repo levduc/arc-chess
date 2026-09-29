@@ -24,13 +24,22 @@ describe("config", () => {
     expect(c.defaults.deposit).toBe(1_000_000n);
     expect(c.limits).toEqual(DEFAULT_LIMITS);
     expect(c.trustProxy).toBe(false);
-    const base = { rpcUrl: "http://x", chainId: 1, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20) };
+    const base = { rpcUrl: "http://x", chainId: 1, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20), audit: "unaudited; guarded launch" };
     expect(parseServerConfig({ ...base, trustProxy: true }).trustProxy).toBe(true);
     expect(() => parseServerConfig({ ...base, trustProxy: "yes" })).toThrow(/trustProxy/);
   });
   it("names the bad field", () => {
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "nope" })).toThrow(/hub/);
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20), fundingWindow: "9000" })).toThrow(/fundingWindow/); // > 7200
+  });
+  it("final review m21: outside a local Anvil chain, audit must be set and must not be the development default", () => {
+    const base = { rpcUrl: "http://x", chainId: 5042002, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20) };
+    expect(() => parseServerConfig(base)).toThrow(/audit: is required/);
+    expect(() => parseServerConfig({ ...base, audit: "unaudited (development build)" })).toThrow(/audit: .*development/);
+    const audit = "unaudited; guarded launch, caps 10 USDC per player and 1,000 USDC in total";
+    expect(parseServerConfig({ ...base, audit }).audit).toBe(audit);
+    // A local Anvil chain keeps the development default.
+    expect(parseServerConfig({ ...base, chainId: 31337 }).audit).toBe("unaudited (development build)");
   });
   it("rejects a non-positive rate-limit burst or perSec, naming the field", () => {
     const base = validBase();
