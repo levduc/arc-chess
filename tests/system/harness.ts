@@ -334,6 +334,9 @@ export type Player = {
   start(): Promise<void>;
   /** The daemon process's combined stdout+stderr, most recent lines last. */
   logs(): string;
+  /** This player's daemon's current OS pid (a method, not a field, since it changes across `kill()`/`start()`),
+   *  or `undefined` if it has exited. For soak/load sampling: `/proc/<pid>/status` (RSS) and `/proc/<pid>/fd`. */
+  pid(): number | undefined;
 };
 
 export type Stack = {
@@ -566,6 +569,9 @@ export async function startStack(
       },
       logs(): string {
         return tracked.lines.join("\n");
+      },
+      pid(): number | undefined {
+        return tracked.child.pid;
       },
     };
   }

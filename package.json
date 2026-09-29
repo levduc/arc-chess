@@ -14,6 +14,7 @@
     "test:cli": "pnpm --filter @arena/cli test",
     "test:server": "pnpm --filter @arena/server test",
     "test:system": "pnpm --filter @arena/system-tests test",
+    "soak": "tsx tests/system/soak.ts",
     "dev:up": "tsx scripts/dev-up.ts"
   },
   "devDependencies": {

@@ -86,3 +86,42 @@ export async function playRandomGame(
   }
   throw new Error(`playRandomGame: game did not end within ${maxMoves} half-moves`);
 }
+
+/**
+ * Like `playRandomGame`, but never throws on hitting the ply cap (Plan 4.5 Task 11's load/soak harnesses): on the
+ * last allowed half-move the mover's move is sent with `offerDraw: true`, and the other side accepts it, so every
+ * game reaches a terminal state (a natural checkmate/stalemate/draw earlier than the cap still returns early, same
+ * as `playRandomGame`). Callers should still `waitStatus` for a terminal `gameStatus` afterward: a mate/stalemate
+ * detected before a move is sent (the mover has no legal move) is left for the daemon's own auto-resign/claim, just
+ * as in `playRandomGame`.
+ */
+export async function playRandomGameCapped(
+  white: Player,
+  black: Player,
+  opts: { channelId: Hex; seed?: number; maxMoves?: number; ms?: number },
+): Promise<Status> {
+  const rand = mulberry32(opts.seed ?? 1);
+  const maxMoves = opts.maxMoves ?? 40;
+  const ms = opts.ms ?? 10_000;
+  for (let i = 0; i < maxMoves; i++) {
+    const whiteStatus = (await white.api("GET", statusPath(opts.channelId))) as Status;
+    if (whiteStatus.gameStatus !== "playing" && whiteStatus.gameStatus !== "draw_offered") return whiteStatus;
+    const [mover, other] = whiteStatus.myTurn ? [white, black] : [black, white];
+    const moverStatus = whiteStatus.myTurn ? whiteStatus : ((await black.api("GET", statusPath(opts.channelId))) as Status);
+    if (moverStatus.legalMoves.length === 0) return moverStatus;
+    const lastPly = i === maxMoves - 1;
+    const move = moverStatus.legalMoves[Math.floor(rand() * moverStatus.legalMoves.length)];
+    const resultStatus = (await mover.api("POST", "/move", { move, channel: opts.channelId, offerDraw: lastPly })) as Status;
+    if (resultStatus.gameStatus !== "playing" && resultStatus.gameStatus !== "draw_offered") return resultStatus;
+    await waitStatus(other, (s) => s.turnNum === resultStatus.turnNum || s.gameStatus !== "playing", ms, opts.channelId);
+    if (lastPly) {
+      const offered = await waitStatus(other, (s) => s.gameStatus === "draw_offered", ms, opts.channelId);
+      if (offered.gameStatus === "draw_offered") {
+        await other.api("POST", "/accept-draw", { channel: opts.channelId });
+        return await waitStatus(mover, (s) => s.gameStatus === "draw", ms, opts.channelId);
+      }
+      return offered;
+    }
+  }
+  throw new Error(`playRandomGameCapped: exhausted ${maxMoves} half-moves without reaching a terminal state`);
+}
