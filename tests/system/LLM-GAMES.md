@@ -101,3 +101,36 @@ Live games between two headless Claude Code agents, driven only by `skill.md` an
 - Step 2 ("`arena daemon`") now tells a non-interactive/headless agent to background it with its own tool's background-execution feature, not a shell `&`/`nohup` -- confirmed by hand that Claude Code's Bash tool denies a bare `&` ("defers execution past approval-time safety checks") under --permission-prompts none, while its native background-run mode is unaffected.
 - The play loop now explains `wait`'s "timeout" reason with no channel id: normal before a match, not an error -- re-run `wait` (and check `offers`). Previously the loop only documented the channel-carrying reasons.
 
+## Run 3 -- 2026-09-29T11:10:18.718Z
+
+- Result: **PASS**
+- Args: --agents 2 --games 2 --minutes 30
+- Duration: 20.5 min
+- alice: exit=0, duration=20.5 min (ended its own turn)
+- bob: exit=0, duration=19.4 min (ended its own turn)
+- Channel: 0x21d5ac1bd4219b05e0aa1d0ca8b455ef167b7c1a93536ac00e8b23364a047ef3
+- Finalized: true
+- Games played (server-reported): 2
+- Conserved balances: true
+  - before: A=10.000000 B=10.000000 host=0.000000 USDC
+  - after: A=9.995000 B=9.995000 host=0.010000 USDC
+- Cost: alice=$3.4710, bob=$2.0903, total=$5.5613
+
+### Notable agent confusions
+
+- alice:
+  - "Game 2: I miscounted — my rook couldn't recapture on d5 because my own d6 pawn blocks the file, so I lost a knight. I'm now a piece down for a pawn and will try to fight back."
+  - "I played both games and the match ended 1–1. The channel is closed and settled on-chain, and my balance is back to 1.00 USDC, the same as I deposited (before the host's flat fee). - **Game 1 (I was White): won.** It was"
+  - allowlist denials (from the session's own `permission_denials`, none arena-level -- all outside this run's allowlist, built by `buildAllowedTools` -- `arena` plus `curl` pinned to this stack's own server origin, nothing else):
+    - `Bash: curl -s http://127.0.0.1:45351/templates/chess/skill.md; echo; echo $ARENA_HOME; ls $ARENA_HOME; which arena stockfish`
+    - `Bash: python3 -c "import chess; print(chess.__version__)"; arena --help`
+- bob:
+  - "I played both games and closed the channel. It ended 1–1, so the stakes cancelled out and I finished with the same 1.00 USDC I deposited. - **Game 1 (Black, loss):** It was a standard Ruy Lopez and the position was leve"
+  - allowlist denials (from the session's own `permission_denials`, none arena-level -- all outside this run's allowlist, built by `buildAllowedTools` -- `arena` plus `curl` pinned to this stack's own server origin, nothing else):
+    - `Bash: curl -s http://127.0.0.1:45351/templates/chess/skill.md; echo; echo $ARENA_HOME; ls -la $ARENA_HOME; cat $ARENA_HOME/*.json 2>/dev/null | grep -v -i key; curl -s http://127.0.0.1:45351/templates`
+    - `Bash: which stockfish python3; python3 -c "import chess; print(chess.__version__)"`
+
+### skill.md text this run used
+
+Not duplicated here (a copy here would silently go stale the next time `apps/server/src/docs.ts` changes) -- see that file's `skillMd`/`chessSkillMd` at this run's commit for the exact wording.
+
