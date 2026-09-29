@@ -179,6 +179,12 @@ export class ArenaDaemon {
   private readonly aborter = new AbortController();
   /** Plan 4.5 Task 10 re-review (M5): failed attempts to open a recorded channel, by channel id. */
   private readonly openFailures = new Map<Hex, number>();
+  /** Plan 4.5 Task 11 fix round (C2): the most recent "too many watched offers" (or other subscribe-refusal)
+   *  message from the host, if any. Sticky until this process restarts: only a restart clears the underlying
+   *  cause (the host connection's watch-slot cap was hit), so there is nothing to un-set it. Exposed via
+   *  ChannelStatus.lobbyError, and blocks new createOffer/acceptOffer calls (checkLobbyHealthy) so a silent,
+   *  permanent loss of match notifications is never mistaken for a healthy 200. */
+  private lobbyError: string | null = null;
 
   constructor(protected readonly opts: DaemonOptions) {
     const c = opts.config;
@@ -210,6 +216,16 @@ export class ArenaDaemon {
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => void this.onMatch(m)));
     this.unsubscribers.push(this.opts.relay.onMessage((m) => void this.onRelay(m)));
     this.unsubscribers.push(this.opts.relay.onJoined((id) => void this.onJoined(id)));
+    // Plan 4.5 Task 11 fix round (C2): make a subscribe refusal visible instead of a silent, permanent loss of
+    // match notifications. Sticky (see `lobbyError`'s docstring): this daemon refuses new offers/accepts from
+    // here on, and every channel's status carries the message, until it is restarted.
+    this.unsubscribers.push(
+      this.opts.lobby.onWatchRefused((msg) => {
+        this.lobbyError = msg;
+        this.log(`lobby: ${msg} -- this daemon will not learn of new matches as an offerer until it is restarted`);
+        this.notify();
+      }),
+    );
     // I1: every channel entry is loaded in isolation. A corrupt record or session file, or a record that does not
     // match this hub/chain, is logged and reported as degraded (see channels()) instead of aborting start() —
     // which would leave every other channel, including ones mid-dispute, unwatched.
@@ -301,6 +317,10 @@ export class ArenaDaemon {
   }
 
   async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
+    // Plan 4.5 Task 11 fix round (C2): once the host has refused a subscribe, this connection's match delivery is
+    // broken until restart -- a new offer would post fine (200) and then silently never learn of its match if it
+    // is the offerer. Refuse up front instead of returning a false 200.
+    this.checkLobbyHealthy();
     // I4: refuse offers the hub would never let anyone fund (ChannelHub rejects these params on deposit), so a
     // matched channel can never sit unfundable while its deposit reverts on every tick.
     if (o.stakePerGame <= 0n) throw new DaemonError(400, "stakePerGame must be greater than 0");
@@ -335,7 +355,8 @@ export class ArenaDaemon {
       this.records.removeOffer(id);
       throw err;
     }
-    this.opts.lobby.watch([id]);
+    // M5: `postOffer` above already calls `watch([id])` on success -- a second call here was a harmless but
+    // pointless duplicate subscribe frame.
     return { offerId: id };
   }
 
@@ -349,6 +370,8 @@ export class ArenaDaemon {
   }
 
   async acceptOffer(offerIdInput: Hex): Promise<void> {
+    // Plan 4.5 Task 11 fix round (C2): see createOffer's identical guard.
+    this.checkLobbyHealthy();
     const offerId = (typeof offerIdInput === "string" ? offerIdInput.toLowerCase() : "") as Hex;
     if (!isCanonicalId(offerId)) throw new DaemonError(400, "offerId must be 0x followed by 64 hex characters");
     // Guards against two concurrent acceptOffer calls for the same offer both reaching the host (M-carry):
@@ -370,7 +393,7 @@ export class ArenaDaemon {
         } catch (err) {
           throw new DaemonError(409, `offer ${offerId} was already accepted; the host did not take it again: ${errorText(err)}`);
         }
-        this.opts.lobby.watch([offerId]);
+        // M5: `accept` above already calls `watch([offerId])` on success.
         return;
       }
       const so = (await this.opts.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
@@ -391,7 +414,7 @@ export class ArenaDaemon {
       // Crash ordering: the record (with the signed acceptance) is on disk before the acceptance leaves.
       this.records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter", acceptance: signed });
       await this.opts.lobby.accept(signed);
-      this.opts.lobby.watch([offerId]);
+      // M5: `accept` above already calls `watch([offerId])` on success.
     } finally {
       this.accepting.delete(offerId);
     }
@@ -407,6 +430,13 @@ export class ArenaDaemon {
       this.log(`ignoring match: malformed offerId ${JSON.stringify(String(offerId)).slice(0, 80)}`);
       return;
     }
+    // Plan 4.5 Task 11 fix round (C2, the load-bearing fix): an offer matches at most once, ever (C1's invariant
+    // below), so any match event for it -- opened, already open, refused for any reason, even a malformed or
+    // duplicate one -- means its watch slot will never be needed again. Unwatch unconditionally and first, before
+    // any branch below, so no path (including one this daemon ultimately ignores) can leak it. Leaving a matched
+    // offer watched forever is exactly what exhausted the host connection's per-connection watch-slot cap and
+    // left this daemon permanently unable to hear of new matches as an offerer -- see the Task 11 report.
+    this.opts.lobby.unwatch([offerId]);
     // I3: claim the offerId synchronously, before any await, so a second match event for the same offer
     // (concurrent or back-to-back) bails here instead of racing this call to open a second channel.
     if (this.claiming.has(offerId)) return;
@@ -549,6 +579,17 @@ export class ArenaDaemon {
     for (const l of this.live.values()) if (same(l.record)) return l.record.channelId;
     for (const e of this.records.scanChannels()) if (e.record && same(e.record)) return e.record.channelId;
     return null;
+  }
+
+  /** Plan 4.5 Task 11 fix round (C2): throws if a prior subscribe refusal means this connection can no longer be
+   *  trusted to deliver a future match notification -- see `lobbyError`'s docstring. */
+  private checkLobbyHealthy(): void {
+    if (this.lobbyError) {
+      throw new DaemonError(
+        503,
+        `the host refused this connection's last subscribe (${this.lobbyError}); restart this daemon to recover`,
+      );
+    }
   }
 
   private async openChannel(record: ChannelRecord): Promise<void> {
@@ -1294,6 +1335,7 @@ export class ArenaDaemon {
       chain: l.chain,
       lastError: l.lastError,
       lastProgressAt: l.lastProgressAt,
+      lobbyError: this.lobbyError,
     });
   }
 

@@ -47,6 +47,63 @@ describe("ArenaDaemon core", () => {
     expect(bob.daemon.handle(id).record.me).toBe(1);
   });
 
+  it("C2 (Plan 4.5 Task 11 fix round): unwatches an offer once it is matched, on both sides", async () => {
+    // The load-bearing fix for the watched-offer leak: a matched offer must free its watch slot on both the
+    // offerer's and the accepter's host connection, or a long-lived daemon eventually hits the host's
+    // per-connection watch cap and goes permanently deaf to new matches as an offerer (Task 11 report).
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    expect(pair.alice.client.watched()).toContain(offerId);
+    await pair.bob.daemon.acceptOffer(offerId);
+    expect(pair.bob.client.watched()).toContain(offerId);
+    await waitFor(
+      () => pair.alice.daemon.channelIds().length === 1 && pair.bob.daemon.channelIds().length === 1,
+      20_000,
+      "match",
+    );
+    expect(pair.alice.client.watched()).not.toContain(offerId);
+    expect(pair.alice.client.unwatched()).toContain(offerId);
+    expect(pair.bob.client.watched()).not.toContain(offerId);
+    expect(pair.bob.client.unwatched()).toContain(offerId);
+  });
+
+  it("C2: a replayed match event for an offer that already has a channel also unwatches it", async () => {
+    // Covers onMatch's "recorded" and "existing" early-return paths (a retried/duplicate match event), which the
+    // main success path's unwatch call never reaches.
+    const { alice, id } = await matched();
+    const offerId = alice.daemon.handle(id).record.offerId;
+    expect(alice.client.watched()).not.toContain(offerId); // already unwatched by the first, real match
+    // Force alice's `watched` set to include it again (simulating a stale re-subscribe, e.g. from onHello after
+    // a reconnect replaying an old `watch()` call this fix is meant to have prevented in the first place).
+    alice.client.lobby.watch([offerId]);
+    expect(alice.client.watched()).toContain(offerId);
+    await internals(alice.daemon).onMatch({ offerId, params: alice.daemon.handle(id).record.params });
+    expect(alice.client.watched()).not.toContain(offerId);
+  });
+
+  it("C2: a lobby subscribe refusal is visible in status and blocks new offers/accepts", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    // Before any refusal: createOffer/acceptOffer work, and no channel carries a lobbyError.
+    const { offerId: firstOfferId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.bob.daemon.acceptOffer(firstOfferId);
+    const id = await waitFor(() => pair.alice.daemon.channelIds()[0], 20_000, "match");
+    expect((await pair.alice.daemon.status(id)).lobbyError).toBeNull();
+
+    pair.alice.client.refuseWatch("too many watched offers");
+    // Sticky and visible: every channel's status now carries it, with a suggested restart, and new offers/accepts
+    // are refused (503) instead of silently returning 200 while match delivery is actually broken.
+    const status = await pair.alice.daemon.status(id);
+    expect(status.lobbyError).toBe("too many watched offers");
+    expect(status.suggestedActions[0]).toMatch(/restart this daemon.*too many watched offers/);
+    await expect(
+      pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n }),
+    ).rejects.toThrow(/too many watched offers/);
+    const { offerId: secondOfferId } = await pair.bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await expect(pair.alice.daemon.acceptOffer(secondOfferId)).rejects.toThrow(/too many watched offers/);
+  });
+
   it("relays moves between daemons and enforces turn order", async () => {
     const { alice, bob, id } = await matched();
     await expect(bob.daemon.move(undefined, "e7e5", { actor: "agent" })).rejects.toThrow(DaemonError);

@@ -137,6 +137,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   const matchHandlers = new Set<(m: MatchEvent) => void>();
   const relayHandlers = new Set<(m: RelayMessage) => void>();
   const joinedHandlers = new Set<(id: Hex) => void>();
+  const watchRefusedHandlers = new Set<(message: string) => void>();
   const joinWaiters = new Map<Hex, JoinWaiter[]>();
 
   function safeCall<A extends unknown[]>(fn: (...args: A) => void, args: A, what: string): void {
@@ -266,6 +267,13 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
           }
         } else {
           log(`host: server error: ${msg}`);
+          // A subscribe-level refusal (no channelId): the offer id(s) in that frame are not being watched, so
+          // any match on them will be missed until this is resolved (Plan 4.5 Task 11 fix round -- see
+          // onWatchRefused's docstring). Watched by message rather than by frame type, since the server's error
+          // frame carries no other structure to key on.
+          if (msg.includes("too many watched offers")) {
+            for (const h of watchRefusedHandlers) safeCall(h, [msg], "onWatchRefused");
+          }
         }
         if (channelId) settleJoinWaiters(channelId, new Error(msg));
         return;
@@ -389,6 +397,10 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       if (nonce && dropped.length > 0) {
         for (const ids of chunk(dropped, SUBSCRIBE_CHUNK)) sendFrame({ type: "unsubscribe", offerIds: ids });
       }
+    },
+    onWatchRefused(handler: (message: string) => void): () => void {
+      watchRefusedHandlers.add(handler);
+      return () => watchRefusedHandlers.delete(handler);
     },
   };
 

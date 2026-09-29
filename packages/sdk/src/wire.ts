@@ -199,6 +199,11 @@ export interface LobbyClient {
   watch(offerIds: Hex[]): void;
   /** Stop watching these offers (expired or settled), freeing their slots on the host connection. */
   unwatch(offerIds: Hex[]): void;
+  /** Fires when the host refuses a subscribe (e.g. "too many watched offers" -- this connection's watch-slot
+   *  cap): a sign that some offer this client cares about is not being watched, so an agent/operator can see it
+   *  instead of silently missing a match. Plan 4.5 Task 11 fix round: the load-bearing leak (a matched offer that
+   *  was never unwatched) means a long-lived daemon could eventually hit this even so -- this is the backstop. */
+  onWatchRefused(handler: (message: string) => void): () => void;
 }
 
 /** Relay side of the host: forwards signed messages between a channel's two session keys. Plan 4 implements it in

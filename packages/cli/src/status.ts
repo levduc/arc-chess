@@ -28,6 +28,11 @@ export type ChannelStatus = {
   attention: null | "your-turn" | "new-game-proposed" | "game-over" | "close-requested" | "opponent-silent";
   suggestedActions: string[];
   lastError: string | null;
+  /** Plan 4.5 Task 11 fix round (C2): the daemon-wide "too many watched offers" (or other subscribe-refusal)
+   *  message, if the host has ever refused a subscribe on this daemon's connection, else null. Not specific to
+   *  this channel -- it means new offers/accepts are refused until this daemon restarts (see checkLobbyHealthy in
+   *  daemon.ts) -- but every channel's status carries it, since there is no daemon-wide endpoint to put it on. */
+  lobbyError: string | null;
 };
 
 export type StatusInput = {
@@ -41,6 +46,8 @@ export type StatusInput = {
    * phase change), or null if not yet observed. Drives `opponent-silent`.
    */
   lastProgressAt?: bigint | null;
+  /** Plan 4.5 Task 11 fix round (C2): see ChannelStatus.lobbyError. */
+  lobbyError?: string | null;
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -149,6 +156,9 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   } else if (challengeHint) {
     suggestedActions.push(challengeHint);
   }
+  if (input.lobbyError) {
+    suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
+  }
 
   return {
     channelId: record.channelId,
@@ -174,5 +184,6 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     attention,
     suggestedActions,
     lastError: input.lastError,
+    lobbyError: input.lobbyError ?? null,
   };
 }
