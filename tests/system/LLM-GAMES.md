@@ -71,7 +71,8 @@ Live games between two headless Claude Code agents, driven only by `skill.md` an
 - bob: exit=0, duration=11.3 min (ended its own turn)
 - Channel: 0x1b3c71b95ae01405bfe31beabb523d8f52a33121631f5296b7c27539427acb9e
 - Finalized: true
-- Games played (server-reported): 2
+- Games played (server-reported): 2 (both drawn, reached ply 51 and ply 98 respectively per bob's own status polls
+  -- i.e. real, played-out games, not an instant mutual draw)
 - Conserved balances: true
   - before: A=10.000000 B=10.000000 host=0.000000 USDC
   - after: A=9.995000 B=9.995000 host=0.010000 USDC
