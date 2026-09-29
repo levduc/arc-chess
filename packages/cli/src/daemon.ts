@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, http, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, EstimateGasExecutionError, http, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -908,10 +908,23 @@ export class ArenaDaemon {
         this.clearSessionGasLow(l);
       } catch (err) {
         if (this.stopped) return;
-        const first = l.sessionGasLow === null;
-        l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
-        this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
-        if (first) this.notify();
+        // Plan 5 Task 1 (mainnet gates: session-gas-low precision): raised only when the wallet itself cannot pay
+        // (insufficient funds, over its fee cap) or a gas/fee estimate for the refill failed outright -- every
+        // other refill error (a nonce race, a dropped/stuck/aborted send, a missing receipt) is transient and
+        // re-evaluated on the next pass without alarming the agent over something the daemon may resolve on its own.
+        if (
+          err instanceof TxInsufficientFundsError ||
+          err instanceof TxFeeCapError ||
+          err instanceof EstimateGasExecutionError
+        ) {
+          const first = l.sessionGasLow === null;
+          l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
+          this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
+          if (first) this.notify();
+        } else {
+          const name = err instanceof Error ? err.name : "Error";
+          this.log(`channel ${l.record.channelId}: refill failed, ${name}: ${errorText(err)} (re-evaluated on the next pass)`);
+        }
       }
     }).catch(() => undefined);
   }

@@ -228,6 +228,28 @@ describe("final review C1: the session key's dispute gas is refilled while the c
       await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
     }
   });
+
+  it("Plan 5 Task 1: session-gas-low precision -- a TxNonceUsedError during a refill is logged only, never raised as an attention", async () => {
+    const { alice, id, config } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    const logs: string[] = [];
+    (d as unknown as { opts: { log?: (l: string) => void } }).opts.log = (l) => logs.push(l);
+    // Stub out the refill's send entirely: whatever the real cause, this is the shape of error a nonce race
+    // between two refills (or this key's own dispute traffic) produces -- and per the ruling it must never raise
+    // session-gas-low, only be logged and retried.
+    const internals = d as unknown as { topUpSession(l: unknown): Promise<boolean> };
+    internals.topUpSession = () => Promise.reject(new TxNonceUsedError(1));
+    await setEthBalance(session, target / 10n); // below the floor: every pass tries to refill
+    for (let i = 0; i < 5; i++) {
+      await d.idle();
+      await d.tick();
+    }
+    expect(logs.some((l) => /TxNonceUsedError/.test(l))).toBe(true);
+    expect(d.handle(id).sessionGasLow).toBeNull();
+    expect((await d.status(id)).attention).not.toBe("session-gas-low");
+  });
 });
 
 describe("final review I4: a daemon never offers, accepts or funds a challengeTimeout under minChallengeTimeout", () => {
