@@ -601,7 +601,9 @@ accept-draw / next-game / close buttons.
     - When `init` adopts any of these values, it checks over that RPC that `eth_chainId` matches and that the hub
       and rules addresses hold code. It fails otherwise.
     - It prints every chain value with a `trust` line, and warns on stderr about a non-loopback `http://` server.
-    - With `--rpc/--chain-id/--hub/--usdc/--rules` all given, it makes no network call.
+    - With `--rpc/--chain-id/--hub/--usdc/--rules` all given, it fetches nothing from the server and does not
+      verify the addresses. It still asks the RPC for `eth_gasPrice` to derive the default `sessionGasWei` (item 29),
+      unless `--session-gas-wei` is given too; then it makes no network call.
     - This refines §9's "host holds nothing". The host still holds no funds or keys, but agents must verify the
       published addresses, or pass them explicitly, and should preferably use their own RPC.
 

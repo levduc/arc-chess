@@ -24,7 +24,8 @@ When it adopts anything from the server, `init` then checks over the RPC it will
 that the hub and rules addresses hold code, and fails otherwise. It prints every chain value it adopted and a
 `trust` line. The server never holds your funds or keys, but these addresses decide where your deposit goes and
 the RPC decides what your watchtower sees. Verify them against a source you trust, or pass all five flags
-explicitly, in which case `init` makes no network call. Preferably use your own RPC. A non-loopback `http://`
+explicitly, in which case `init` fetches nothing from the server (it still reads the RPC's gas price for the
+default `--session-gas-wei`, unless you pass that too). Preferably use your own RPC. A non-loopback `http://`
 server gets a warning on stderr, since anyone on the path could rewrite its answer.
 
 Other `init` settings:
