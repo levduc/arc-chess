@@ -74,9 +74,9 @@ describe("I1: one bad channel entry never disables the watchtower", () => {
     expect(restarted.channelIds()).toEqual([id]);
     expect((await restarted.status()).phase).toBe("Open");
     await restarted.idle();
-    const before = restarted.handle(id).passes;
+    const before = restarted.handle(id).mainPasses;
     await restarted.tick();
-    expect(restarted.handle(id).passes).toBeGreaterThan(before);
+    expect(restarted.handle(id).mainPasses).toBeGreaterThan(before);
 
     // The bad entries are reported, not watched, and never picked.
     const listed = await restarted.channels();
@@ -193,9 +193,9 @@ describe("I4: never-fundable offers and never-funded channels", () => {
     const st = await bob.daemon.status(id);
     expect(st.suggestedActions[0]).toMatch(/^done: the funding window closed/);
     await bob.daemon.idle();
-    const passes = bob.daemon.handle(id).passes;
+    const passes = [bob.daemon.handle(id).disputePasses, bob.daemon.handle(id).mainPasses];
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBe(passes);
+    expect([bob.daemon.handle(id).disputePasses, bob.daemon.handle(id).mainPasses]).toEqual(passes);
   });
 });
 
@@ -520,7 +520,7 @@ describe("Plan 4.5 Task 10: transient RPC failures", () => {
     expect(failures).toBeGreaterThan(0);
     // ...and the next good pass clears it. Before the fix it stayed until a relay message happened to arrive.
     await waitFor(() => alice.daemon.handle(id).lastError === null, 5_000, "a good pass to clear it");
-    expect(alice.daemon.handle(id).passes).toBeGreaterThan(1);
+    expect(alice.daemon.handle(id).mainPasses).toBeGreaterThan(1);
   });
 });
 
@@ -935,5 +935,27 @@ describe("Plan 4.5 Task 10 re-review (I2): challenged channels are handled concu
       release();
     }
     for (const id of ids) await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 20_000, "both answered");
+  });
+});
+
+describe("Plan 4.5 Task 10 re-review (M3): dispute and main passes are counted apart", () => {
+  it("while the main pass stalls, the dispute-pass count keeps rising and the main-pass count does not", async () => {
+    const { alice, id } = await matched();
+    let release: () => void = () => undefined;
+    const stalled = new Promise<void>((r) => (release = r));
+    (alice.daemon as unknown as { watch: () => Promise<boolean> }).watch = async () => {
+      await stalled;
+      return true;
+    };
+    try {
+      await new Promise((r) => setTimeout(r, 300)); // let a main pass enter the stall
+      const h = alice.daemon.handle(id);
+      const [d0, m0] = [h.disputePasses, h.mainPasses];
+      await new Promise((r) => setTimeout(r, 1_000)); // ~10 timer ticks at pollMs 100
+      expect(h.disputePasses).toBeGreaterThan(d0 + 3);
+      expect(h.mainPasses).toBe(m0); // one pass, still stalled
+    } finally {
+      release();
+    }
   });
 });

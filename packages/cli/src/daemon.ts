@@ -65,8 +65,11 @@ export type ChannelHandle = {
   processedEvents: number;
   chain: ChainView | null;
   lastError: string | null;
-  /** R9/3b: counts every watchtower pass attempt (dispute or main) for this channel — lets tests confirm an explicit `tick()` actually ran a pass (as opposed to being swallowed by the concurrent-tick guard) instead of just assuming it. */
-  passes: number;
+  /** R9/3b, Plan 4.5 Task 10 re-review (M3): count the dispute-pass and main-pass attempts for this channel, apart --
+   *  lets tests confirm an explicit `tick()` (or a pass) actually ran, rather than being swallowed by an in-flight
+   *  guard, and tell which pass it was. */
+  disputePasses: number;
+  mainPasses: number;
   /** I2: chain time of the last observed progress on this channel (in memory only; set on the first refresh after start). */
   lastProgressAt: bigint | null;
   /** I2: fingerprint of the session/phase at `lastProgressAt`; any change counts as progress. */
@@ -540,7 +543,8 @@ export class ArenaDaemon {
       processedEvents: 0,
       chain: null,
       lastError: null,
-      passes: 0,
+      disputePasses: 0,
+      mainPasses: 0,
       lastProgressAt: null,
       progressKey: null,
       autoPlaying: false,
@@ -890,7 +894,7 @@ export class ArenaDaemon {
       if (l.record.finalized || l.disputeBusy) continue;
       l.disputeBusy = true;
       started.push(
-        this.runWatch(l, () => this.watchDispute(l)).finally(() => {
+        this.runWatch(l, "disputePasses", () => this.watchDispute(l)).finally(() => {
           l.disputeBusy = false;
         }),
       );
@@ -909,7 +913,7 @@ export class ArenaDaemon {
       for (const l of this.live.values()) {
         if (this.stopped) break;
         if (l.record.finalized) continue;
-        await this.runWatch(l, () => this.watch(l));
+        await this.runWatch(l, "mainPasses", () => this.watch(l));
       }
       for (const m of [...this.retryMatches.values()]) {
         if (this.stopped) break;
@@ -923,8 +927,8 @@ export class ArenaDaemon {
   }
 
   /** Runs one pass over one channel. `pass` resolves true when it did that channel's full work for its phase. */
-  private async runWatch(l: ChannelHandle, pass: () => Promise<boolean>): Promise<void> {
-    l.passes++;
+  private async runWatch(l: ChannelHandle, counter: "disputePasses" | "mainPasses", pass: () => Promise<boolean>): Promise<void> {
+    l[counter]++;
     try {
       // Plan 4.5 Task 10: a pass that got all the way through means an earlier pass's failure (an RPC blip) no
       // longer applies. Without this, a quiet channel kept that error in lastError indefinitely.

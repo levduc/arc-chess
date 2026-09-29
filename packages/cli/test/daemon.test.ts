@@ -318,13 +318,13 @@ describe("watchtower", () => {
     // idle() first and check the per-channel pass counter actually moved, so each tick() below is known to
     // have run a full watch() pass past the deadline rather than being silently swallowed.
     await bob.daemon.idle();
-    let before = bob.daemon.handle(id).passes;
+    let before = bob.daemon.handle(id).disputePasses; // a Challenged channel is the dispute pass's
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     await bob.daemon.idle();
-    before = bob.daemon.handle(id).passes;
+    before = bob.daemon.handle(id).disputePasses;
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     // Bob is on move in the registered state and past the deadline: calling timeout would forfeit Bob's stake.
     expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
     expect((await bob.daemon.status(id)).challenge?.mustMove).toBe(true);
@@ -346,13 +346,13 @@ describe("watchtower", () => {
     await alice.daemon.stop();
     await increaseTime(601);
     await bob.daemon.idle();
-    let before = bob.daemon.handle(id).passes;
+    let before = bob.daemon.handle(id).disputePasses; // a Challenged channel is the dispute pass's
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     await bob.daemon.idle();
-    before = bob.daemon.handle(id).passes;
+    before = bob.daemon.handle(id).disputePasses;
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     // Bob's local view never caught up (ingest keeps failing), but the registered state has him on move:
     // his watchtower must never call timeout on itself, even though it is well past the deadline.
     expect(session.isMyTurn()).toBe(false); // still stuck at turn 0, not bob's local turn
@@ -391,9 +391,9 @@ describe("watchtower", () => {
     await bob.daemon.hub.challenge(bob.daemon.handle(id).sessionSender, stale);
     await increaseTime(601);
     await alice.daemon.idle();
-    const before = alice.daemon.handle(id).passes;
+    const before = alice.daemon.handle(id).disputePasses; // past the deadline: the dispute pass times it out
     await alice.daemon.tick();
-    expect(alice.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(alice.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     // Past the deadline, respond() would revert (DeadlinePassed): Alice's watchtower must fall back to
     // timeout(), which succeeds because Bob (the opponent) was on move in the registered (stale) state.
     expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Finalized");
