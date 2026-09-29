@@ -24,7 +24,18 @@ import {
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
 import { CHAIN, RPC, increaseTime, now, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
-import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, SETTLED_CACHE_MAX, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
+import {
+  ArenaDaemon,
+  DaemonError,
+  FileSessionStore,
+  RecordStore,
+  SETTLED_CACHE_MAX,
+  SETTLED_GRACE_SECONDS,
+  SWEEP_ABANDON_ATTEMPTS,
+  arenaPaths,
+  loadConfig,
+  type ChannelRecord,
+} from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but these tests craft host events. */
@@ -354,6 +365,44 @@ describe("final review C1: the session key's dispute gas is refilled while the c
       expect(walletBalanceReads).toBeGreaterThan(0);
     } finally {
       d.client.getBalance = realGetBalance;
+    }
+  });
+
+  it("fix round I9: refill back-off doubles from 30s up to the 5 minute cap, then holds there", async () => {
+    // A long pollMs: this test drives every pass itself via explicit tick() calls, and the periodic timer
+    // independently calling ensureSessionGas (and resetting/bumping the very back-off this test asserts on)
+    // between those calls would make the expected sequence unreliable.
+    const pair = await startPair({ pollMs: 3_600_000 });
+    cleanups.push(pair.cleanup);
+    const { alice, config } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => {
+      for (const p of [alice, pair.bob]) {
+        await p.daemon.idle();
+        await p.daemon.tick();
+      }
+      return (await alice.daemon.hub.channelInfo(id)).phase === "Open";
+    }, 20_000, "funding by manual ticks");
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    const l = d.handle(id);
+    const internals = d as unknown as { topUpSession(l: unknown): Promise<boolean> };
+    internals.topUpSession = () => Promise.reject(new TxInsufficientFundsError(alice.address));
+    const expected = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+    try {
+      await setEthBalance(alice.address, 1_000n); // the wallet genuinely cannot pay
+      await setEthBalance(session, target / 10n); // below the floor
+      for (const exp of expected) {
+        l.refillBlockedUntil = 0; // bypass the real wait: this test is about the sequence of durations, not timing
+        await d.idle();
+        await d.tick();
+        expect(l.refillBackoffMs).toBe(exp);
+      }
+    } finally {
+      await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
     }
   });
 });
@@ -1097,6 +1146,48 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
 
     await callSweepChannel(l);
     await waitFor(() => l.record.swept !== undefined, 20_000, "swept once both guards clear");
+  });
+
+  it("fix round I8/I9: sweep back-off reaches SWEEP_ABANDON_ATTEMPTS, marks swept: \"abandoned\", and unblocks eviction", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    internals.performSweep = () => Promise.reject(new Error("simulated sweep failure"));
+    const callSweepChannel = () => (d as unknown as { sweepChannel(x: unknown): Promise<void> }).sweepChannel(l);
+    try {
+      for (let i = 0; i < SWEEP_ABANDON_ATTEMPTS; i++) {
+        l.sweep.blockedUntil = 0; // bypass the real back-off wait between attempts
+        await callSweepChannel();
+      }
+      expect(l.record.swept).toBe("abandoned");
+      expect(l.record.sweptAmount).toBeUndefined();
+    } finally {
+      internals.performSweep = realPerformSweep;
+    }
+    // Eviction can now proceed (swept is no longer unset) once the grace period passes.
+    await d.idle();
+    await d.tick();
+    await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+    await waitFor(() => d.channelIds().length === 0, 10_000, "evicted despite never actually sweeping");
+  });
+
+  it("fix round I9: eviction never proceeds while swept stays unset, even well past the grace period", async () => {
+    const { alice, bob, id } = await matched();
+    await settleWithSweepDisabled(alice, bob, id); // sweepChannel stays a no-op: never re-enabled below
+    const d = alice.daemon;
+    await d.idle();
+    await d.tick(); // settledAt starts here
+    await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+    for (let i = 0; i < 3; i++) {
+      await d.idle();
+      await d.tick();
+    }
+    expect(d.handle(id).record.swept).toBeUndefined();
+    expect(d.channelIds()).toContain(id); // not evicted: the sweep never ran, so its session gas is still live
   });
 
   it("`arena sweep` (daemon.sweep) sweeps a legacy record -- finalized before this feature, no longer in `live`", async () => {
