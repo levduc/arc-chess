@@ -251,7 +251,9 @@ export class SerialTxSender implements TxSender, TxTracker {
   }
   settle(hash: Hex): void {
     const e = this.find(hash);
-    if (e) this.entries.delete(e.nonce);
+    if (!e) return;
+    this.entries.delete(e.nonce);
+    this.markMined(e.nonce);
   }
   release(hash: Hex): void {
     const e = this.find(hash);
@@ -268,29 +270,41 @@ export class SerialTxSender implements TxSender, TxTracker {
     const reader = this.reader;
     if (!reader || !this.tracking) return this.inner.send(tx);
     if (tx.nonce !== undefined) return this.replaceOwn(reader, tx, tx.nonce);
-    await this.prune(reader);
-    const released = [...this.entries.values()].filter((e) => e.state === "released").sort((a, b) => a.nonce - b.nonce)[0];
-    if (released) return this.replaceReleased(reader, tx, released);
-    if (this.entries.size === 0) {
-      // Adopt after a restart: a transaction left pending on this key by an earlier sender. The confirmed count is
-      // read after the pending one, so a transaction of ours mined meanwhile (prune saw its receipt, but read the
-      // count before it landed) is never mistaken for one left pending.
-      const pending = await reader.getTransactionCount({ address: this.address, blockTag: "pending" });
-      const confirmed = await reader.getTransactionCount({ address: this.address, blockTag: "latest" });
-      if (pending > confirmed) {
-        const adopted: Entry = { nonce: confirmed, lastFees: {}, hashes: new Set(), state: "released" };
-        this.entries.set(confirmed, adopted);
-        return this.replaceReleased(reader, tx, adopted);
-      }
+    const { confirmed, pending } = await this.prune(reader);
+    // Adoption (round 5, C1): a pending nonce no entry tracks holds a transaction no wait of ours owns -- left by an
+    // earlier run of this key's sender (a restart). The lowest such nonce is adopted as released, whatever else is
+    // tracked, so a stuck one is replaced instead of blocking every nonce above it.
+    for (let n = confirmed; n < pending; n++) {
+      if (this.entries.has(n)) continue;
+      this.entries.set(n, { nonce: n, lastFees: {}, hashes: new Set(), state: "released" });
+      break;
     }
+    const released = this.lowestReleased();
+    if (released) return this.replaceReleased(reader, tx, released);
     return this.sendFresh(reader, tx);
   }
 
-  /** Drops every entry that is mined (its nonce is below the confirmed count, or one of its hashes has a receipt). */
-  private async prune(reader: TrackerClient): Promise<void> {
-    const confirmed = await reader.getTransactionCount({ address: this.address, blockTag: "latest" });
+  private lowestReleased(except?: Entry): Entry | undefined {
+    return [...this.entries.values()].filter((e) => e.state === "released" && e !== except).sort((a, b) => a.nonce - b.nonce)[0];
+  }
+
+  /** Nonces below this are known used (a receipt was seen for a transaction at them). */
+  private minedBelow = 0;
+  private markMined(nonce: number): void {
+    if (nonce + 1 > this.minedBelow) this.minedBelow = nonce + 1;
+  }
+
+  /**
+   * Drops every entry that is mined (its nonce is below the confirmed count, or one of its hashes has a receipt), and
+   * returns the counts. The confirmed count is read after the pending one, and never below a nonce this sender has
+   * seen mined, so a transaction of ours mined meanwhile (or behind a lagging count) is never taken for one left
+   * pending.
+   */
+  private async prune(reader: TrackerClient): Promise<{ confirmed: number; pending: number }> {
+    const pending = await reader.getTransactionCount({ address: this.address, blockTag: "pending" });
+    const latest = await reader.getTransactionCount({ address: this.address, blockTag: "latest" });
     for (const e of [...this.entries.values()]) {
-      if (e.nonce < confirmed) {
+      if (e.nonce < Math.max(latest, this.minedBelow)) {
         this.entries.delete(e.nonce);
         continue;
       }
@@ -298,10 +312,12 @@ export class SerialTxSender implements TxSender, TxTracker {
         const r = await reader.getTransactionReceipt({ hash: h }).catch(() => null);
         if (r) {
           this.entries.delete(e.nonce);
+          this.markMined(e.nonce);
           break;
         }
       }
     }
+    return { confirmed: Math.max(latest, this.minedBelow), pending };
   }
 
   /** A new intent at a nonce nobody tracks: max(the pending count, the highest tracked nonce + 1). */
@@ -325,6 +341,7 @@ export class SerialTxSender implements TxSender, TxTracker {
       } catch (err) {
         // A pure count race (another sender on this key, a lagging count): retried once, at the next nonce.
         if (attempt === 0 && isNonceUsedError(err)) {
+          this.markMined(nonce);
           nonce = Math.max(await next(), nonce + 1);
           continue;
         }
@@ -360,6 +377,7 @@ export class SerialTxSender implements TxSender, TxTracker {
       } catch (err) {
         if (isNonceUsedError(err)) {
           this.entries.delete(e.nonce);
+          this.markMined(e.nonce);
           throw new TxNonceUsedError(e.nonce, err);
         }
         if (!isUnderpriced(err)) throw this.classify(err);

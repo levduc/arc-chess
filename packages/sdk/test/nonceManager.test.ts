@@ -45,8 +45,10 @@ const within = <T>(p: Promise<T>, ms: number) =>
 
 type PoolTx = { hash: Hex; nonce: number; to: Hex; data: Hex; value: bigint; gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
 
-/** A stub node with a nonce-keyed pool. `mine()` mines every consecutive pending nonce. */
+/** A stub node with a nonce-keyed pool. `mine()` mines every consecutive pending nonce whose fee meets `market`.
+ *  `lostResponse` makes the next send be accepted by the node while its response is lost (a transport error). */
 function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
+  const state = { market: 0n, lostResponse: false, onEstimateGas: undefined as (() => void) | undefined };
   let latest = 0;
   let seq = 1;
   let balance = opts.balance ?? 10n ** 18n;
@@ -84,6 +86,10 @@ function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
         throw new Error("replacement transaction underpriced");
       }
       pool.set(nonce, t);
+      if (state.lostResponse) {
+        state.lostResponse = false;
+        throw new Error("fetch failed: socket hang up"); // the node has it; the response never arrived
+      }
       return t.hash;
     },
   };
@@ -109,6 +115,7 @@ function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
       return { ...estimate };
     },
     async estimateGas() {
+      state.onEstimateGas?.();
       return gasLimit;
     },
     async getBalance() {
@@ -116,7 +123,7 @@ function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
     },
   };
   const mine = () => {
-    while (pool.has(latest)) {
+    while (pool.has(latest) && pool.get(latest)!.maxFeePerGas >= state.market) {
       const t = pool.get(latest)!;
       pool.delete(latest);
       receipts.set(t.hash, t);
@@ -133,6 +140,7 @@ function mempool(opts: { balance?: bigint; gas?: bigint } = {}) {
     latest = t.nonce + 1;
   };
   return {
+    state,
     inner,
     client: client as unknown as ReceiptClient & TrackerClient,
     rawClient: client,
@@ -456,5 +464,41 @@ describe("restart adoption (Anvil, automine off)", () => {
     expect(err).toBeInstanceOf(TxFeeCapError);
     expect(n.attempts.slice(1).every((t) => t.maxFeePerGas <= 4_000n)).toBe(true);
     expect(n.pool.get(0)?.to).toBe(to(0x01));
+  });
+});
+
+describe("round 5, C1: every untracked pending nonce is adopted, not only while nothing is tracked", () => {
+  it("E1': after a restart with nonces 0 and 1 pending below a risen market, two new intents replace both; the key never stalls", async () => {
+    const n = mempool();
+    const old = new SerialTxSender(n.inner, n.client);
+    await old.send({ to: to(1), data: "0xaa00" });
+    await old.send({ to: to(1), data: "0xaa01" });
+    n.state.market = 2_500n; // both are now stuck
+    n.estimate.maxFeePerGas = 2_500n;
+    const w = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n }); // the daemon restarts
+    const x = await w.send({ to: to(2), data: "0xb0" }); // adopts nonce 0
+    const y = await w.send({ to: to(2), data: "0xb1" }); // x is waiting: y adopts nonce 1 (before: fresh at 2, behind it)
+    expect([n.byHash(x).nonce, n.byHash(y).nonce]).toEqual([0, 1]);
+    n.mine();
+    expect(n.landed.map((t) => t.data)).toEqual(["0xb0", "0xb1"]);
+    expect(n.pool.size).toBe(0);
+    const z = await w.send({ to: to(3), data: "0xc0" }); // and the key goes on
+    expect(n.byHash(z).nonce).toBe(2);
+  });
+
+  it("E2: an old top-up left pending next to a stuck nonce, then re-sent after the restart, lands once", async () => {
+    const n = mempool();
+    const old = new SerialTxSender(n.inner, n.client);
+    await old.send({ to: to(1), data: "0xaa01" }); // nonce 0: will be stuck
+    await old.send({ to: to(9), data: "0x", value: 7n }); // nonce 1: an old top-up at a fine price
+    n.pool.get(0)!.maxFeePerGas = 500n;
+    n.state.market = 900n; // nonce 0 cannot be mined, so neither can nonce 1
+    const w = new SerialTxSender(n.inner, n.client);
+    await w.send({ to: to(9), data: "0x", value: 7n }); // the re-read balance is short: the top-up again
+    await w.send({ to: to(2), data: "0xcc" });
+    n.mine();
+    // Before: the re-sent top-up adopted nonce 0 and the next intent went fresh to 2, so both top-ups landed.
+    expect(n.landed.filter((t) => t.value === 7n)).toHaveLength(1);
+    expect(n.pool.size).toBe(0);
   });
 });
