@@ -735,3 +735,28 @@ describe("Plan 4.5 Task 10 review: dispute work first", () => {
     }
   });
 });
+
+describe("Plan 4.5 Task 10 review: a retried match opens a recorded channel that is not live", () => {
+  it("openChannel fails once after the record is saved; the retry opens it and the channel funds", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const d = alice.daemon as unknown as { openChannel(r: ChannelRecord): Promise<void> };
+    const real = d.openChannel.bind(alice.daemon);
+    let failed = false;
+    d.openChannel = async (r) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("EIO: session store unavailable");
+      }
+      return real(r);
+    };
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    // Before the fix the retry found the record (offer already removed) and ignored the match: never live.
+    const id = await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "alice's channel goes live");
+    expect(failed).toBe(true);
+    expect(new RecordStore(alice.home).channel(id)?.offerId).toBe(offerId);
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "funded and open");
+  });
+});

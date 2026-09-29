@@ -365,6 +365,18 @@ export class ArenaDaemon {
       }
     };
     try {
+      // Plan 4.5 Task 10 review: a retried match whose channel record is already on disk but not live (openChannel
+      // failed after the record was saved) opens that channel now, instead of being ignored as a duplicate.
+      const recorded = this.channelForOffer(offerId);
+      if (recorded && !this.live.has(recorded)) {
+        const r = this.records.channel(recorded);
+        if (r && !r.finalized) {
+          await this.openChannel(r);
+          this.notify();
+          void this.tick();
+        }
+        return release();
+      }
       const rec = this.records.offer(offerId);
       if (!rec) return release();
       // C1: the stored offer must be the one this id names (a record filed under the wrong name is never used).
