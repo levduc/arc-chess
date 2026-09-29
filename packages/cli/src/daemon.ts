@@ -135,6 +135,10 @@ export const FUND_BACKOFF_SECONDS = 30n;
  *  retrying it (the close API and the relay path still submit at once). */
 export const CLOSE_RETRY_BACKOFF_MS = 30_000;
 
+/** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
+ *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
+export const MAX_OPEN_ATTEMPTS = 5;
+
 /** The hub error names that mean "this deposit cannot go through right now because of a launch limit" (spec §13),
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
@@ -168,6 +172,8 @@ export class ArenaDaemon {
    *  next tick. The host sends a match once per subscription, so without a retry one failed read at match time
    *  left the channel unopened (and unfunded) for good. Explicit rejections are never retried. */
   private readonly retryMatches = new Map<Hex, MatchEvent>();
+  /** Plan 4.5 Task 10 re-review (M5): failed attempts to open a recorded channel, by channel id. */
+  private readonly openFailures = new Map<Hex, number>();
 
   constructor(protected readonly opts: DaemonOptions) {
     const c = opts.config;
@@ -401,8 +407,22 @@ export class ArenaDaemon {
       const recorded = this.channelForOffer(offerId);
       if (recorded && !this.live.has(recorded)) {
         const r = this.records.channel(recorded);
-        if (r && !r.finalized) {
-          await this.openChannel(r);
+        if (r && !r.finalized && !this.degraded.has(recorded)) {
+          try {
+            await this.openChannel(r);
+            this.openFailures.delete(recorded);
+          } catch (err) {
+            // Plan 4.5 Task 10 re-review (M5): a channel that keeps failing to open is reported as degraded (like one
+            // that fails to load at start()) instead of being retried on every tick forever.
+            const failures = (this.openFailures.get(recorded) ?? 0) + 1;
+            if (failures < MAX_OPEN_ATTEMPTS) {
+              this.openFailures.set(recorded, failures);
+              throw err; // retried on the next tick
+            }
+            this.openFailures.delete(recorded);
+            this.markDegraded(recorded, `could not be opened after ${failures} attempts: ${errorText(err)}`);
+            return release();
+          }
           this.notify();
           void this.tick();
         }

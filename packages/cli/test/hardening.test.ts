@@ -959,3 +959,27 @@ describe("Plan 4.5 Task 10 re-review (M3): dispute and main passes are counted a
     }
   });
 });
+
+describe("Plan 4.5 Task 10 re-review (M5): a channel that never opens is degraded, not retried forever", () => {
+  it("openChannel fails on every match retry: after MAX_OPEN_ATTEMPTS the channel is reported degraded and retries stop", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const d = alice.daemon as unknown as { openChannel(r: ChannelRecord): Promise<void> };
+    let attempts = 0;
+    d.openChannel = async () => {
+      attempts++;
+      throw new Error("EIO: session store unavailable");
+    };
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const degraded = await waitFor(async () => {
+      const chs = await alice.daemon.channels();
+      return chs.find((c) => "degraded" in c && c.degraded) ?? null;
+    }, 10_000, "the channel reported degraded");
+    expect((degraded as { error: string }).error).toMatch(/could not be opened after \d+ attempts: EIO/);
+    const settled = attempts;
+    await new Promise((r) => setTimeout(r, 1_000)); // ~10 more ticks at pollMs 100
+    expect(attempts).toBe(settled); // before the fix: one more attempt on every tick, forever
+  });
+});
