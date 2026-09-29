@@ -400,3 +400,20 @@ describe("waitOrReplace: a give-up time (Task 10 re-review I2)", () => {
     expect(Date.now() - t0).toBeLessThan(1_200);
   });
 });
+
+describe("waitOrReplace: legacy transactions (Task 10 re-review M2)", () => {
+  it("prices a legacy replacement against the node's legacy fee estimate", async () => {
+    const n = stubNode({ legacy: true });
+    const hash = await n.sender.send({ to: TO, data: "0x" }); // gasPrice 2000; the node's legacy estimate is 3000
+    const realSend = n.sender.send.bind(n.sender);
+    n.sender.send = async (tx) => {
+      const r = await realSend(tx);
+      if (tx.nonce !== undefined) n.mined.add(r);
+      return r;
+    };
+    await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 10, pollMs: 5 });
+    expect(n.estimates).toEqual(["legacy"]); // before: an EIP-1559 estimate, which has no gasPrice
+    expect(n.sent[1].gasPrice).toBe(3_000n); // before: 2250 (the bump alone), under the market price
+    expect(n.sent[1].maxFeePerGas).toBeUndefined();
+  });
+});

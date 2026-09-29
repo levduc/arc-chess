@@ -259,16 +259,22 @@ export async function waitOrReplace(
       if (lastSendError !== undefined) throw lastSendError;
       throw new TxStuckError(hashes);
     }
-    const estimate = await client.estimateFeesPerGas().catch(() => undefined);
-    const replacement: TxRequest =
-      pending.maxFeePerGas !== undefined && pending.maxFeePerGas !== null
-        ? {
-            ...req,
-            nonce: pending.nonce,
-            maxFeePerGas: max(bump(pending.maxFeePerGas), estimate?.maxFeePerGas),
-            maxPriorityFeePerGas: max(bump(pending.maxPriorityFeePerGas ?? 0n), estimate?.maxPriorityFeePerGas),
-          }
-        : { ...req, nonce: pending.nonce, gasPrice: max(bump(pending.gasPrice ?? 0n), estimate?.gasPrice) };
+    let replacement: TxRequest;
+    if (pending.maxFeePerGas !== undefined && pending.maxFeePerGas !== null) {
+      const estimate = await client.estimateFeesPerGas().catch(() => undefined);
+      replacement = {
+        ...req,
+        nonce: pending.nonce,
+        maxFeePerGas: max(bump(pending.maxFeePerGas), estimate?.maxFeePerGas),
+        maxPriorityFeePerGas: max(bump(pending.maxPriorityFeePerGas ?? 0n), estimate?.maxPriorityFeePerGas),
+      };
+    } else {
+      // Plan 4.5 Task 10 re-review (M2): a legacy transaction is priced against the node's legacy estimate (an
+      // EIP-1559 estimate carries no gasPrice, so the bump alone could stay under the market price).
+      const legacy = { type: "legacy" } as Parameters<ReceiptClient["estimateFeesPerGas"]>[0];
+      const estimate = (await client.estimateFeesPerGas(legacy).catch(() => undefined)) as { gasPrice?: bigint } | undefined;
+      replacement = { ...req, nonce: pending.nonce, gasPrice: max(bump(pending.gasPrice ?? 0n), estimate?.gasPrice) };
+    }
     try {
       hashes.push(await sender.send(replacement));
     } catch (err) {
