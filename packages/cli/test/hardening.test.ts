@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
@@ -933,6 +933,85 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
 
     // A second sweep finds nothing left to do (swept is no longer unset).
     expect(await restarted.sweep()).toEqual([]);
+  });
+});
+
+describe("Plan 5 Task 1: settled index", () => {
+  /** Plays a quick draw and closes both sides, so `id` settles (Finalized). */
+  async function settleByDraw(alice: Awaited<ReturnType<typeof matched>>["alice"], bob: Awaited<ReturnType<typeof matched>>["bob"], id: Hex) {
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
+  }
+
+  it("channels() lists settled channels after a restart (loaded from the index at start(), not re-opened)", async () => {
+    const { alice, bob, id: id0 } = await matched();
+    await settleByDraw(alice, bob, id0);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id1 = await waitFor(() => alice.daemon.channelIds().find((c) => c !== id0), 20_000, "second match");
+    await waitFor(() => bob.daemon.channelIds().includes(id1), 20_000, "bob's second match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id1)).phase === "Open", 20_000, "second open");
+    await settleByDraw(alice, bob, id1);
+
+    await alice.daemon.stop();
+    await bob.daemon.stop();
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    expect(restarted.channelIds()).toEqual([]); // finalized: never re-opened (existing I1 behaviour)
+    const listed = await restarted.channels();
+    expect(listed.map((c) => c.channelId).sort()).toEqual([id0, id1].sort());
+    expect(listed.every((c) => "phase" in c && c.phase === "Finalized")).toBe(true);
+    // Served directly too, without a `channels()` scan.
+    expect((await restarted.status(id0)).phase).toBe("Finalized");
+  });
+
+  it("orders the loaded index by settledAt, newest first, capped at SETTLED_CACHE_MAX", async () => {
+    const { alice, id } = await matched();
+    await alice.daemon.stop();
+    const realRecord = new RecordStore(alice.home).channel(id)!;
+    const paths = arenaPaths(alice.home);
+    const sessionSnapshot = readFileSync(paths.channelSession(id), "utf8");
+    // A handful of synthetic finalized records, cloned from one real (never-settled, but that only affects
+    // `phase`, not the ordering this test checks) channel's session file, each with its own settledAt. Finalized
+    // records skip the params/channelId hash check (see openChannel's docstring), so the clones need only a
+    // canonical id of their own.
+    const settledAts = [500, 100, 900, 300];
+    const cloneIds = settledAts.map((_, i) => `0x${(i + 1).toString(16).padStart(64, "0")}` as Hex);
+    for (const [i, sat] of settledAts.entries()) {
+      const cloneId = cloneIds[i];
+      const clone: ChannelRecord = { ...realRecord, channelId: cloneId, finalized: true, finalPhase: "Finalized", settledAt: sat, swept: true };
+      mkdirSync(join(alice.home, "channels", cloneId), { recursive: true });
+      new RecordStore(alice.home).saveChannel(clone);
+      writeFileSync(paths.channelSession(cloneId), sessionSnapshot);
+    }
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    const listed = await restarted.channels();
+    const ordered = listed.map((c) => c.channelId).filter((cid) => cloneIds.includes(cid as Hex));
+    // Newest (highest settledAt) first: 900, 500, 300, 100 -> cloneIds[2], cloneIds[0], cloneIds[3], cloneIds[1].
+    // (SETTLED_CACHE_MAX itself -- the cap on how many are kept -- is exercised only at this small scale here;
+    // see the report's concerns for the untested large-N boundary.)
+    expect(ordered).toEqual([cloneIds[2], cloneIds[0], cloneIds[3], cloneIds[1]]);
   });
 });
 

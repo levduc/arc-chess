@@ -201,7 +201,8 @@ describe("ArenaDaemon core", () => {
     expect(listed.map((c) => c.channelId).sort()).toEqual([...ids].sort());
     expect(listed.every((c) => "phase" in c && c.phase === "Finalized")).toBe(true);
     await expect(alice.daemon.move(ids[0], "e4", { actor: "agent" })).rejects.toThrow(/is settled/);
-    // After a restart (nothing cached, settled channels are never loaded), status is served from disk.
+    // After a restart, status is served from the settled index loaded at start() (Plan 5 Task 1) rather than from
+    // any cache carried over from the old process (there is none -- each ArenaDaemon starts with an empty one).
     await alice.daemon.stop();
     const again = new ArenaDaemon({
       home: alice.home,

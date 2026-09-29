@@ -27,6 +27,10 @@ export type ChannelRecord = {
    *  channel not finalized yet, or finalized but not yet swept (including every record written before this
    *  feature existed -- `arena sweep`/`POST /sweep` picks those up too). */
   swept?: true | "dust";
+  /** Plan 5 Task 1 (mainnet gates: settled index): wall-clock ms at which this channel was first seen finalized,
+   *  set alongside `finalized`. Used to sort the settled index loaded at `start()` by settle time, newest first.
+   *  Absent in records written before this field existed (sorts as the oldest). */
+  settledAt?: number;
 };
 
 /** One entry of `channels/`: its record, or why it could not be read. */

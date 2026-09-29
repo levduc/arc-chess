@@ -294,6 +294,9 @@ export class ArenaDaemon {
     // I1: every channel entry is loaded in isolation. A corrupt record or session file, or a record that does not
     // match this hub/chain, is logged and reported as degraded (see channels()) instead of aborting start() —
     // which would leave every other channel, including ones mid-dispute, unwatched.
+    // Plan 5 Task 1 (mainnet gates: settled index): finalized records collected here, loaded into `this.settled`
+    // below (once the whole scan is done, so it can be sorted by settle time and capped first).
+    const finalizedRecords: ChannelRecord[] = [];
     for (const entry of this.records.scanChannels()) {
       if (this.stopped) break;
       if (entry.record === null) {
@@ -305,7 +308,10 @@ export class ArenaDaemon {
       if (typeof entry.record.offerId === "string") {
         this.offerIdIndex.set(entry.record.offerId.toLowerCase() as Hex, entry.record.channelId);
       }
-      if (entry.record.finalized) continue;
+      if (entry.record.finalized) {
+        finalizedRecords.push(entry.record);
+        continue;
+      }
       try {
         await this.openChannel(entry.record);
       } catch (err) {
@@ -315,6 +321,15 @@ export class ArenaDaemon {
       }
     }
     if (this.stopped) return;
+    // Plan 5 Task 1: the settled index -- newest `SETTLED_CACHE_MAX` finalized channels by `settledAt` (a record
+    // with none, written before this field existed, sorts as the oldest). Older ones are still served from disk
+    // by `status`/`settledStatus`, just not listed by `channels()`.
+    finalizedRecords.sort((a, b) => (b.settledAt ?? 0) - (a.settledAt ?? 0));
+    for (const record of finalizedRecords.slice(0, SETTLED_CACHE_MAX)) {
+      if (this.stopped) return;
+      const status = await this.loadSettledStatus(record).catch(() => null);
+      if (status) this.settled.set(record.channelId, status);
+    }
     // Plan 4.5 Task 10 re-review (C1): the timer is armed before anything else can wait. start() used to await a
     // first full tick first -- so a main pass stalled on a receipt wait right after a restart held back every
     // dispute pass (and start() itself, with the API behind it) until it finished. Re-review 2 (minor 7): before
@@ -1487,19 +1502,10 @@ export class ArenaDaemon {
     }
   }
 
-  /** Final review I3: the status of a settled channel no longer in `live` -- its cached final status, or, for one
-   *  evicted before this process started (or pushed out of the cache), rebuilt from its files on disk. */
-  private async settledStatus(ref: string): Promise<ChannelStatus | null> {
-    const want = ref.toLowerCase();
-    const cached = [...this.settled.values()].filter((st) => st.channelId.toLowerCase().startsWith(want));
-    if (cached.length === 1) return cached[0];
-    if (cached.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
-    const recs = this.records.channels().filter((r) => r.finalized && r.channelId.toLowerCase().startsWith(want));
-    if (recs.length !== 1) {
-      if (recs.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
-      return null;
-    }
-    const record = recs[0];
+  /** Final review I3 / Plan 5 Task 1: rebuilds a finalized channel's status from its files on disk (no chain
+   *  reads) -- used both by `settledStatus`'s disk fallback and by `start()`'s settled index. Null for a record
+   *  with no session snapshot, or one for another hub/chain (see `openChannel`'s identical check). */
+  private async loadSettledStatus(record: ChannelRecord): Promise<ChannelStatus | null> {
     // Read only: restored into a memory store (open() would create a session file if there were none).
     const snapshot = await new FileSessionStore(arenaPaths(this.opts.home).channelSession(record.channelId)).load();
     if (!snapshot) return null;
@@ -1524,6 +1530,21 @@ export class ArenaDaemon {
         }
       : null;
     return buildStatus({ record, snapshot: session.snapshot(), myTurn: session.isMyTurn(), chain, lastError: null });
+  }
+
+  /** Final review I3: the status of a settled channel no longer in `live` -- its cached final status, or, for one
+   *  evicted before this process started (or pushed out of the cache), rebuilt from its files on disk. */
+  private async settledStatus(ref: string): Promise<ChannelStatus | null> {
+    const want = ref.toLowerCase();
+    const cached = [...this.settled.values()].filter((st) => st.channelId.toLowerCase().startsWith(want));
+    if (cached.length === 1) return cached[0];
+    if (cached.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+    const recs = this.records.channels().filter((r) => r.finalized && r.channelId.toLowerCase().startsWith(want));
+    if (recs.length !== 1) {
+      if (recs.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+      return null;
+    }
+    return this.loadSettledStatus(recs[0]);
   }
 
   /** Runs one pass over one channel. `pass` resolves true when it did that channel's full work for its phase. */
@@ -1588,7 +1609,8 @@ export class ArenaDaemon {
     // Final review m4: an agent waiting after its close (or on a dispute) is woken once by the settlement. A channel
     // retired without our deposit (None/Funding) never opened: nothing to report.
     if (phase === "Finalized" || phase === "Reclaimed") l.settledWake = true;
-    l.record = { ...l.record, finalized: true, finalPhase: phase };
+    // Plan 5 Task 1 (mainnet gates: settled index): recorded so the index start() loads can sort by settle time.
+    l.record = { ...l.record, finalized: true, finalPhase: phase, settledAt: Date.now() };
     this.records.saveChannel(l.record);
     this.opts.relay.leave(l.record.channelId);
   }
