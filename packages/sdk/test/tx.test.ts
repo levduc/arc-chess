@@ -27,6 +27,7 @@ import {
   SerialTxSender,
   TxDroppedError,
   TxStuckError,
+  TxWaitAbortedError,
   isNonceUsedError,
   waitOrReplace,
   type ReceiptClient,
@@ -655,5 +656,19 @@ describe("HubClient.write reports the transaction that actually reverted (re-rev
     const err = await new HubClient(TO, client).timeout(n.sender, h(1), { receiptTimeoutMs: 10 }).catch((e) => e);
     expect(err).toBeInstanceOf(HubRevertError);
     expect(String((err as Error).message)).toContain(replacement!); // before: the original's hash
+  });
+});
+
+describe("waitOrReplace can be aborted (re-review 2, minor 5)", () => {
+  it("an aborted signal ends the wait at once, with no replacement", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 50);
+    const t0 = Date.now();
+    const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 5_000, signal: ctl.signal }).catch((e) => e);
+    expect(err).toBeInstanceOf(TxWaitAbortedError);
+    expect(Date.now() - t0).toBeLessThan(1_000); // before: the full 5 s round, then replacements
+    expect(n.sent).toHaveLength(1);
   });
 });

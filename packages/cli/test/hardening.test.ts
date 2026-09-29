@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-import type { Hex } from "viem";
+import { TransactionReceiptNotFoundError, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
@@ -1026,5 +1026,24 @@ describe("Plan 4.5 Task 10 re-review 2: a stuck respond is replaced by the next 
     }
     expect((await alice.daemon.hub.registeredState(id)).turnNum).toBe(3n);
     expect((await alice.daemon.hub.disputeEvents(id)).filter((e) => e.kind === "Responded")).toHaveLength(1);
+  });
+});
+
+describe("Plan 4.5 Task 10 re-review 2 (minor 5): stop() aborts receipt waits", () => {
+  it("a daemon stopped while its main pass waits for a receipt stops at once, not after the 30 s round", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    // Alice's node never returns a receipt: every wait of hers runs its full 30 s round.
+    alice.daemon.client.getTransactionReceipt = (async ({ hash }: { hash: Hex }) => {
+      throw new TransactionReceiptNotFoundError({ hash });
+    }) as typeof alice.daemon.client.getTransactionReceipt;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "match");
+    await new Promise((r) => setTimeout(r, 1_500)); // her funding pass is now inside a receipt wait
+    const t0 = Date.now();
+    await alice.daemon.stop();
+    expect(Date.now() - t0).toBeLessThan(3_000); // before: stop() waited for the pass, i.e. the rest of the round
   });
 });

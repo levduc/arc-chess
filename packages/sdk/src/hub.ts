@@ -131,12 +131,16 @@ export type WriteOptions = {
   nonce?: number;
   /** Wall-clock ms past which the receipt wait neither replaces nor waits (a dispute deadline; see waitOrReplace). */
   giveUpAt?: number;
+  /** Aborts the receipt wait (TxWaitAbortedError). */
+  signal?: AbortSignal;
 };
 
 export class HubClient {
+  /** `defaults` apply to every write unless the call overrides them (e.g. a daemon's stop `signal`). */
   constructor(
     readonly hub: Address,
     readonly client: PublicClient,
+    private readonly defaults: WriteOptions = {},
   ) {}
 
   approve(sender: TxSender, token: Address, amount: bigint, opts?: WriteOptions): Promise<TransactionReceipt> {
@@ -371,7 +375,8 @@ export class HubClient {
    * between the simulate and the send (e.g. two players racing the same cooperative close): a revert the sender's
    * own gas estimate hits is reported as a HubRevertError too, named when decodable, never as a raw viem error.
    */
-  private async write(sender: TxSender, to: Address, data: Hex, opts: WriteOptions = {}): Promise<TransactionReceipt> {
+  private async write(sender: TxSender, to: Address, data: Hex, callOpts: WriteOptions = {}): Promise<TransactionReceipt> {
+    const opts: WriteOptions = { ...this.defaults, ...callOpts };
     try {
       await this.client.call({ account: sender.address, to, data });
     } catch (err) {
@@ -395,7 +400,12 @@ export class HubClient {
     // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
     let receipt: TransactionReceipt;
     try {
-      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, { timeoutMs: opts.receiptTimeoutMs, nonce, giveUpAt: opts.giveUpAt });
+      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, {
+        timeoutMs: opts.receiptTimeoutMs,
+        nonce,
+        giveUpAt: opts.giveUpAt,
+        signal: opts.signal,
+      });
     } catch (err) {
       // A replacement send can revert too (Plan 4.5 Task 10 re-review I1): classified like the original send.
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);

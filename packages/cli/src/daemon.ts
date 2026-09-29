@@ -163,6 +163,7 @@ export class ArenaDaemon {
    *  next tick. The host sends a match once per subscription, so without a retry one failed read at match time
    *  left the channel unopened (and unfunded) for good. Explicit rejections are never retried. */
   private readonly retryMatches = new Map<Hex, MatchEvent>();
+  private readonly aborter = new AbortController();
   /** Plan 4.5 Task 10 re-review (M5): failed attempts to open a recorded channel, by channel id. */
   private readonly openFailures = new Map<Hex, number>();
 
@@ -175,7 +176,8 @@ export class ArenaDaemon {
       rpcUrls: { default: { http: [c.rpcUrl] } },
     });
     this.client = createPublicClient({ chain: this.chain, transport: http(c.rpcUrl) });
-    this.hub = new HubClient(c.hub, this.client);
+    // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
+    this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 re-review 2): each knows its outstanding transaction, read via this.client.
     this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client);
     this.domain = { chainId: c.chainId, hub: c.hub };
@@ -233,6 +235,8 @@ export class ArenaDaemon {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
+    // Receipt waits in flight end now (TxWaitAbortedError); their transactions stay outstanding in the senders.
+    this.aborter.abort();
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
     while (this.ticking) await new Promise((r) => setTimeout(r, 10));
@@ -649,7 +653,7 @@ export class ArenaDaemon {
         // dropped or ended stuck replaces it at its nonce (Plan 4.5 Task 10 re-review 2), so it is paid at most once.
         const sent = await this.wallet.sendWithNonce(req);
         // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
-        await waitOrReplace(this.client, this.wallet, req, sent.hash, { nonce: sent.nonce });
+        await waitOrReplace(this.client, this.wallet, req, sent.hash, { nonce: sent.nonce, signal: this.aborter.signal });
       }
     }
     if (this.stopped) return;

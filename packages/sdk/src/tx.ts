@@ -324,6 +324,19 @@ export class TxStuckError extends Error {
   }
 }
 
+/** The wait was aborted (its `signal`, e.g. a daemon stopping): nothing more is sent or awaited. The transaction is
+ *  left as it was -- a tracking SerialTxSender keeps it outstanding for its next send. */
+export class TxWaitAbortedError extends Error {
+  constructor(
+    readonly hashes: Hex[],
+    readonly nonce?: number,
+    readonly lastFees?: Fees,
+  ) {
+    super(`stopped waiting for transaction ${hashes.at(-1)}`);
+    this.name = "TxWaitAbortedError";
+  }
+}
+
 /** The subset of a viem PublicClient `waitOrReplace` uses (tests pass a stub). */
 export type ReceiptClient = Pick<
   PublicClient,
@@ -360,6 +373,8 @@ export async function waitOrReplace(
     /** Wall-clock ms (Plan 4.5 Task 10 re-review I2): no replacement is sent and no wait runs past it -- e.g. a
      *  respond's dispute deadline, after which the transaction can no longer help. */
     giveUpAt?: number;
+    /** Aborts the wait (Plan 4.5 Task 10 re-review 2): e.g. a daemon's stop() must not wait out a 30 s round. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<TransactionReceipt> {
   const timeoutMs = opts.timeoutMs ?? RECEIPT_TIMEOUT_MS;
@@ -391,6 +406,19 @@ export async function waitOrReplace(
     }
     return null;
   };
+  const aborted = () => opts.signal?.aborted === true;
+  /** Sleeps `ms`, or less if the signal aborts meanwhile. */
+  const nap = (ms: number) =>
+    new Promise<void>((resolve) => {
+      if (aborted()) return resolve();
+      const done = () => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      opts.signal?.addEventListener("abort", done, { once: true });
+    });
   for (let round = 0; ; round++) {
     const current = hashes[hashes.length - 1];
     // Plan 4.5 Task 10 re-review (M1): one round polls the receipts of every hash sent so far -- the original can
@@ -399,10 +427,11 @@ export async function waitOrReplace(
     for (let poll = 0; ; poll++) {
       const mined = await minedOne();
       if (mined) return mined;
+      if (aborted()) throw new TxWaitAbortedError(hashes, nonce, lastFees);
       const left = roundEnd - Date.now();
       if (left <= 0) break;
       // Quick first polls (a transaction is usually mined within a block or two), then every `pollMs`.
-      await new Promise((r) => setTimeout(r, Math.min(pollMs, 50 * 2 ** poll, left)));
+      await nap(Math.min(pollMs, 50 * 2 ** poll, left));
     }
     // The newest of our transactions the node still knows (an older one may outlive a dropped replacement).
     let pending: Awaited<ReturnType<typeof lookup>> = null;

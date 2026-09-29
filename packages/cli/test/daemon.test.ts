@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
-import { HubRevertError, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
+import { HubClient, HubRevertError, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
 import { DaemonError, type ArenaDaemon } from "../src/index.js";
 import { increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
@@ -223,7 +223,8 @@ describe("watchtower", () => {
     await alice.daemon.stop();
     // A misbehaving Alice registers the stale state (sent directly, bypassing her stopped daemon); Bob's
     // watchtower must answer with turn 2.
-    await alice.daemon.hub.challenge(alice.daemon.handle(id).sessionSender, stale);
+    // (A client of its own: a stopped daemon's HubClient aborts its receipt waits.)
+    await new HubClient(alice.daemon.hub.hub, alice.daemon.client).challenge(alice.daemon.handle(id).sessionSender, stale);
     await waitFor(async () => (await bob.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "respond");
     expect((await bob.daemon.hub.registeredState(id)).turnNum).toBe(2n);
     const responded = (await bob.daemon.hub.disputeEvents(id)).find((e) => e.kind === "Responded");
