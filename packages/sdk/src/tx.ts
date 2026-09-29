@@ -173,6 +173,9 @@ export class TxInsufficientFundsError extends Error {
 export const FEE_CAP_MULTIPLIER = 4n;
 /** Default `feeCeiling` (per gas): the cap is never below it, so a quiet chain still leaves room to bump. */
 export const DEFAULT_FEE_CEILING_WEI = 100n * 10n ** 9n;
+/** A `feeCeiling` that never binds: only the balance bound caps the fee. For session keys, whose dispute
+ *  transactions (respond, timeout) must never be refused by a fee cap below what the key can pay (round 5). */
+export const NO_FEE_CEILING = 2n ** 128n;
 
 export type SerialTxSenderOptions = {
   /** The cap is max(FEE_CAP_MULTIPLIER x the current estimate, feeCeiling) per gas, on both fee fields. */
@@ -203,7 +206,8 @@ export class SerialTxSender implements TxSender, TxTracker {
   private tail: Promise<unknown> = Promise.resolve();
   private readonly entries = new Map<number, Entry>();
   private readonly reader: TrackerClient | undefined;
-  private readonly feeCeiling: bigint;
+  /** max(4 x the estimate, this) caps every fee this sender pays (see SerialTxSenderOptions). */
+  readonly feeCeiling: bigint;
 
   constructor(
     private readonly inner: TxSender,
@@ -316,8 +320,22 @@ export class SerialTxSender implements TxSender, TxTracker {
           break;
         }
       }
+      // Round 5 (I1): a released transaction the node no longer holds (dropped, or the pool was flushed) has no
+      // price to outbid. Its last fees are forgotten, so the next send at its nonce is priced from the market --
+      // not bumped over fees that may already sit at the cap.
+      if (this.entries.get(e.nonce) === e && e.state === "released" && hasFees(e.lastFees)) {
+        if (pending <= e.nonce || !(await this.knowsAny(reader, e))) e.lastFees = {};
+      }
     }
     return { confirmed: Math.max(latest, this.minedBelow), pending };
+  }
+
+  private async knowsAny(reader: TrackerClient, e: Entry): Promise<boolean> {
+    for (const h of e.hashes) {
+      const t = await reader.getTransaction({ hash: h }).catch(() => null);
+      if (t) return true;
+    }
+    return false;
   }
 
   /** A new intent at a nonce nobody tracks: max(the pending count, the highest tracked nonce + 1). */

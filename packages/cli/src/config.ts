@@ -19,7 +19,7 @@ export type ArenaConfig = {
   pollMs: number;
   /** I3: max block span per `getLogs` call when scanning dispute events (real RPCs cap the range). */
   logChunkBlocks?: number;
-  /** Plan 4.5 Task 10 round 4: the fee ceiling per gas of the wallet's and session keys' senders. A replacement
+  /** Plan 4.5 Task 10 round 4: the fee ceiling per gas of the wallet's sender (session keys have none: round 5). A replacement
    *  never pays more than max(4 x the node's estimate, this); default the SDK's DEFAULT_FEE_CEILING_WEI. */
   feeCeilingWei?: bigint;
 };

@@ -8,6 +8,7 @@ import {
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
+  NO_FEE_CEILING,
   RECEIPT_TIMEOUT_MS,
   SerialTxSender,
   TxDroppedError,
@@ -191,7 +192,7 @@ export class ArenaDaemon {
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
-    // Round 4: every replacement is capped at max(4 x the node's estimate, feeCeilingWei) and what the key can pay.
+    // Round 4: every fee the wallet pays is capped at max(4 x the node's estimate, feeCeilingWei) and what it can pay.
     this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client, {
       feeCeiling: c.feeCeilingWei,
     });
@@ -571,7 +572,9 @@ export class ArenaDaemon {
     const sessionSender = new SerialTxSender(
       new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
       this.client,
-      { feeCeiling: this.opts.config.feeCeilingWei },
+      // Round 5: dispute transactions are never refused by a fee ceiling -- only what the session key can pay
+      // (its balance) bounds them. The wallet keeps the configured ceiling.
+      { feeCeiling: NO_FEE_CEILING },
     );
     const signer = privateKeyToAccount(record.sessionKey);
     const l: ChannelHandle = {

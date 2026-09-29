@@ -11,6 +11,8 @@ import {
   LocalKeyTxSender,
   TxDroppedError,
   TxNonceUsedError,
+  NO_FEE_CEILING,
+  DEFAULT_FEE_CEILING_WEI,
   buildParams,
   hashState,
   offerId as computeOfferId,
@@ -1195,3 +1197,12 @@ async function idleDispute(h: { disputeBusy: boolean }): Promise<void> {
   await waitFor(() => !h.disputeBusy, 5_000, "no dispute pass in flight");
   h.disputeBusy = true;
 }
+
+describe("Plan 4.5 Task 10 round 5 (I1): dispute intents are never refused by a fee ceiling", () => {
+  it("session-key senders have no fee ceiling (only their balance bounds them); the wallet keeps the configured one", async () => {
+    const { alice, id } = await matched();
+    const ceiling = (s: unknown) => (s as { feeCeiling: bigint }).feeCeiling;
+    expect(ceiling(alice.daemon.handle(id).sessionSender)).toBe(NO_FEE_CEILING); // before: the wallet's 100 gwei
+    expect(ceiling(alice.daemon.wallet)).toBe(loadConfig(alice.home).feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI);
+  });
+});

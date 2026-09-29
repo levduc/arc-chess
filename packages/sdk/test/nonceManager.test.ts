@@ -15,6 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { TransactionNotFoundError, TransactionReceiptNotFoundError, type Hex, type TransactionReceipt } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import * as sdk from "../src/index.js";
 import {
   LocalKeyTxSender,
   SerialTxSender,
@@ -500,5 +501,44 @@ describe("round 5, C1: every untracked pending nonce is adopted, not only while 
     // Before: the re-sent top-up adopted nonce 0 and the next intent went fresh to 2, so both top-ups landed.
     expect(n.landed.filter((t) => t.value === 7n)).toHaveLength(1);
     expect(n.pool.size).toBe(0);
+  });
+});
+
+describe("round 5, I1: a dropped transaction's old fees never block the key; session keys are capped by their balance only", () => {
+  it("E3: after an outage pushed the fees to the cap and the node dropped the pool, the next send goes out and lands", async () => {
+    const n = mempool();
+    const w = new SerialTxSender(n.inner, n.client, { feeCeiling: 0n }); // cap = 4 x 1000
+    n.state.market = 10n ** 9n; // nothing is included for a while
+    let last: unknown;
+    for (let i = 0; i < 20 && !(last instanceof TxFeeCapError); i++) {
+      last = await w.send({ to: to(3), data: "0xdd" }).catch((e: unknown) => e);
+      if (typeof last === "string") {
+        await waitOrReplace(n.client, w, { to: to(3), data: "0xdd" }, last as Hex, { timeoutMs: 5, pollMs: 2, maxReplacements: 1 }).catch(() => undefined);
+      }
+    }
+    expect(last).toBeInstanceOf(TxFeeCapError); // the outage reached the cap
+    n.pool.clear(); // the node restarts with an empty pool: nothing is pending at nonce 0 any more
+    n.state.market = 0n;
+    const h = await w.send({ to: to(4), data: "0xee" }).catch((e: unknown) => e);
+    // Before: TxFeeCapError on every send, forever -- the dropped transaction's last fees still had to be bumped.
+    expect(typeof h).toBe("string");
+    n.mine();
+    expect(n.landed.map((t) => t.data)).toEqual(["0xee"]);
+  });
+
+  it("a session-key sender (no fee ceiling) replaces above the wallet's cap, bounded only by its balance", async () => {
+    const n = mempool({ balance: 21_000n * 10_000n }); // it can pay at most 10000 per gas
+    const session = new SerialTxSender(n.inner, n.client, { feeCeiling: sdk.NO_FEE_CEILING });
+    const req: TxRequest = { to: to(1), data: "0x" };
+    let last: unknown;
+    for (let i = 0; i < 40 && !(last instanceof Error); i++) {
+      last = await session.send(req).catch((e: unknown) => e);
+      if (typeof last === "string") {
+        await waitOrReplace(n.client, session, req, last as Hex, { timeoutMs: 2, pollMs: 2, maxReplacements: 0 }).catch(() => undefined);
+      }
+    }
+    expect(n.attempts.some((t) => t.maxFeePerGas > 4_000n)).toBe(true); // above what a wallet (4 x estimate) may pay
+    expect(n.attempts.every((t) => t.maxFeePerGas * t.gas + t.value <= 21_000n * 10_000n)).toBe(true);
+    expect(last).toBeInstanceOf(TxInsufficientFundsError); // stopped by the balance, never by a fee cap
   });
 });
