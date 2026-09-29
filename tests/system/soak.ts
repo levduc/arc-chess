@@ -197,7 +197,12 @@ async function main(): Promise<void> {
   let exitCode = 0;
 
   const stack: Stack = await startStack({
-    serverOverrides: { limits: { wsPerIp: 128, maxOpenOffersPerIp: 128, httpPostBurst: 400 } },
+    // wsPerIp/maxOpenOffersPerIp/httpPostBurst per the Task 11 brief -- every daemon here shares 127.0.0.1, which a
+    // production deployment never would. httpPostPerSec is the same accommodation for a different limit: a real
+    // soak run's *sustained* POST rate (2 lobby POSTs per channel cycle, times every channel slot, continuously)
+    // exceeds the default 1/s once enough channels are churning, which the raised burst alone only postpones --
+    // the Task 11 report has the run that found this the hard way (a `POST /offers -> 500: rate limited`).
+    serverOverrides: { limits: { wsPerIp: 128, maxOpenOffersPerIp: 128, httpPostBurst: 400, httpPostPerSec: 50 } },
   });
 
   // Override the harness's own SIGINT/SIGTERM handlers (they kill everything and exit immediately, with no chance
