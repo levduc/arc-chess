@@ -444,6 +444,7 @@ export async function waitOrReplace(
     };
     try {
       hashes.push(await sender.send(replacement));
+      lastSendError = undefined; // a later replacement went out: an earlier one's failure no longer explains anything
     } catch (err) {
       // e.g. "nonce too low": the original was mined after all
       const r = await minedOne();

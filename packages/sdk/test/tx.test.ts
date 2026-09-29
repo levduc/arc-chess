@@ -615,3 +615,21 @@ describe("a replacement that would revert against the pending state (Task 10 re-
     }
   });
 });
+
+describe("waitOrReplace: an earlier replacement's failure is forgotten once a later one goes out (re-review 2, minor 1)", () => {
+  it("replacement 1 reverts, 2 and 3 are sent: the result is TxStuckError, not that revert", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const realSend = n.sender.send.bind(n.sender);
+    let replacements = 0;
+    n.sender.send = async (tx) => {
+      if (tx.nonce !== undefined && ++replacements === 1) {
+        throw new ExecutionRevertedError({ cause: new BaseError("execution reverted", { details: "execution reverted" }) });
+      }
+      return realSend(tx);
+    };
+    const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, { timeoutMs: 10, pollMs: 5 }).catch((e) => e);
+    expect(replacements).toBe(3);
+    expect(err).toBeInstanceOf(TxStuckError); // before: the stale revert of replacement 1
+  });
+});
