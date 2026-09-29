@@ -850,19 +850,19 @@ describe("Plan 4.5 Task 10 re-review (I3): the session-gas top-up is never paid 
     cleanups.push(pair.cleanup);
     const { alice, bob } = pair;
     const wallet = alice.daemon.wallet;
-    const real = wallet.sendWithNonce.bind(wallet);
-    const topUps: Array<number | undefined> = [];
+    const real = wallet.send.bind(wallet);
+    const topUps: Hex[] = [];
     let sessionAddr: string | undefined;
-    wallet.sendWithNonce = async (tx) => {
-      if (tx.value === undefined || tx.data !== "0x") return real(tx);
-      topUps.push(tx.nonce);
+    wallet.send = async (tx) => {
+      if (tx.value === undefined || tx.data !== "0x" || tx.nonce !== undefined) return real(tx);
       sessionAddr = tx.to;
-      const sent = await real({ ...tx, nonce: undefined });
+      const hash = await real(tx);
+      topUps.push(hash);
       if (topUps.length === 1) {
-        await alice.daemon.client.waitForTransactionReceipt({ hash: sent.hash });
-        throw new TxDroppedError(sent.hash, sent.nonce); // it landed, but was reported dropped
+        await alice.daemon.client.waitForTransactionReceipt({ hash });
+        throw new TxDroppedError(hash); // it landed, but was reported dropped
       }
-      return sent;
+      return hash;
     };
     const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await bob.daemon.acceptOffer(offerId);

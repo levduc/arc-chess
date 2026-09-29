@@ -335,27 +335,22 @@ describe("waitOrReplace: drops, nonces and the replacement contract (Task 10 re-
     expect((err as TxDroppedError).nonce).toBe(9);
   });
 
-  it("HubClient.write records the nonce at send time and sends at a nonce it is given", async () => {
+  it("HubClient.write sends without a nonce (round 4: the sender picks it) and reports a dropped write", async () => {
     const n = stubNode();
-    const seen: Array<number | undefined> = [];
     const sender: TxSender = {
       address: n.sender.address,
-      send: n.sender.send,
-      async sendWithNonce(tx) {
-        seen.push(tx.nonce);
-        const nonce = tx.nonce ?? 11;
-        const hash = await n.sender.send({ ...tx, nonce });
+      async send(tx) {
+        expect(tx.nonce).toBeUndefined();
+        const hash = await n.sender.send({ ...tx, nonce: 11 });
         n.pool.delete(hash); // dropped at once
-        return { hash, nonce };
+        return hash;
       },
     };
     const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
     const hub = new HubClient(TO, client);
-    const first = await hub.timeout(sender, h(1), { receiptTimeoutMs: 10 }).catch((e) => e);
-    expect(first).toBeInstanceOf(TxDroppedError);
-    expect((first as TxDroppedError).nonce).toBe(11); // before: undefined -- the resend would take a fresh nonce
-    await hub.timeout(sender, h(1), { receiptTimeoutMs: 10, nonce: (first as TxDroppedError).nonce }).catch(() => undefined);
-    expect(seen).toEqual([undefined, 11]);
+    const err = await hub.timeout(sender, h(1), { receiptTimeoutMs: 10 }).catch((e) => e);
+    expect(err).toBeInstanceOf(TxDroppedError);
+    expect((err as TxDroppedError).nonce).toBeUndefined(); // an untracked sender: the node no longer knows it
   });
 
   it("a sender that declares supportsReplacement = false is never replaced: it only waits, bounded, then reports", async () => {
@@ -366,18 +361,17 @@ describe("waitOrReplace: drops, nonces and the replacement contract (Task 10 re-
     expect(n.sent).toHaveLength(1); // before the fix: 3 replacements it could not honour
   });
 
-  it("SerialTxSender(LocalKeyTxSender).sendWithNonce picks the pending nonce and honours a given one (Anvil)", async () => {
+  it("SerialTxSender(LocalKeyTxSender) picks the pending nonce itself; a replacement at a used nonce is refused (Anvil)", async () => {
     const key = generatePrivateKey();
     const address = privateKeyToAccount(key).address;
     await setEthBalance(address, 10n ** 18n);
     const sender = new SerialTxSender(new LocalKeyTxSender(key, RPC, CHAIN));
     const pub = publicClient();
-    const a = await sender.sendWithNonce({ to: TO, data: "0x", value: 1n });
-    expect(a.nonce).toBe(0);
-    expect((await pub.getTransaction({ hash: a.hash })).nonce).toBe(0);
-    const b = await sender.sendWithNonce({ to: TO, data: "0x", value: 1n });
-    expect(b.nonce).toBe(1);
-    await expect(sender.sendWithNonce({ to: TO, data: "0x", value: 1n, nonce: 1 })).rejects.toThrow(/nonce/i); // used
+    const a = await sender.send({ to: TO, data: "0x", value: 1n });
+    expect((await pub.getTransaction({ hash: a })).nonce).toBe(0);
+    const b = await sender.send({ to: TO, data: "0x", value: 1n });
+    expect((await pub.getTransaction({ hash: b })).nonce).toBe(1);
+    await expect(sender.send({ to: TO, data: "0x", value: 1n, nonce: 1 })).rejects.toThrow(/nonce/i); // used
   });
 });
 
@@ -521,47 +515,47 @@ describe("SerialTxSender tracks its outstanding transaction (Task 10 re-review 2
       expect(await pub.getBalance({ address: to })).toBe(3n);
     }));
 
-  it("a shared wallet: a send pre-empts another channel's pending transaction, which sees a drop, resends, and lands once", () =>
+  it("round 4, invariant 1: a send while another transaction's wait is active never pre-empts it; both land", () =>
     manual(async () => {
       const { sender } = await fresh();
       const pub = publicClient();
       const [x, y] = [recipient(), recipient()];
       const forA: TxRequest = { to: x, data: "0x", value: 1n }; // channel A's transaction
-      const forB: TxRequest = { to: y, data: "0x", value: 1n }; // channel B's, sent while A's is still pending
+      const forB: TxRequest = { to: y, data: "0x", value: 1n }; // channel B's, sent while A's wait is active
       const a = await sender.send(forA);
-      const b = await sender.send(forB); // replaces A's at its nonce
-      expect((await pub.getTransaction({ hash: b })).nonce).toBe(0);
+      const waitA = waitOrReplace(pub, sender, forA, a, { timeoutMs: 5_000, pollMs: 100 }).catch((e) => e);
+      await nap(150); // A's wait is polling
+      const b = await sender.send(forB);
+      // Round 3 sent B at A's nonce 0 and knocked A's healthy transaction out of the pool.
+      expect((await pub.getTransaction({ hash: b })).nonce).toBe(1);
       await anvil("evm_setIntervalMining", [1]); // the chain goes on
-      const waitA = waitOrReplace(pub, sender, forA, a, { timeoutMs: 3_000, pollMs: 100 }).catch((e) => e);
       await waitOrReplace(pub, sender, forB, b, { timeoutMs: 5_000, pollMs: 100 });
-      expect(await waitA).toBeInstanceOf(TxDroppedError); // A's was pre-empted...
-      const a2 = await sender.send(forA); // ...so A's next pass sends it again, at a fresh nonce (B's landed)
-      expect((await pub.getTransaction({ hash: a2 })).nonce).toBe(1);
-      await waitOrReplace(pub, sender, forA, a2, { timeoutMs: 5_000, pollMs: 100 });
+      expect(((await waitA) as TransactionReceipt).transactionHash).toBe(a);
       expect(await pub.getBalance({ address: x })).toBe(1n); // each landed exactly once
       expect(await pub.getBalance({ address: y })).toBe(1n);
-      expect(sender.outstanding).toBeNull();
+      expect(sender.tracked()).toEqual([]);
     }));
 
-  it("a nonce-used error clears the outstanding transaction and the send is retried once at a fresh nonce", async () => {
+  it("round 4: a fresh send whose nonce turns out used (a pure count race) is retried once at the next nonce", async () => {
     const { key, address } = await fresh();
     const pub = publicClient();
     const inner = new LocalKeyTxSender(key, RPC, CHAIN);
-    // A reader that never sees the first transaction confirmed, so the tracker tries to reuse its (used) nonce.
+    // Nonce 0 is used by a send this tracker never saw, and its reader's counts lag behind it.
+    const h0 = await inner.send({ to: recipient(), data: "0x", value: 1n });
+    await pub.waitForTransactionReceipt({ hash: h0 });
     const blind = {
-      getTransactionReceipt: async ({ hash }: { hash: Hex }) => {
-        throw new TransactionReceiptNotFoundError({ hash });
-      },
+      getTransactionReceipt: pub.getTransactionReceipt.bind(pub),
       getTransactionCount: async () => 0,
       getTransaction: pub.getTransaction.bind(pub),
       estimateFeesPerGas: pub.estimateFeesPerGas.bind(pub),
+      estimateGas: pub.estimateGas.bind(pub),
+      getBalance: pub.getBalance.bind(pub),
     } as unknown as TrackerClient;
     const sender = new SerialTxSender(inner, blind);
-    const h1 = await sender.send({ to: recipient(), data: "0x", value: 1n }); // automine: mined at nonce 0
+    const h1 = await sender.send({ to: recipient(), data: "0x", value: 1n }); // 0 is refused, then nonce 1
     await pub.waitForTransactionReceipt({ hash: h1 });
-    const h2 = await sender.send({ to: recipient(), data: "0x", value: 1n }); // reuse of 0 fails, then nonce 1
-    expect((await pub.getTransaction({ hash: h2 })).nonce).toBe(1);
-    expect(sender.outstanding?.nonce).toBe(1);
+    expect((await pub.getTransaction({ hash: h1 })).nonce).toBe(1);
+    expect(sender.tracked().map((t) => t.nonce)).toEqual([1]);
     expect(await pub.getTransactionCount({ address })).toBe(2);
   });
 

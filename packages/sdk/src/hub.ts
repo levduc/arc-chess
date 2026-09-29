@@ -126,9 +126,6 @@ function isSendRevert(err: unknown): boolean {
  *  write passes less when its deadline is closer (see `waitOrReplace`). */
 export type WriteOptions = {
   receiptTimeoutMs?: number;
-  /** Send at this nonce: the resend of a transaction reported dropped (`TxDroppedError.nonce`), so that if it was not
-   *  really dropped at most one of the two lands (Plan 4.5 Task 10 re-review I3). */
-  nonce?: number;
   /** Wall-clock ms past which the receipt wait neither replaces nor waits (a dispute deadline; see waitOrReplace). */
   giveUpAt?: number;
   /** Aborts the receipt wait (TxWaitAbortedError). */
@@ -387,14 +384,13 @@ export class HubClient {
       throw err;
     }
     let hash: Hex;
-    let nonce: number | undefined;
     try {
-      // The nonce is recorded at send time: a TxDroppedError carries it, for the caller's resend.
-      const req = { to, data, ...(opts.nonce !== undefined ? { nonce: opts.nonce } : {}) };
-      ({ hash, nonce } = sender.sendWithNonce ? await sender.sendWithNonce(req) : { hash: await sender.send(req), nonce: opts.nonce });
+      // No nonce: a tracking sender (SerialTxSender) picks it, and replaces its own released transaction if any.
+      hash = await sender.send({ to, data });
     } catch (err) {
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
-      // not a revert (RPC down, nonce, gas allowance, a non-viem sender's own failure): the caller sees it unchanged
+      // not a revert (RPC down, a used nonce (TxNonceUsedError), the fee cap or the balance (TxFeeCapError,
+      // TxInsufficientFundsError), a non-viem sender's own failure): the caller sees it unchanged
       throw err;
     }
     // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
@@ -402,7 +398,6 @@ export class HubClient {
     try {
       receipt = await waitOrReplace(this.client, sender, { to, data }, hash, {
         timeoutMs: opts.receiptTimeoutMs,
-        nonce,
         giveUpAt: opts.giveUpAt,
         signal: opts.signal,
       });

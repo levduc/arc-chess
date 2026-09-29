@@ -178,7 +178,7 @@ export class ArenaDaemon {
     this.client = createPublicClient({ chain: this.chain, transport: http(c.rpcUrl) });
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
-    // Tracking senders (Plan 4.5 Task 10 re-review 2): each knows its outstanding transaction, read via this.client.
+    // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
     this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client);
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
@@ -237,7 +237,7 @@ export class ArenaDaemon {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
-    // Receipt waits in flight end now (TxWaitAbortedError); their transactions stay outstanding in the senders.
+    // Receipt waits in flight end now (TxWaitAbortedError); the senders release their transactions.
     this.aborter.abort();
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
@@ -646,16 +646,17 @@ export class ArenaDaemon {
       // I1: top up only the shortfall, and only while the session key is actually below the target — otherwise
       // a deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever.
       // Read afresh on every attempt, a resend after a reported drop included: a top-up that landed after all is
-      // never paid twice (and a resend goes out at the dropped attempt's nonce).
+      // never paid twice (and a resend replaces the dropped attempt at its nonce).
       const balance = await this.client.getBalance({ address: l.sessionSender.address });
       if (balance < this.opts.config.sessionGasWei) {
         if (this.stopped) return;
         const req = { to: l.sessionSender.address, data: "0x" as Hex, value: this.opts.config.sessionGasWei - balance };
-        // The wallet's sender tracks its outstanding transaction: a top-up re-sent after an earlier one was reported
-        // dropped or ended stuck replaces it at its nonce (Plan 4.5 Task 10 re-review 2), so it is paid at most once.
-        const sent = await this.wallet.sendWithNonce(req);
+        // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
+        // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
+        // paid at most once.
+        const hash = await this.wallet.send(req);
         // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
-        await waitOrReplace(this.client, this.wallet, req, sent.hash, { nonce: sent.nonce, signal: this.aborter.signal });
+        await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
       }
     }
     if (this.stopped) return;
@@ -746,8 +747,8 @@ export class ArenaDaemon {
     // Plan 4.5 Task 10 re-review (I2): past the deadline a respond can no longer help, so its wait stops there.
     const giveUpAt = Date.now() + Number(info.deadline > now ? info.deadline - now : 0n) * 1000;
     try {
-      // A respond that ended stuck stays outstanding in the session key's sender: the next dispute transaction
-      // (this respond again, or a timeout) replaces it at its nonce with higher fees (Plan 4.5 Task 10 re-review 2).
+      // A respond whose wait gave up is released by the session key's sender: the next dispute transaction (this
+      // respond again, or a timeout) replaces it at its nonce with higher fees (Plan 4.5 Task 10 round 4).
       await this.hub.respond(l.sessionSender, l.session.challengeProof(), {
         receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
         giveUpAt,
