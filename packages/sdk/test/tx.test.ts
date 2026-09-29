@@ -12,6 +12,8 @@ import {
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
   WaitForTransactionReceiptTimeoutError,
+  encodeFunctionData,
+  erc20Abi,
   type Hex,
   type PublicClient,
   type TransactionReceipt,
@@ -32,7 +34,7 @@ import {
   type TxRequest,
   type TxSender,
 } from "../src/index.js";
-import { CHAIN, RPC, deployArena, publicClient, setEthBalance } from "./helpers/chain.js";
+import { CHAIN, RPC, deployArena, mintUsdc, publicClient, setEthBalance } from "./helpers/chain.js";
 
 const h = (n: number): Hex => `0x${n.toString(16).padStart(64, "0")}`;
 const TO = "0x00000000000000000000000000000000000000aa" as const;
@@ -571,5 +573,45 @@ describe("SerialTxSender tracks its outstanding transaction (Task 10 re-review 2
     const broke = await poor.send({ to: recipient(), data: "0x", value: 1n }).catch((e) => e);
     expect(broke).toBeInstanceOf(Error);
     expect(isNonceUsedError(broke)).toBe(false);
+  });
+});
+
+describe("a replacement that would revert against the pending state (Task 10 re-review 2)", () => {
+  async function anvil<T = unknown>(method: string, params: unknown[]): Promise<T> {
+    const res = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    return ((await res.json()) as { result: T }).result;
+  }
+
+  it("is still sent: it carries its original's gas limit, and a new intent is estimated against the latest block", async () => {
+    const env = await deployArena();
+    const key = generatePrivateKey();
+    const address = privateKeyToAccount(key).address;
+    await setEthBalance(address, 10n ** 18n);
+    await mintUsdc(env.usdc, address, 1_000n);
+    const pub = publicClient();
+    const sender = new SerialTxSender(new LocalKeyTxSender(key, RPC, CHAIN));
+    // Moving the whole balance succeeds once: against a pending state that already holds it, it would revert.
+    const all: TxRequest = {
+      to: env.usdc,
+      data: encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [TO, 1_000n] }),
+    };
+    await anvil("evm_setAutomine", [false]);
+    try {
+      const h1 = await sender.send(all);
+      const stuck = await waitOrReplace(pub, sender, all, h1, { timeoutMs: 200, pollMs: 50, maxReplacements: 1 }).catch((e) => e);
+      // Before: the replacement's gas estimate reverted (pending state), so the wait ended in that revert.
+      expect(stuck).toBeInstanceOf(TxStuckError);
+      expect((stuck as TxStuckError).hashes).toHaveLength(2);
+      const again = await sender.send(all); // the next send of the same intent, at the stuck nonce
+      expect((await pub.getTransaction({ hash: again })).nonce).toBe(0);
+      await anvil("evm_mine", []);
+      expect((await pub.getTransactionReceipt({ hash: again })).status).toBe("success");
+    } finally {
+      await anvil("evm_setAutomine", [true]);
+    }
   });
 });

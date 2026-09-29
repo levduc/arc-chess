@@ -25,6 +25,9 @@ export type TxRequest = {
   maxFeePerGas?: bigint;
   maxPriorityFeePerGas?: bigint;
   gasPrice?: bigint;
+  /** Gas limit. A same-nonce replacement carries its original's (Plan 4.5 Task 10 re-review 2): estimating it
+   *  again would run against a pending state that already includes the original, where it can revert. */
+  gas?: bigint;
 };
 
 /** A sent transaction and, when the sender knows it, the nonce it was sent at. */
@@ -77,7 +80,13 @@ export class LocalKeyTxSender implements TxSender {
     return this.account.address;
   }
 
-  send(tx: TxRequest): Promise<Hex> {
+  async send(tx: TxRequest): Promise<Hex> {
+    // Gas is estimated here, against the latest block, unless given: some nodes (Anvil) estimate against the pending
+    // block by default, which already holds this account's stuck transaction -- a new intent replacing it at its
+    // nonce (see SerialTxSender) could then revert in estimation although it is valid.
+    const gas =
+      tx.gas ??
+      (await this.reader.estimateGas({ account: this.account.address, to: tx.to, data: tx.data, value: tx.value, blockTag: "latest" }));
     const fees =
       tx.gasPrice !== undefined
         ? { gasPrice: tx.gasPrice }
@@ -90,6 +99,7 @@ export class LocalKeyTxSender implements TxSender {
       to: tx.to,
       data: tx.data,
       value: tx.value,
+      gas,
       ...(tx.nonce !== undefined ? { nonce: tx.nonce } : {}),
       ...fees,
     } as Parameters<WalletClient["sendTransaction"]>[0]);
@@ -429,6 +439,7 @@ export async function waitOrReplace(
     const replacement: TxRequest = {
       ...req,
       nonce: pending.nonce,
+      gas: (pending as { gas?: bigint }).gas,
       ...replacementFees(lastFees, await estimateLike(client, lastFees)),
     };
     try {
