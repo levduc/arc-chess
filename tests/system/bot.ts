@@ -21,7 +21,18 @@ function statusPath(channelId?: Hex): string {
   return channelId ? `/status?channel=${channelId}` : "/status";
 }
 
-/** Polls `player`'s `/status` until `predicate` is true, or throws (with the last status seen) after `ms`. */
+/** Plan 4.5 Task 11: right after a match, the accepter's own daemon has already created its channel record (that's
+ *  how its channel id was found), but the offerer's daemon learns of the match asynchronously (a lobby event
+ *  delivered over its host connection, processed by `onMatch`) -- under load-test/soak levels of concurrency on a
+ *  shared daemon, that can lag long enough for a `/status` poll to land in the brief window before the record
+ *  exists, which the API reports as a 404 "unknown channel". That is a transient "not ready yet", not a real
+ *  failure, so it is retried like a false predicate. Anything else (a killed daemon refusing the connection, a 500,
+ *  a malformed response) still fails immediately -- unlike a missing-channel race, those never resolve themselves. */
+function isUnknownChannelError(err: unknown): boolean {
+  return err instanceof Error && /-> 404: unknown channel/.test(err.message);
+}
+
+/** Polls `player`'s `/status` until `predicate` is true, or throws (with the last status/error seen) after `ms`. */
 export async function waitStatus(
   player: Player,
   predicate: (s: Status) => boolean,
@@ -30,12 +41,22 @@ export async function waitStatus(
 ): Promise<Status> {
   const end = Date.now() + ms;
   let last: Status | undefined;
+  let lastErr: unknown;
   while (Date.now() < end) {
-    last = (await player.api("GET", statusPath(channelId))) as Status;
-    if (predicate(last)) return last;
+    try {
+      last = (await player.api("GET", statusPath(channelId))) as Status;
+      lastErr = undefined;
+      if (predicate(last)) return last;
+    } catch (err) {
+      if (!isUnknownChannelError(err)) throw err;
+      lastErr = err;
+    }
     await sleep(100);
   }
-  throw new Error(`waitStatus timed out after ${ms}ms; last status: ${JSON.stringify(last)}`);
+  throw new Error(
+    `waitStatus timed out after ${ms}ms; last status: ${JSON.stringify(last)}` +
+      (lastErr ? `; last error: ${String(lastErr)}` : ""),
+  );
 }
 
 /** Plays an exact sequence of moves, alternating between `white` and `black` based on whose turn it actually is
