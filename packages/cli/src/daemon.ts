@@ -253,10 +253,12 @@ export class ArenaDaemon {
     if (!this.stopped) void this.tick();
   }
 
+  /** Stops the daemon. Bounded by the transport timeouts of RPC calls already in flight (round 5, m3). */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
-    // Receipt waits in flight end now (TxWaitAbortedError); the senders release their transactions.
+    // Receipt waits in flight end now (TxWaitAbortedError); the senders release their transactions. stop() is then
+    // bounded by the RPC calls already in flight (viem's transport timeout and retries), not by any receipt wait.
     this.aborter.abort();
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];

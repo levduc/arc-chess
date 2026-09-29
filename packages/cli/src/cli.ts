@@ -12,7 +12,8 @@ export type CliIo = {
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--max-fee N] [--session-gas-wei N] [--poll-ms N] [--log-chunk-blocks N] [--fee-ceiling-wei N]
-       (missing chain settings are filled from the server's /templates and checked over the RPC)
+       (missing chain settings are filled from the server's /templates and checked over the RPC;
+        the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]

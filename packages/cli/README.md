@@ -30,6 +30,13 @@ server gets a warning on stderr, since anyone on the path could rewrite its answ
 `ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json`, `daemon.lock` and
 `channels/<id>/`. All of these files are mode 0600.
 
+**The daemon's wallet key (`--wallet-key`, or the one `init` generates) must not be used anywhere else.** The
+daemon manages that key's nonces itself: on start, and whenever it finds a pending transaction on the key that it
+did not send, it adopts that nonce and replaces the transaction with its own (Plan 4.5 Task 10). A transfer you send
+from the same key with another wallet can be replaced and never land. `--fee-ceiling-wei` sets the most the wallet
+pays per gas for a replacement (at least 4x the node's estimate; default 100 gwei); session keys have no ceiling
+and are bounded only by their balance.
+
 ## Running the daemon
 
     arena daemon        # or: arena daemon start
