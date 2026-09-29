@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, http, maxUint256, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, http, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -727,7 +727,7 @@ export class ArenaDaemon {
     }
   }
 
-  /** Approve once, give the session key gas for disputes, then deposit (spec §3.1, §5). */
+  /** Approve this deposit, give the session key gas for disputes, then deposit (spec §3.1, §5). */
   protected async fund(l: ChannelHandle): Promise<void> {
     if (this.stopped) return;
     const p = l.record.params;
@@ -743,7 +743,10 @@ export class ArenaDaemon {
     });
     if (allowance < p.deposit + p.feePerPlayer) {
       if (this.stopped) return;
-      await this.hub.approve(this.wallet, this.opts.config.usdc, maxUint256);
+      // Final review I2: exactly what this deposit pulls, never an unlimited allowance. The hub address may come from
+      // the host's /templates; a wrong or hostile "hub" given maxUint256 could take the whole wallet, not one deposit.
+      // Costs one approve per channel.
+      await this.hub.approve(this.wallet, this.opts.config.usdc, p.deposit + p.feePerPlayer);
     }
     if (this.stopped) return;
     if (this.opts.config.sessionGasWei > 0n) {

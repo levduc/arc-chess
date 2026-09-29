@@ -1,10 +1,10 @@
 import { randomBytes } from "node:crypto";
-import type { Hex } from "viem";
+import { erc20Abi, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
-import { HubClient, HubRevertError, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
+import { HubClient, HubRevertError, LocalKeyTxSender, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
 import { DaemonError, type ArenaDaemon } from "../src/index.js";
-import { increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { CHAIN, RPC, increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
@@ -45,6 +45,22 @@ describe("ArenaDaemon core", () => {
     expect(await usdcBalance(env.usdc, bob.address)).toBe(START - 1_000_000n - 5_000n);
     expect(alice.daemon.handle(id).record.me).toBe(0);
     expect(bob.daemon.handle(id).record.me).toBe(1);
+  });
+
+  it("final review I2: approves exactly deposit + fee per funding, never an unlimited allowance", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob, env } = pair;
+    const allowance = (owner: Hex) =>
+      alice.daemon.client.readContract({ address: env.usdc, abi: erc20Abi, functionName: "allowance", args: [owner, env.hub] });
+    // Alice already holds a larger allowance of her own: the daemon approves nothing and uses only what it needs.
+    await alice.daemon.hub.approve(new LocalKeyTxSender(alice.walletKey, RPC, CHAIN), env.usdc, 3_000_000n);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "funding");
+    expect(await allowance(bob.address)).toBe(0n); // approved exactly 1_000_000 + 5_000, all of it spent
+    expect(await allowance(alice.address)).toBe(3_000_000n - 1_005_000n); // the exact remainder of her own approval
   });
 
   it("C2 (Plan 4.5 Task 11 fix round): unwatches an offer once it is matched, on both sides", async () => {
