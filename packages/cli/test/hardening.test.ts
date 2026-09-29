@@ -1168,6 +1168,27 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     await waitFor(() => l.record.swept !== undefined, 20_000, "swept once both guards clear");
   });
 
+  it("fix round 2, important 2: sweep() (API path) also honours rule 1 -- never sweeps while a refill or the dispute pass is busy", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    (d as unknown as SweepableDaemon).sweepChannel = original; // restored, though sweep() bypasses it regardless
+    l.refilling = new Promise<void>(() => undefined); // never resolves: a refill genuinely stuck in flight
+    l.disputeBusy = true;
+    const before = await d.client.getBalance({ address: l.sessionSender.address });
+    try {
+      const result = await d.sweep(id);
+      expect(result.results[0].swept).toMatch(/^error:/);
+      expect(l.record.swept).toBeUndefined();
+      // The gas the refill is (ostensibly) still adding, or that the dispute pass may still need, is untouched.
+      expect(await d.client.getBalance({ address: l.sessionSender.address })).toBe(before);
+    } finally {
+      l.refilling = null;
+      l.disputeBusy = false;
+    }
+  });
+
   it("fix round I8/I9: sweep back-off reaches SWEEP_ABANDON_ATTEMPTS, marks swept: \"abandoned\", and unblocks eviction", async () => {
     const { alice, bob, id } = await matched();
     const original = await settleWithSweepDisabled(alice, bob, id);

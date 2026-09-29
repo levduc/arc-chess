@@ -1356,9 +1356,13 @@ export class ArenaDaemon {
     const wasAbandoned = record.swept === "abandoned";
     const l = this.live.get(id);
     if (l) {
+      // Fix round 2, important 2: the manual path must honour rule 1 too -- a refill or the dispute pass working
+      // this same session key is exactly the case rule 1 exists to keep the sweep away from, and `sweepOneNow`
+      // calls `runSweepAttempt` directly (not through `sweepChannel`, which already checks this).
+      const busy = () => l.mainBusy || l.refilling || l.disputeBusy;
       const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
-      while (l.mainBusy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
-      if (l.mainBusy) return { channelId: id, swept: "error: the watchtower is working on this channel: retry shortly" };
+      while (busy() && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
+      if (busy()) return { channelId: id, swept: "error: the watchtower is working on this channel: retry shortly" };
       l.mainBusy = true;
       try {
         const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(r), { force: true });
