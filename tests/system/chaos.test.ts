@@ -1023,16 +1023,18 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       };
       cleanups.push(restoreMining);
       let dropped: Hex | undefined;
+      let droppedNonce: number | undefined;
       let dropping = true;
       let minedByHand = 0;
       const dropper = (async () => {
         while (dropping && !dropped) {
           const pool = await rpc<{ pending: Record<string, Record<string, { hash: Hex; input: Hex }>> }>(s.rpcUrl, "txpool_content", []);
           const mine = Object.entries(pool.pending).find(([a]) => a.toLowerCase() === alice.address.toLowerCase())?.[1] ?? {};
-          const deposit = Object.values(mine).find((t) => t.input.startsWith("0x98b1e06a")); // ChannelHub.deposit
+          const deposit = Object.entries(mine).find(([, t]) => t.input.startsWith("0x98b1e06a")); // ChannelHub.deposit
           if (deposit) {
-            await rpc(s.rpcUrl, "anvil_dropTransaction", [deposit.hash]);
-            dropped = deposit.hash;
+            await rpc(s.rpcUrl, "anvil_dropTransaction", [deposit[1].hash]);
+            droppedNonce = Number(deposit[0]);
+            dropped = deposit[1].hash;
             await rpc(s.rpcUrl, "evm_setIntervalMining", [1]);
           } else if (Object.keys(pool.pending).length > 0) {
             await rpc(s.rpcUrl, "evm_mine", []);
@@ -1103,6 +1105,9 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       }
       const deposits = await pub.getContractEvents({ address: s.hub, abi: channelHubAbi, eventName: "Deposited", args: { channelId: idA }, fromBlock: 0n });
       expect(deposits).toHaveLength(2); // one each: the dropped deposit never landed, the resent one did once
+      // The resend went out at the dropped deposit's nonce (the wallet's sender kept it outstanding).
+      const aliceDeposit = deposits.find((e) => e.args.player === 0)!;
+      expect((await pub.getTransaction({ hash: aliceDeposit.transactionHash })).nonce).toBe(droppedNonce);
       await expectBalances(s, [
         [alice, START + 2n * STAKE - 2n * FEE],
         [bob, START - STAKE - FEE],
