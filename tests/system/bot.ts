@@ -136,12 +136,16 @@ export async function playRandomGameCapped(
     if (resultStatus.gameStatus !== "playing" && resultStatus.gameStatus !== "draw_offered") return resultStatus;
     await waitStatus(other, (s) => s.turnNum === resultStatus.turnNum || s.gameStatus !== "playing", ms, opts.channelId);
     if (lastPly) {
-      const offered = await waitStatus(other, (s) => s.gameStatus === "draw_offered", ms, opts.channelId);
-      if (offered.gameStatus === "draw_offered") {
-        await other.api("POST", "/accept-draw", { channel: opts.channelId });
-        return await waitStatus(mover, (s) => s.gameStatus === "draw", ms, opts.channelId);
-      }
-      return offered;
+      // The capping move's `offerDraw` flag doesn't stop it from also being a mate: the daemon never computes
+      // checkmate/stalemate at move-application time (a state's status is only ever PLAYING or, with the flag,
+      // DRAW_OFFERED -- see chess.ts's normalMove), but `other`'s own daemon re-evaluates the position on its next
+      // tick regardless of that flag and auto-resigns/claims if it is actually mated (spec §6.3), which can race
+      // ahead of this poll ever observing "draw_offered" at all. Wait for *any* non-playing result, not
+      // specifically "draw_offered": a decisive result here is a real terminal state too, and needs no draw.
+      const otherStatus = await waitStatus(other, (s) => s.gameStatus !== "playing", ms, opts.channelId);
+      if (otherStatus.gameStatus !== "draw_offered") return otherStatus;
+      await other.api("POST", "/accept-draw", { channel: opts.channelId });
+      return await waitStatus(mover, (s) => s.gameStatus === "draw", ms, opts.channelId);
     }
   }
   throw new Error(`playRandomGameCapped: exhausted ${maxMoves} half-moves without reaching a terminal state`);

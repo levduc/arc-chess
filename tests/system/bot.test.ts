@@ -8,8 +8,9 @@
  * No real stack: `Player.api` is the only surface `waitStatus` touches, so a fake implementing just that is enough.
  */
 import { describe, expect, it } from "vitest";
+import type { Hex } from "viem";
 import type { Player } from "./harness.js";
-import { waitStatus, type Status } from "./bot.js";
+import { playRandomGameCapped, waitStatus, type Status } from "./bot.js";
 
 function fakePlayer(api: Player["api"]): Player {
   return { name: "fake", home: "", address: "0x0", apiUrl: "", token: "", api, kill: async () => {}, start: async () => {}, logs: () => "", pid: () => undefined };
@@ -57,5 +58,59 @@ describe("waitStatus tolerates the offerer's transient 'unknown channel' race bu
       throw UNKNOWN_CHANNEL_ERR;
     });
     await expect(waitStatus(player, (s) => s.phase === "Open", 250)).rejects.toThrow(/timed out after 250ms.*unknown channel/s);
+  });
+});
+
+/**
+ * Plan 4.5 Task 11 regression: found by the 15-minute soak run -- a game capped at the ply limit stalled for the
+ * full `ms` budget instead of finishing, because `playRandomGameCapped`'s capping move (sent with `offerDraw: true`)
+ * happened to also be a checkmate. The daemon never computes mate/stalemate at move-application time (a state's
+ * status is only ever "playing" or, with the flag, "draw_offered" -- see chess.ts's `normalMove`), but the mated
+ * side's own daemon re-evaluates the position on its own tick regardless of that flag and auto-resigns (spec
+ * §6.3) -- which can race ahead of any poll ever observing "draw_offered" at all. The old code waited specifically
+ * for "draw_offered" and had no other way out, so it looped until the timeout even though the game had already
+ * reached a perfectly good terminal state.
+ */
+describe("playRandomGameCapped resolves a decisive result that races ahead of a forced draw at the ply cap", () => {
+  it("returns the decisive status promptly instead of waiting out the timeout for a 'draw_offered' that never appears", async () => {
+    const channelId = "0xabc" as Hex;
+    const state = { turnNum: "0", whiteTurn: true };
+    let whiteGameStatus: Status["gameStatus"] = "playing";
+    let blackGameStatus: Status["gameStatus"] = "playing";
+    let acceptDrawCalls = 0;
+    const statusFor = (color: "white" | "black"): Status => ({
+      channelId,
+      phase: "Open",
+      myTurn: color === "white" ? state.whiteTurn : !state.whiteTurn,
+      turnNum: state.turnNum,
+      gameStatus: color === "white" ? whiteGameStatus : blackGameStatus,
+      legalMoves: ["a2a3"],
+      attention: null,
+    });
+    const white = fakePlayer(async (method, path) => {
+      if (method === "GET") return statusFor("white");
+      if (method === "POST" && path === "/move") {
+        state.turnNum = "1";
+        state.whiteTurn = false;
+        whiteGameStatus = "draw_offered"; // the mover's own view right after its offerDraw move
+        blackGameStatus = "black_won"; // the race: black's daemon auto-resigned, never showing "draw_offered"
+        return statusFor("white");
+      }
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    });
+    const black = fakePlayer(async (method, path) => {
+      if (method === "GET") return statusFor("black");
+      if (method === "POST" && path === "/accept-draw") {
+        acceptDrawCalls++;
+        return statusFor("black");
+      }
+      throw new Error(`unexpected ${method} ${String(path)}`);
+    });
+
+    const started = Date.now();
+    const result = await playRandomGameCapped(white, black, { channelId, maxMoves: 1, ms: 5_000 });
+    expect(result.gameStatus).toBe("black_won");
+    expect(acceptDrawCalls).toBe(0); // already decisive: no draw to accept
+    expect(Date.now() - started).toBeLessThan(1_000); // must not have waited out the ms budget
   });
 });
