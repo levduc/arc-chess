@@ -1616,6 +1616,34 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     },
     15_000,
   );
+
+  it("fix round 2, minor 4: `sweep --channel` re-checks an already-swept channel's key balance and sweeps a late top-up", async () => {
+    const { alice, bob, id } = await matched();
+    await settleWithSweepDisabled(alice, bob, id); // automatic sweeping stays off: only the explicit calls below sweep
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const session = l.sessionSender.address;
+
+    const first = await d.sweep(id);
+    expect(first.results[0].swept).toMatch(/^0x[0-9a-f]+$/);
+    expect(l.record.swept).toBe(true);
+    const firstTx = first.results[0].hash;
+
+    // Documented (minor 4): a wallet-side refill that was in flight, or a manual top-up, can land on the session
+    // key after this sweep already ran and reported "true" -- comfortably above dust, not the sweep's own
+    // untouched fee reserve (see minor 4's "already" path for that case, covered by the pre-existing
+    // "an already-swept channel ... reports already" test just above).
+    const topUp = 1_000_000_000_000_000n;
+    await setEthBalance(session, topUp);
+    const walletBefore = await d.client.getBalance({ address: alice.address });
+
+    const second = await d.sweep(id);
+    expect(second.results).toEqual([{ channelId: id, swept: expect.stringMatching(/^0x[0-9a-f]+$/), hash: expect.any(String) }]);
+    expect(second.results[0].hash).not.toBe(firstTx); // a new transaction, not the first sweep's own
+    expect(l.record.sweptTx).toBe(second.results[0].hash); // the record now reflects the *new* sweep
+    expect(await d.client.getBalance({ address: alice.address })).toBeGreaterThan(walletBefore);
+    expect(await d.client.getBalance({ address: session })).toBeLessThan(topUp); // actually swept, not left sitting there
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {

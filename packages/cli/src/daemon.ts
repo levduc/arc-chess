@@ -1267,9 +1267,15 @@ export class ArenaDaemon {
     sender: SerialTxSender,
     backoff: SweepBackoff,
     save: (r: ChannelRecord) => void,
-    // Minor 3: `giveUpAt` bounds this one record's own receipt wait (via `performSweep`), so it can never eat more
-    // than its share of `sweep()`'s overall budget.
-    opts: { force?: boolean; giveUpAt?: number } = {},
+    opts: {
+      force?: boolean;
+      // Minor 3: bounds this one record's own receipt wait (via `performSweep`), so it can never eat more than
+      // its share of `sweep()`'s overall budget.
+      giveUpAt?: number;
+      // Minor 4: a re-check of an already-`isSweptDone` channel that `sweep()`'s `--channel` branch found a
+      // non-dust balance sitting on -- lets this one call through the "already done" skip guard just below.
+      recheck?: boolean;
+    } = {},
   ): Promise<SweepAttemptResult> {
     // Fix round 2, minor 2: a receipt this daemon lost track of (`TxReceiptMissingError`) from a *previous*
     // attempt is checked first, before anything else below -- including the back-off gate just past this block --
@@ -1293,7 +1299,8 @@ export class ArenaDaemon {
     // every abandoned channel as "not sweepable yet" forever.
     const retryingAbandoned = opts.force === true && record.swept === "abandoned";
     if (retryingAbandoned) backoff.attempts = 0;
-    if (this.stopped || (record.swept !== undefined && !retryingAbandoned)) return { kind: "skipped", record };
+    const rechecking = opts.recheck === true && isSweptDone(record.swept);
+    if (this.stopped || (record.swept !== undefined && !retryingAbandoned && !rechecking)) return { kind: "skipped", record };
     if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
     // Rule 1: never beside a transaction actively being waited on elsewhere on this same session key.
     if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
@@ -1301,6 +1308,11 @@ export class ArenaDaemon {
       if (!(await this.isSweepable(record))) return { kind: "skipped", record };
       const outcome = await this.performSweep(sender, opts.giveUpAt);
       if (outcome.status === "dust") {
+        // Minor 4: a recheck of an already-done channel finding only dust residue (typically the previous
+        // sweep's own untouched fee reserve, never truly zero) is not new information -- the record already
+        // correctly reflects its prior state (`true`, with its real amount/tx, or already "dust"), and must
+        // never be downgraded from a genuine `true` to "dust" just because what is left over now is small.
+        if (rechecking) return { kind: "dust", record };
         const updated: ChannelRecord = { ...record, swept: "dust" };
         save(updated);
         this.endSweepBackoff(record.channelId, backoff);
@@ -1326,6 +1338,10 @@ export class ArenaDaemon {
       this.log(`channel ${record.channelId}: sweep failed (retried with back-off): ${errorText(err)}`);
       backoff.attempts++;
       if (backoff.attempts >= SWEEP_ABANDON_ATTEMPTS) {
+        // Minor 4: a recheck's own repeated failures (e.g. a stuck entry that turned up only after the channel
+        // was already fully swept) must never downgrade an already-done record to "abandoned" -- same principle
+        // as the dust case above.
+        if (rechecking) return { kind: "error", record, error: err };
         const updated: ChannelRecord = { ...record, swept: "abandoned" };
         save(updated);
         this.log(`channel ${record.channelId}: sweep abandoned after ${backoff.attempts} failed attempts: its session gas is written off`);
@@ -1456,7 +1472,14 @@ export class ArenaDaemon {
         if (matches.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
         const record = matches[0];
         if (isSweptDone(record.swept)) {
-          return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
+          // Minor 4: the wallet-side session key can receive money again after a sweep already reported "true"
+          // or "dust" -- a refill that was in flight and landed late, a manual top-up, a slightly-off dust read.
+          // `--channel` re-checks the key's current balance before answering "already"; anything above dust
+          // falls through to a real attempt, which does the precise dust math itself (and may still, correctly,
+          // decline it and record "dust" again).
+          const balance = await this.client.getBalance({ address: this.senderFor(record.channelId, record).address });
+          if (balance === 0n) return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
+          return { results: [await this.sweepOneNow(record, deadline, true)], remaining: 0 };
         }
         return { results: [await this.sweepOneNow(record, deadline)], remaining: 0 };
       }
@@ -1489,37 +1512,57 @@ export class ArenaDaemon {
    * racing it (another `sweep()` call cannot: this method is only ever reached while `sweep()` holds its own
    * single-flight lock).
    */
-  private async sweepOneNow(record: ChannelRecord, giveUpAt?: number): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
+  /** Fix round 2, minor 4: the sender already associated with a channel id, if it is live or queued, otherwise a
+   *  fresh one-shot sender built from the record's own session key -- never registered anywhere; used only to
+   *  read a balance before deciding whether a re-check attempt is worth running at all. */
+  private senderFor(id: Hex, record: ChannelRecord): SerialTxSender {
+    return (
+      this.live.get(id)?.sessionSender ??
+      this.sweepQueue.get(id)?.sender ??
+      new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, { feeCeiling: NO_FEE_CEILING })
+    );
+  }
+
+  private async sweepOneNow(
+    record: ChannelRecord,
+    giveUpAt?: number,
+    // Minor 4: `sweep()`'s `--channel` branch sets this once it has found a non-dust balance still sitting on an
+    // already-`isSweptDone` channel's key -- bypasses every "already" short-circuit below (and, correspondingly,
+    // `runSweepAttempt`'s own skip guard) for exactly this one call, so a real attempt actually runs; if there
+    // turns out to be nothing worth sending after all, `performSweep`'s own precise dust math still declines it.
+    recheck = false,
+  ): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
     const id = record.channelId;
     const l = this.live.get(id);
     if (l) {
-      if (isSweptDone(l.record.swept)) return { channelId: id, swept: "already" };
+      if (isSweptDone(l.record.swept) && !recheck) return { channelId: id, swept: "already" };
       const wasAbandoned = l.record.swept === "abandoned";
       const busy = () => l.mainBusy || l.refilling || l.disputeBusy;
       const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
       while (busy() && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
       if (busy()) return { channelId: id, swept: "error: the watchtower is working on this channel: retry shortly" };
-      if (isSweptDone(l.record.swept)) return { channelId: id, swept: "already" }; // settled while we waited
+      if (isSweptDone(l.record.swept) && !recheck) return { channelId: id, swept: "already" }; // settled while we waited
       l.mainBusy = true;
       try {
         const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(this.applySweptFields(l.record, r)), {
           force: true,
           giveUpAt,
+          recheck,
         });
         l.record = this.applySweptFields(l.record, result.record);
-        return this.sweepResultWithHash(id, result, wasAbandoned);
+        return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
       } finally {
         l.mainBusy = false;
       }
     }
     const queued = this.sweepQueue.get(id);
     if (queued) {
-      if (isSweptDone(queued.record.swept)) return { channelId: id, swept: "already" };
+      if (isSweptDone(queued.record.swept) && !recheck) return { channelId: id, swept: "already" };
       const wasAbandoned = queued.record.swept === "abandoned";
       const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
       while (queued.busy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
       if (queued.busy) return { channelId: id, swept: "error: a sweep pass is already working on this channel: retry shortly" };
-      if (isSweptDone(queued.record.swept)) return { channelId: id, swept: "already" }; // settled while we waited
+      if (isSweptDone(queued.record.swept) && !recheck) return { channelId: id, swept: "already" }; // settled while we waited
       queued.busy = true;
       try {
         const result = await this.runSweepAttempt(
@@ -1530,14 +1573,14 @@ export class ArenaDaemon {
             queued.record = this.applySweptFields(queued.record, r);
             this.records.saveChannel(queued.record);
           },
-          { force: true, giveUpAt },
+          { force: true, giveUpAt, recheck },
         );
         queued.record = this.applySweptFields(queued.record, result.record);
         if (queued.record.swept !== undefined) {
           this.sweepQueue.delete(id);
           this.refreshSettledCache(id, queued.record);
         }
-        return this.sweepResultWithHash(id, result, wasAbandoned);
+        return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
       } finally {
         queued.busy = false;
       }
@@ -1545,22 +1588,31 @@ export class ArenaDaemon {
     // Not tracked anywhere in memory (a record from another process, or predating this daemon's own start()): a
     // fresh disk read, and a fresh, one-shot sender and back-off.
     const fresh = this.records.channel(id) ?? record;
-    if (isSweptDone(fresh.swept)) return { channelId: id, swept: "already" };
+    if (isSweptDone(fresh.swept) && !recheck) return { channelId: id, swept: "already" };
     const wasAbandoned = fresh.swept === "abandoned";
     const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
       feeCeiling: NO_FEE_CEILING,
     });
     const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
-    const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt });
-    return this.sweepResultWithHash(id, result, wasAbandoned);
+    const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt, recheck });
+    return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
   }
 
-  private sweepResultWithHash(id: Hex, result: SweepAttemptResult, wasAbandoned = false): { channelId: Hex; swept: string; hash?: Hex } {
-    const base = this.sweepResultToString(id, result, wasAbandoned);
+  private sweepResultWithHash(
+    id: Hex,
+    result: SweepAttemptResult,
+    wasAbandoned = false,
+    recheck = false,
+  ): { channelId: Hex; swept: string; hash?: Hex } {
+    const base = this.sweepResultToString(id, result, wasAbandoned, recheck);
     return result.kind === "swept" ? { ...base, hash: result.hash } : base;
   }
 
-  private sweepResultToString(id: Hex, result: SweepAttemptResult, wasAbandoned = false): { channelId: Hex; swept: string } {
+  private sweepResultToString(id: Hex, result: SweepAttemptResult, wasAbandoned = false, recheck = false): { channelId: Hex; swept: string } {
+    // Minor 4: a recheck finding only dust (the common case -- the prior sweep's own untouched reserve, not a
+    // real top-up) reports the same "already" a caller would have seen without minor 4 at all: nothing new
+    // happened, and `runSweepAttempt` deliberately left the record untouched (see the `rechecking` branch there).
+    if (recheck && result.kind === "dust") return { channelId: id, swept: "already" };
     // Fix round 2, important 1: a manual retry of a previously-"abandoned" channel gets its own distinct result
     // string, so `arena sweep`'s output tells that case apart from an ordinary first-time sweep.
     const prefix = wasAbandoned ? "retried: " : "";
