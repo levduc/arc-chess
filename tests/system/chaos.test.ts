@@ -461,32 +461,54 @@ async function crashLoop(seed: number): Promise<void> {
   let log: EquivocationLog | undefined;
   let sampler: ReturnType<typeof startSampler> | undefined;
   let point = 0;
-  /** Kill point `point`: SIGKILL a seeded side after a seeded jitter, restart it at once. */
-  const crash = async (): Promise<Player> => {
+  let chanId: Hex | undefined;
+  const missed: string[] = []; // kill points not hit in their intended state
+  /** Kill point `point`: SIGKILL a seeded side after a seeded jitter, restart it at once. Just before the kill, the
+   *  chain's view and the victim's own status are recorded, and `intended` checks the point was hit where it is
+   *  meant to be -- for every seed. */
+  type KillCtx = { phase: string | null; funded: readonly [boolean, boolean] | null; st: Status | null; channels: number };
+  const crash = async (intended: (c: KillCtx) => boolean): Promise<Player> => {
     const name = KILL_POINTS[point++];
     const victim = rand() < 0.5 ? alice : bob;
     const jitter = Math.floor(rand() ** 2 * 250); // skewed small: most kills land while the daemon is still busy
-    plan.push(`${point}. ${name}: kill ${victim.name} after ${jitter} ms`);
     await sleep(jitter);
     await sampler?.sample();
+    const chs = ((await victim.api("GET", "/channels").catch(() => [])) as Array<{ channelId: Hex }>);
+    chanId ??= chs[0]?.channelId;
+    const info = chanId ? await hub.channelInfo(chanId) : null;
+    const st = chanId && chs.some((c) => c.channelId === chanId) ? ((await victim.api("GET", `/status?channel=${chanId}`).catch(() => null)) as Status | null) : null;
+    const ctx: KillCtx = { phase: info?.phase ?? null, funded: info?.funded ?? null, st, channels: chs.length };
     await victim.kill("SIGKILL");
+    const where =
+      `chain ${ctx.phase ?? "-"}${ctx.funded ? ` funded=${ctx.funded}` : ""}; ${victim.name} ` +
+      (st ? `turn ${st.turnNum} game ${String(st.gameIndex)} ${st.gameStatus} newGame=${String(st.newGame)}` : `${ctx.channels} channel(s)`);
+    const ok = intended(ctx);
+    plan.push(`${point}. ${name}: kill ${victim.name} after ${jitter} ms [${where}]${ok ? "" : " <- NOT the intended state"}`);
+    if (!ok) missed.push(`${point}. ${name}: ${where}`);
     await victim.start();
     await sampler?.sample();
     return victim;
   };
+  const turnIs = (c: KillCtx, turns: number[]) => c.st !== null && turns.includes(Number(c.st.turnNum));
 
   try {
     const offerId = await postOffer(alice);
-    await crash(); // 1. after offer
+    await crash((c) => c.phase === null && c.channels === 0); // 1. after offer: no channel anywhere yet
+    // Bob has no gas until after kill point 3, so his deposit cannot follow Alice's within the kill window: points 2
+    // and 3 are hit before the channel opens, deterministically (his funding attempts fail and are retried).
+    const testClient = createTestClient({ mode: "anvil", chain: foundry, transport: http(s.rpcUrl) });
+    await testClient.setBalance({ address: bob.address, value: 0n });
     await bob.api("POST", "/offers/accept", { offerId });
-    await crash(); // 2. after match
+    await crash((c) => c.phase === null || c.phase === "None" || c.phase === "Funding"); // 2. after match: not yet open
     const id = await channelOf(bob);
     await channelOf(alice);
     log = new EquivocationLog({ chainId: s.chainId, hub: s.hub }, id, await signersOf(bob, id), s.serverDbPath);
     sampler = startSampler(log, [alice, bob]);
 
     await waitFor(async () => (await hub.channelInfo(id)).funded[0], 30_000, "alice's deposit");
-    await crash(); // 3. mid-funding
+    // 3. mid-funding: Alice's deposit in, Bob's not (he has no gas yet)
+    await crash((c) => c.phase === "Funding" && c.funded?.[0] === true && c.funded[1] === false);
+    await testClient.setBalance({ address: bob.address, value: 10n ** 20n });
     await waitPhase(hub, id, "Open", 30_000);
     await waitSt(alice, (st) => st.phase === "Open", 20_000, id, "Open");
     await waitSt(bob, (st) => st.phase === "Open", 20_000, id, "Open");
@@ -498,30 +520,34 @@ async function crashLoop(seed: number): Promise<void> {
       await waitSt(bob, (st) => st.turnNum === String(turn - 1), 20_000, id, `turn ${turn - 1}`);
       await moveOnce(alice, bob, id, move);
     };
+    const openAt = (turns: number[]) => (c: KillCtx) => c.phase === "Open" && turnIs(c, turns);
     await play("e2e4", 1);
-    await crash(); // 4
+    await crash(openAt([1])); // 4
     await play("e7e5", 2);
-    await crash(); // 5
+    await crash(openAt([2])); // 5
     await play("d1h5", 3);
-    await crash(); // 6
+    await crash(openAt([3])); // 6
     await waitSt(bob, (st) => st.turnNum === "3" && st.myTurn, 20_000, id, "Bob on move at turn 3");
     await alice.api("POST", "/challenge", { channel: id });
     await waitPhase(hub, id, "Challenged");
-    await crash(); // 7. while challenged
+    await crash((c) => c.phase === "Challenged" && turnIs(c, [3])); // 7. while challenged
     await waitSt(bob, (st) => (st.challenge as { mustMove?: boolean } | null)?.mustMove === true, 20_000, id, "mustMove");
     await bob.api("POST", "/move", { move: "b8c6", channel: id });
-    await crash(); // 8. after the answering move (bob's daemon responds right after it; alice's watchtower may race)
+    // 8. after the answering move (bob's daemon responds right after it; alice's watchtower may race): the victim
+    // holds turn 3 or 4, whether or not the respond has landed yet
+    await crash((c) => (c.phase === "Challenged" || c.phase === "Open") && turnIs(c, [3, 4]));
     await waitPhase(hub, id, "Open", 30_000);
     await play("f1c4", 5);
     await play("g8f6", 6);
     await play("h5f7", 7); // mate: Bob's daemon auto-resigns (turn 8)
-    await crash(); // 9. after the mating move
+    await crash((c) => c.phase === "Open" && turnIs(c, [7, 8]) && c.st?.gameIndex === 0); // 9. after the mating move
     await waitSt(alice, (st) => st.gameStatus === "white_won" && st.turnNum === "8", 20_000, id, "game 0 over");
     await waitSt(bob, (st) => st.gameStatus === "white_won" && st.turnNum === "8", 20_000, id, "game 0 over");
 
     // Game 1: Alice proposes, Bob countersigns; Bob is white.
     await alice.api("POST", "/next-game", { channel: id });
-    await crash(); // 10. after proposing a new game
+    // 10. after proposing a new game: game 1 has not started for the victim (the checkpoint is not countersigned)
+    await crash((c) => c.phase === "Open" && c.st?.gameIndex === 0 && turnIs(c, [8]));
     await waitSt(bob, (st) => st.attention === "new-game-proposed", 20_000, id, "new game proposed");
     await bob.api("POST", "/next-game", { channel: id });
     await waitSt(alice, (st) => (st.gameIndex as number) === 1 && st.newGame === "none", 20_000, id, "game 1 started");
@@ -530,7 +556,7 @@ async function crashLoop(seed: number): Promise<void> {
     await play(FOOLS_MATE[0], g1 + 1);
     await play(FOOLS_MATE[1], g1 + 2);
     await play(FOOLS_MATE[2], g1 + 3);
-    await crash(); // 11. after a game-1 move
+    await crash((c) => c.phase === "Open" && c.st?.gameIndex === 1 && turnIs(c, [g1 + 3])); // 11. after a game-1 move
     await play(FOOLS_MATE[3], g1 + 4); // mate: Bob's daemon auto-resigns
     const end = String(g1 + 5);
     await waitSt(alice, (st) => st.gameStatus === "black_won" && st.turnNum === end, 20_000, id, "game 1 over");
@@ -538,13 +564,16 @@ async function crashLoop(seed: number): Promise<void> {
 
     // Close: Alice signs, a crash, then Bob signs once he holds Alice's Close signature.
     await alice.api("POST", "/close", { channel: id });
-    await crash(); // 12. after signing Close
+    // 12. after signing Close: game 1 is over and the channel is still Open (Bob has not signed Close yet)
+    await crash((c) => c.phase === "Open" && c.st?.gameIndex === 1 && c.st.gameStatus === "black_won");
     await waitSt(bob, (st) => st.opponentWantsToClose === true, 20_000, id, "alice's Close signature");
     await bob.api("POST", "/close", { channel: id });
     await waitPhase(hub, id, "Finalized", 30_000);
     await waitSt(alice, (st) => st.phase === "Finalized", 20_000, id, "Finalized");
     await waitSt(bob, (st) => st.phase === "Finalized", 20_000, id, "Finalized");
     expect(point).toBe(KILL_POINTS.length);
+    console.log(`[chaos] seed=${seed} kill plan:\n  ${plan.join("\n  ")}`);
+    expect(missed, "kill points not hit in their intended state").toEqual([]);
 
     await expectBalances(s, [
       [alice, START + 2n * STAKE - FEE],
@@ -565,7 +594,6 @@ async function crashLoop(seed: number): Promise<void> {
     // Coverage: both seats' signatures on every turn of both games, from more than one source.
     expect(log.pairs).toBeGreaterThanOrEqual(Number(end));
     expect(Object.keys(log.counts.bySource).sort()).toEqual(expect.arrayContaining(["chain", "mitm", "relayCache", "session"]));
-    console.log(`[chaos] seed=${seed} kill plan:\n  ${plan.join("\n  ")}`);
   } catch (err) {
     const msg = `crash loop failed with CHAOS_SEED=${seed} at kill point ${point}/${KILL_POINTS.length}\n  ${plan.join("\n  ")}`;
     console.error(`[chaos] ${msg}\n--- alice ---\n${alice.logs().slice(-4000)}\n--- bob ---\n${bob.logs().slice(-4000)}`);
@@ -620,8 +648,11 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       const aliceRpc = await startFaultyRpc(s.rpcUrl, { seed, label: "faulty-rpc:alice" });
       const bobRpc = await startFaultyRpc(s.rpcUrl, { seed: seed + 2, label: "faulty-rpc:bob" });
       cleanups.push(() => aliceRpc.stop(), () => bobRpc.stop());
-      const alice = await s.player("alice", undefined, { rpcUrl: aliceRpc.url });
-      const bob = await s.player("bob", undefined, { rpcUrl: bobRpc.url });
+      // A pass-through MITM in front of the server, so the equivocation check also covers every relayed frame.
+      const mitm = await startMitm(s.serverUrl);
+      cleanups.push(() => mitm.stop());
+      const alice = await s.player("alice", undefined, { rpcUrl: aliceRpc.url, serverUrl: mitm.url });
+      const bob = await s.player("bob", undefined, { rpcUrl: bobRpc.url, serverUrl: mitm.url });
       const { hub, pub } = hubOf(s);
       const proxies: FaultyRpc[] = [aliceRpc, bobRpc, serverRpc];
 
@@ -662,7 +693,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         const offerId = (await retry("post offer", () => postOffer(alice)))!;
         await retry("accept", () => bob.api("POST", "/offers/accept", { offerId }));
         const id = await channelOf(bob, 60_000);
-        const equivocation = await watchEquivocation(s, [alice, bob], id);
+        const equivocation = await watchEquivocation(s, [alice, bob], id, mitm);
         await waitSt(alice, (st) => st.phase === "Open", 90_000, id, "Open");
         await waitSt(bob, (st) => st.phase === "Open", 90_000, id, "Open");
 
@@ -861,12 +892,9 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
         await waitSt(bob, (st) => st.phase === "Open", 20_000, id, "Open");
         await waitFor(async () => (await serverChannel(s, id)).phase === "Open", 20_000, "indexer: Open");
 
-        // The reorg targets a deposit whose funding flow has completed. Bob's status can read Open while his
-        // watchtower pass is still inside viem's receipt wait for that deposit (its immediate receipt check can
-        // miss a just-mined transaction; it then polls every 4 s). Anvil discards reorged-out transactions rather
-        // than returning them to the mempool, so a receipt wait caught by the reorg never ends before viem's
-        // 180 s timeout, stalling the whole pass (see the Task 10 report). Let any such poll finish first.
-        await sleep(5_000);
+        // No settling pause before the reorg (the Task 10 review): Bob's status can read Open while his watchtower
+        // is still inside the receipt wait for the deposit this reorg drops. That wait is bounded now (30 s, then
+        // TxDroppedError and a resend on the next pass) instead of viem's 180 s, so the flow recovers either way.
         const deposits = async () =>
           pub.getContractEvents({ address: s.hub, abi: channelHubAbi, eventName: "Deposited", args: { channelId: id }, fromBlock: 0n });
         const [, second] = await deposits();
@@ -915,7 +943,7 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
           }
         })();
         try {
-          await waitPhase(hub, id, "Open", 30_000);
+          await waitPhase(hub, id, "Open", 60_000);
         } catch (err) {
           console.error(`[chaos] depth ${depth} re-funding timeline:\n  ${timeline.join("\n  ")}\n--- bob ---\n${bob.logs().slice(-4000)}`);
           throw err;
@@ -952,6 +980,139 @@ describe("chaos (real server, real `arena daemon` processes, real chain)", () =>
       120_000,
     );
   }
+
+  timed(
+    "dispute first: channel A's deposit is dropped mid-wait while channel B (challengeTimeout 60) is challenged -> B answered in time, A recovers",
+    async () => {
+      const s = await startStack();
+      stack = s;
+      const alice = await s.player("alice");
+      const bob = await s.player("bob");
+      const carol = await s.player("carol");
+      const { hub, pub } = hubOf(s);
+
+      // Channel B: Alice vs Carol, with the hub's minimum challengeTimeout (60 s).
+      const { offerId: offerB } = await alice.api("POST", "/offers", {
+        deposit: DEPOSIT.toString(),
+        stakePerGame: STAKE.toString(),
+        challengeTimeout: "60",
+      });
+      await carol.api("POST", "/offers/accept", { offerId: offerB });
+      const idB = await channelOf(carol);
+      const eqB = await watchEquivocation(s, [alice, carol], idB);
+      await waitSt(alice, (st) => st.phase === "Open", 30_000, idB, "B Open");
+      await waitSt(carol, (st) => st.phase === "Open", 30_000, idB, "B Open");
+      await moveOnce(alice, carol, idB, "e2e4");
+      await moveOnce(alice, carol, idB, "e7e5");
+      const carolDir = join(carol.home, "channels", idB);
+      const snap = readJson<SessionSnapshot>(join(carolDir, "session.json"))!;
+      expect(snap.latest.state.turnNum).toBe(2n);
+      const staleProof: Proof = { hasPrev: true, prev: snap.prev!, latest: snap.latest };
+      await moveOnce(alice, carol, idB, "d1h5"); // Alice holds turn 3
+      await carol.kill("SIGKILL"); // only Alice's watchtower may answer
+
+      // From here the chain mines a block every second, and the first deposit Alice's wallet sends (channel A's) is
+      // removed from the mempool while her watchtower waits for its receipt.
+      await rpc(s.rpcUrl, "evm_setAutomine", [false]);
+      await rpc(s.rpcUrl, "evm_setIntervalMining", [1]);
+      const restoreMining = async () => {
+        await rpc(s.rpcUrl, "evm_setIntervalMining", [0]).catch(() => undefined);
+        await rpc(s.rpcUrl, "evm_setAutomine", [true]).catch(() => undefined);
+      };
+      cleanups.push(restoreMining);
+      let dropped: Hex | undefined;
+      let dropping = true;
+      const dropper = (async () => {
+        while (dropping && !dropped) {
+          const pool = await rpc<{ pending: Record<string, Record<string, { hash: Hex; input: Hex }>> }>(s.rpcUrl, "txpool_content", []);
+          const mine = Object.entries(pool.pending).find(([a]) => a.toLowerCase() === alice.address.toLowerCase())?.[1] ?? {};
+          const deposit = Object.values(mine).find((t) => t.input.startsWith("0x98b1e06a")); // ChannelHub.deposit
+          if (deposit) {
+            await rpc(s.rpcUrl, "anvil_dropTransaction", [deposit.hash]);
+            dropped = deposit.hash;
+          }
+          await sleep(20);
+        }
+      })();
+
+      // Channel A: Alice vs Bob. Alice (the offerer) funds first -- and that deposit is dropped.
+      const offerA = await postOffer(alice);
+      await bob.api("POST", "/offers/accept", { offerId: offerA });
+      const idA = await channelOf(bob, 30_000);
+      const eqA = await watchEquivocation(s, [alice, bob], idA);
+      await waitFor(() => dropped, 30_000, "alice's deposit for channel A (dropped from the mempool)");
+      const tDrop = Date.now();
+
+      // Carol challenges B with the stale turn-2 proof, straight from her session key.
+      const carolRecord = readJson<ChannelRecord>(join(carolDir, "record.json"))!;
+      await hub.challenge(new LocalKeyTxSender(carolRecord.sessionKey, s.rpcUrl, foundry), staleProof);
+      const aliceErrorsOnA = new Set<string>();
+      await waitFor(async () => {
+        const a = (await alice.api("GET", "/channels")) as Array<{ channelId: Hex; lastError: string | null }>;
+        const err = a.find((c) => c.channelId === idA)?.lastError;
+        if (err) aliceErrorsOnA.add(err);
+        return (await hub.channelInfo(idB)).phase === "Open";
+      }, 45_000, "alice's dispute pass answers B");
+      const answeredMs = Date.now() - tDrop;
+      // Alice's main pass was still waiting on A's dropped deposit when B was answered: A had no deposit yet.
+      expect((await hub.channelInfo(idA)).funded[0]).toBe(false);
+      expect(answeredMs).toBeLessThan(30_000); // the main pass's bounded receipt wait (30 s) had not even expired
+      expect((await hub.registeredState(idB)).turnNum).toBe(3n);
+      const events = await hub.disputeEvents(idB);
+      const challengedEv = events.find((e) => e.kind === "Challenged")!;
+      const respondedEv = events.find((e) => e.kind === "Responded")!;
+      const respondedAt = (await pub.getBlock({ blockNumber: respondedEv.blockNumber })).timestamp;
+      expect(respondedAt).toBeLessThan(challengedEv.deadline!); // answered inside the 60 s window
+      const respondTx = await pub.getTransaction({ hash: respondedEv.transactionHash });
+      expect(respondTx.from.toLowerCase()).toBe((await hub.channelParams(idB)).signers[0].toLowerCase()); // Alice's session key
+      console.log(`[chaos] dispute-first: B answered ${answeredMs} ms after A's deposit was dropped, ${challengedEv.deadline! - respondedAt} s before its deadline`);
+
+      // A recovers: the bounded wait gives up (TxDroppedError), the next main pass deposits again, Bob funds.
+      await waitFor(async () => {
+        const a = (await alice.api("GET", "/channels")) as Array<{ channelId: Hex; lastError: string | null }>;
+        const err = a.find((c) => c.channelId === idA)?.lastError;
+        if (err) aliceErrorsOnA.add(err);
+        return (await hub.channelInfo(idA)).phase === "Open";
+      }, 90_000, "channel A funded after the dropped deposit");
+      console.log(`[chaos] dispute-first: A open ${Date.now() - tDrop} ms after the drop; alice's lastErrors on A: ${JSON.stringify([...aliceErrorsOnA])}`);
+      expect([...aliceErrorsOnA].some((e) => /dropped/.test(e))).toBe(true);
+      dropping = false;
+      await dropper;
+      await restoreMining();
+
+      // Both games finish and both channels close.
+      await carol.start();
+      await waitSt(carol, (st) => st.phase === "Open" && st.turnNum === "3" && st.myTurn, 30_000, idB, "carol back on B");
+      for (const m of SCHOLARS_MATE.slice(3)) await moveOnce(alice, carol, idB, m);
+      for (const m of SCHOLARS_MATE) await moveOnce(alice, bob, idA, m);
+      for (const [opp, id] of [[carol, idB], [bob, idA]] as const) {
+        await waitSt(opp, (st) => st.gameStatus === "white_won" && st.turnNum === "8", 20_000, id, "game over");
+        await waitSt(alice, (st) => st.turnNum === "8", 20_000, id, "turn 8");
+        await alice.api("POST", "/close", { channel: id });
+        await waitSt(opp, (st) => st.opponentWantsToClose === true, 20_000, id, "alice's Close");
+        await opp.api("POST", "/close", { channel: id });
+        await waitPhase(hub, id, "Finalized", 30_000);
+      }
+      const deposits = await pub.getContractEvents({ address: s.hub, abi: channelHubAbi, eventName: "Deposited", args: { channelId: idA }, fromBlock: 0n });
+      expect(deposits).toHaveLength(2); // one each: the dropped deposit never landed, the resent one did once
+      await expectBalances(s, [
+        [alice, START + 2n * STAKE - 2n * FEE],
+        [bob, START - STAKE - FEE],
+        [carol, START - STAKE - FEE],
+        ["host", 4n * FEE],
+      ]);
+      await waitFor(async () => {
+        for (const p of [alice, bob, carol]) {
+          const chs = (await p.api("GET", "/channels")) as Array<{ lastError: string | null }>;
+          if (chs.some((c) => c.lastError !== null)) return false;
+        }
+        return true;
+      }, 20_000, "no lastError left");
+      await eqA.finish();
+      await eqB.finish();
+    },
+    240_000,
+  );
 
   timed(
     "server restart at the moment of a match (the match is replayed) and mid-game (play resumes), then settles",
