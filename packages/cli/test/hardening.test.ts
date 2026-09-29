@@ -24,7 +24,7 @@ import {
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
 import { CHAIN, RPC, increaseTime, now, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
-import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
+import { ArenaDaemon, DaemonError, FileSessionStore, RecordStore, SETTLED_CACHE_MAX, arenaPaths, loadConfig, type ChannelRecord } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but these tests craft host events. */
@@ -1270,6 +1270,35 @@ describe("Plan 5 Task 1: settled index", () => {
     // (SETTLED_CACHE_MAX itself -- the cap on how many are kept -- is exercised only at this small scale here;
     // see the report's concerns for the untested large-N boundary.)
     expect(ordered).toEqual([cloneIds[2], cloneIds[0], cloneIds[3], cloneIds[1]]);
+  });
+
+  it("fix round I4: trims by settledAt (oldest dropped), not insertion order, past SETTLED_CACHE_MAX entries", async () => {
+    const { alice } = await matched();
+    const d = alice.daemon as unknown as {
+      insertSettled(id: Hex, status: unknown, settledAt: number): void;
+      settled: Map<Hex, { status: { channelId: Hex }; settledAt: number }>;
+    };
+    // SETTLED_CACHE_MAX + a handful more, inserted in an order that does NOT match settledAt order (a plain FIFO
+    // eviction, keyed on insertion order, would drop the wrong ones): the newest-settledAt entries are inserted
+    // first, then a run of older ones, so a FIFO trim would keep the (wrong) newest-inserted-but-oldest-settled
+    // ones and drop the genuinely newest.
+    const total = SETTLED_CACHE_MAX + 5;
+    const ids: Hex[] = [];
+    for (let i = 0; i < total; i++) {
+      const id = `0x${(i + 1).toString(16).padStart(64, "0")}` as Hex;
+      ids.push(id);
+      // Insert order: i = 0..4 get the HIGHEST settledAt values (inserted first); i = 5.. get lower ones
+      // (inserted after) -- the opposite of settledAt order, so insertion-order (FIFO) trimming would keep
+      // exactly the wrong five and drop five of the genuinely newest.
+      const settledAt = i < 5 ? 1_000_000 - i : total - i;
+      d.insertSettled(id, { channelId: id }, settledAt);
+    }
+    expect(d.settled.size).toBe(SETTLED_CACHE_MAX);
+    // The five inserted first (highest settledAt: 1000000..999996) must all still be present.
+    for (let i = 0; i < 5; i++) expect(d.settled.has(ids[i])).toBe(true);
+    // The five with the very lowest settledAt (inserted last, ids[total-5..total-1], settledAt 5..1) must be the
+    // ones dropped -- a FIFO trim (oldest-inserted-first) would instead have dropped ids[0..4].
+    for (let i = total - 5; i < total; i++) expect(d.settled.has(ids[i])).toBe(false);
   });
 });
 
