@@ -636,6 +636,39 @@ describe("round 5, I2: a send whose response is lost is still tracked", () => {
   });
 });
 
+describe("final review m1: an own replacement whose send response is lost is still ours", () => {
+  it("it lands: the wait returns its receipt, not TxNonceUsedError ('an earlier intent landed')", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    n.state.market = 10n ** 12n; // nothing is mined on its own
+    const req: TxRequest = { to: to(7), data: "0x07" };
+    const a = await w.send(req);
+    const realRaw = n.inner.sendRawTransaction!.bind(n.inner);
+    const realGet = n.rawClient.getTransaction;
+    let failNextGet = false;
+    n.rawClient.getTransaction = async (args: { hash: Hex }) => {
+      if (failNextGet) {
+        failNextGet = false;
+        throw new Error("fetch failed"); // the node cannot even be asked whether it took the replacement
+      }
+      return realGet(args);
+    };
+    n.inner.sendRawTransaction = async (raw: Hex) => {
+      const h = await realRaw(raw); // the node takes the wait's own replacement...
+      n.inner.sendRawTransaction = realRaw;
+      n.mineHash(n.byHash(h)); // ...and mines it
+      failNextGet = true;
+      throw new Error("fetch failed: socket hang up"); // ...but the response is lost
+    };
+    const r = await waitOrReplace(n.client, w, req, a, { timeoutMs: 20, pollMs: 5 });
+    const replacement = n.landed[0];
+    expect(replacement.hash).not.toBe(a);
+    expect(replacement.data).toBe("0x07");
+    expect(r.transactionHash).toBe(replacement.hash); // before: TxNonceUsedError for our own transaction
+    expect(w.tracked()).toEqual([]);
+  });
+});
+
 describe("round 5, minor fixes", () => {
   it("m2: an entry released while a fresh send is being prepared is replaced by that send, not queued behind", async () => {
     const n = mempool();

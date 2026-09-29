@@ -900,12 +900,24 @@ export async function waitOrReplace(
         gas: (pending as { gas?: bigint }).gas,
         ...replacementFees(base, await estimateLike(client, base)),
       };
+      // Final review m1: the entry's hashes before this send. A send that fails ambiguously (a lost response) may
+      // still have added its transaction to the entry; that one is ours too (see the catch below).
+      const before = new Set(tracker?.entryOf(hash)?.hashes ?? []);
       try {
         const sent = await sender.send(replacement);
         hashes.push(sent);
         known.add(sent);
         lastSendError = undefined; // a later replacement went out: an earlier one's failure no longer explains anything
       } catch (err) {
+        // Final review m1: a replacement the node may hold although its response was lost is recorded in the entry
+        // (round 5, I2). It is this intent's own transaction, not an earlier intent's: if it lands, the wait returns
+        // its receipt instead of reporting TxNonceUsedError for it.
+        for (const h of tracker?.entryOf(hash)?.hashes ?? []) {
+          if (!before.has(h) && !hashes.includes(h)) {
+            hashes.push(h);
+            known.add(h);
+          }
+        }
         // Round 4: the replacement would go over the fee cap or the balance: nothing was sent; keep waiting.
         if (err instanceof TxFeeCapError || err instanceof TxInsufficientFundsError) continue;
         // e.g. "nonce too low": the original (or an earlier intent at this nonce) was mined after all
