@@ -109,6 +109,9 @@ export async function startApi(
           case "POST /reclaim":
             await daemon.reclaim(ch);
             return send(res, 200, await daemon.status(ch));
+          case "POST /sweep":
+            // Plan 5 Task 1: a daemon-wide sweep (no `channel`) has no single channel's status to return.
+            return send(res, 200, await daemon.sweep(ch));
           case "POST /handoff": {
             const to = b.to;
             if (to !== "agent" && to !== "human") throw new DaemonError(400, 'to must be "agent" or "human"');

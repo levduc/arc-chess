@@ -22,6 +22,11 @@ export type ChannelRecord = {
    *  channel that never opened), recorded with `finalized`, so its status can still be served from disk once the
    *  daemon has let go of it. Absent in records written before it existed. */
   finalPhase?: string;
+  /** Plan 5 Task 1 (mainnet gates: session-gas sweep): `true` once the session key's balance has been swept back
+   *  to the wallet, or `"dust"` if it was declined as too small to be worth the send cost. Absent (unset) for a
+   *  channel not finalized yet, or finalized but not yet swept (including every record written before this
+   *  feature existed -- `arena sweep`/`POST /sweep` picks those up too). */
+  swept?: true | "dust";
 };
 
 /** One entry of `channels/`: its record, or why it could not be read. */

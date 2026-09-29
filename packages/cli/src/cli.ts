@@ -30,7 +30,7 @@ const USAGE = `usage: arena <command> [options]
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
-  resign | accept-draw | next-game | close | challenge | reclaim  [--channel ID]
+  resign | accept-draw | next-game | close | challenge | reclaim | sweep [--channel ID]
   handoff human|agent [--note TEXT] [--channel ID]`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
@@ -313,6 +313,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "close":
       case "challenge":
       case "reclaim":
+      case "sweep":
         request = { method: "POST", path: `/${cmd}`, body: withChannel({}) };
         break;
       case "handoff":

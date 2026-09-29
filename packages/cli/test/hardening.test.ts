@@ -856,6 +856,86 @@ describe("Plan 4.5 Task 10: a match whose handling fails on an RPC error is retr
   });
 });
 
+describe("Plan 5 Task 1: session-gas sweep", () => {
+  it("sweeps the session key's balance back to the wallet after settle, leaving less than dust", async () => {
+    const { alice, bob, id, config } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    void config; // sessionGasWei is not needed here directly -- the balance is read straight off chain
+    await d.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await d.status(id)).attention === "game-over", 5_000, "draw seen");
+    await d.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+
+    const sessionBefore = await d.client.getBalance({ address: session });
+    const walletBefore = await d.client.getBalance({ address: alice.address });
+    await bob.daemon.close(id, "agent"); // this is the submission that settles the channel
+    await waitFor(() => d.handle(id).record.finalized, 20_000, "settled");
+    await waitFor(() => d.handle(id).record.swept !== undefined, 20_000, "swept");
+
+    expect(d.handle(id).record.swept).toBe(true);
+    const sessionAfter = await d.client.getBalance({ address: session });
+    const walletAfter = await d.client.getBalance({ address: alice.address });
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const dustBound = 2n * 21_000n * maxFeePerGas;
+    expect(sessionAfter).toBeLessThan(dustBound);
+    expect(sessionAfter).toBeLessThan(sessionBefore);
+    const swept = walletAfter - walletBefore;
+    expect(swept).toBeGreaterThan(0n);
+    // Nearly everything that left the session key reached the wallet -- the remainder is the tx's own gas cost.
+    expect(swept + sessionAfter).toBeGreaterThanOrEqual((sessionBefore * 9n) / 10n);
+  });
+
+  it("`arena sweep` (daemon.sweep) sweeps a legacy record -- finalized before this feature, no longer in `live`", async () => {
+    const { alice, bob, id } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    // Disable the automatic sweep so this channel settles exactly like a record written before the feature
+    // existed: finalized, `swept` unset, its session key still fully funded.
+    (d as unknown as { sweepChannel(l: unknown): Promise<void> }).sweepChannel = () => Promise.resolve();
+    await d.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await d.status(id)).attention === "game-over", 5_000, "draw seen");
+    await d.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => d.handle(id).record.finalized, 20_000, "settled");
+    await d.idle();
+    await d.tick();
+    expect(d.handle(id).record.swept).toBeUndefined(); // the stub really did suppress the automatic sweep
+    const sessionBefore = await d.client.getBalance({ address: session });
+
+    await d.stop();
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    expect(restarted.channelIds()).toEqual([]); // finalized: never re-opened (existing I1 behaviour)
+
+    const walletBefore = await restarted.client.getBalance({ address: alice.address });
+    const results = await restarted.sweep();
+    expect(results).toEqual([{ channelId: id, swept: expect.stringMatching(/^0x[0-9a-f]+$/) }]);
+
+    const record = new RecordStore(alice.home).channel(id)!;
+    expect(record.swept).toBe(true);
+    const sessionAfter = await restarted.client.getBalance({ address: session });
+    const walletAfter = await restarted.client.getBalance({ address: alice.address });
+    expect(sessionAfter).toBeLessThan(sessionBefore);
+    expect(walletAfter).toBeGreaterThan(walletBefore);
+
+    // A second sweep finds nothing left to do (swept is no longer unset).
+    expect(await restarted.sweep()).toEqual([]);
+  });
+});
+
 describe("Plan 4.5 Task 10: a settled channel keeps no transient error", () => {
   it("the pass that sees Finalized, then fails its last read, leaves lastError null (the channel is never watched again)", async () => {
     // Manual ticks only (a long pollMs), so each pass below is exactly the one the test stages.
