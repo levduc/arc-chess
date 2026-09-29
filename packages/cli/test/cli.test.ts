@@ -64,6 +64,23 @@ describe("arena CLI", () => {
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({ to: "human", note: "look" });
   });
 
+  it("fix round I5: arena sweep maps to POST /sweep and prints a note when channels remain", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const t = io(home, [{ status: 200, body: { results: [{ channelId: "0xaa", swept: "0x64" }], remaining: 2 } }]);
+    expect(await runCli(["sweep"], t.io)).toBe(0);
+    const c = t.calls.at(-1)!;
+    expect(c.url).toBe("http://127.0.0.1:7010/sweep");
+    expect(c.init.method).toBe("POST");
+    expect(JSON.parse(String(c.init.body))).toEqual({}); // no --channel given
+    expect(t.err.some((l) => /note: 2 channel\(s\) still need sweeping/.test(l))).toBe(true);
+
+    const t2 = io(home, [{ status: 200, body: { results: [], remaining: 0 } }]);
+    expect(await runCli(["sweep", "--channel", "0xab"], t2.io)).toBe(0);
+    expect(JSON.parse(String(t2.calls.at(-1)!.init.body))).toEqual({ channel: "0xab" });
+    expect(t2.err).toEqual([]); // nothing left: no note printed
+  });
+
   it("reports API errors and usage errors", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     const t = io(home, [{ status: 409, body: { error: "not your turn" } }]);

@@ -77,4 +77,20 @@ describe("local API", () => {
     const listed = await pair.alice.daemon.listOffers();
     expect(listed.find((o) => o.offerId === body.offerId)!.offer.challengeTimeout).toBe(1800n);
   });
+
+  it("fix round I5: POST /sweep returns {results, remaining}", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const res = await fetch(`${url}/sweep`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ results: [], remaining: 0 }); // no settled channels yet
+  });
 });

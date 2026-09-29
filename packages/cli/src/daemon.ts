@@ -242,6 +242,10 @@ export const SWEEP_ABANDON_ATTEMPTS = 12;
 export const SWEEP_HEADROOM_NUM = 13n;
 export const SWEEP_HEADROOM_DEN = 10n;
 
+/** Plan 5 fix round (I5): the wall-clock budget one `sweep()` call (with no `--channel`) spends attempting
+ *  records before returning, reporting `remaining` for whatever is left rather than hanging the caller. */
+export const SWEEP_TIME_BUDGET_MS = 60_000;
+
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
@@ -1280,39 +1284,98 @@ export class ArenaDaemon {
   }
 
   /**
-   * `arena sweep` / `POST /sweep`: sweeps every settled channel whose record has `swept` unset -- live ones (using
-   * their existing session sender/back-off) and legacy ones no longer in `live` (a fresh sender built from the
-   * record's `sessionKey`), including records written before this feature existed. `ref`, if given, narrows to
-   * channel ids starting with it (as `pick` does). Never throws for one channel's own failure -- each result
-   * reports its own outcome, `"error: …"` included.
+   * `arena sweep` / `POST /sweep`: sweeps every settled channel whose record has `swept` unset or `"abandoned"`
+   * (`true`/`"dust"` are done already) -- live ones (their existing session sender/back-off), queued ones (the
+   * sweep queue's own sender/back-off), and legacy ones tracked in neither (a fresh, one-shot sender built from
+   * the record's `sessionKey`). `ref`, if given, narrows to a single channel id starting with it, exactly as
+   * `pick` does: none matching is 404, more than one is 400 (ambiguous); a channel already swept reports
+   * `"already"` rather than an error. **I5**: single-flight -- a concurrent call is refused with 409 -- and
+   * spends at most `SWEEP_TIME_BUDGET_MS` attempting records (with no `--channel`), reporting `remaining` for
+   * whatever is left rather than hanging the caller. Never throws for one channel's own failure.
    */
-  async sweep(ref?: string): Promise<Array<{ channelId: Hex; swept: string }>> {
-    const want = ref?.toLowerCase();
-    const records = this.records.channels().filter((r) => r.finalized && r.swept === undefined);
-    const targets = want ? records.filter((r) => r.channelId.toLowerCase().startsWith(want)) : records;
-    if (want && targets.length === 0) throw new DaemonError(404, `no settled, unswept channel matches ${ref}`);
-    const results: Array<{ channelId: Hex; swept: string }> = [];
-    for (const record of targets) {
-      const l = this.live.get(record.channelId);
-      // Fix round I2: a queued (restart-time) record shares the queue's own sender/back-off, rather than a fresh
-      // `SerialTxSender` on the same key that knows nothing of what the queue's own pass may have already sent.
-      const queued = this.sweepQueue.get(record.channelId);
-      const sender =
-        l?.sessionSender ??
-        queued?.sender ??
-        new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
-          feeCeiling: NO_FEE_CEILING,
-        });
-      const backoff = l?.sweep ?? queued?.sweep ?? { blockedUntil: 0, backoffMs: 0, attempts: 0 };
-      const result = await this.runSweepAttempt(record, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
-      if (l) l.record = result.record;
-      if (queued) {
-        queued.record = result.record;
-        if (queued.record.swept !== undefined) this.sweepQueue.delete(record.channelId);
+  async sweep(
+    ref?: string,
+    // `budgetMs` is test-only (never set by the CLI/API): lets a test exercise the `remaining` mechanism without
+    // waiting out the real SWEEP_TIME_BUDGET_MS.
+    opts: { budgetMs?: number } = {},
+  ): Promise<{ results: Array<{ channelId: Hex; swept: string; hash?: Hex }>; remaining: number }> {
+    if (this.sweeping) throw new DaemonError(409, "a sweep is already in progress: retry shortly");
+    this.sweeping = true;
+    try {
+      const want = ref?.toLowerCase();
+      const allFinalized = this.records.channels().filter((r) => r.finalized);
+      if (want) {
+        const matches = allFinalized.filter((r) => r.channelId.toLowerCase().startsWith(want));
+        if (matches.length === 0) throw new DaemonError(404, `no settled channel matches ${ref}`);
+        if (matches.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+        const record = matches[0];
+        if (record.swept === true || record.swept === "dust") {
+          return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
+        }
+        return { results: [await this.sweepOneNow(record)], remaining: 0 };
       }
-      results.push(this.sweepResultToString(record.channelId, result));
+      const targets = allFinalized.filter((r) => r.swept !== true && r.swept !== "dust");
+      const deadline = Date.now() + (opts.budgetMs ?? SWEEP_TIME_BUDGET_MS);
+      const results: Array<{ channelId: Hex; swept: string; hash?: Hex }> = [];
+      let processed = 0;
+      for (const record of targets) {
+        if (Date.now() >= deadline) break;
+        processed++;
+        results.push(await this.sweepOneNow(record));
+      }
+      return { results, remaining: targets.length - processed };
+    } finally {
+      this.sweeping = false;
     }
-    return results;
+  }
+
+  /** One record's sweep, right now (`force`, bypassing the back-off's own timing) -- guarded by the same
+   *  busy-wait pattern `reclaim()` uses against the main pass (**I1**): a live channel's `mainBusy`, or a queued
+   *  record's own `busy` flag, so a manual sweep and the periodic pass never send on the same key at once. */
+  private async sweepOneNow(record: ChannelRecord): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
+    const id = record.channelId;
+    const l = this.live.get(id);
+    if (l) {
+      const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
+      while (l.mainBusy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
+      if (l.mainBusy) return { channelId: id, swept: "error: the watchtower is working on this channel: retry shortly" };
+      l.mainBusy = true;
+      try {
+        const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(r), { force: true });
+        l.record = result.record;
+        return this.sweepResultWithHash(id, result);
+      } finally {
+        l.mainBusy = false;
+      }
+    }
+    const queued = this.sweepQueue.get(id);
+    if (queued) {
+      const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
+      while (queued.busy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
+      if (queued.busy) return { channelId: id, swept: "error: a sweep pass is already working on this channel: retry shortly" };
+      queued.busy = true;
+      try {
+        const result = await this.runSweepAttempt(queued.record, queued.sender, queued.sweep, (r) => this.records.saveChannel(r), { force: true });
+        queued.record = result.record;
+        if (queued.record.swept !== undefined) this.sweepQueue.delete(id);
+        return this.sweepResultWithHash(id, result);
+      } finally {
+        queued.busy = false;
+      }
+    }
+    // Not tracked anywhere in memory (a record from another process, or predating this daemon's own start()): a
+    // fresh, one-shot sender and back-off.
+    const sender = new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
+      feeCeiling: NO_FEE_CEILING,
+    });
+    const backoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
+    const result = await this.runSweepAttempt(record, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
+    return this.sweepResultWithHash(id, result);
+  }
+
+  private sweepResultWithHash(id: Hex, result: SweepAttemptResult): { channelId: Hex; swept: string; hash?: Hex } {
+    const base = this.sweepResultToString(id, result);
+    return result.kind === "swept" ? { ...base, hash: result.hash } : base;
   }
 
   private sweepResultToString(id: Hex, result: SweepAttemptResult): { channelId: Hex; swept: string } {

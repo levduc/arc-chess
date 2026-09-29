@@ -1070,21 +1070,93 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(restarted.channelIds()).toEqual([]); // finalized: never re-opened (existing I1 behaviour)
 
     const walletBefore = await restarted.client.getBalance({ address: alice.address });
-    const results = await restarted.sweep();
+    const { results, remaining } = await restarted.sweep();
+    expect(remaining).toBe(0);
     expect(results).toHaveLength(1);
     expect(results[0].channelId).toBe(id);
     expect(results[0].swept).toMatch(/^0x[0-9a-f]+$/);
+    expect(results[0].hash).toMatch(/^0x[0-9a-f]{64}$/); // I9: the sweep hash is returned in the result
 
     const record = new RecordStore(alice.home).channel(id)!;
     expect(record.swept).toBe(true);
-    expect(record.sweptTx).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(record.sweptTx).toBe(results[0].hash);
     const sessionAfter = await restarted.client.getBalance({ address: session });
     const walletAfter = await restarted.client.getBalance({ address: alice.address });
     expect(sessionAfter).toBeLessThan(sessionBefore);
     expect(walletAfter - walletBefore).toBe(record.sweptAmount);
 
-    // A second sweep finds nothing left to do (swept is no longer unset).
-    expect(await restarted.sweep()).toEqual([]);
+    // A second sweep finds nothing left to do (already swept).
+    expect(await restarted.sweep()).toEqual({ results: [], remaining: 0 });
+  });
+
+  it("fix round I5: sweep() is single-flight -- a concurrent call is refused with 409", async () => {
+    const { alice, bob, id } = await matched();
+    const d = alice.daemon;
+    await settleWithSweepDisabled(alice, bob, id); // unswept: sweep() below has real work to do
+    const p1 = d.sweep(); // sets `sweeping` synchronously, before its first await
+    const p2 = d.sweep();
+    await expect(p2).rejects.toThrow(/already in progress/);
+    await expect(p2).rejects.toBeInstanceOf(DaemonError);
+    await p1; // let the first one finish before the test's own cleanup runs
+  });
+
+  it("fix round: an already-swept channel targeted by `--channel` reports \"already\", not an error", async () => {
+    const { alice, bob, id } = await matched();
+    const d = alice.daemon;
+    await d.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await d.status(id)).attention === "game-over", 5_000, "draw seen");
+    await d.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => d.handle(id).record.swept !== undefined, 20_000, "auto-swept");
+    expect(d.handle(id).record.swept).toBe(true);
+
+    expect(await d.sweep(id)).toEqual({ results: [{ channelId: id, swept: "already" }], remaining: 0 });
+  });
+
+  it("fix round (minor): `sweep --channel` with an ambiguous prefix errors, matching pick()", async () => {
+    const { alice, bob, id } = await matched();
+    const d = alice.daemon;
+    await settleWithSweepDisabled(alice, bob, id); // never re-enabled: stays unswept
+    const realRecord = new RecordStore(alice.home).channel(id)!;
+    const paths = arenaPaths(alice.home);
+    // A second finalized record whose id shares `id`'s leading hex digits ("0x" + 8 hex chars), but is not `id`.
+    const prefix = id.slice(0, 10);
+    const cloneId = `${prefix}${"0".repeat(66 - prefix.length)}` as Hex;
+    expect(cloneId.toLowerCase()).not.toBe(id.toLowerCase());
+    new RecordStore(alice.home).saveChannel({ ...realRecord, channelId: cloneId, finalized: true, finalPhase: "Finalized" });
+    writeFileSync(paths.channelSession(cloneId), readFileSync(paths.channelSession(id), "utf8"));
+
+    await expect(d.sweep(prefix)).rejects.toThrow(/ambiguous channel/);
+    await expect(d.sweep(prefix)).rejects.toBeInstanceOf(DaemonError);
+  });
+
+  it("fix round I5: sweep() spends a bounded budget and reports remaining for what's left", async () => {
+    const { alice, bob, id: id0 } = await matched();
+    await settleWithSweepDisabled(alice, bob, id0);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id1 = await waitFor(() => alice.daemon.channelIds().find((c) => c !== id0), 20_000, "second match");
+    await waitFor(() => bob.daemon.channelIds().includes(id1), 20_000, "bob's second match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id1)).phase === "Open", 20_000, "second open");
+    await settleWithSweepDisabled(alice, bob, id1);
+    const d = alice.daemon;
+    expect(d.handle(id0).record.swept).toBeUndefined();
+    expect(d.handle(id1).record.swept).toBeUndefined();
+
+    // A 1 ms budget: real work (an RPC round trip) always exceeds it, so exactly one of the two targets is
+    // attempted before the loop's own deadline check stops it.
+    const { results, remaining } = await d.sweep(undefined, { budgetMs: 1 });
+    expect(results).toHaveLength(1);
+    expect(remaining).toBe(1);
+    // A follow-up call (the real budget) finishes what was left.
+    const rest = await d.sweep();
+    expect(rest.results).toHaveLength(1);
+    expect(rest.remaining).toBe(0);
+    expect(d.handle(id0).record.swept).not.toBeUndefined();
+    expect(d.handle(id1).record.swept).not.toBeUndefined();
   });
 
   it("fix round I2: the periodic main pass sweeps a finalized-but-unswept record found at start() on its own -- no `arena sweep` needed", async () => {

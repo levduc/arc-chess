@@ -337,6 +337,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       return 1;
     }
     io.out(JSON.stringify(payload, null, 2));
+    // Plan 5 fix round (I5): a daemon-wide sweep may not finish everything within its own time budget.
+    if (cmd === "sweep" && typeof (payload as { remaining?: unknown }).remaining === "number") {
+      const remaining = (payload as { remaining: number }).remaining;
+      if (remaining > 0) io.err(`note: ${remaining} channel(s) still need sweeping; rerun "arena sweep" to continue`);
+    }
     return 0;
   } catch (err) {
     if (err instanceof UsageError) {
