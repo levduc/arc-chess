@@ -184,6 +184,26 @@ function isSweptDone(swept: ChannelRecord["swept"]): boolean {
   return swept === true || swept === "dust";
 }
 
+/** Fix round 2, important 5: the fee per gas a set of fees (`SerialTxSender`'s own `Fees` shape) asks for, in the
+ *  same style `tx.ts`'s own internal `feeOf` reads it (not exported). */
+function feePerGasOf(f: { maxFeePerGas?: bigint; gasPrice?: bigint }): bigint {
+  return f.maxFeePerGas ?? f.gasPrice ?? 0n;
+}
+
+/** True once a fee set names an actual value (as opposed to `{}`, e.g. an adopted-after-restart entry whose fees
+ *  were never observed). Mirrors `tx.ts`'s own internal `hasFees` (not exported). */
+function hasKnownFee(f: { maxFeePerGas?: bigint; gasPrice?: bigint }): boolean {
+  return f.maxFeePerGas !== undefined || f.gasPrice !== undefined;
+}
+
+/** Fix round 2, important 5: the same "raise a fee by at least 12.5%, rounded up" rule `SerialTxSender`'s own
+ *  same-nonce replacement path uses internally (`tx.ts`'s `bump`, not exported) -- needed here to size the
+ *  sweep's reserve against a dead entry's own last fee, not just the current market estimate. */
+function bumpFeePerGas(x: bigint): bigint {
+  const raised = (x * 1125n + 999n) / 1000n;
+  return raised > x ? raised : x + 1n;
+}
+
 export type DaemonOptions = {
   home: string;
   config: ArenaConfig;
@@ -1168,12 +1188,23 @@ export class ArenaDaemon {
    * does the right thing on its own, and a genuine race with something that lands first at that nonce surfaces as
    * `TxNonceUsedError`, not a false success (the reviewer's scenario B: waiting on a stale respond's hash reported
    * that respond's own receipt as if it were the sweep). **Rule 3**: reserves `gas * ceil(feePerGas *
-   * SWEEP_HEADROOM_NUM/DEN)` (1.3x), so a single 12.5% same-nonce replacement bump still fits the balance bound;
-   * dust if that leaves `<= gas * feePerGas`. Throws if the fee estimate is 0 (nothing reliable to reserve a bump
-   * against). **Rule 4**: success requires the mined receipt's `status` to be `"success"` -- a reverted send (a
-   * contract-wallet recipient that rejects it) must never be recorded as swept -- and its hash is, structurally,
-   * always one this call's own `send`/its replacements produced (waitOrReplace only ever follows the entry seeded
-   * by *this* `hash`). **I7**: at most one immediate retry, with fresh reads, on `TxInsufficientFundsError`.
+   * SWEEP_HEADROOM_NUM/DEN)` (1.3x) by default -- so a single 12.5% same-nonce replacement bump still fits the
+   * balance bound; dust if that leaves `<= gas * feePerGas` *and* the key has no dead entry to answer for (see
+   * important 5 below). Throws if the fee estimate is 0 (nothing reliable to reserve a bump against). **Rule 4**:
+   * success requires the mined receipt's `status` to be `"success"` -- a reverted send (a contract-wallet
+   * recipient that rejects it) must never be recorded as swept -- and its hash is, structurally, always one this
+   * call's own `send`/its replacements produced (waitOrReplace only ever follows the entry seeded by *this*
+   * `hash`). **I7**: at most one immediate retry, with fresh reads, on `TxInsufficientFundsError`.
+   *
+   * **Fix round 2, important 5**: a dead (released) entry already on this key -- there should be at most one,
+   * since rule 1's gate above already refuses to run while any entry is still `"waiting"` -- needs its own last
+   * fee bumped by at least 12.5% to be replaceable at all (`SerialTxSender.replaceReleased`'s own
+   * `affordable(bumpFees(e.lastFees), room)` check). If that bump exceeds the normal 1.3x reserve, the sweep
+   * reserves for it instead, or its own replacement send below could never afford to outbid it -- the channel
+   * would just back off, retry, and fail the same way forever, eventually abandoning gas it could have swept.
+   * When the reserve is elevated for this reason and the balance still can't clear it, this throws (backs off
+   * and retries) rather than declining as dust: a low *value* here is about the dead entry, not a genuinely small
+   * balance -- the one case `"dust"` is for.
    */
   private async performSweep(sender: SerialTxSender): Promise<{ status: "dust" } | { status: "swept"; amount: bigint; hash: Hex }> {
     for (let attempt = 0; ; attempt++) {
@@ -1182,9 +1213,25 @@ export class ArenaDaemon {
       const gasLimit = await this.gasForSweep(sender);
       const feePerGas = await this.currentFeePerGas();
       if (feePerGas === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
-      const reservePerGas = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+      const baseReserve = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+      const stuck = sender
+        .tracked()
+        .filter((t) => t.state === "released")
+        .sort((a, b) => a.nonce - b.nonce)[0];
+      // An unknown-fee entry (e.g. adopted from a pending nonce after a restart) is replaced with `2 x` the
+      // market estimate (`SerialTxSender.replaceReleased`'s own `doubled(estimate)` path, which skips the
+      // `affordable` check but still prices the send there); a known one needs at least its own fee bumped.
+      const stuckReserve = !stuck ? 0n : hasKnownFee(stuck.lastFees) ? bumpFeePerGas(feePerGasOf(stuck.lastFees)) : 2n * feePerGas;
+      const reservePerGas = stuck && stuckReserve > baseReserve ? stuckReserve : baseReserve;
       const value = balance - gasLimit * reservePerGas;
-      if (value <= gasLimit * feePerGas) return { status: "dust" };
+      if (value <= gasLimit * feePerGas) {
+        if (stuck) {
+          throw new Error(
+            `a dead transaction on this key (nonce ${stuck.nonce}, last fee ${feePerGasOf(stuck.lastFees)}) needs more reserve than this balance affords to replace`,
+          );
+        }
+        return { status: "dust" };
+      }
       const req = { to: this.wallet.address, data: "0x" as Hex, value, gas: gasLimit };
       let hash: Hex;
       try {

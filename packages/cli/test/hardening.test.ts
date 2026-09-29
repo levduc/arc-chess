@@ -1116,6 +1116,50 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     }
   });
 
+  it("fix round 2, important 5: a dead entry bumped several times still gets replaced and swept (dynamic reserve)", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    try {
+      const standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      // Bump it several times against a chain that never mines -- the pool still holds the stand-in (and every
+      // bump of it) throughout, so the sender's own lastFees for this nonce stays known and elevated, rather
+      // than being forgotten by a later prune() (which only forgets it once the pool no longer holds any of this
+      // intent's transactions). maxReplacements is generous (the reviewer's own repro reached ~1.67x the market
+      // estimate this way, comfortably past the old fixed 1.3x reserve; this run's own ratio depends on how the
+      // market estimate itself moved between rounds, not just the bump percentage, so it is observed rather than
+      // asserted -- the point of this test is that the sweep succeeds despite it, whatever it turns out to be).
+      await waitOrReplace(d.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, { timeoutMs: 100, maxReplacements: 5 }).catch(
+        () => undefined,
+      );
+      const stuckEntry = sender.tracked()[0];
+      expect(stuckEntry.state).toBe("released");
+      const stuckNonce = stuckEntry.nonce;
+
+      const walletBefore = await d.client.getBalance({ address: alice.address });
+      (d as unknown as SweepableDaemon).sweepChannel = original;
+      // Automine stays off (as in important 4/scenario B): the stuck entry must still be there, at its elevated
+      // fee, for the sweep to actually have to reserve for it and replace it -- not just find it already mined
+      // and start over at a fresh nonce.
+      await waitFor(() => sender.tracked()[0]?.hashes.length === stuckEntry.hashes.length + 1, 10_000, "the sweep replaced the dead entry at its nonce");
+      const entry = sender.tracked()[0];
+      expect(entry.nonce).toBe(stuckNonce);
+
+      await testClient.mine({ blocks: 1 });
+      await waitFor(() => l.record.swept === true, 20_000, "swept despite the elevated dead entry");
+      const walletAfter = await d.client.getBalance({ address: alice.address });
+      expect(walletAfter - walletBefore).toBe(l.record.sweptAmount);
+      const receipt = await d.client.getTransactionReceipt({ hash: l.record.sweptTx! });
+      expect(receipt.status).toBe("success");
+    } finally {
+      await testClient.setAutomine(true);
+    }
+  });
+
   it("sweeps a retired (never funded past its deadline) channel's session gas too, not just Finalized/Reclaimed", async () => {
     const pair = await startPair({ pollMs: 3_600_000 });
     cleanups.push(pair.cleanup);
