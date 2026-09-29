@@ -33,6 +33,8 @@ import {
   SETTLED_CACHE_MAX,
   SETTLED_GRACE_SECONDS,
   SWEEP_ABANDON_ATTEMPTS,
+  SWEEP_HEADROOM_DEN,
+  SWEEP_HEADROOM_NUM,
   arenaPaths,
   loadConfig,
   type ChannelRecord,
@@ -1643,6 +1645,49 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(l.record.sweptTx).toBe(second.results[0].hash); // the record now reflects the *new* sweep
     expect(await d.client.getBalance({ address: alice.address })).toBeGreaterThan(walletBefore);
     expect(await d.client.getBalance({ address: session })).toBeLessThan(topUp); // actually swept, not left sitting there
+  });
+
+  it("fix round 2, minor 5: the dust boundary is exact -- gas*(ceil(1.3F)+F) declines, one wei above sweeps", async () => {
+    const gas = 21_000n;
+    // A fixed F, not a live read: the real market fee can (and, in practice, does) drift by the time the periodic
+    // pass gets around to reading it itself -- enough to tip a balance chosen to land exactly on the boundary
+    // computed from an earlier read. currentFeePerGas is stubbed to this fixed value below so the boundary this
+    // test computes and the one performSweep actually applies are guaranteed to be the same number.
+    const F = 1_500_000_000n;
+    const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN; // ceil(1.3F)
+    // `value = balance - gas*reserve` is dust once `value <= gas*F` -- i.e. `balance <= gas*(reserve+F)` exactly.
+    const boundary = gas * (reserve + F);
+
+    // Exactly at the boundary: declined, recorded "dust", the balance left untouched.
+    {
+      const { alice, bob, id } = await matched();
+      const original = await settleWithSweepDisabled(alice, bob, id);
+      const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
+      d.currentFeePerGas = () => Promise.resolve(F);
+      const l = alice.daemon.handle(id);
+      const session = l.sessionSender.address;
+      await setEthBalance(session, boundary);
+      d.sweepChannel = original;
+      await waitFor(() => l.record.swept !== undefined, 20_000, "declined at the boundary");
+      expect(l.record.swept).toBe("dust");
+      expect(l.record.sweptAmount).toBeUndefined();
+      expect(await alice.daemon.client.getBalance({ address: session })).toBe(boundary); // untouched: no transaction sent
+    }
+
+    // One wei above the same boundary: no longer dust -- a real sweep.
+    {
+      const { alice, bob, id } = await matched();
+      const original = await settleWithSweepDisabled(alice, bob, id);
+      const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
+      d.currentFeePerGas = () => Promise.resolve(F);
+      const l = alice.daemon.handle(id);
+      const session = l.sessionSender.address;
+      await setEthBalance(session, boundary + 1n);
+      d.sweepChannel = original;
+      await waitFor(() => l.record.swept !== undefined, 20_000, "swept one wei above the boundary");
+      expect(l.record.swept).toBe(true);
+      expect(l.record.sweptAmount).toBeGreaterThan(0n);
+    }
   });
 });
 
