@@ -1,8 +1,9 @@
 /**
  * Plan 4.5 Task 11: a CI load scenario over the real host server, real `arena daemon` processes and a real chain
- * (Anvil) -- 6 daemons, 9 channels open at once (a 3-regular pairing: each daemon in exactly 3 channels), random
- * games capped at 40 plies (forced to a draw at the cap so every game reaches a terminal state), then a cooperative
- * close. Must finish well under CI's budget (a few minutes).
+ * (Anvil) -- 6 daemons, 9 channels open at once (a 3-regular pairing: each daemon in exactly 3 channels). Two
+ * channels play a scripted mate each (one white win, one black win -- M1, Task 11 review), the rest play random
+ * games capped at 40 plies (forced to a draw at the cap so every game reaches a terminal state); all close
+ * cooperatively. Must finish well under CI's budget (a few minutes).
  *
  * The server runs every daemon from 127.0.0.1, so this stack raises the per-IP limits that would otherwise throttle
  * nine simultaneous offers and connections from one source address -- the same way a production deployment behind
@@ -15,7 +16,7 @@ import { foundry } from "viem/chains";
 import { HubClient } from "@arena/sdk";
 import { readJson, type ChannelRecord } from "@arena/cli";
 import { startStack, usdcBalanceOf, type Player, type Stack } from "./harness.js";
-import { playRandomGameCapped, waitStatus, type Status } from "./bot.js";
+import { playLine, playRandomGameCapped, waitStatus, type Status } from "./bot.js";
 
 const DEPOSIT = 1_000_000n;
 const STAKE = 100_000n;
@@ -23,6 +24,12 @@ const START = 10_000_000n;
 const FEE = 5_000n;
 const N_DAEMONS = 6;
 const PLY_CAP = 40;
+// M1 (Task 11 review): random play with seeds 1..9 reaches the 40-ply cap on every one of these 9 channels (the
+// reviewer simulated it), so relying on random play alone only ever exercises the fee-accounting side of the
+// balance assertion, never the stake-shift branch in either direction. Two channels instead play a scripted mate
+// each, deterministically exercising both directions; the rest still play random capped games.
+const SCHOLARS_MATE = ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]; // white (the offerer) mates
+const FOOLS_MATE = ["f2f3", "e7e5", "g2g4", "d8h4"]; // black (the accepter) mates
 
 let stack: Stack | undefined;
 afterEach(async () => {
@@ -142,15 +149,27 @@ describe("load: 6 daemons, 9 channels at once (Plan 4.5 Task 11)", () => {
 
       expect((await hub.limits()).committedEscrow).toBe(neededEscrow);
 
-      // Random games, seeded, capped at 40 plies (a forced draw at the cap), all 9 channels concurrently.
+      // Games, all 9 channels concurrently: channel 0 a scripted white win, channel 1 a scripted black win (M1 --
+      // deterministically exercises both stake-shift directions), the rest random and capped at 40 plies (a
+      // forced draw at the cap).
       const results = await Promise.all(
         opened.map(async ({ white, black, id }, idx) => {
+          if (idx === 0) {
+            await playLine(white, black, id, SCHOLARS_MATE);
+            return (await waitStatus(white, (s) => s.gameStatus === "white_won", 15_000, id)).gameStatus;
+          }
+          if (idx === 1) {
+            await playLine(white, black, id, FOOLS_MATE);
+            return (await waitStatus(white, (s) => s.gameStatus === "black_won", 15_000, id)).gameStatus;
+          }
           await playRandomGameCapped(white, black, { channelId: id, seed: idx + 1, maxMoves: PLY_CAP, ms: 15_000 });
           const end = await waitStatus(white, (s) => s.gameStatus !== "playing" && s.gameStatus !== "draw_offered", 20_000, id);
           return end.gameStatus;
         }),
       );
       console.log(`[load] 9 games: ${results.join(", ")}`);
+      expect(results[0]).toBe("white_won");
+      expect(results[1]).toBe("black_won");
 
       // Close every channel.
       await Promise.all(opened.map(({ white, black, id }) => closeBoth(white, black, id, hub)));
