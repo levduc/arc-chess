@@ -114,7 +114,10 @@ async function findChannelByOffer(p: Player, offerId: Hex): Promise<Hex> {
   }, OP_TIMEOUT_MS, `${p.name}'s channel for offer ${offerId}`);
 }
 
-async function closeBoth(a: Player, b: Player, id: Hex, hub: HubClient): Promise<void> {
+/** Closes cooperatively and waits for Finalized, then reports (M3, Task 11 review) whether this channel was ever
+ *  Challenged -- a lost relay message would force one, so a soak run claiming a clean bill of health should
+ *  actually have checked, the way load.test.ts already does. */
+async function closeBoth(a: Player, b: Player, id: Hex, hub: HubClient): Promise<{ everChallenged: boolean }> {
   const aStatus = (await a.api("GET", `/status?channel=${id}`)) as Status;
   await waitStatus(b, (s) => s.turnNum === aStatus.turnNum, OP_TIMEOUT_MS, id);
   await a.api("POST", "/close", { channel: id });
@@ -123,6 +126,8 @@ async function closeBoth(a: Player, b: Player, id: Hex, hub: HubClient): Promise
   await waitFor(async () => (await hub.channelInfo(id)).phase === "Finalized", OP_TIMEOUT_MS, `channel ${id} Finalized`);
   await waitStatus(a, (s) => s.phase === "Finalized", OP_TIMEOUT_MS, id);
   await waitStatus(b, (s) => s.phase === "Finalized", OP_TIMEOUT_MS, id);
+  const disputes = await hub.disputeEvents(id);
+  return { everChallenged: disputes.length > 0 };
 }
 
 // ------------------------------------------------------------------------------------------------------ /proc
@@ -291,6 +296,8 @@ async function main(): Promise<void> {
       lastProgressAt: number;
       gamesCompleted: number;
       channelsCompleted: number;
+      /** M3 (Task 11 review): channel ids this slot closed that were ever Challenged on chain. */
+      everChallenged: Hex[];
       rand: () => number;
       maxMatchLatencyMs: number;
       slowMatches: number;
@@ -304,6 +311,7 @@ async function main(): Promise<void> {
       lastProgressAt: Date.now(),
       gamesCompleted: 0,
       channelsCompleted: 0,
+      everChallenged: [],
       rand: mulberry32(1000 + idx),
       maxMatchLatencyMs: 0,
       slowMatches: 0,
@@ -365,7 +373,11 @@ async function main(): Promise<void> {
         }
         if (!finished || stopping) break; // shutting down: leave this channel as-is, the stack teardown kills it
 
-        await closeBoth(slot.offerer, slot.accepter, id, hub);
+        const { everChallenged } = await closeBoth(slot.offerer, slot.accepter, id, hub);
+        if (everChallenged) {
+          slot.everChallenged.push(id);
+          console.log(`[soak] slot ${slot.idx}: channel ${id} was Challenged at some point (a lost relay message would force one)`);
+        }
         slot.channelsCompleted++;
         slot.channelId = null;
         slot.lastProgressAt = Date.now();
@@ -481,10 +493,18 @@ async function main(): Promise<void> {
       fdsEnd: Object.fromEntries(samples[samples.length - 1].procs.map((p) => [p.name, p.fds])),
       maxMatchLatencyMs: Math.max(0, ...slots.map((s) => s.maxMatchLatencyMs)),
       slowMatches: slots.reduce((n, s) => n + s.slowMatches, 0),
+      everChallenged: slots.flatMap((s) => s.everChallenged),
       rssViolations,
       failures,
       exitCode,
     };
+    // M3 (Task 11 review): a channel going Challenged during a run with no injected faults means a lost relay
+    // message -- a real bug, the same bar load.test.ts already holds every channel to.
+    if (summary.everChallenged.length > 0) {
+      const msg = `${summary.everChallenged.length} channel(s) were Challenged at some point: ${summary.everChallenged.join(", ")}`;
+      failures.push(msg);
+      summary.exitCode = exitCode = 1;
+    }
     writeReport(summary);
     console.log(`[soak] finished: ${JSON.stringify(summary)}`);
   } catch (err) {
