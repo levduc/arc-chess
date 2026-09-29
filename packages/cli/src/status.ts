@@ -41,6 +41,13 @@ export type ChannelStatus = {
    *  this channel -- it means new offers/accepts are refused until this daemon restarts (see checkLobbyHealthy in
    *  daemon.ts) -- but every channel's status carries it, since there is no daemon-wide endpoint to put it on. */
   lobbyError: string | null;
+  /** Plan 5 fix round (I2): the record's own sweep outcome -- `null` while not finalized or not yet swept,
+   *  `true`/`"dust"`/`"abandoned"` once the sweep (or the abandon back-off) has run. See `ChannelRecord.swept`. */
+  swept: true | "dust" | "abandoned" | null;
+  /** Plan 5 fix round: the swept amount (base units of native gas), set alongside `swept: true`. */
+  sweptAmount: string | null;
+  /** Plan 5 fix round: the sweep transaction's hash, set alongside `swept: true`. */
+  sweptTx: Hex | null;
 };
 
 export type StatusInput = {
@@ -209,5 +216,8 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     suggestedActions,
     lastError: input.lastError,
     lobbyError: input.lobbyError ?? null,
+    swept: record.swept ?? null,
+    sweptAmount: record.sweptAmount !== undefined ? record.sweptAmount.toString() : null,
+    sweptTx: record.sweptTx ?? null,
   };
 }

@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-import { TransactionReceiptNotFoundError, type Hex } from "viem";
+import { createTestClient, http, TransactionReceiptNotFoundError, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
@@ -18,6 +18,7 @@ import {
   hashState,
   offerId as computeOfferId,
   signClose,
+  waitOrReplace,
   type MatchEvent,
   type SignedAcceptance,
 } from "@arena/sdk";
@@ -857,55 +858,198 @@ describe("Plan 4.5 Task 10: a match whose handling fails on an RPC error is retr
 });
 
 describe("Plan 5 Task 1: session-gas sweep", () => {
-  it("sweeps the session key's balance back to the wallet after settle, leaving less than dust", async () => {
-    const { alice, bob, id, config } = await matched();
-    const d = alice.daemon;
-    const session = d.handle(id).sessionSender.address;
-    void config; // sessionGasWei is not needed here directly -- the balance is read straight off chain
-    await d.move(id, "e4", { actor: "agent", offerDraw: true });
+  type SweepableDaemon = { sweepChannel(l: unknown): Promise<void> };
+
+  /** Plays a quick draw, closes both sides (settling the channel), with the automatic sweep suppressed for the
+   *  duration -- so a test can pose its own session-key scenario before letting the real sweep run. Returns the
+   *  real `sweepChannel` (bound), for the test to reinstate when it is ready. */
+  async function settleWithSweepDisabled(alice: Awaited<ReturnType<typeof matched>>["alice"], bob: Awaited<ReturnType<typeof matched>>["bob"], id: Hex) {
+    const d = alice.daemon as unknown as SweepableDaemon;
+    const original = d.sweepChannel.bind(d);
+    d.sweepChannel = () => Promise.resolve();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
     await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
     await bob.daemon.acceptDraw(id, "agent");
-    await waitFor(async () => (await d.status(id)).attention === "game-over", 5_000, "draw seen");
-    await d.close(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
     await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
+    return original;
+  }
+
+  it("sweeps the session key's balance back to the wallet after settle: exact accounting (rule 4/I9)", async () => {
+    const { alice, bob, id } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    // settleWithSweepDisabled waits for `record.finalized`, which only flips once alice's own watch() has read
+    // Finalized on-chain -- by then any racing close-resubmission (both sides may submit the same cooperative
+    // close at once; Plan 4.5 Task 10) has already landed or reverted, so it is safe to measure the wallet from
+    // here: nothing but the sweep itself should touch it from this point on.
+    const original = await settleWithSweepDisabled(alice, bob, id);
 
     const sessionBefore = await d.client.getBalance({ address: session });
     const walletBefore = await d.client.getBalance({ address: alice.address });
-    await bob.daemon.close(id, "agent"); // this is the submission that settles the channel
-    await waitFor(() => d.handle(id).record.finalized, 20_000, "settled");
+    (d as unknown as SweepableDaemon).sweepChannel = original;
     await waitFor(() => d.handle(id).record.swept !== undefined, 20_000, "swept");
 
-    expect(d.handle(id).record.swept).toBe(true);
+    const record = d.handle(id).record;
+    expect(record.swept).toBe(true);
+    expect(record.sweptAmount).toBeGreaterThan(0n);
+    expect(record.sweptTx).toMatch(/^0x[0-9a-f]{64}$/);
+    const receipt = await d.client.getTransactionReceipt({ hash: record.sweptTx! });
+    expect(receipt.status).toBe("success");
+    expect(receipt.to?.toLowerCase()).toBe(alice.address.toLowerCase());
+
     const sessionAfter = await d.client.getBalance({ address: session });
     const walletAfter = await d.client.getBalance({ address: alice.address });
+    // I9 exact assertions:
+    expect(walletAfter - walletBefore).toBe(record.sweptAmount); // the wallet gained exactly the recorded amount
+    // what left the session key beyond the swept amount is exactly the sweep tx's own gas cost
+    const gasCost = receipt.gasUsed * receipt.effectiveGasPrice;
+    expect(sessionBefore - sessionAfter - (walletAfter - walletBefore)).toBe(gasCost);
+    // the residue stays within the reserved headroom (rule 3: gas * ceil(F * 1.3))
     const { maxFeePerGas } = await d.client.estimateFeesPerGas();
-    const dustBound = 2n * 21_000n * maxFeePerGas;
-    expect(sessionAfter).toBeLessThan(dustBound);
-    expect(sessionAfter).toBeLessThan(sessionBefore);
-    const swept = walletAfter - walletBefore;
-    expect(swept).toBeGreaterThan(0n);
-    // Nearly everything that left the session key reached the wallet -- the remainder is the tx's own gas cost.
-    expect(swept + sessionAfter).toBeGreaterThanOrEqual((sessionBefore * 9n) / 10n);
+    expect(sessionAfter).toBeLessThanOrEqual((receipt.gasUsed * maxFeePerGas * 13n) / 10n);
+  });
+
+  it("declines a dust balance without sending a transaction, recording swept: \"dust\"", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const session = l.sessionSender.address;
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const dustBalance = 21_000n * maxFeePerGas; // rule 3: dust once value <= gas * F -- this balance leaves exactly that
+    await setEthBalance(session, dustBalance);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.record.swept !== undefined, 20_000, "declined");
+    expect(l.record.swept).toBe("dust");
+    expect(l.record.sweptAmount).toBeUndefined();
+    expect(await d.client.getBalance({ address: session })).toBe(dustBalance); // untouched: no transaction sent
+  });
+
+  it("scenario A (reviewer repro): a dropped tracked entry on the session key recovers -- no permanent stall", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    try {
+      // A stand-in for a stuck respond: sent, then abandoned by an aborted wait (released, never mined).
+      const standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      const ac = new AbortController();
+      ac.abort();
+      await waitOrReplace(d.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, { signal: ac.signal }).catch(
+        () => undefined,
+      );
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]);
+      await testClient.dropTransaction({ hash: standInHash }); // the node no longer knows it at all
+      await testClient.setAutomine(true);
+    } finally {
+      await testClient.setAutomine(true);
+    }
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.record.swept === true, 20_000, "recovered and swept");
+    const record = l.record;
+    expect(record.sweptAmount).toBeGreaterThan(0n);
+    const receipt = await d.client.getTransactionReceipt({ hash: record.sweptTx! });
+    expect(receipt.status).toBe("success");
+    expect(receipt.to?.toLowerCase()).toBe(alice.address.toLowerCase());
+  });
+
+  it("scenario B (reviewer repro): replacing a released (not dropped) tracked entry produces a real, verifiable sweep -- never a false success", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    let standInHash: Hex;
+    try {
+      // A stand-in for a stuck respond that is still sitting in the node's mempool (unlike scenario A's dropped
+      // one) when the sweep runs -- the old bug waited on *this* hash directly and reported its receipt (to
+      // itself, not the wallet) as a successful sweep.
+      standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      const ac = new AbortController();
+      ac.abort();
+      await waitOrReplace(d.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, { signal: ac.signal }).catch(
+        () => undefined,
+      );
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]);
+    } finally {
+      await testClient.setAutomine(true); // back to normal: the real sweep's replacement mines like any other tx
+    }
+    const walletBefore = await d.client.getBalance({ address: alice.address });
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.record.swept === true, 20_000, "swept");
+    const record = l.record;
+    const walletAfter = await d.client.getBalance({ address: alice.address });
+    expect(walletAfter - walletBefore).toBe(record.sweptAmount); // the wallet genuinely received the funds
+    expect(record.sweptTx).not.toBe(standInHash); // never reported the stale entry's own hash as the sweep
+    const receipt = await d.client.getTransactionReceipt({ hash: record.sweptTx! });
+    expect(receipt.status).toBe("success");
+    expect(receipt.to?.toLowerCase()).toBe(alice.address.toLowerCase());
+    expect(sender.tracked()).toEqual([]); // the replaced entry is gone, not left dangling
+  });
+
+  it("sweeps a retired (never funded past its deadline) channel's session gas too, not just Finalized/Reclaimed", async () => {
+    const pair = await startPair({ pollMs: 3_600_000 });
+    cleanups.push(pair.cleanup);
+    const { alice, bob, env } = pair;
+    const d = alice.daemon;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    try {
+      await setPaused(env.hub, true); // fund() tops up the session key, then the deposit itself reverts (Paused)
+      await d.idle();
+      await d.tick();
+      const session = d.handle(id).sessionSender.address;
+      await waitFor(async () => (await d.client.getBalance({ address: session })) > 0n, 10_000, "session key funded despite the paused deposit");
+      await increaseTime(3601); // past the funding deadline
+      await d.idle();
+      await d.tick(); // retires the channel (None/Funding, unfunded, past the deadline) -- same pass sweeps it
+      await waitFor(() => d.handle(id).record.finalized, 10_000, "retired");
+      expect(d.handle(id).record.finalPhase === "None" || d.handle(id).record.finalPhase === "Funding").toBe(true);
+      await waitFor(() => d.handle(id).record.swept !== undefined, 20_000, "swept");
+      expect(d.handle(id).record.swept === true || d.handle(id).record.swept === "dust").toBe(true);
+    } finally {
+      await setPaused(env.hub, false);
+    }
+  });
+
+  it("never sweeps while a refill or the dispute pass is working the same session key (rule 1)", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const callSweepChannel = (h: unknown) => (d as unknown as { sweepChannel(x: unknown): Promise<void> }).sweepChannel(h);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+
+    l.refilling = new Promise<void>(() => undefined); // simulates a refill genuinely in flight; never resolves
+    await callSweepChannel(l);
+    expect(l.record.swept).toBeUndefined(); // skipped: the refill guard held
+    l.refilling = null;
+
+    l.disputeBusy = true;
+    await callSweepChannel(l);
+    expect(l.record.swept).toBeUndefined(); // skipped: the dispute-pass guard held
+    l.disputeBusy = false;
+
+    await callSweepChannel(l);
+    await waitFor(() => l.record.swept !== undefined, 20_000, "swept once both guards clear");
   });
 
   it("`arena sweep` (daemon.sweep) sweeps a legacy record -- finalized before this feature, no longer in `live`", async () => {
     const { alice, bob, id } = await matched();
     const d = alice.daemon;
     const session = d.handle(id).sessionSender.address;
-    // Disable the automatic sweep so this channel settles exactly like a record written before the feature
-    // existed: finalized, `swept` unset, its session key still fully funded.
-    (d as unknown as { sweepChannel(l: unknown): Promise<void> }).sweepChannel = () => Promise.resolve();
-    await d.move(id, "e4", { actor: "agent", offerDraw: true });
-    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
-    await bob.daemon.acceptDraw(id, "agent");
-    await waitFor(async () => (await d.status(id)).attention === "game-over", 5_000, "draw seen");
-    await d.close(id, "agent");
-    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
-    await bob.daemon.close(id, "agent");
-    await waitFor(() => d.handle(id).record.finalized, 20_000, "settled");
-    await d.idle();
-    await d.tick();
-    expect(d.handle(id).record.swept).toBeUndefined(); // the stub really did suppress the automatic sweep
+    await settleWithSweepDisabled(alice, bob, id); // never re-enabled: this channel stays unswept, like a legacy record
+    expect(d.handle(id).record.swept).toBeUndefined();
     const sessionBefore = await d.client.getBalance({ address: session });
 
     await d.stop();
@@ -922,14 +1066,17 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
 
     const walletBefore = await restarted.client.getBalance({ address: alice.address });
     const results = await restarted.sweep();
-    expect(results).toEqual([{ channelId: id, swept: expect.stringMatching(/^0x[0-9a-f]+$/) }]);
+    expect(results).toHaveLength(1);
+    expect(results[0].channelId).toBe(id);
+    expect(results[0].swept).toMatch(/^0x[0-9a-f]+$/);
 
     const record = new RecordStore(alice.home).channel(id)!;
     expect(record.swept).toBe(true);
+    expect(record.sweptTx).toMatch(/^0x[0-9a-f]{64}$/);
     const sessionAfter = await restarted.client.getBalance({ address: session });
     const walletAfter = await restarted.client.getBalance({ address: alice.address });
     expect(sessionAfter).toBeLessThan(sessionBefore);
-    expect(walletAfter).toBeGreaterThan(walletBefore);
+    expect(walletAfter - walletBefore).toBe(record.sweptAmount);
 
     // A second sweep finds nothing left to do (swept is no longer unset).
     expect(await restarted.sweep()).toEqual([]);
@@ -1032,7 +1179,8 @@ describe("Plan 4.5 Task 10: a settled channel keeps no transient error", () => {
       return (await alice.daemon.hub.channelInfo(id)).phase === "Open";
     }, 20_000, "funding by manual ticks");
     // Inside one pass: an earlier failure is on record, the step-4 read sees Finalized, then refreshChain's read
-    // fails. (The phase is faked: this is the daemon's bookkeeping, not the hub's.)
+    // fails, and (Plan 5 fix round, rule 1) the same pass's sweep gate re-reads the chain too and fails the same
+    // way. (The phase is faked: this is the daemon's bookkeeping, not the hub's.)
     const hub = alice.daemon.hub;
     const real = hub.channelInfo.bind(hub);
     let call = 0;
@@ -1040,15 +1188,17 @@ describe("Plan 4.5 Task 10: a settled channel keeps no transient error", () => {
       call++;
       if (call === 1) return real(c); // the pass's first read
       if (call === 2) return { ...(await real(c)), phase: "Finalized" }; // step 4: settled
-      throw new Error("HTTP request failed."); // refreshChain
+      throw new Error("HTTP request failed."); // refreshChain, then the sweep gate's own fresh read
     };
     alice.daemon.handle(id).lastError = "watch: HTTP request failed."; // from an earlier failed pass
     await alice.daemon.idle();
     await alice.daemon.mainPass(); // the main pass alone (the dispute pass would take the first read)
-    expect(call).toBe(3);
+    expect(call).toBe(4);
     expect(alice.daemon.handle(id).record.finalized).toBe(true);
     // Before the fix: "watch: HTTP request failed." for good.
     expect(alice.daemon.handle(id).lastError).toBeNull();
+    // The sweep gate's own failure never sets lastError either (the channel is already settled).
+    expect(alice.daemon.handle(id).record.swept).toBeUndefined(); // the gate's read failed: not yet swept
   });
 });
 
