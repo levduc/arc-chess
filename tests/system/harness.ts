@@ -339,6 +339,10 @@ export type Player = {
   pid(): number | undefined;
 };
 
+/** `serverUrl`/`rpcUrl`: see `Stack.player`. `sessionGasWei`/`sessionGasFloor`: the daemon's session-key dispute gas
+ *  target and refill floor (`arena init --session-gas-wei/--session-gas-floor`); default 1e16 wei and half of it. */
+export type PlayerOptions = { serverUrl?: string; rpcUrl?: string; sessionGasWei?: bigint; sessionGasFloor?: bigint };
+
 export type Stack = {
   rpcUrl: string;
   chainId: number;
@@ -355,7 +359,7 @@ export type Stack = {
    *  daemon's host connection) somewhere other than the stack's own server -- e.g. at a MITM proxy in front of it.
    *  `opts.rpcUrl` overrides the RPC the daemon uses (`arena init --rpc`) -- e.g. a faulty RPC proxy in front of
    *  this stack's Anvil; everything else still comes from the server's `/templates`. */
-  player(name: string, key?: Hex, opts?: { serverUrl?: string; rpcUrl?: string }): Promise<Player>;
+  player(name: string, key?: Hex, opts?: PlayerOptions): Promise<Player>;
   /** Gives `address` native gas (100 ETH) and, unless `usdc` is 0, mints it MockUSDC (default 10 USDC) -- the same
    *  funding `player()` gives a daemon's wallet, for SDK-only actors (a malicious peer, an attacker). */
   fund(address: Address, usdc?: bigint): Promise<void>;
@@ -491,7 +495,7 @@ export async function startStack(
       await pub.waitForTransactionReceipt({ hash: mintHash });
     }
 
-    async function player(name: string, key?: Hex, opts: { serverUrl?: string; rpcUrl?: string } = {}): Promise<Player> {
+    async function player(name: string, key?: Hex, opts: PlayerOptions = {}): Promise<Player> {
     const walletKey = key ?? generatePrivateKey();
     const address = privateKeyToAccount(walletKey).address;
     await fund(address);
@@ -514,6 +518,11 @@ export async function startStack(
         // daemon's production floor is 900 s (final review I4).
         "--min-challenge-timeout",
         "60",
+        // Explicit, so the suites' session-key balances do not depend on Anvil's gas price (arena init's default is
+        // derived from it, final review C1).
+        "--session-gas-wei",
+        String(opts.sessionGasWei ?? 10n ** 16n),
+        ...(opts.sessionGasFloor !== undefined ? ["--session-gas-floor", String(opts.sessionGasFloor)] : []),
       ],
       home,
     );

@@ -1,4 +1,5 @@
 import { parseUnits, type Address, type Hex } from "viem";
+import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
 import {
   defaultHome,
   initHome,
@@ -6,6 +7,7 @@ import {
   loadToken,
   DEFAULT_LOG_CHUNK_BLOCKS,
   DEFAULT_MIN_CHALLENGE_TIMEOUT,
+  defaultSessionGasWei,
   knownDeploymentWarnings,
   type ArenaConfig,
 } from "./config.js";
@@ -20,8 +22,9 @@ export type CliIo = {
 
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
-       [--max-fee N] [--session-gas-wei N] [--poll-ms N] [--log-chunk-blocks N] [--fee-ceiling-wei N]
-       [--min-challenge-timeout SECONDS]
+       [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
+       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS]
+       (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
@@ -188,6 +191,18 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       // Final review I2: on a chain with a known canonical deployment, a different hub or rules is loud.
       for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
+      // Final review C1: the session key's dispute gas is derived from the chain unless given. A key that cannot pay
+      // for a respond cannot answer a stale challenge, and an unanswered one can roll the channel back.
+      const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
+      let sessionGasWei: bigint;
+      if (flag("session-gas-wei") !== undefined) sessionGasWei = BigInt(flag("session-gas-wei")!);
+      else {
+        const price = await rpcCall(io, rpcUrl, "eth_gasPrice", []);
+        if (typeof price !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(price)) {
+          throw new Error(`RPC ${rpcUrl} returned a malformed eth_gasPrice: ${JSON.stringify(price)?.slice(0, 80)} (or pass --session-gas-wei)`);
+        }
+        sessionGasWei = defaultSessionGasWei(feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI, BigInt(price));
+      }
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,
@@ -197,10 +212,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         serverUrl: server,
         port: Number(flag("port") ?? "7070"),
         maxFeePerPlayer: BigInt(flag("max-fee") ?? "10000"),
-        sessionGasWei: BigInt(flag("session-gas-wei") ?? "10000000000000000"),
+        sessionGasWei,
+        ...(flag("session-gas-floor") !== undefined ? { sessionGasFloor: BigInt(flag("session-gas-floor")!) } : {}),
         pollMs: Number(flag("poll-ms") ?? "2000"),
         logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
-        ...(flag("fee-ceiling-wei") !== undefined ? { feeCeilingWei: BigInt(flag("fee-ceiling-wei")!) } : {}),
+        ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),
         ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
@@ -214,6 +230,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         hub,
         usdc,
         rules,
+        sessionGasWei: cfg.sessionGasWei.toString(),
       };
       if (fromServer) {
         summary.trust =

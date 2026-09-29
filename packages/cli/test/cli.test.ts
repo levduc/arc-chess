@@ -20,6 +20,7 @@ const INIT = [
   "init", "--rpc", "http://127.0.0.1:8546", "--chain-id", "31337",
   "--hub", "0x000000000000000000000000000000000000beef", "--usdc", "0x000000000000000000000000000000000000cafe",
   "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
+  "--session-gas-wei", "10000000000000000", // explicit: no RPC call for the default (final review C1)
 ];
 
 describe("arena CLI", () => {

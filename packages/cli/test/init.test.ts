@@ -21,7 +21,7 @@ function templatesResponse(overrides: Record<string, unknown> = {}) {
 
 /** Serves `GET <server>/templates` and answers JSON-RPC POSTs to any other URL as a chain with `chainId` whose
  *  contracts are the addresses in `withCode`. Every request URL is recorded in `calls`. */
-function stubFetch(opts: { templates?: unknown; chainId?: number; withCode?: string[] } = {}) {
+function stubFetch(opts: { templates?: unknown; chainId?: number; withCode?: string[]; gasPrice?: bigint } = {}) {
   const calls: Array<{ url: string; method?: string }> = [];
   const withCode = new Set((opts.withCode ?? [`0x${"11".repeat(20)}`, `0x${"33".repeat(20)}`]).map((a) => a.toLowerCase()));
   const fetchStub = (async (url: string, init?: RequestInit) => {
@@ -34,7 +34,9 @@ function stubFetch(opts: { templates?: unknown; chainId?: number; withCode?: str
     const result =
       req.method === "eth_chainId"
         ? `0x${(opts.chainId ?? 31337).toString(16)}`
-        : withCode.has(String(req.params[0]).toLowerCase())
+        : req.method === "eth_gasPrice"
+          ? `0x${(opts.gasPrice ?? 1_000_000_000n).toString(16)}`
+          : withCode.has(String(req.params[0]).toLowerCase())
           ? "0x6080"
           : "0x";
     return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }));
@@ -79,6 +81,7 @@ describe("arena init --server", () => {
       ["http://rpc.test", "eth_chainId"],
       ["http://rpc.test", "eth_getCode"],
       ["http://rpc.test", "eth_getCode"],
+      ["http://rpc.test", "eth_gasPrice"], // the default sessionGasWei (final review C1)
     ]);
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
     expect(printed).toMatchObject({
@@ -119,6 +122,37 @@ describe("arena init --server", () => {
     }
     // An unknown chain id (the table is empty until Plan 6 fills in Arc mainnet): nothing to compare, no warning.
     expect((await run()).err).not.toMatch(/WARNING/);
+  });
+
+  it("final review C1: the default sessionGasWei is 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price); the floor defaults to half", async () => {
+    const init = async (args: string[], gasPrice: bigint) => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub, calls } = stubFetch({ gasPrice });
+      const out: string[] = [];
+      const code = await runCli(["init", "--server", "https://host.test", ...args], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: (s) => out.push(s),
+        err: () => undefined,
+      });
+      expect(code).toBe(0);
+      return { cfg: loadConfig(home), calls, printed: JSON.parse(out.join("\n")) as Record<string, unknown> };
+    };
+    const G = 2_100_000n;
+    // A quiet chain (1 gwei): the default wallet fee ceiling (100 gwei) is the higher.
+    const quiet = await init([], 1_000_000_000n);
+    expect(quiet.cfg.sessionGasWei).toBe(4n * G * 100_000_000_000n);
+    expect(quiet.printed.sessionGasWei).toBe((4n * G * 100_000_000_000n).toString());
+    // A busy chain (50 gwei): 4 x the estimate is the higher.
+    expect((await init([], 50_000_000_000n)).cfg.sessionGasWei).toBe(4n * G * 200_000_000_000n);
+    // An explicit ceiling counts.
+    expect((await init(["--fee-ceiling-wei", "300000000000"], 1_000_000_000n)).cfg.sessionGasWei).toBe(4n * G * 300_000_000_000n);
+    // --session-gas-wei overrides it (and the RPC's price is not even asked); --session-gas-floor sets the floor.
+    const explicit = await init(["--session-gas-wei", "123", "--session-gas-floor", "100"], 1_000_000_000n);
+    expect(explicit.cfg.sessionGasWei).toBe(123n);
+    expect(explicit.cfg.sessionGasFloor).toBe(100n);
+    expect(explicit.calls.some((c) => c.method === "eth_gasPrice")).toBe(false);
+    expect(quiet.cfg.sessionGasFloor).toBeUndefined(); // the daemon defaults it to half of sessionGasWei
   });
 
   it("fails when the adopted RPC serves another chain id", async () => {
@@ -189,7 +223,7 @@ describe("arena init --server", () => {
     }
   });
 
-  it("with every chain setting explicit, makes no network call and prints no trust line", async () => {
+  it("with every chain setting (and --session-gas-wei) explicit, makes no network call and prints no trust line", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-init-"));
     const fetchStub = (async () => {
       throw new Error("no network call expected: every chain-setting flag is explicit");
@@ -197,7 +231,8 @@ describe("arena init --server", () => {
     const out: string[] = [];
     const code = await runCli(
       ["init", "--server", "http://host.test", "--rpc", "http://rpc.test", "--chain-id", "31337",
-        "--hub", `0x${"11".repeat(20)}`, "--usdc", `0x${"22".repeat(20)}`, "--rules", `0x${"33".repeat(20)}`],
+        "--hub", `0x${"11".repeat(20)}`, "--usdc", `0x${"22".repeat(20)}`, "--rules", `0x${"33".repeat(20)}`,
+        "--session-gas-wei", "10000000000000000"],
       { env: { ARENA_HOME: home }, fetch: fetchStub, out: (s) => out.push(s), err: () => undefined },
     );
     expect(code).toBe(0);
