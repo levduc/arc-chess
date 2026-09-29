@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadConfig, runCli } from "../src/index.js";
+import { KNOWN_DEPLOYMENTS, loadConfig, runCli } from "../src/index.js";
 
 function templatesResponse(overrides: Record<string, unknown> = {}) {
   return [
@@ -90,6 +90,35 @@ describe("arena init --server", () => {
     });
     expect(printed.trust).toMatch(/come from https:\/\/host\.test; verify them against a source you trust/);
     expect(err).toEqual([]); // https: no plain-http warning
+  });
+
+  it("final review I2: warns loudly when the hub or rules differ from the canonical deployment of a known chain", async () => {
+    const run = async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const err: string[] = [];
+      const code = await runCli(["init", "--server", "https://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: stubFetch().fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+      });
+      return { code, err: err.join("\n") };
+    };
+    try {
+      // The template serves hub 0x11.. and rules 0x33..; the canonical entry for its chain names another hub.
+      KNOWN_DEPLOYMENTS[31337] = { name: "test chain", hub: `0x${"44".repeat(20)}`, rules: `0x${"33".repeat(20)}` };
+      const bad = await run();
+      expect(bad.code).toBe(0); // a warning, not a refusal
+      expect(bad.err).toMatch(/WARNING: hub 0x1{40} is not the canonical test chain hub 0x4{40}/);
+      expect(bad.err).not.toMatch(/rules .* is not the canonical/);
+      // The canonical addresses themselves: no warning.
+      KNOWN_DEPLOYMENTS[31337] = { name: "test chain", hub: `0x${"11".repeat(20)}`, rules: `0x${"33".repeat(20)}` };
+      expect((await run()).err).not.toMatch(/WARNING/);
+    } finally {
+      delete KNOWN_DEPLOYMENTS[31337];
+    }
+    // An unknown chain id (the table is empty until Plan 6 fills in Arc mainnet): nothing to compare, no warning.
+    expect((await run()).err).not.toMatch(/WARNING/);
   });
 
   it("fails when the adopted RPC serves another chain id", async () => {

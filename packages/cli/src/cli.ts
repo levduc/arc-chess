@@ -6,6 +6,7 @@ import {
   loadToken,
   DEFAULT_LOG_CHUNK_BLOCKS,
   DEFAULT_MIN_CHALLENGE_TIMEOUT,
+  knownDeploymentWarnings,
   type ArenaConfig,
 } from "./config.js";
 import { startDaemonProcess } from "./run.js";
@@ -185,6 +186,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         }
         await verifyChain(io, rpcUrl, chainId, { hub, rules });
       }
+      // Final review I2: on a chain with a known canonical deployment, a different hub or rules is loud.
+      for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,

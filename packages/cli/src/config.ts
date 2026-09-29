@@ -28,6 +28,40 @@ export type ArenaConfig = {
   minChallengeTimeout?: bigint;
 };
 
+/** A canonical arena deployment on one chain (final review I2). */
+export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc?: Address };
+
+/**
+ * Final review I2: the canonical deployments, by chain id. `arena init` warns loudly when the hub, rules (or USDC,
+ * where listed) it is about to use on a listed chain differ from these -- the addresses usually come from the
+ * host's /templates, and a wrong hub is where deposits go.
+ *
+ * TODO(Plan 6): add Arc mainnet (and Arc Testnet, if used) once the contracts are deployed and verified. Until then
+ * the table is empty and init only checks that the addresses hold code.
+ */
+export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {};
+
+/** The warnings for `addresses` on `chainId` against `table` (empty for a chain it does not list). */
+export function knownDeploymentWarnings(
+  chainId: number,
+  addresses: { hub: Address; rules: Address; usdc: Address },
+  table: Record<number, KnownDeployment> = KNOWN_DEPLOYMENTS,
+): string[] {
+  const known = table[chainId];
+  if (!known) return [];
+  const out: string[] = [];
+  for (const field of ["hub", "rules", "usdc"] as const) {
+    const want = known[field];
+    if (want !== undefined && want.toLowerCase() !== addresses[field].toLowerCase()) {
+      out.push(
+        `WARNING: ${field} ${addresses[field]} is not the canonical ${known.name} ${field} ${want}. ` +
+          "Deposits go to the hub this config names: do not fund this wallet unless you know why they differ.",
+      );
+    }
+  }
+  return out;
+}
+
 /** I3: default `logChunkBlocks` when a config omits it. */
 export const DEFAULT_LOG_CHUNK_BLOCKS = 1000;
 
