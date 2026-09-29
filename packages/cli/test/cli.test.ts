@@ -45,11 +45,18 @@ describe("arena CLI", () => {
     expect(headers.get("authorization")).toMatch(/^Bearer [0-9a-f]{64}$/);
     expect(headers.get("x-arena-actor")).toBe("agent");
 
+    // Plan 5 Task 1: arena offer omits challengeTimeout unless --timeout is given -- the daemon applies its own
+    // minChallengeTimeoutOf(config) default (POST /offers), not a value baked into the CLI.
     await runCli(["offer", "--deposit", "1.5", "--stake", "0.1"], t.io);
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({
       deposit: "1500000",
       stakePerGame: "100000",
-      challengeTimeout: "900", // final review I4: the default is the daemon's default minChallengeTimeout
+    });
+    await runCli(["offer", "--deposit", "1.5", "--stake", "0.1", "--timeout", "1800"], t.io);
+    expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({
+      deposit: "1500000",
+      stakePerGame: "100000",
+      challengeTimeout: "1800",
     });
     await runCli(["wait", "--timeout", "30"], t.io);
     expect(t.calls.at(-1)!.url).toBe("http://127.0.0.1:7010/wait?timeout=30");

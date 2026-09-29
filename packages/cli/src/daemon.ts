@@ -399,7 +399,7 @@ export class ArenaDaemon {
     }
   }
 
-  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
+  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout?: bigint }): Promise<{ offerId: Hex }> {
     // Plan 4.5 Task 11 fix round (C2): once the host has refused a subscribe, this connection's match delivery is
     // broken until restart -- a new offer would post fine (200) and then silently never learn of its match if it
     // is the offerer. Refuse up front instead of returning a false 200.
@@ -408,11 +408,15 @@ export class ArenaDaemon {
     // matched channel can never sit unfundable while its deposit reverts on every tick.
     if (o.stakePerGame <= 0n) throw new DaemonError(400, "stakePerGame must be greater than 0");
     if (o.deposit < o.stakePerGame) throw new DaemonError(400, "deposit must be at least stakePerGame");
+    // Plan 5 Task 1 (mainnet gates: offer default timeout): an omitted challengeTimeout takes this daemon's own
+    // minChallengeTimeout -- always at or above the floor `checkChallengeTimeout` enforces just below, so this
+    // daemon's own default offer is always accepted by itself and by any peer at the same floor.
+    const challengeTimeout = o.challengeTimeout ?? minChallengeTimeoutOf(this.opts.config);
     const bounds = await this.hub.timeoutBounds();
-    if (o.challengeTimeout < bounds.min || o.challengeTimeout > bounds.max) {
+    if (challengeTimeout < bounds.min || challengeTimeout > bounds.max) {
       throw new DaemonError(400, `challengeTimeout must be between ${bounds.min} and ${bounds.max} seconds`);
     }
-    this.checkChallengeTimeout(o.challengeTimeout);
+    this.checkChallengeTimeout(challengeTimeout);
     await this.checkDepositAllowed(o.deposit, { escrow: true });
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
@@ -426,7 +430,7 @@ export class ArenaDaemon {
       signer: privateKeyToAccount(sessionKey).address,
       deposit: o.deposit,
       stakePerGame: o.stakePerGame,
-      challengeTimeout: o.challengeTimeout,
+      challengeTimeout,
       expiresAt: chainNow + 3600n,
       nonce: `0x${randomBytes(32).toString("hex")}`,
     };

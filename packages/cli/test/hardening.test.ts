@@ -257,6 +257,16 @@ describe("final review I4: a daemon never offers, accepts or funds a challengeTi
     await expect(bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 900n })).resolves.toHaveProperty("offerId");
   });
 
+  it("Plan 5 Task 1: omitting challengeTimeout defaults it to this daemon's minChallengeTimeout, and the daemon accepts its own default offer", async () => {
+    const pair = await startPair({ aliceConfig: { minChallengeTimeout: 1800n }, bobConfig: { minChallengeTimeout: 1800n } });
+    cleanups.push(pair.cleanup);
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n });
+    const listed = await bob.daemon.listOffers();
+    expect(listed.find((o) => o.offerId === offerId)!.offer.challengeTimeout).toBe(1800n);
+    await expect(bob.daemon.acceptOffer(offerId)).resolves.toBeUndefined();
+  });
+
   it("ignores a match whose challengeTimeout is under the floor (the floor was raised after the offer was accepted)", async () => {
     const pair = await startPair();
     cleanups.push(pair.cleanup);

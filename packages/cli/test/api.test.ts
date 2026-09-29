@@ -58,4 +58,23 @@ describe("local API", () => {
     expect((await call(url, token, "POST", "/handoff", { to: "human", note: "n" })).body.controller).toBe("human");
     expect((await call(url, token, "POST", "/handoff", { to: "robot" })).status).toBe(400);
   });
+
+  it("Plan 5 Task 1: POST /offers without challengeTimeout defaults to minChallengeTimeoutOf(config)", async () => {
+    const pair = await startPair({ aliceConfig: { minChallengeTimeout: 1800n } });
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const res = await fetch(`${url}/offers`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ deposit: "1000000", stakePerGame: "100000" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { offerId: string };
+    const listed = await pair.alice.daemon.listOffers();
+    expect(listed.find((o) => o.offerId === body.offerId)!.offer.challengeTimeout).toBe(1800n);
+  });
 });

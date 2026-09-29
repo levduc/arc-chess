@@ -6,7 +6,6 @@ import {
   loadConfig,
   loadToken,
   DEFAULT_LOG_CHUNK_BLOCKS,
-  DEFAULT_MIN_CHALLENGE_TIMEOUT,
   defaultSessionGasWei,
   knownDeploymentWarnings,
   type ArenaConfig,
@@ -28,7 +27,7 @@ const USAGE = `usage: arena <command> [options]
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
-  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default 900)] | accept <offerId>
+  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
   resign | accept-draw | next-game | close | challenge | reclaim  [--channel ID]
@@ -275,10 +274,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         request = {
           method: "POST",
           path: "/offers",
+          // Plan 5 Task 1: omitted unless --timeout is given -- the daemon applies its own minChallengeTimeoutOf.
           body: {
             deposit: usdcAmount("deposit"),
             stakePerGame: usdcAmount("stake"),
-            challengeTimeout: flag("timeout") ?? DEFAULT_MIN_CHALLENGE_TIMEOUT.toString(),
+            ...(flag("timeout") !== undefined ? { challengeTimeout: flag("timeout") } : {}),
           },
         };
         break;
