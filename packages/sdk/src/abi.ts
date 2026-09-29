@@ -28,6 +28,16 @@ export const channelHubAbi = [
         "name": "maxFeePerPlayer_",
         "type": "uint256",
         "internalType": "uint256"
+      },
+      {
+        "name": "maxDepositPerPlayer_",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "maxCommittedEscrow_",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "stateMutability": "nonpayable"
@@ -41,6 +51,19 @@ export const channelHubAbi = [
         "name": "",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_FUNDING_WINDOW",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ],
     "stateMutability": "view"
@@ -330,6 +353,19 @@ export const channelHubAbi = [
   },
   {
     "type": "function",
+    "name": "committedEscrow",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "deposit",
     "inputs": [
       {
@@ -544,6 +580,32 @@ export const channelHubAbi = [
   },
   {
     "type": "function",
+    "name": "maxCommittedEscrow",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "maxDepositPerPlayer",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "maxFeePerPlayer",
     "inputs": [],
     "outputs": [
@@ -583,6 +645,19 @@ export const channelHubAbi = [
         "name": "",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "paused",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
       }
     ],
     "stateMutability": "view"
@@ -712,6 +787,37 @@ export const channelHubAbi = [
         "name": "feeRecipient_",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setLimits",
+    "inputs": [
+      {
+        "name": "maxDepositPerPlayer_",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "maxCommittedEscrow_",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "setPaused",
+    "inputs": [
+      {
+        "name": "paused_",
+        "type": "bool",
+        "internalType": "bool"
       }
     ],
     "outputs": [],
@@ -920,6 +1026,25 @@ export const channelHubAbi = [
   },
   {
     "type": "event",
+    "name": "LimitsUpdated",
+    "inputs": [
+      {
+        "name": "maxDepositPerPlayer",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "maxCommittedEscrow",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "Opened",
     "inputs": [
       {
@@ -965,6 +1090,19 @@ export const channelHubAbi = [
         "type": "address",
         "indexed": true,
         "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "PausedSet",
+    "inputs": [
+      {
+        "name": "paused",
+        "type": "bool",
+        "indexed": false,
+        "internalType": "bool"
       }
     ],
     "anonymous": false
@@ -1048,6 +1186,16 @@ export const channelHubAbi = [
   },
   {
     "type": "error",
+    "name": "DepositTooLarge",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "EscrowCapReached",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "FeeMismatch",
     "inputs": []
   },
@@ -1112,6 +1260,11 @@ export const channelHubAbi = [
         "internalType": "address"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "Paused",
+    "inputs": []
   },
   {
     "type": "error",

@@ -153,6 +153,75 @@ describe("lobby http", () => {
     expect(third.body.error).toMatch(/open offers/);
   });
 
+  it("Task 2 (spec §13): rejects an offer over the hub's per-player deposit cap (400)", async () => {
+    const chain = new FakeChain();
+    chain.hubLimits = { ...chain.hubLimits, maxDepositPerPlayer: 500_000n };
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain); // deposit 1_000_000n > cap
+    const res = await postOffer(server, so);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("deposit exceeds the hub's per-player cap of 500000 base units");
+  });
+
+  it("Task 2 (spec §13): rejects a posted offer while the hub is paused (409)", async () => {
+    const chain = new FakeChain();
+    chain.hubLimits = { ...chain.hubLimits, paused: true };
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const res = await postOffer(server, so);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("the hub is paused: no new channels");
+  });
+
+  it("Task 2 (spec §13): rejects posting when the chain is unavailable (503), not silently through", async () => {
+    const chain = new FakeChain();
+    chain.limitsError = new Error("rpc down");
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const res = await postOffer(server, so);
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("chain unavailable");
+  });
+
+  it("Task 2 (spec §13): rejects accepting while the hub is paused (409)", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const posted = await postOffer(server, so);
+    const id = posted.body.offerId as Hex;
+    chain.hubLimits = { ...chain.hubLimits, paused: true };
+    const { sa } = await makeAcceptance(id);
+    const res = await acceptOffer(server, id, sa);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("the hub is paused: no new channels");
+  });
+
+  it("Task 2 (spec §13): rejects accepting once it would push committedEscrow over the cap (409)", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain); // deposit 1_000_000n, fee 5_000n -> reserves 2_010_000n
+    const posted = await postOffer(server, so);
+    const id = posted.body.offerId as Hex;
+    chain.hubLimits = { ...chain.hubLimits, maxCommittedEscrow: 2_000_000n };
+    const { sa } = await makeAcceptance(id);
+    const res = await acceptOffer(server, id, sa);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("the hub's escrow cap is reached");
+  });
+
+  it("Task 2 (spec §13): rejects accepting when the chain is unavailable (503), never as an accept", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const { so } = await makeOffer(chain);
+    const posted = await postOffer(server, so);
+    const id = posted.body.offerId as Hex;
+    chain.limitsError = new Error("rpc down");
+    const { sa } = await makeAcceptance(id);
+    const res = await acceptOffer(server, id, sa);
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("chain unavailable");
+  });
+
   it("rejects a duplicate offer id (409)", async () => {
     const chain = new FakeChain();
     server = await startServer(testConfig(), { chain });
@@ -301,10 +370,15 @@ describe("lobby http", () => {
       pruneRelayCache: (nowMs) => real.pruneRelayCache(nowMs),
       cursor: () => real.cursor(),
       setCursor: (block) => real.setCursor(block),
+      identity: () => real.identity(),
+      setIdentity: (identity) => real.setIdentity(identity),
       channelRow: (id) => real.channelRow(id),
       saveChannelRow: (row) => real.saveChannelRow(row),
       channelRowsFor: (player) => real.channelRowsFor(player),
       recentChannels: (limit) => real.recentChannels(limit),
+      deleteChannelRow: (id) => real.deleteChannelRow(id),
+      reorgWatch: () => real.reorgWatch(),
+      setReorgWatch: (ids) => real.setReorgWatch(ids),
       close: () => real.close(),
     };
 
@@ -437,23 +511,58 @@ describe("lobby over /ws", () => {
     server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, maxWatchedOffers: 3 } }), { chain });
 
     const ids: Hex[] = [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 4; i++) {
       const { offer, so } = await makeOffer(chain, { nonce: randomNonce() });
       await postOffer(server, so);
       ids.push(computeOfferId(offer));
     }
-    // one offer inside the cap and one beyond it get matched *before* the subscribe, to prove which ones replay
-    const { sa: saIn } = await makeAcceptance(ids[0]);
-    await acceptOffer(server, ids[0], saIn);
-    const { sa: saOut } = await makeAcceptance(ids[4]);
-    await acceptOffer(server, ids[4], saOut);
 
     const c = await wsConnect(server.url);
-    c.send({ type: "subscribe", offerIds: ids });
+    // The first 3, all genuinely unmatched, fill the cap.
+    c.send({ type: "subscribe", offerIds: ids.slice(0, 3) });
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/); // room for all 3
+
+    // A 4th unmatched offer is refused: the cap is full.
+    c.send({ type: "subscribe", offerIds: [ids[3]] });
     expect((await c.next((f) => f.type === "error")).error).toMatch(/too many watched offers/);
-    const replay = await c.next((f) => f.type === "match");
-    expect(replay.event.offerId).toBe(ids[0]);
-    await expect(c.next((f) => f.type === "match", 300)).rejects.toThrow(/no matching frame/); // ids[4] was never added
+  });
+
+  it("Plan 4.5 Task 11 fix round (C2, server-side eviction): a match always replays and never occupies a watch " +
+    "slot, even once the cap is full or the id was refused before it matched", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig({ limits: { ...DEFAULT_LIMITS, maxWatchedOffers: 3 } }), { chain });
+
+    const ids: Hex[] = [];
+    for (let i = 0; i < 4; i++) {
+      const { offer, so } = await makeOffer(chain, { nonce: randomNonce() });
+      await postOffer(server, so);
+      ids.push(computeOfferId(offer));
+    }
+
+    const c = await wsConnect(server.url);
+    c.send({ type: "subscribe", offerIds: ids.slice(0, 3) }); // fills the cap (3/3)
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/);
+    c.send({ type: "subscribe", offerIds: [ids[3]] }); // refused: the cap is full
+    expect((await c.next((f) => f.type === "error")).error).toMatch(/too many watched offers/);
+
+    // Match the refused offer, then subscribe to it again: it must always replay, exactly like the daemon's own
+    // `onHello` re-subscribe would send after a reconnect -- a match must never be silently dropped just because
+    // the connection's watch slots were full when it happened, or are still full now.
+    const { sa } = await makeAcceptance(ids[3]);
+    await acceptOffer(server, ids[3], sa);
+    c.send({ type: "subscribe", offerIds: [ids[3]] });
+    expect((await c.next((f) => f.type === "match")).event.offerId).toBe(ids[3]);
+
+    // Matching one of the 3 that *did* occupy a slot frees it immediately (the eviction fix), without needing a
+    // fresh subscribe to notice: the push itself is what frees it.
+    const { sa: sa0 } = await makeAcceptance(ids[0]);
+    await acceptOffer(server, ids[0], sa0);
+    expect((await c.next((f) => f.type === "match")).event.offerId).toBe(ids[0]);
+    const { offer: offer4, so: so4 } = await makeOffer(chain, { nonce: randomNonce() });
+    await postOffer(server, so4);
+    const id4 = computeOfferId(offer4);
+    c.send({ type: "subscribe", offerIds: [id4] });
+    await expect(c.next((f) => f.type === "error", 300)).rejects.toThrow(/no matching frame/); // room again
   });
 
   it("closes a connection that exceeds the frame rate (1008)", async () => {
@@ -464,6 +573,20 @@ describe("lobby over /ws", () => {
     for (let i = 0; i < 10; i++) c.ws.send(toWire({ type: "subscribe", offerIds: [] }));
     const closeEvent = (await c.closed) as { code: number };
     expect(closeEvent.code).toBe(1008);
+  });
+
+  it("final review m8: the default frame limits sustain a busy daemon (a 2000-frame burst is not closed)", async () => {
+    const chain = new FakeChain();
+    server = await startServer(testConfig(), { chain });
+    const c = await wsConnect(server.url);
+    let closed = false;
+    void c.closed.then(() => (closed = true));
+    for (let i = 0; i < 2000; i++) c.ws.send(toWire({ type: "subscribe", offerIds: [] }));
+    await new Promise((r) => setTimeout(r, 500));
+    expect(closed).toBe(false); // before: closed with 1008 after the 200th frame
+    // The soak needed 2000 burst / 200 per s per connection (Task 11 report); the defaults carry a 2x margin.
+    expect(DEFAULT_LIMITS.wsFrameBurst).toBe(4000);
+    expect(DEFAULT_LIMITS.wsFramePerSec).toBe(400);
   });
 
   it("refuses more than wsPerIp connections from one IP, and frees the slot once one closes", async () => {

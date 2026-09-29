@@ -19,6 +19,7 @@ type Member = {
   unwatched: Hex[];
   handlers: Set<(m: RelayMessage) => void>;
   joinedHandlers: Set<(id: Hex) => void>;
+  watchRefusedHandlers: Set<(message: string) => void>;
   connected: boolean;
 };
 
@@ -40,6 +41,10 @@ export class MemoryArena {
     /** Offer ids this client currently watches, and every id it has unwatched, in order. */
     watched(): Hex[];
     unwatched(): Hex[];
+    /** Test-only: simulates the host refusing a subscribe (e.g. "too many watched offers"), firing every handler
+     *  registered via `lobby.onWatchRefused`. Plan 4.5 Task 11 fix round -- this in-memory stand-in has no real
+     *  per-connection watch cap to trip on its own. */
+    refuseWatch(message: string): void;
   } {
     const member: Member = {
       rooms: new Set(),
@@ -47,6 +52,7 @@ export class MemoryArena {
       unwatched: [],
       handlers: new Set(),
       joinedHandlers: new Set(),
+      watchRefusedHandlers: new Set(),
       connected: true,
     };
     this.members.add(member);
@@ -55,6 +61,10 @@ export class MemoryArena {
         if (!(await verifyOffer(so))) throw new Error("bad offer signature");
         const id = offerId(so.offer);
         this.offers.set(id, structuredClone(so));
+        // Mirrors host.ts's real postOffer, which watches its own new offer on success (Plan 4.5 Task 11 fix
+        // round: daemon.ts no longer does this redundantly itself -- see M5 -- so the fake must do it here for
+        // its `watched()`/`unwatched()` bookkeeping to mean anything).
+        lobby.watch([id]);
         return id;
       },
       listOffers: async () => [...this.offers.values()].map((o) => structuredClone(o)),
@@ -66,6 +76,8 @@ export class MemoryArena {
         const params = buildParams(so.offer, sa.acceptance, t, t.now);
         this.offers.delete(sa.acceptance.offerId);
         const event: MatchEvent = { offerId: sa.acceptance.offerId, params };
+        // Mirrors host.ts's real accept(), which watches the just-matched offer on success -- see postOffer above.
+        lobby.watch([event.offerId]);
         setTimeout(() => {
           for (const h of this.matchHandlers) h(structuredClone(event));
         }, 0);
@@ -82,6 +94,10 @@ export class MemoryArena {
           member.watched.delete(id);
           member.unwatched.push(id);
         }
+      },
+      onWatchRefused: (h) => {
+        member.watchRefusedHandlers.add(h);
+        return () => member.watchRefusedHandlers.delete(h);
       },
     };
     const relay: RelayClient = {
@@ -131,6 +147,9 @@ export class MemoryArena {
       rooms: () => [...member.rooms],
       watched: () => [...member.watched],
       unwatched: () => [...member.unwatched],
+      refuseWatch: (message: string) => {
+        for (const h of member.watchRefusedHandlers) h(message);
+      },
     };
   }
 }

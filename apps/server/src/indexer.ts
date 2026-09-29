@@ -1,10 +1,10 @@
-import type { Address } from "viem";
+import type { Address, Hex } from "viem";
 import { chunkRanges, isGameOver, mover } from "@arena/sdk";
 import type { HubEvent, PlayerIndex, SignedState, State } from "@arena/sdk";
 import type { ChainReader } from "./chain.js";
 import type { ServerConfig } from "./config.js";
 import type { Relay } from "./relay.js";
-import type { ChannelRow, Repo } from "./repo.js";
+import type { ChannelRow, Repo, UndoEntry } from "./repo.js";
 
 export type PlayerStats = {
   address: Address;
@@ -33,8 +33,29 @@ export function gamesOf(s: State): number {
   return s.gameIndex + (s.turnNum > 0n ? 1 : 0);
 }
 
-function eventKey(e: HubEvent): { block: bigint; logIndex: number } {
-  return { block: e.blockNumber, logIndex: e.logIndex };
+function eventKey(e: HubEvent): { block: bigint; logIndex: number; blockHash?: Hex } {
+  return e.blockHash === undefined
+    ? { block: e.blockNumber, logIndex: e.logIndex }
+    : { block: e.blockNumber, logIndex: e.logIndex, blockHash: e.blockHash };
+}
+
+/** A row as an undo snapshot: without its own undo log (entries never nest). */
+function snapshotOf(row: ChannelRow): ChannelRow {
+  const { undo: _undo, ...rest } = row;
+  return rest;
+}
+
+/** Whether the chain still returns the event an undo entry recorded: same channel, position and kind, and (when both
+ *  sides know it) the same block hash -- the same position in a replaced block is a different event. */
+function stillThere(u: UndoEntry, id: Hex, events: HubEvent[]): boolean {
+  return events.some(
+    (e) =>
+      e.channelId === id &&
+      e.blockNumber === u.block &&
+      e.logIndex === u.logIndex &&
+      e.kind === u.kind &&
+      (u.blockHash === undefined || e.blockHash === undefined || e.blockHash === u.blockHash),
+  );
 }
 
 /** Whether `e` is strictly newer than the last event folded into a row -- used to make `apply` idempotent when a
@@ -71,8 +92,19 @@ export class Indexer {
       this.repo.pruneRelayCache(Date.now());
       const head = await this.chain.head();
       const cursor = this.repo.cursor() ?? this.cfg.indexer.startBlock - 1n;
+      if (cursor > head) {
+        // The chunk range below (from just past the cursor to head) is then empty, so this poll silently does
+        // nothing -- which looks identical to "fully caught up" on /metrics unless this is logged. The usual
+        // cause is a database left over from a different chain instance (a redeployed local Anvil, a chain
+        // reset) reusing a cursor that no longer makes sense; `startServer`'s chain-identity check now refuses
+        // to start in that situation for a *new* config, but a long-lived process whose underlying chain was
+        // reset out from under it (without a restart) still needs this warning.
+        this.log(`indexer: cursor (${cursor}) is ahead of the chain head (${head}) -- indexing is stalled until the chain catches up`);
+      }
       const rescan = cursor + 1n - INDEXER_RESCAN_BLOCKS;
       const from = rescan > this.cfg.indexer.startBlock ? rescan : this.cfg.indexer.startBlock;
+      // Undo entries behind the window are final: this poll never re-reads their blocks.
+      this.pruneUndo(from);
       const ranges = chunkRanges(from, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL);
       for (const r of ranges) {
         let events: HubEvent[];
@@ -82,12 +114,72 @@ export class Indexer {
           this.log(`indexer: ${err instanceof Error ? err.message : String(err)}`);
           return;
         }
+        // Before folding in this chunk, unwind any row whose already-applied events in these (already indexed)
+        // blocks are gone -- reorged out -- so the events the chain has now are applied to the row as it was.
+        if (r.fromBlock <= cursor) await this.unwind(events, r.fromBlock, r.toBlock < cursor ? r.toBlock : cursor);
         for (const e of events) this.apply(e);
         if (r.toBlock > cursor) this.repo.setCursor(r.toBlock); // a rescanned chunk never moves the cursor back
       }
     } catch (err) {
       this.log(`indexer: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /** Drops undo entries older than `from` (final: no later poll re-reads their blocks) and forgets rows left with
+   *  none. */
+  private pruneUndo(from: bigint): void {
+    const watch = this.repo.reorgWatch();
+    if (watch.length === 0) return;
+    const keep: Hex[] = [];
+    for (const id of watch) {
+      const row = this.repo.channelRow(id);
+      if (!row?.undo?.length) continue;
+      const undo = row.undo.filter((u) => u.block >= from);
+      if (undo.length !== row.undo.length) this.repo.saveChannelRow({ ...row, undo });
+      if (undo.length > 0) keep.push(id);
+    }
+    if (keep.length !== watch.length) this.repo.setReorgWatch(keep);
+  }
+
+  /**
+   * Plan 4.5 Task 10 (reorgs): for every watched row, checks the undo entries in `[from, to]` against `events`, the
+   * chain's current events for those blocks. The first entry whose event is gone rolls the row back to how it was
+   * before that event (a vanished `ChannelCreated` deletes the row); `apply` then re-applies whatever the chain
+   * still has after it. An event can also be missing because the RPC's log index lags its head, not because of a
+   * reorg: when the entry carries a block hash and the chain reader can look one up, the row is only unwound if
+   * the block at that height has actually been replaced.
+   */
+  private async unwind(events: HubEvent[], from: bigint, to: bigint): Promise<void> {
+    const watch = this.repo.reorgWatch();
+    let changed = false;
+    for (const id of watch) {
+      const row = this.repo.channelRow(id);
+      if (!row?.undo?.length) continue;
+      const i = row.undo.findIndex((u) => u.block >= from && u.block <= to && !stillThere(u, id, events));
+      if (i < 0) continue;
+      const gone = row.undo[i];
+      if (gone.blockHash !== undefined && this.chain.blockHash) {
+        const now = await this.chain.blockHash(gone.block);
+        if (now === gone.blockHash) continue; // same block: a lagging log index, not a reorg -- retried next poll
+      }
+      this.log(`indexer: reorg: ${gone.kind} of channel ${id} at block ${gone.block} is gone; rolling the row back`);
+      if (gone.before === null) {
+        this.repo.deleteChannelRow(id);
+        changed = true;
+      } else {
+        this.repo.saveChannelRow({ ...gone.before, undo: row.undo.slice(0, i) });
+      }
+    }
+    if (changed) this.repo.setReorgWatch(watch.filter((id) => this.repo.channelRow(id) !== null));
+  }
+
+  /** Records that `e` was applied to a row that was `before` (null: `e` created it), for `unwind`. */
+  private withUndo(next: ChannelRow, e: HubEvent, before: ChannelRow | null): ChannelRow {
+    const entry: UndoEntry = { block: e.blockNumber, logIndex: e.logIndex, kind: e.kind, before: before && snapshotOf(before) };
+    if (e.blockHash !== undefined) entry.blockHash = e.blockHash;
+    const watch = this.repo.reorgWatch();
+    if (!watch.includes(e.channelId)) this.repo.setReorgWatch([...watch, e.channelId]);
+    return { ...next, undo: [...(before?.undo ?? []), entry] };
   }
 
   /** Pure state transition on a `ChannelRow`, exported for unit tests. Idempotent: an event at or before the
@@ -109,7 +201,7 @@ export class Indexer {
         balances: null,
         lastEvent: eventKey(e),
       };
-      this.repo.saveChannelRow(row);
+      this.repo.saveChannelRow(this.withUndo(row, e, null));
       return;
     }
 
@@ -162,7 +254,7 @@ export class Indexer {
         this.recordSettlement(next);
         break;
     }
-    this.repo.saveChannelRow(next);
+    this.repo.saveChannelRow(this.withUndo(next, e, row));
   }
 
   /** Copies what reputation and `/api/channels` read from the relay cache into the row, so they outlive the

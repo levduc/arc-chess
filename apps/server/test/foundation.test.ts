@@ -24,13 +24,22 @@ describe("config", () => {
     expect(c.defaults.deposit).toBe(1_000_000n);
     expect(c.limits).toEqual(DEFAULT_LIMITS);
     expect(c.trustProxy).toBe(false);
-    const base = { rpcUrl: "http://x", chainId: 1, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20) };
+    const base = { rpcUrl: "http://x", chainId: 1, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20), audit: "unaudited; guarded launch" };
     expect(parseServerConfig({ ...base, trustProxy: true }).trustProxy).toBe(true);
     expect(() => parseServerConfig({ ...base, trustProxy: "yes" })).toThrow(/trustProxy/);
   });
   it("names the bad field", () => {
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "nope" })).toThrow(/hub/);
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20), fundingWindow: "9000" })).toThrow(/fundingWindow/); // > 7200
+  });
+  it("final review m21: outside a local Anvil chain, audit must be set and must not be the development default", () => {
+    const base = { rpcUrl: "http://x", chainId: 5042002, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20) };
+    expect(() => parseServerConfig(base)).toThrow(/audit: is required/);
+    expect(() => parseServerConfig({ ...base, audit: "unaudited (development build)" })).toThrow(/audit: .*development/);
+    const audit = "unaudited; guarded launch, caps 10 USDC per player and 1,000 USDC in total";
+    expect(parseServerConfig({ ...base, audit }).audit).toBe(audit);
+    // A local Anvil chain keeps the development default.
+    expect(parseServerConfig({ ...base, chainId: 31337 }).audit).toBe("unaudited (development build)");
   });
   it("rejects a non-positive rate-limit burst or perSec, naming the field", () => {
     const base = validBase();
@@ -73,6 +82,9 @@ describe("chain", () => {
       hubEvents() {
         throw new Error("not used");
       },
+      limits() {
+        throw new Error("not used");
+      },
     };
     const reader = new RpcChainReader(
       { rpcUrl: "http://127.0.0.1:1", chainId: 31337, hub: "0x" + "11".repeat(20) as `0x${string}` },
@@ -81,6 +93,29 @@ describe("chain", () => {
     await expect(reader.timeoutBounds()).rejects.toThrow("rpc down");
     await expect(reader.timeoutBounds()).resolves.toEqual({ min: 60n, max: 86_400n });
     expect(calls).toBe(2);
+  });
+
+  it("Task 2 (spec §13): caches limits() for a few seconds, and a rejection is not cached", async () => {
+    let calls = 0;
+    const value = { maxDepositPerPlayer: 10_000_000n, maxCommittedEscrow: 10n ** 12n, committedEscrow: 0n, paused: false };
+    const hub: HubLike = {
+      feeConfig() { throw new Error("not used"); },
+      timeoutBounds() { throw new Error("not used"); },
+      blockNumber() { throw new Error("not used"); },
+      hubEvents() { throw new Error("not used"); },
+      limits() {
+        calls++;
+        return calls === 1 ? Promise.reject(new Error("rpc down")) : Promise.resolve(value);
+      },
+    };
+    const reader = new RpcChainReader(
+      { rpcUrl: "http://127.0.0.1:1", chainId: 31337, hub: "0x" + "11".repeat(20) as `0x${string}` },
+      hub,
+    );
+    await expect(reader.limits()).rejects.toThrow("rpc down");
+    await expect(reader.limits()).resolves.toEqual(value);
+    await expect(reader.limits()).resolves.toEqual(value);
+    expect(calls).toBe(2); // the second call is served from the 5s cache
   });
 });
 
@@ -358,6 +393,37 @@ describe("http foundation", () => {
     }
     expect(await (await fetch(`${server.url}/skill.md`)).text()).toMatch(/arena init --server/);
     expect((await fetch(`${server.url}/nope`)).status).toBe(404);
+  });
+
+  it("Task 2 (spec §13): skill.md explains the launch limits and points at /templates", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toMatch(/cap/i);
+    expect(text).toMatch(/pause/i);
+    expect(text).toMatch(/\/templates/);
+  });
+
+  it("Task 2 (spec §13): /templates publishes the hub's current launch limits", async () => {
+    const chain = new FakeChain();
+    chain.hubLimits = { maxDepositPerPlayer: 10_000_000n, maxCommittedEscrow: 1_000_000_000n, committedEscrow: 500_000n, paused: true };
+    server = await startServer(testConfig(), { chain });
+    const templates = (await (await fetch(`${server.url}/templates`)).json()) as Array<{ limits: unknown }>;
+    expect(templates[0].limits).toEqual({
+      maxDepositPerPlayer: "10000000",
+      maxCommittedEscrow: "1000000000",
+      committedEscrow: "500000",
+      paused: true,
+    });
+  });
+
+  it("Task 2 (spec §13): /templates renders limits: null rather than failing when the chain is unavailable", async () => {
+    const chain = new FakeChain();
+    chain.limitsError = new Error("rpc down");
+    server = await startServer(testConfig(), { chain });
+    const res = await fetch(`${server.url}/templates`);
+    expect(res.status).toBe(200);
+    const templates = (await res.json()) as Array<{ limits: unknown }>;
+    expect(templates[0].limits).toBeNull();
   });
   it("rate-limits GETs per IP with 429", async () => {
     server = await startServer({ ...testConfig(), limits: { ...DEFAULT_LIMITS, httpGetBurst: 2, httpGetPerSec: 0.001 } }, { chain: new FakeChain() });

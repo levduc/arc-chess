@@ -6,9 +6,16 @@ export type Limits = {
   maxOpenOffersPerIp: number; maxWatchedOffers: number; maxJoinsPerConnection: number;
 };
 
+/**
+ * Final review m8: `wsFrameBurst`/`wsFramePerSec` are per connection, and one daemon sends every channel's relay
+ * traffic (moves, re-sends after each join, close signatures) over its one connection. At the old 200 / 20 a busy
+ * daemon tripped the limit, and the server closes the socket on a trip (1008), so the reconnect-and-re-send cycle
+ * turned into a reconnect storm that blacked out match delivery (Task 11 soak). The soak needed 2000 / 200; the
+ * defaults are twice that. The per-IP caps (`wsPerIp`, the HTTP buckets, `maxOpenOffersPerIp`) are unchanged.
+ */
 export const DEFAULT_LIMITS: Limits = {
   httpPostBurst: 30, httpPostPerSec: 1, httpGetBurst: 120, httpGetPerSec: 10,
-  wsPerIp: 16, wsFrameBurst: 200, wsFramePerSec: 20, maxFrameBytes: 64 * 1024,
+  wsPerIp: 16, wsFrameBurst: 4000, wsFramePerSec: 400, maxFrameBytes: 64 * 1024,
   maxOpenOffersPerIp: 5, maxWatchedOffers: 256, maxJoinsPerConnection: 64,
 };
 
@@ -32,6 +39,10 @@ export type ServerConfig = {
    *  (which is then the proxy itself). Never enable it on a directly exposed server: clients could spoof it. */
   trustProxy: boolean;
 };
+
+/** Anvil's chain id: the only chain where the development `audit` default is allowed. */
+const ANVIL_CHAIN_ID = 31337;
+const DEV_AUDIT = "unaudited (development build)";
 
 // the daemons refuse funding deadlines further out than 7200s (maxFundingWindow); see hub.ts checkMatchParams
 const MAX_FUNDING_WINDOW = 7200n;
@@ -154,11 +165,16 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   const defaults = {
     deposit: bigint(defaultsRaw, "defaults.deposit", 1_000_000n),
     stakePerGame: bigint(defaultsRaw, "defaults.stakePerGame", 100_000n),
-    challengeTimeout: bigint(defaultsRaw, "defaults.challengeTimeout", 600n),
+    // Final review I4: daemons refuse a challengeTimeout under 900 s by default, so the published default matches.
+    challengeTimeout: bigint(defaultsRaw, "defaults.challengeTimeout", 900n),
   };
 
   const cliCommand = str(obj, "cliCommand", "arena");
-  const audit = str(obj, "audit", "unaudited (development build)");
+  // Final review m21: `audit` is published in /templates. Outside a local Anvil chain it must be set, and must not be
+  // the development default: the mainnet value states the truth (e.g. "unaudited; guarded launch, caps X/Y").
+  const local = chainId === ANVIL_CHAIN_ID;
+  const audit = str(obj, "audit", local ? DEV_AUDIT : undefined);
+  if (!local && audit === DEV_AUDIT) fail("audit", `must describe this deployment, not the development default "${DEV_AUDIT}"`);
 
   const indexerRaw = obj.indexer === undefined ? {} : asRecord(obj.indexer);
   const indexer = {

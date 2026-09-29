@@ -17,7 +17,9 @@ export type Player = {
   client: ReturnType<MemoryArena["client"]>;
 };
 
-export async function startPair(opts: { pollMs?: number; bobConfig?: Partial<ArenaConfig> } = {}) {
+export async function startPair(
+  opts: { pollMs?: number; aliceConfig?: Partial<ArenaConfig>; bobConfig?: Partial<ArenaConfig> } = {},
+) {
   const env = await deployArena();
   const arena = new MemoryArena(async () => ({
     rules: env.rules,
@@ -37,6 +39,9 @@ export async function startPair(opts: { pollMs?: number; bobConfig?: Partial<Are
     maxFeePerPlayer: 10_000n,
     sessionGasWei: 10n ** 16n,
     pollMs: opts.pollMs ?? 100,
+    // The suites use the hub's own minimum windows (60 s, 600 s) and move chain time with increaseTime; the
+    // production floor (900 s, final review I4) is tested explicitly where it matters.
+    minChallengeTimeout: 60n,
   };
   const make = async (walletKey: Hex, overrides: Partial<ArenaConfig> = {}): Promise<Player> => {
     const home = mkdtempSync(join(tmpdir(), "arena-"));
@@ -49,7 +54,7 @@ export async function startPair(opts: { pollMs?: number; bobConfig?: Partial<Are
     await daemon.start();
     return { daemon, home, walletKey, address, client };
   };
-  const alice = await make(ANVIL_KEYS[1]);
+  const alice = await make(ANVIL_KEYS[1], opts.aliceConfig);
   const bob = await make(ANVIL_KEYS[2], opts.bobConfig);
   return {
     env,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { PublicClient } from "viem";
+import { BaseError, ExecutionRevertedError, type PublicClient } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import {
   ChannelSession,
@@ -7,11 +7,14 @@ import {
   HubClient,
   HubRevertError,
   LocalKeyTxSender,
+  MAX_FUNDING_WINDOW,
   MemoryStore,
+  channelHubAbi,
   chunkRanges,
   signState,
   type CloseTransaction,
   type SessionConfig,
+  type TxSender,
 } from "../src/index.js";
 import { ANVIL_KEYS, CHAIN, RPC, deployArena, increaseTime, mintUsdc, now, setEthBalance, usdcBalance } from "./helpers/chain.js";
 import { SCHOLARS_MATE, makeParams } from "./helpers/fixtures.js";
@@ -130,6 +133,40 @@ describe("channel lifecycle on Anvil", () => {
     expect((await x.hub.channelInfo(a.id)).phase).toBe("Reclaimed");
   });
 
+  it("reads the launch limits and tracks committedEscrow across deposit and close", async () => {
+    const x = await arena("limits");
+    // Drift check: the SDK's exported MAX_FUNDING_WINDOW must track the hub's own on-chain constant.
+    const onChainMaxFundingWindow = await x.env.pub.readContract({
+      address: x.env.hub,
+      abi: channelHubAbi,
+      functionName: "MAX_FUNDING_WINDOW",
+    });
+    expect(onChainMaxFundingWindow).toBe(MAX_FUNDING_WINDOW);
+
+    const limits0 = await x.hub.limits();
+    expect(limits0.maxDepositPerPlayer).toBe(10_000_000n);
+    expect(limits0.maxCommittedEscrow).toBe(10n ** 12n);
+    expect(limits0.paused).toBe(false);
+    expect(limits0.committedEscrow).toBe(0n);
+
+    const commit = 2n * (x.params.deposit + x.params.feePerPlayer);
+    await x.hub.deposit(x.alice, x.params);
+    expect((await x.hub.limits()).committedEscrow).toBe(commit);
+
+    await x.hub.deposit(x.bob, x.params); // second deposit never changes committedEscrow
+    expect((await x.hub.limits()).committedEscrow).toBe(commit);
+
+    const a = await ChannelSession.create(x.cfg(0));
+    const b = await ChannelSession.create(x.cfg(1));
+    await b.receive(await a.resign());
+    await b.receiveClose(await a.signClose());
+    await a.receiveClose(await b.signClose());
+    const tx = a.closeTransaction();
+    expect(tx).not.toBeNull();
+    await x.hub.closeCooperative(x.alice, tx!);
+    expect((await x.hub.limits()).committedEscrow).toBe(0n);
+  });
+
   it("surfaces hub custom errors by name", async () => {
     const x = await arena("errors");
     const { a, b } = await open(x);
@@ -149,6 +186,31 @@ describe("channel lifecycle on Anvil", () => {
     expect(err).toBeInstanceOf(HubRevertError);
     expect((err as HubRevertError).errorName).toBe("BadSignature");
     await expect(x.hub.deposit(x.alice, x.params)).rejects.toThrow(/WrongPhase/);
+  });
+
+  it("a revert at send time (state changed after the simulate) also surfaces as a named HubRevertError", async () => {
+    // Plan 4.5 Task 8: two daemons race the same cooperative close. The loser's simulate still sees "Open", but by
+    // the time its own send estimates gas the winner's tx is mined, so the node refuses it (WrongPhase) inside
+    // sender.send -- which escaped HubClient.write as a raw viem error, bypassing every HubRevertError handler.
+    const x = await arena("send-race");
+    const { a, b } = await open(x);
+    await b.receive(await a.move("e2e4"));
+    await a.receive(await b.resign());
+    await b.receiveClose(await a.signClose());
+    await a.receiveClose(await b.signClose());
+    const tx = a.closeTransaction()!;
+    // A sender that lets the other player's close land between HubClient.write's simulate and its own send.
+    const racing: TxSender = {
+      address: x.alice.address,
+      async send(t) {
+        await x.hub.closeCooperative(x.bob, tx);
+        return x.alice.send(t);
+      },
+    };
+    const err = await x.hub.closeCooperative(racing, tx).catch((e: unknown) => e);
+    expect((await x.hub.channelInfo(a.id)).phase).toBe("Finalized");
+    expect(err).toBeInstanceOf(HubRevertError);
+    expect((err as HubRevertError).errorName).toBe("WrongPhase");
   });
 
   // --- R8: Close only on terminal states (regressions for PoC1a/PoC1b) -------------------------------------
@@ -345,6 +407,42 @@ describe("HubClient.disputeEvents", () => {
   });
 });
 
+describe("HubClient.write send-time errors (stubbed)", () => {
+  // The simulate passes; the sender's own send then fails with `err` (Plan 4.5 Task 8 fix round).
+  const stubHub = () =>
+    new HubClient("0x000000000000000000000000000000000000beef", { call: async () => ({ data: "0x" }) } as unknown as PublicClient);
+  const failingSender = (err: unknown): TxSender => ({
+    address: "0x000000000000000000000000000000000000a11c",
+    send: async () => {
+      throw err;
+    },
+  });
+  // What viem's getNodeError builds from a node message: an ExecutionRevertedError whose `details` carry it.
+  const nodeError = (message: string) =>
+    new ExecutionRevertedError({ cause: new BaseError("RPC Request failed.", { details: message }), message });
+  const id = `0x${"11".repeat(32)}` as const;
+
+  it("a no-data 'execution reverted' from the node is a HubRevertError with no name", async () => {
+    const err = await stubHub().timeout(failingSender(nodeError("execution reverted")), id).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HubRevertError);
+    expect((err as HubRevertError).errorName).toBeUndefined();
+  });
+
+  it("'gas required exceeds allowance' (viem also calls it ExecutionRevertedError) passes through unchanged", async () => {
+    const original = nodeError("gas required exceeds allowance (0)");
+    expect(original.message).toMatch(/execution reverted/i); // the top-level message would have misled a naive check
+    const err = await stubHub().timeout(failingSender(original), id).catch((e: unknown) => e);
+    expect(err).toBe(original);
+    expect(err).not.toBeInstanceOf(HubRevertError);
+  });
+
+  it("a non-viem send failure passes through unchanged", async () => {
+    const original = new Error("socket hang up");
+    const err = await stubHub().timeout(failingSender(original), id).catch((e: unknown) => e);
+    expect(err).toBe(original);
+  });
+});
+
 describe("hub scans", () => {
   it("chunkRanges splits inclusive ranges", () => {
     expect(chunkRanges(10n, 12n, 2n)).toEqual([
@@ -381,6 +479,10 @@ describe("hub scans", () => {
     expect(kinds.at(-1)).toMatch(/Finalized|Reclaimed/);
     const created = events.find((e) => e.kind === "ChannelCreated" && e.channelId === id);
     expect(created && created.kind === "ChannelCreated" && created.params).toEqual(params);
+    // Plan 4.5 Task 10: each event carries its block's hash (the server indexer tells reorgs from a lagging log
+    // index by it).
+    const block = await x.hub.client.getBlock({ blockNumber: created!.blockNumber });
+    expect(created!.blockHash).toBe(block.hash);
 
     const all = await x.hub.disputeEvents(id, 0n);
     expect(all.map((e) => e.kind)).toEqual(["Challenged"]); // Bob never responded

@@ -15,10 +15,41 @@ remappings = [
 ]
 fs_permissions = [
   { access = "read", path = "./test/vectors" },
+  { access = "read", path = "./test/vectors-deep" },
   { access = "read-write", path = "./deployments" },
 ]
+# ChessDifferentialDeepTest declares 200 test_chunkN functions so each chunk gets its own gas/memory budget
+# (see ChessDifferentialDeep.t.sol), but under the default profile ARENA_DEEP_VECTORS is never set, so all of
+# them just skip — 200+ skipped tests of pure noise in `pnpm test:contracts`. Excluded here; re-included under
+# [profile.deep] below, where it's actually meant to run.
+no_match_contract = "ChessDifferentialDeepTest"
 
 [invariant]
-runs = 64
-depth = 50
-fail_on_revert = false
+runs = 1500
+depth = 100
+fail_on_revert = true
+
+# Deeper invariant/fuzz sweep, run explicitly via `pnpm test:contracts:deep` (not part of the default
+# `pnpm test:contracts` loop, which must stay fast). memory_limit is raised above the default 32MB
+# per-call-frame limit because the deep chess vector chunks are larger than the default set.
+[profile.deep]
+memory_limit = 1073741824
+# Override [profile.default]'s exclusion (profiles inherit unset keys from default): this is the one profile
+# ChessDifferentialDeepTest is meant to run under. "^$" (matches only the empty string, which no contract name
+# ever is) represents "exclude nothing" — an empty pattern instead matches everything, excluding everything.
+no_match_contract = "^$"
+
+[profile.deep.invariant]
+runs = 1000
+depth = 200
+fail_on_revert = true
+
+[profile.deep.fuzz]
+runs = 20000
+
+# Fast profile used only by scripts/tools/mutants.sh, so 18 mutants can each get a full test run without
+# the mutation sweep itself taking 10+ minutes.
+[profile.mutation.invariant]
+runs = 128
+depth = 150
+fail_on_revert = true

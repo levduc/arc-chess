@@ -24,3 +24,10 @@ export const INITIAL_META = 0xff0f00n;
 export const MAX_PLY = 300;
 export const FIFTY_MOVE_HALFMOVES = 100;
 export const ZERO_HASH: Hex = `0x${"00".repeat(32)}`;
+
+/** ChannelHub's on-chain hard cap on `params.fundingDeadline - block.timestamp` (spec §13 item 2's
+ *  reservation bound): a channel created with a deadline further out than this reverts `InvalidParams`.
+ *  Callers that pick `fundingDeadline` (daemons, the host) already enforce a stricter operational window
+ *  (see `checkMatchParams`' `maxFundingWindow`, e.g. 7200s); this is the on-chain backstop, not a value to
+ *  relax any off-chain window up to. */
+export const MAX_FUNDING_WINDOW = 86_400n;

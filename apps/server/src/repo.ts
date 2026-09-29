@@ -21,7 +21,13 @@ export type ChannelRow = {
   /** The last hub event applied to this row (block, logIndex) -- lets `Indexer.apply` ignore an event it has
    *  already folded in when a partially-processed chunk is re-scanned. Optional so older/hand-built rows
    *  (e.g. the foundation test's literal) still round-trip. */
-  lastEvent?: { block: bigint; logIndex: number };
+  lastEvent?: { block: bigint; logIndex: number; blockHash?: Hex };
+  /** Plan 4.5 Task 10 (reorgs): one entry per event applied inside the indexer's rescan window, oldest first, each
+   *  with this row as it was *before* that event (`null` for `ChannelCreated`: no row before it). If a later scan
+   *  of the window no longer returns one of these events (reorged out), the row is rolled back to that entry's
+   *  `before` and the events the chain still has are re-applied. Entries older than the window are final and
+   *  dropped. */
+  undo?: UndoEntry[];
   /** Set when the indexer applies `Finalized`/`Reclaimed`: the relay's verified latest state and the games count
    *  derived from it, kept so reputation and `/api/channels` survive the relay cache being pruned. */
   games?: number;
@@ -30,7 +36,21 @@ export type ChannelRow = {
   finalizedAt?: number;
 };
 
+export type UndoEntry = {
+  block: bigint;
+  logIndex: number;
+  blockHash?: Hex;
+  kind: string;
+  before: ChannelRow | null;
+};
+
 export type OfferEntry = { signed: SignedOffer; acceptance: SignedAcceptance | null; match: MatchEvent | null };
+
+/** What `startServer` records in `meta` the first time it opens this database, and checks on every later open.
+ *  `genesisHash` (not just `chainId`) is what actually distinguishes one local chain instance from another --
+ *  every fresh Anvil/Hardhat node reuses the same chain id (usually 31337), so chain id alone cannot tell a
+ *  redeployed local chain apart from the one this database was last opened against. */
+export type ChainIdentity = { chainId: number; hub: Address; genesisHash: Hex };
 
 export interface Repo {
   insertOffer(offerId: Hex, so: SignedOffer, ip: string): boolean;
@@ -57,10 +77,19 @@ export interface Repo {
   pruneRelayCache(nowMs: number): number;
   cursor(): bigint | null;
   setCursor(block: bigint): void;
+  /** The chain/deployment identity recorded in `meta` the first time this database was opened, or `null` for a
+   *  database that has never had one recorded (a brand-new database, or one written before this check existed). */
+  identity(): ChainIdentity | null;
+  setIdentity(identity: ChainIdentity): void;
   channelRow(id: Hex): ChannelRow | null;
   saveChannelRow(row: ChannelRow): void;
   channelRowsFor(player: Address): ChannelRow[];
   recentChannels(limit: number): ChannelRow[];
+  /** Removes a channel's indexer row (its `ChannelCreated` was reorged out: the channel no longer exists). */
+  deleteChannelRow(id: Hex): void;
+  /** The channels whose rows hold `undo` entries (events inside the indexer's rescan window), for reorg checks. */
+  reorgWatch(): Hex[];
+  setReorgWatch(ids: Hex[]): void;
   close(): void;
 }
 
@@ -371,6 +400,38 @@ export class SqliteRepo implements Repo {
       .run(block.toString());
   }
 
+  private getMeta(key: string): string | null {
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined;
+    return row ? row.value : null;
+  }
+
+  private setMeta(key: string, value: string): void {
+    this.db
+      .prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(key, value);
+  }
+
+  identity(): ChainIdentity | null {
+    const chainId = this.getMeta("identity_chainId");
+    const hub = this.getMeta("identity_hub");
+    const genesisHash = this.getMeta("identity_genesisHash");
+    if (chainId === null || hub === null || genesisHash === null) return null;
+    return { chainId: Number(chainId), hub: hub as Address, genesisHash: genesisHash as Hex };
+  }
+
+  setIdentity(identity: ChainIdentity): void {
+    this.db.exec("BEGIN");
+    try {
+      this.setMeta("identity_chainId", String(identity.chainId));
+      this.setMeta("identity_hub", identity.hub.toLowerCase());
+      this.setMeta("identity_genesisHash", identity.genesisHash.toLowerCase());
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   channelRow(id: Hex): ChannelRow | null {
     const row = this.db.prepare("SELECT body FROM channels WHERE channel_id = ?").get(id) as
       | { body: string }
@@ -395,6 +456,19 @@ export class SqliteRepo implements Repo {
     const p = player.toLowerCase();
     const rows = this.db.prepare("SELECT body FROM channels WHERE a = ? OR b = ?").all(p, p) as Array<{ body: string }>;
     return rows.map((r) => fromWire<ChannelRow>(r.body));
+  }
+
+  deleteChannelRow(id: Hex): void {
+    this.db.prepare("DELETE FROM channels WHERE channel_id = ?").run(id);
+  }
+
+  reorgWatch(): Hex[] {
+    const v = this.getMeta("reorg_watch");
+    return v === null ? [] : (JSON.parse(v) as Hex[]);
+  }
+
+  setReorgWatch(ids: Hex[]): void {
+    this.setMeta("reorg_watch", JSON.stringify(ids));
   }
 
   recentChannels(limit: number): ChannelRow[] {

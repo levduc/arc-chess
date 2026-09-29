@@ -49,6 +49,16 @@ export class Lobby {
     private readonly cfg: ServerConfig,
   ) {}
 
+  /** Task 2 (spec §13): `ChainReader.limits()`, mapped so an RPC failure becomes a 503 here rather than either
+   *  a silent stale read or a request that falls through as if the hub had no limits at all. */
+  private async limits() {
+    try {
+      return await this.chain.limits();
+    } catch {
+      throw new LobbyError(503, "chain unavailable");
+    }
+  }
+
   async post(body: unknown, ip: string): Promise<{ offerId: Hex }> {
     let so: SignedOffer;
     try {
@@ -70,6 +80,17 @@ export class Lobby {
     if (offer.expiresAt <= now) throw new LobbyError(400, "expiresAt must be in the future");
     if (offer.expiresAt > now + this.cfg.offerMaxLifetime) {
       throw new LobbyError(400, `expiresAt must be at most ${this.cfg.offerMaxLifetime} seconds from now`);
+    }
+
+    // Task 2 (spec §13): refuse an offer the hub would refuse right now -- paused (checked first, mirroring
+    // ChannelHub.deposit's own order), or over the per-player deposit cap.
+    const limits = await this.limits();
+    if (limits.paused) throw new LobbyError(409, "the hub is paused: no new channels");
+    if (offer.deposit > limits.maxDepositPerPlayer) {
+      throw new LobbyError(
+        400,
+        `deposit exceeds the hub's per-player cap of ${limits.maxDepositPerPlayer} base units`,
+      );
     }
 
     if (this.repo.openOfferCount(ip, now) >= this.cfg.limits.maxOpenOffersPerIp) {
@@ -112,6 +133,15 @@ export class Lobby {
     }
 
     const feeConfig = await this.chain.feeConfig();
+    // Task 2 (spec §13): paused blocks every deposit, including a second-side deposit onto an already-open
+    // channel, so it applies here too, not only at post(). The escrow-cap check is best effort, against the
+    // current on-chain committedEscrow only (no server-side tracking of other matches not yet funded): it adds
+    // the 2x(deposit+feePerPlayer) this match would reserve on-chain at its first deposit.
+    const limits = await this.limits();
+    if (limits.paused) throw new LobbyError(409, "the hub is paused: no new channels");
+    if (limits.committedEscrow + 2n * (offer.deposit + feeConfig.feePerPlayer) > limits.maxCommittedEscrow) {
+      throw new LobbyError(409, "the hub's escrow cap is reached");
+    }
     const terms = {
       rules: this.cfg.rules,
       feeRecipient: feeConfig.feeRecipient,

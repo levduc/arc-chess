@@ -1,14 +1,18 @@
 import { randomBytes } from "node:crypto";
-import type { Hex } from "viem";
+import { erc20Abi, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
-import { DaemonError, type ArenaDaemon } from "../src/index.js";
-import { increaseTime, now, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { HubClient, HubRevertError, LocalKeyTxSender, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
+import { ArenaDaemon, DaemonError, SETTLED_GRACE_SECONDS, loadConfig } from "../src/index.js";
+import { CHAIN, RPC, increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
-type Internals = { onMatch(m: MatchEvent): Promise<void>; records: { saveOffer(r: unknown): void } };
+type Internals = {
+  onMatch(m: MatchEvent): Promise<void>;
+  records: { saveOffer(r: unknown): void; offer(id: Hex): unknown };
+  opts: { log?: (line: string) => void };
+};
 const internals = (d: ArenaDaemon): Internals => d as unknown as Internals;
 
 const randomNonce = (): Hex => `0x${randomBytes(32).toString("hex")}`;
@@ -43,6 +47,181 @@ describe("ArenaDaemon core", () => {
     expect(bob.daemon.handle(id).record.me).toBe(1);
   });
 
+  it("final review I2: approves exactly deposit + fee per funding, never an unlimited allowance", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob, env } = pair;
+    const allowance = (owner: Hex) =>
+      alice.daemon.client.readContract({ address: env.usdc, abi: erc20Abi, functionName: "allowance", args: [owner, env.hub] });
+    // Alice already holds a larger allowance of her own: the daemon approves nothing and uses only what it needs.
+    await alice.daemon.hub.approve(new LocalKeyTxSender(alice.walletKey, RPC, CHAIN), env.usdc, 3_000_000n);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "funding");
+    expect(await allowance(bob.address)).toBe(0n); // approved exactly 1_000_000 + 5_000, all of it spent
+    expect(await allowance(alice.address)).toBe(3_000_000n - 1_005_000n); // the exact remainder of her own approval
+  });
+
+  it("final review m6: acceptOffer re-verifies the offer signature before it records or signs anything", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    // A host that lists a forged offer in Alice's name: another session key, and her real signature, which does not
+    // sign this offer.
+    const real = (await bob.client.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId)!;
+    const forged = { offer: { ...real.offer, signer: privateKeyToAccount(generatePrivateKey()).address }, sig: real.sig };
+    const forgedId = computeOfferId(forged.offer);
+    const list = bob.client.lobby.listOffers;
+    bob.client.lobby.listOffers = async () => [...(await list()), forged];
+    const err = await bob.daemon.acceptOffer(forgedId).catch((e: unknown) => e as DaemonError);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toMatch(/signature does not verify/);
+    expect(internals(bob.daemon).records.offer(forgedId)).toBeNull(); // nothing recorded, nothing signed
+    expect(bob.client.watched()).not.toContain(forgedId);
+    // The genuine offer is still accepted.
+    await expect(bob.daemon.acceptOffer(offerId)).resolves.toBeUndefined();
+  });
+
+  it("C2 (Plan 4.5 Task 11 fix round): unwatches an offer once it is matched, on both sides", async () => {
+    // The load-bearing fix for the watched-offer leak: a matched offer must free its watch slot on both the
+    // offerer's and the accepter's host connection, or a long-lived daemon eventually hits the host's
+    // per-connection watch cap and goes permanently deaf to new matches as an offerer (Task 11 report).
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    expect(pair.alice.client.watched()).toContain(offerId);
+    await pair.bob.daemon.acceptOffer(offerId);
+    expect(pair.bob.client.watched()).toContain(offerId);
+    await waitFor(
+      () => pair.alice.daemon.channelIds().length === 1 && pair.bob.daemon.channelIds().length === 1,
+      20_000,
+      "match",
+    );
+    expect(pair.alice.client.watched()).not.toContain(offerId);
+    expect(pair.alice.client.unwatched()).toContain(offerId);
+    expect(pair.bob.client.watched()).not.toContain(offerId);
+    expect(pair.bob.client.unwatched()).toContain(offerId);
+  });
+
+  it("C2: a replayed match event for an offer that already has a channel also unwatches it", async () => {
+    // Covers onMatch's "recorded" and "existing" early-return paths (a retried/duplicate match event), which the
+    // main success path's unwatch call never reaches.
+    const { alice, id } = await matched();
+    const offerId = alice.daemon.handle(id).record.offerId;
+    expect(alice.client.watched()).not.toContain(offerId); // already unwatched by the first, real match
+    // Force alice's `watched` set to include it again (simulating a stale re-subscribe, e.g. from onHello after
+    // a reconnect replaying an old `watch()` call this fix is meant to have prevented in the first place).
+    alice.client.lobby.watch([offerId]);
+    expect(alice.client.watched()).toContain(offerId);
+    await internals(alice.daemon).onMatch({ offerId, params: alice.daemon.handle(id).record.params });
+    expect(alice.client.watched()).not.toContain(offerId);
+  });
+
+  it("C2: a lobby subscribe refusal is visible in status and blocks new offers/accepts", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    // Before any refusal: createOffer/acceptOffer work, and no channel carries a lobbyError.
+    const { offerId: firstOfferId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.bob.daemon.acceptOffer(firstOfferId);
+    const id = await waitFor(() => pair.alice.daemon.channelIds()[0], 20_000, "match");
+    expect((await pair.alice.daemon.status(id)).lobbyError).toBeNull();
+
+    pair.alice.client.refuseWatch("too many watched offers");
+    // Sticky and visible: every channel's status now carries it, with a suggested restart, and new offers/accepts
+    // are refused (503) instead of silently returning 200 while match delivery is actually broken.
+    const status = await pair.alice.daemon.status(id);
+    expect(status.lobbyError).toBe("too many watched offers");
+    expect(status.suggestedActions[0]).toMatch(/restart this daemon.*too many watched offers/);
+    await expect(
+      pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n }),
+    ).rejects.toThrow(/too many watched offers/);
+    const { offerId: secondOfferId } = await pair.bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await expect(pair.alice.daemon.acceptOffer(secondOfferId)).rejects.toThrow(/too many watched offers/);
+  });
+
+  it("I1 (Plan 4.5 Task 11 fix round): channels()/status() never refresh a Finalized channel from chain again", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "finalized");
+
+    const find = async () => {
+      const c = (await alice.daemon.channels()).find((c) => c.channelId === id);
+      if (!c || !("phase" in c)) throw new Error("expected a ChannelStatus for the finalized channel");
+      return c;
+    };
+    expect((await find()).phase).toBe("Finalized");
+    // `refreshChain` always replaces `ChannelHandle.chain` with a fresh object; if `channels()` skips it for a
+    // Finalized channel (the fix), the reference itself never changes -- a direct, black-box-proof check, unlike
+    // comparing ChannelStatus fields (cooldown is floor-clamped at 0 once past due, so a second, real chain read
+    // would not visibly change the API response even if it happened).
+    const chainBefore = alice.daemon.handle(id).chain;
+    // Within the settled-channel grace period (final review I3: evicted from live after SETTLED_GRACE_SECONDS).
+    await increaseTime(300);
+    await find();
+    expect(alice.daemon.handle(id).chain).toBe(chainBefore);
+  });
+
+  it("final review I3: settled channels leave live after the grace period; status and channels still serve them", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob } = pair;
+    const ids: Hex[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await bob.daemon.acceptOffer(offerId);
+      const id = await waitFor(() => alice.daemon.channelIds().find((c) => !ids.includes(c)), 20_000, `match ${i}`);
+      await waitFor(() => bob.daemon.channelIds().includes(id), 20_000, `bob's match ${i}`);
+      await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, `open ${i}`);
+      await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+      await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+      await bob.daemon.acceptDraw(id, "agent");
+      await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+      await alice.daemon.close(id, "agent");
+      await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+      await bob.daemon.close(id, "agent");
+      await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
+      await alice.daemon.idle();
+      await alice.daemon.tick(); // a pass that sees it settled (the grace period starts)
+      expect(alice.daemon.channelIds()).toEqual([id]); // kept for the grace period
+      await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+      await waitFor(() => alice.daemon.channelIds().length === 0, 10_000, `eviction ${i}`); // before: live kept every one
+      ids.push(id);
+    }
+    // Still served, from the cached final status.
+    for (const id of ids) expect((await alice.daemon.status(id)).phase).toBe("Finalized");
+    const listed = await alice.daemon.channels();
+    expect(listed.map((c) => c.channelId).sort()).toEqual([...ids].sort());
+    expect(listed.every((c) => "phase" in c && c.phase === "Finalized")).toBe(true);
+    await expect(alice.daemon.move(ids[0], "e4", { actor: "agent" })).rejects.toThrow(/is settled/);
+    // After a restart (nothing cached, settled channels are never loaded), status is served from disk.
+    await alice.daemon.stop();
+    const again = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanup = async () => {
+      await again.stop();
+      await pair.cleanup();
+    };
+    await again.start();
+    expect(again.channelIds()).toEqual([]);
+    const fromDisk = await again.status(ids[1]);
+    expect(fromDisk.phase).toBe("Finalized");
+    expect(fromDisk.channelId).toBe(ids[1]);
+    expect(fromDisk.gameStatus).toBe("draw");
+  });
+
   it("relays moves between daemons and enforces turn order", async () => {
     const { alice, bob, id } = await matched();
     await expect(bob.daemon.move(undefined, "e7e5", { actor: "agent" })).rejects.toThrow(DaemonError);
@@ -75,6 +254,9 @@ describe("ArenaDaemon core", () => {
   it("I1: a persistently failing deposit tops up the session key's gas at most once", async () => {
     const pair = await startPair({ pollMs: 50 });
     cleanup = pair.cleanup;
+    // Raise the hub's per-player cap (spec §13) above this deposit, so the revert this test drives comes from
+    // alice's insufficient USDC balance, not from the launch-limit check createOffer now applies up front.
+    await setLimits(pair.env.hub, 100_000_000n, 10n ** 12n);
     // A deposit far beyond alice's minted balance: hub.deposit() will keep reverting on every tick.
     const { offerId } = await pair.alice.daemon.createOffer({ deposit: 50_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await pair.bob.daemon.acceptOffer(offerId);
@@ -112,6 +294,28 @@ describe("ArenaDaemon core", () => {
     };
     await internals(pair.bob.daemon).onMatch({ offerId, params: swapped });
     expect(pair.bob.daemon.channelIds()).toEqual([]);
+  });
+
+  it("Plan 4.5 Task 9: the accepter refuses a match that substitutes the offerer (wallet and session key)", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    const so = (await pair.alice.client.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
+    if (!so) throw new Error("offer not found");
+    // Bob accepted alice's offer (the record is what acceptOffer stores); the only match he sees is the host's
+    // substituted one below, which names an impostor (wallet and session key) in the offerer's seat.
+    const sessionKey = generatePrivateKey();
+    internals(pair.bob.daemon).records.saveOffer({ offerId, offer: so.offer, sessionKey, role: "accepter" });
+    const t = await now();
+    const terms = { rules: pair.env.rules, feeRecipient: pair.env.host, feePerPlayer: 5_000n, fundingWindow: 3600n };
+    const acceptance = { offerId, player: pair.bob.address, signer: privateKeyToAccount(sessionKey).address, nonce: randomNonce() };
+    const impostorOffer = { ...so.offer, player: privateKeyToAccount(generatePrivateKey()).address, signer: privateKeyToAccount(generatePrivateKey()).address };
+    const substituted = buildParams(impostorOffer, acceptance, terms, t);
+    const logs: string[] = [];
+    internals(pair.bob.daemon).opts.log = (l: string) => logs.push(l);
+    await internals(pair.bob.daemon).onMatch({ offerId, params: substituted });
+    expect(pair.bob.daemon.channelIds()).toEqual([]);
+    expect(logs.join("\n")).toMatch(/ignoring match for offer .*: params do not name the expected opponent's wallet/);
   });
 
   it("I3: two match events for one offer open and fund exactly one channel", async () => {
@@ -158,6 +362,28 @@ describe("ArenaDaemon core", () => {
     await expect(waiting).resolves.toEqual({ channelId: id, reason: "your-turn" });
   });
 
+  it("final review m4: wait() wakes once with reason 'settled' when a channel this player closed settles", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    // Alice's agent waits after its close: it is woken by the settlement (before: only by its own timeout).
+    const waiting = alice.daemon.wait({ timeoutMs: 20_000 });
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "settled" });
+    const st = await alice.daemon.status(id);
+    expect(st.phase).toBe("Finalized");
+    expect(st.attention).toBeNull(); // one wake: consumed
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    // Bob's side shows it in status until a wait takes it.
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "settled", 20_000, "bob sees settled");
+    await expect(bob.daemon.wait({ timeoutMs: 1_000 })).resolves.toEqual({ channelId: id, reason: "settled" });
+    expect((await bob.daemon.status(id)).attention).toBeNull();
+  });
+
   it("R8.4c: wait() resolves control-changed on a handoff even without new attention", async () => {
     const { alice, bob, id } = await matched();
     // Make it bob's turn, so alice has no `attention` for wait() to notice first.
@@ -194,7 +420,8 @@ describe("watchtower", () => {
     await alice.daemon.stop();
     // A misbehaving Alice registers the stale state (sent directly, bypassing her stopped daemon); Bob's
     // watchtower must answer with turn 2.
-    await alice.daemon.hub.challenge(alice.daemon.handle(id).sessionSender, stale);
+    // (A client of its own: a stopped daemon's HubClient aborts its receipt waits.)
+    await new HubClient(alice.daemon.hub.hub, alice.daemon.client).challenge(alice.daemon.handle(id).sessionSender, stale);
     await waitFor(async () => (await bob.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "respond");
     expect((await bob.daemon.hub.registeredState(id)).turnNum).toBe(2n);
     const responded = (await bob.daemon.hub.disputeEvents(id)).find((e) => e.kind === "Responded");
@@ -202,6 +429,62 @@ describe("watchtower", () => {
     // Confirm it was Bob's session key that sent the Responded transaction (spec §3.1 / R9-I1).
     const tx = await bob.daemon.client.getTransaction({ hash: responded!.transactionHash });
     expect(tx.from.toLowerCase()).toBe(bobSessionAddr.toLowerCase());
+  });
+
+  /** Alice challenges on Bob's turn and stops; returns Bob's daemon with `hub.respond` replaced by `patch`, and a
+   *  capture of Bob's daemon log. Shared by the respond-failure tests below (Plan 4.5 Task 8 and its review). */
+  async function bobMustRespond(patch: (original: ArenaDaemon["hub"]["respond"]) => ArenaDaemon["hub"]["respond"]) {
+    const m = await matched();
+    const { alice, bob, id } = m;
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await alice.daemon.challenge(undefined, "agent"); // Bob must move
+    await alice.daemon.stop(); // only Bob's daemon from here, so each race below is the one the test stages
+    // Bob's own dispute pass would answer the challenge concurrently with his move (it runs independently of the
+    // main pass since the Task 10 review): switched off so the race each test stages is the only one.
+    (bob.daemon as unknown as { watchDispute: () => Promise<boolean> }).watchDispute = async () => false;
+    // A dispute pass already in flight when it was switched off still holds the channel, and the move path's respond
+    // skips a channel the dispute pass holds (Plan 4.5 Task 10 round 4): let it finish first.
+    await waitFor(() => !bob.daemon.handle(id).disputeBusy, 10_000, "bob's dispute pass in flight finishes");
+    const hub = bob.daemon.hub;
+    hub.respond = patch(hub.respond.bind(hub));
+    const logs: string[] = [];
+    (bob.daemon as unknown as { opts: { log?: (line: string) => void } }).opts.log = (line) => logs.push(line);
+    return { ...m, hub, logs };
+  }
+
+  it("losing the race to answer a challenge someone else already answered leaves no lastError, but logs it (Plan 4.5 Task 8)", async () => {
+    // Both watchtowers answer the same challenge once both hold Bob's move (his own right after the move, Alice's
+    // on her next tick): the other respond lands between Bob's phase check and his own respond, which reverts
+    // WrongPhase. Staged here by landing an identical respond just before the daemon's own.
+    const { bob, id, hub, logs } = await bobMustRespond((original) => async (sender, proof) => {
+      await original(sender, proof); // "the other watchtower" wins
+      return original(sender, proof); // the daemon's own call, now against an Open channel
+    });
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    expect((await hub.channelInfo(id)).phase).toBe("Open");
+    expect((await hub.registeredState(id)).turnNum).toBe(2n);
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(logs.some((l) => /already answered \(registered turn 2, ours 2\).*WrongPhase/.test(l))).toBe(true);
+  });
+
+  it("a respond that fails while the channel is still Challenged sets lastError (review: negative case)", async () => {
+    const { bob, id, hub } = await bobMustRespond(() => async () => {
+      throw new HubRevertError("BadSignature", new Error("stubbed revert"));
+    });
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    expect((await hub.channelInfo(id)).phase).toBe("Challenged");
+    expect(bob.daemon.handle(id).lastError).toBe("respond: hub reverted: BadSignature");
+  });
+
+  it("a respond failure that is not a hub revert sets lastError even if the channel is Open again (review)", async () => {
+    const { bob, id, hub } = await bobMustRespond((original) => async (sender, proof) => {
+      await original(sender, proof); // the challenge does get answered...
+      throw new Error("socket hang up"); // ...but this daemon's own send failed in transport: its problem to report
+    });
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    expect((await hub.channelInfo(id)).phase).toBe("Open");
+    expect(bob.daemon.handle(id).lastError).toBe("respond: socket hang up");
   });
 
   it("times out a silent opponent and never times out itself", async () => {
@@ -236,13 +519,13 @@ describe("watchtower", () => {
     // idle() first and check the per-channel pass counter actually moved, so each tick() below is known to
     // have run a full watch() pass past the deadline rather than being silently swallowed.
     await bob.daemon.idle();
-    let before = bob.daemon.handle(id).passes;
+    let before = bob.daemon.handle(id).disputePasses; // a Challenged channel is the dispute pass's
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     await bob.daemon.idle();
-    before = bob.daemon.handle(id).passes;
+    before = bob.daemon.handle(id).disputePasses;
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     // Bob is on move in the registered state and past the deadline: calling timeout would forfeit Bob's stake.
     expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
     expect((await bob.daemon.status(id)).challenge?.mustMove).toBe(true);
@@ -264,13 +547,13 @@ describe("watchtower", () => {
     await alice.daemon.stop();
     await increaseTime(601);
     await bob.daemon.idle();
-    let before = bob.daemon.handle(id).passes;
+    let before = bob.daemon.handle(id).disputePasses; // a Challenged channel is the dispute pass's
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     await bob.daemon.idle();
-    before = bob.daemon.handle(id).passes;
+    before = bob.daemon.handle(id).disputePasses;
     await bob.daemon.tick();
-    expect(bob.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(bob.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     // Bob's local view never caught up (ingest keeps failing), but the registered state has him on move:
     // his watchtower must never call timeout on itself, even though it is well past the deadline.
     expect(session.isMyTurn()).toBe(false); // still stuck at turn 0, not bob's local turn
@@ -309,9 +592,9 @@ describe("watchtower", () => {
     await bob.daemon.hub.challenge(bob.daemon.handle(id).sessionSender, stale);
     await increaseTime(601);
     await alice.daemon.idle();
-    const before = alice.daemon.handle(id).passes;
+    const before = alice.daemon.handle(id).disputePasses; // past the deadline: the dispute pass times it out
     await alice.daemon.tick();
-    expect(alice.daemon.handle(id).passes).toBeGreaterThan(before);
+    expect(alice.daemon.handle(id).disputePasses).toBeGreaterThan(before);
     // Past the deadline, respond() would revert (DeadlinePassed): Alice's watchtower must fall back to
     // timeout(), which succeeds because Bob (the opponent) was on move in the registered (stale) state.
     expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Finalized");

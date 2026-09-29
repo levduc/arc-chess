@@ -1,5 +1,6 @@
 import {
   BaseError,
+  ExecutionRevertedError,
   decodeErrorResult,
   encodeFunctionData,
   erc20Abi,
@@ -10,7 +11,7 @@ import {
 } from "viem";
 import { channelHubAbi, mockUsdcAbi } from "./abi.js";
 import { decodeParams, decodeSignedState, encodeParams, encodeProof, encodeSignedState } from "./abiCodec.js";
-import type { TxSender } from "./tx.js";
+import { waitOrReplace, type TxSender } from "./tx.js";
 import type { CloseTransaction, Params, PlayerIndex, Proof, SignedState, State } from "./types.js";
 
 export const PHASE = ["None", "Funding", "Open", "Challenged", "Finalized", "Reclaimed"] as const;
@@ -38,7 +39,15 @@ export type DisputeEvent = {
 };
 
 /** One hub event, for any channel, decoded from `getContractEvents` with `eventName` omitted (hubEvents). */
-export type HubEvent = { blockNumber: bigint; logIndex: number; channelId: Hex } & (
+export type HubEvent = {
+  blockNumber: bigint;
+  logIndex: number;
+  channelId: Hex;
+  /** The hash of the block the event was read from -- lets an indexer tell a reorg (the block at this height was
+   *  replaced) from a lagging `getLogs` index (the block is still canonical; its logs are just not served yet).
+   *  Optional so hand-built events (tests) need not invent one. */
+  blockHash?: Hex;
+} & (
   | { kind: "ChannelCreated"; params: Params }
   | { kind: "Deposited"; player: PlayerIndex; amount: bigint }
   | { kind: "Opened" }
@@ -98,48 +107,76 @@ export function decodeRevert(err: unknown): string | undefined {
   }
 }
 
+/**
+ * True if an error thrown by `TxSender.send` (or by the simulating `eth_call` before it) is an execution revert, as
+ * opposed to a failure of the send itself.
+ * Decodable revert data settles it. Without data, only the node's own message counts, and only if it says
+ * "execution reverted": viem also classifies "gas required exceeds allowance" (the sender cannot pay for gas, not
+ * a hub revert) as an ExecutionRevertedError, and its top-level message reads "Execution reverted with reason:
+ * ..." either way -- so the raw node message (`details`, propagated up the cause chain) is what is tested.
+ */
+function isSendRevert(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return false;
+  if (decodeRevert(err) !== undefined) return true;
+  const reverted = err.walk((e) => e instanceof ExecutionRevertedError) as BaseError | null;
+  return reverted !== null && /execution reverted/i.test(reverted.details ?? "");
+}
+
+/** Per-write options. `receiptTimeoutMs` bounds each receipt wait (default `RECEIPT_TIMEOUT_MS`, 30 s); a dispute
+ *  write passes less when its deadline is closer (see `waitOrReplace`). */
+export type WriteOptions = {
+  receiptTimeoutMs?: number;
+  /** Wall-clock ms past which the receipt wait neither replaces nor waits (a dispute deadline; see waitOrReplace). */
+  giveUpAt?: number;
+  /** Aborts the receipt wait (TxWaitAbortedError). */
+  signal?: AbortSignal;
+};
+
 export class HubClient {
+  /** `defaults` apply to every write unless the call overrides them (e.g. a daemon's stop `signal`). */
   constructor(
     readonly hub: Address,
     readonly client: PublicClient,
+    private readonly defaults: WriteOptions = {},
   ) {}
 
-  approve(sender: TxSender, token: Address, amount: bigint): Promise<TransactionReceipt> {
-    return this.write(sender, token, encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.hub, amount] }));
+  approve(sender: TxSender, token: Address, amount: bigint, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.write(sender, token, encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.hub, amount] }), opts);
   }
 
-  deposit(sender: TxSender, p: Params): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "deposit", args: [encodeParams(p)] }));
+  deposit(sender: TxSender, p: Params, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "deposit", args: [encodeParams(p)] }), opts);
   }
 
   /** Submits a cooperative close. Takes only a `CloseTransaction` (see `ChannelSession.closeTransaction()`). */
-  closeCooperative(sender: TxSender, tx: CloseTransaction): Promise<TransactionReceipt> {
+  closeCooperative(sender: TxSender, tx: CloseTransaction, opts?: WriteOptions): Promise<TransactionReceipt> {
     if (tx.kind !== "close") throw new TypeError('closeCooperative needs a CloseTransaction (kind: "close")');
     const ss = { state: tx.state, sigA: tx.sigA, sigB: tx.sigB }; // strip `kind` before ABI encoding
     return this.call(
       sender,
       encodeFunctionData({ abi: channelHubAbi, functionName: "closeCooperative", args: [encodeSignedState(ss)] }),
+      opts,
     );
   }
 
-  challenge(sender: TxSender, proof: Proof): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "challenge", args: [encodeProof(proof)] }));
+  challenge(sender: TxSender, proof: Proof, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "challenge", args: [encodeProof(proof)] }), opts);
   }
 
-  respond(sender: TxSender, proof: Proof): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "respond", args: [encodeProof(proof)] }));
+  respond(sender: TxSender, proof: Proof, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "respond", args: [encodeProof(proof)] }), opts);
   }
 
-  timeout(sender: TxSender, id: Hex): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "timeout", args: [id] }));
+  timeout(sender: TxSender, id: Hex, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "timeout", args: [id] }), opts);
   }
 
-  reclaim(sender: TxSender, id: Hex): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "reclaim", args: [id] }));
+  reclaim(sender: TxSender, id: Hex, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "reclaim", args: [id] }), opts);
   }
 
-  claim(sender: TxSender, to: Address): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim", args: [to] }));
+  claim(sender: TxSender, to: Address, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim", args: [to] }), opts);
   }
 
   async channelInfo(id: Hex): Promise<ChannelInfo> {
@@ -168,6 +205,28 @@ export class HubClient {
       this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "feeRecipient" }),
     ]);
     return { feePerPlayer, feeRecipient };
+  }
+
+  /**
+   * The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause
+   * flag. All four are read at one block number (cacheTime 0, as in `disputeEvents`/`hubEvents`) so a block
+   * mined between reads cannot produce an inconsistent snapshot (e.g. a cap and a commitment from different
+   * blocks).
+   */
+  async limits(): Promise<{
+    maxDepositPerPlayer: bigint;
+    maxCommittedEscrow: bigint;
+    committedEscrow: bigint;
+    paused: boolean;
+  }> {
+    const blockNumber = await this.client.getBlockNumber({ cacheTime: 0 });
+    const [maxDepositPerPlayer, maxCommittedEscrow, committedEscrow, paused] = await Promise.all([
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxDepositPerPlayer", blockNumber }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "maxCommittedEscrow", blockNumber }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "committedEscrow", blockNumber }),
+      this.client.readContract({ address: this.hub, abi: channelHubAbi, functionName: "paused", blockNumber }),
+    ]);
+    return { maxDepositPerPlayer, maxCommittedEscrow, committedEscrow, paused };
   }
 
   /** The hub's accepted `challengeTimeout` range in seconds (`MIN_TIMEOUT`..`MAX_TIMEOUT`, inclusive). */
@@ -238,8 +297,8 @@ export class HubClient {
   /**
    * Every hub event for every channel in `[fromBlock, toBlock]`, chain order -- for a watchtower scanning the
    * whole hub rather than one channel at a time, since it may not know every channel to poll for ahead of time.
-   * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, EIP712DomainChanged, OZ Ownership*) are
-   * skipped.
+   * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, LimitsUpdated, PausedSet,
+   * EIP712DomainChanged, OZ Ownership*) are skipped.
    */
   async hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
     const logs = await this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, fromBlock, toBlock });
@@ -248,7 +307,7 @@ export class HubClient {
       const args = log.args as Record<string, unknown>;
       if (typeof args.channelId !== "string") continue;
       const channelId = args.channelId as Hex;
-      const base = { blockNumber: log.blockNumber, logIndex: log.logIndex, channelId };
+      const base = { blockNumber: log.blockNumber, logIndex: log.logIndex, channelId, blockHash: log.blockHash };
       switch (log.eventName) {
         case "ChannelCreated":
           events.push({ ...base, kind: "ChannelCreated", params: decodeParams(args.params as Hex) });
@@ -304,20 +363,53 @@ export class HubClient {
     );
   }
 
-  private call(sender: TxSender, data: Hex): Promise<TransactionReceipt> {
-    return this.write(sender, this.hub, data);
+  private call(sender: TxSender, data: Hex, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.write(sender, this.hub, data, opts);
   }
 
-  /** Simulates first so reverts surface as named errors, then sends and waits for success. */
-  private async write(sender: TxSender, to: Address, data: Hex): Promise<TransactionReceipt> {
+  /**
+   * Simulates first so reverts surface as named errors, then sends and waits for success. The chain can change
+   * between the simulate and the send (e.g. two players racing the same cooperative close): a revert the sender's
+   * own gas estimate hits is reported as a HubRevertError too, named when decodable, never as a raw viem error.
+   */
+  private async write(sender: TxSender, to: Address, data: Hex, callOpts: WriteOptions = {}): Promise<TransactionReceipt> {
+    const opts: WriteOptions = { ...this.defaults, ...callOpts };
     try {
       await this.client.call({ account: sender.address, to, data });
     } catch (err) {
-      throw new HubRevertError(decodeRevert(err), err);
+      // Plan 4.5 Task 10 review: only an execution revert is a HubRevertError. A transport failure (HTTP 500, a
+      // reset, a JSON-RPC error from an overloaded node) carries no revert data and is rethrown unchanged -- the
+      // caller must not read "the hub refused this" into "the RPC is down".
+      if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      throw err;
     }
-    const hash = await sender.send({ to, data });
-    const receipt = await this.client.waitForTransactionReceipt({ hash });
-    if (receipt.status !== "success") throw new HubRevertError(undefined, new Error(`transaction ${hash} reverted`));
+    let hash: Hex;
+    try {
+      // No nonce: a tracking sender (SerialTxSender) picks it, and replaces its own released transaction if any.
+      hash = await sender.send({ to, data });
+    } catch (err) {
+      if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      // not a revert (RPC down, a used nonce (TxNonceUsedError), the fee cap or the balance (TxFeeCapError,
+      // TxInsufficientFundsError), a non-viem sender's own failure): the caller sees it unchanged
+      throw err;
+    }
+    // Plan 4.5 Task 10 review: a bounded wait that detects a dropped transaction and replaces a stuck one.
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await waitOrReplace(this.client, sender, { to, data }, hash, {
+        timeoutMs: opts.receiptTimeoutMs,
+        giveUpAt: opts.giveUpAt,
+        signal: opts.signal,
+      });
+    } catch (err) {
+      // A replacement send can revert too (Plan 4.5 Task 10 re-review I1): classified like the original send.
+      if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
+      throw err;
+    }
+    // The mined transaction may be a replacement of the one first sent: report the one that actually reverted.
+    if (receipt.status !== "success") {
+      throw new HubRevertError(undefined, new Error(`transaction ${receipt.transactionHash} reverted`));
+    }
     return receipt;
   }
 }

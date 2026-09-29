@@ -20,6 +20,7 @@ const INIT = [
   "init", "--rpc", "http://127.0.0.1:8546", "--chain-id", "31337",
   "--hub", "0x000000000000000000000000000000000000beef", "--usdc", "0x000000000000000000000000000000000000cafe",
   "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
+  "--session-gas-wei", "10000000000000000", // explicit: no RPC call for the default (final review C1)
 ];
 
 describe("arena CLI", () => {
@@ -48,7 +49,7 @@ describe("arena CLI", () => {
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({
       deposit: "1500000",
       stakePerGame: "100000",
-      challengeTimeout: "600",
+      challengeTimeout: "900", // final review I4: the default is the daemon's default minChallengeTimeout
     });
     await runCli(["wait", "--timeout", "30"], t.io);
     expect(t.calls.at(-1)!.url).toBe("http://127.0.0.1:7010/wait?timeout=30");

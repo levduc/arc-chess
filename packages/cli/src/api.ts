@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Hex } from "viem";
+import { DEFAULT_MIN_CHALLENGE_TIMEOUT } from "./config.js";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
 
 function send(res: ServerResponse, code: number, value: unknown): void {
@@ -74,7 +75,8 @@ export async function startApi(
               await daemon.createOffer({
                 deposit: amount(b.deposit, "deposit"),
                 stakePerGame: amount(b.stakePerGame, "stakePerGame"),
-                challengeTimeout: b.challengeTimeout === undefined ? 600n : amount(b.challengeTimeout, "challengeTimeout"),
+                challengeTimeout:
+                  b.challengeTimeout === undefined ? DEFAULT_MIN_CHALLENGE_TIMEOUT : amount(b.challengeTimeout, "challengeTimeout"),
               }),
             );
           case "POST /offers/accept": {

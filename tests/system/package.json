@@ -1,0 +1,23 @@
+{
+  "name": "@arena/system-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@arena/cli": "workspace:*",
+    "@arena/sdk": "workspace:*",
+    "@arena/server": "workspace:*",
+    "viem": "2.56.8",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.8",
+    "@types/ws": "8.18.1",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "vitest": "5.0.1"
+  }
+}

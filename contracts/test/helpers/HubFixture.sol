@@ -29,13 +29,16 @@ abstract contract HubFixture is Test, ChessTestUtils {
     uint256 internal constant DEPOSIT = 1_000_000;
     uint256 internal constant STAKE = 100_000;
     uint64 internal constant TIMEOUT = 600;
+    // Generous launch limits so existing tests (which don't exercise spec §13) are unaffected.
+    uint256 internal constant MAX_DEPOSIT = 10_000_000;
+    uint256 internal constant MAX_COMMITTED = 1e12;
 
     function setUp() public virtual {
         (aliceSigner, aliceKey) = makeAddrAndKey("aliceSession");
         (bobSigner, bobKey) = makeAddrAndKey("bobSession");
         usdc = new MockUSDC();
         rules = new ChessRules();
-        hub = new ChannelHub(IERC20(address(usdc)), owner, feeRecipient, FEE, MAX_FEE);
+        hub = new ChannelHub(IERC20(address(usdc)), owner, feeRecipient, FEE, MAX_FEE, MAX_DEPOSIT, MAX_COMMITTED);
         usdc.mint(alice, 100e6);
         usdc.mint(bob, 100e6);
         vm.prank(alice);

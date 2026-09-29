@@ -89,11 +89,36 @@ The daemon sends on-chain transactions (`approve`, `deposit`, `challenge`,
   primary sender fails. Circle agent-wallet sessions are authenticated by email
   OTP and can expire; a forfeit must never depend on a human re-authenticating
   within `challengeTimeout`. At funding, the daemon tops up each session key
-  with a configurable gas allowance (on Arc, gas is paid in USDC) from the
-  player's wallet; leftover is swept back after finalize.
+  to `sessionGasWei` (on Arc, gas is paid in USDC) from the player's wallet.
+  While the channel is Open or Challenged, the daemon refills the key from the
+  wallet back to `sessionGasWei` whenever it drops below `sessionGasFloor`
+  (§12 item 29). Leftover session-key gas is **not** swept back after finalize:
+  this is not implemented (deferred to Plan 5). Up to `sessionGasWei` per
+  settled channel stays on its session key, whose private key remains in
+  `ARENA_HOME`. `owed` payouts are not claimed by the daemon either.
 
 `deposit` and `approve` must come from the participant wallet (primary sender).
 Session-key signing of states is always local and independent of `TxSender`.
+
+**The `TxSender` contract** (Plan 4.5; `packages/sdk/src/tx.ts`):
+
+- `send(tx)` MUST honour `tx.nonce` and the fee overrides (`maxFeePerGas`,
+  `maxPriorityFeePerGas`, `gasPrice`) and the gas limit. A stuck transaction
+  is replaced by sending again at its nonce with higher fees.
+- A sender that cannot honour them MUST declare `supportsReplacement = false`.
+  Its transactions are then never replaced: the receipt wait only waits
+  (bounded) and reports. Such a sender is also untracked by the nonce manager
+  and its fees are not capped, so it gives up invariants 3 and 4 of §12
+  item 22.
+- Optionally, `signTransaction(tx)` and `sendRawTransaction(raw)`, both or
+  neither: signing before sending lets the nonce manager know a transaction's
+  hash even when the send's response is lost.
+- The wallet key behind the daemon's wallet sender is used **only by that
+  daemon**. The nonce manager adopts and replaces any pending transaction it
+  finds on the key, so a transfer sent from the same key elsewhere can be
+  replaced and never land.
+
+Plan 6's `CircleCliTxSender` is written against this contract.
 
 ## 4. Contracts
 
@@ -347,6 +372,9 @@ holds config, wallet settings, and per-channel state including session keys
   calls `timeout()` / `reclaim()` when they become available and favorable.
 - Submits all dispute transactions through `SessionKeyTxSender`, so it keeps
   working when the Circle session has expired.
+- Keeps each open channel's session key able to pay for those transactions:
+  it refills a key below `sessionGasFloor` from the wallet, and raises
+  `session-gas-low` if the wallet cannot (§12 item 29).
 
 ### 6.4 Web board
 
@@ -413,6 +441,8 @@ accept-draw / next-game / close buttons.
 | Accepter never funds | Offerer-first funding order; reclaim after deadline |
 | Opponent posts stale state | Respond with newer supported state; `turnNum` monotonic |
 | Serial griefing challenges | Per-player cooldown; reputation |
+| Forced responds drain the session key, then a stale challenge goes unanswered | Refill below `sessionGasFloor` while Open/Challenged; `session-gas-low` when the wallet cannot (§12 item 29) |
+| Short `challengeTimeout` makes a missed deadline likely | Daemons refuse offers and matches under `minChallengeTimeout`, default 900 s (§12 item 30) |
 | Session key leak | Loss bounded to that channel's deposit and gas allowance; payouts only to participant wallets; keys per channel, file-mode 0600 |
 | Malicious host / relay | Host holds nothing; relay only forwards signed data; alternative relay possible |
 | Malicious rules contract | Off-chain allowlist in registry; daemons refuse unlisted rules by default |
@@ -443,7 +473,7 @@ accept-draw / next-game / close buttons.
 - Legal review: real-money skill-game wagering and host fee in target jurisdictions.
 - Mainnet multisig owner; deployment runbook; monitoring and alerting on the indexer.
 
-## 12. Implementation refinements (from Plans 1 and 2)
+## 12. Implementation refinements (from Plans 1, 2 and 4.5)
 
 1. `IGameRules` also exposes `isCheckpoint(s)`, `isGameOver(s)`, `forfeitBalances(s, p)`; `ChessRules`
    additionally exposes `successor(prev, move, p)`, the canonical next state used for SDK parity.
@@ -554,9 +584,9 @@ accept-draw / next-game / close buttons.
 19. **Host connection lifecycle (CLI).**
     - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
       or the local API. A failed join is recorded as the channel's `lastError`.
-    - After a reconnect, re-joins go out at 10 per second or fewer, and only for channels that are not settled.
-      That is half the server's default sustained frame rate of 20 per second, because every confirmed join
-      makes the daemon re-send frames of its own. The loop stops at the first "too many channels on this
+    - After a reconnect, re-joins go out at 10 per second or fewer, and only for channels that are not settled,
+      because every confirmed join makes the daemon re-send frames of its own. The server's default sustained
+      frame rate is 400 per second per connection (item 34). The loop stops at the first "too many channels on this
       connection" refusal, and the remaining joins wait for the next `hello`.
     - The reconnect backoff resets only after a connection has stayed up for 30 s past `hello`. A server that
       accepts the connection and drops it at once therefore sees a growing delay.
@@ -571,9 +601,90 @@ accept-draw / next-game / close buttons.
     - When `init` adopts any of these values, it checks over that RPC that `eth_chainId` matches and that the hub
       and rules addresses hold code. It fails otherwise.
     - It prints every chain value with a `trust` line, and warns on stderr about a non-loopback `http://` server.
-    - With `--rpc/--chain-id/--hub/--usdc/--rules` all given, it makes no network call.
+    - With `--rpc/--chain-id/--hub/--usdc/--rules` all given, it fetches nothing from the server and does not
+      verify the addresses. It still asks the RPC for `eth_gasPrice` to derive the default `sessionGasWei` (item 29),
+      unless `--session-gas-wei` is given too; then it makes no network call.
     - This refines §9's "host holds nothing". The host still holds no funds or keys, but agents must verify the
       published addresses, or pass them explicitly, and should preferably use their own RPC.
+
+### Plan 4.5 refinements (hardening, 2026-09-29)
+
+22. **Per-key nonce manager.** Every key the daemon sends from (the wallet and each session key) has a tracking
+    `SerialTxSender`. Sends are serialized per key, and each nonce the key has used and not yet seen mined is
+    tracked with its hashes and last fees, in state `waiting` (a receipt wait owns it) or `released` (its wait
+    ended without success). It holds five invariants:
+    1. **No pre-emption.** A new intent never replaces a transaction whose wait is still active; it takes the next
+       nonce.
+    2. **At-most-once intent.** Our own resends never make one intent land twice. A replacement that finds its
+       nonce used throws `TxNonceUsedError` and is never re-sent at a fresh nonce: the caller re-reads the chain.
+       The one accepted residual: a top-up whose send response was lost, mined before the resend and read against
+       a stale balance, can be paid once more (at most one extra `sessionGasWei`).
+    3. **Stuck transactions are never abandoned.** Once a wait gives up on nonce N, the next send from that key
+       replaces N with raised fees instead of queueing behind it. A fresh sender that finds pending nonces it does
+       not track (a restart, or a lost response) adopts the lowest one as released and replaces it.
+    4. **Bounded fees.** The wallet never pays more per gas than max(4 × the node's estimate, `feeCeilingWei`,
+       default 100 gwei), nor more than its balance can cover. Session keys have no fee ceiling (a dispute must
+       never be refused by one); only their balance bounds them, which is why item 29 exists.
+    5. **Every wait is bounded** by its give-up time, its replacement count or the daemon's stop signal.
+
+    It assumes instant finality (Arc): after a reorg that un-mines one of our transactions, that nonce is not
+    adopted again.
+23. **`TxSender` contract.** See §3.1: honour the nonce and fee overrides or declare `supportsReplacement =
+    false`; the optional sign-then-send pair; the wallet key is used only by this daemon.
+24. **Two-pass watchtower.** Every `pollMs` the daemon starts two independent passes. The dispute pass handles only
+    Challenged channels (adopt on-chain states, respond, auto-resign or claim, time out a silent opponent), each
+    channel concurrently with its own session key. The main pass does everything else: offer pruning, funding,
+    reclaim, dispute scans and self-heal for channels that are not Challenged, the cooperative-close retry, match
+    retries and settled-channel eviction. A stalled funding or close transaction therefore never delays a respond,
+    and one channel's stuck respond never delays another's. Per-channel flags keep a respond (the dispute pass or
+    the move path) and a reclaim (the main pass or the reclaim API) from running twice at once.
+25. **Bounded receipt waits.** Every write waits at most `RECEIPT_TIMEOUT_MS` (30 s) per round; a dispute
+    transaction waits min(30 s, a third of the time left to its deadline), never under 10 s. After each round a
+    dropped transaction is reported (the caller re-evaluates), and a pending one is replaced at its nonce with fees
+    raised by at least 12.5 %, up to 3 times. A respond gives up at its dispute deadline. A transaction the node
+    reports mined whose receipt stays unreadable for 3 rounds is treated as mined.
+26. **Chain and deployment identity.** The server records `(chainId, hub, genesis hash)` in its database the first
+    time it opens it and refuses to start against a different chain or deployment. The indexer unwinds rows whose
+    events a reorg removed, within a 32-block window. A daemon refuses to load a channel record whose params do not
+    hash to its id under the configured hub and chain (it is reported as degraded).
+27. **Lobby watch slots.** An offer matches at most once, so the daemon unwatches it on any match event for it,
+    before anything else; the server also frees a watch slot as soon as it pushes that offer's match. A subscribe
+    the host refuses sets a daemon-wide `lobbyError`, shown in every channel's status, and new offers and accepts
+    answer 503 until the daemon restarts. The daemon leaves a settled channel's relay room, freeing its join slot.
+28. **Accepter binding.** The accepter re-verifies the offer's signature before recording or signing anything, and
+    `checkMatchParams` binds the offerer's seat (wallet and session key) to the offer it accepted, so a host cannot
+    seat someone else opposite it.
+29. **Session-key dispute gas (final review C1).** Responding is a safety property: an unanswered challenge on any
+    supported earlier state lets the challenger time out on it, erasing every game since and taking a forfeit. So:
+    - While a channel is Open or Challenged, a session key below `sessionGasFloor` (default half of
+      `sessionGasWei`) is refilled from the wallet (its nonce-managed sender) up to `sessionGasWei`. The balance is
+      read again right before the send. The main pass refills Challenged channels first; the dispute pass also
+      refills, after its own respond. One refill per channel at a time.
+    - If the wallet cannot refill, the channel raises the `session-gas-low` attention (first, whoever controls the
+      channel) with the suggested action "fund your wallet: dispute gas for channel X is low". `wait` wakes for it
+      once per episode.
+    - `arena init` derives the default `sessionGasWei` from the chain:
+      $$\text{sessionGasWei} = k \cdot G_{\text{respond}} \cdot F_{\text{cap}}$$
+      with $k = 4$, $G_{\text{respond}} = 2{,}100{,}000$ (the heaviest measured respond, about 1.86M, plus a
+      margin) and $F_{\text{cap}} = \max(\text{fee ceiling}, 4 \times \text{the RPC's gas price})$.
+      `--session-gas-wei` overrides it. Arc's real fee level decides the final values (Plan 6).
+30. **Minimum challenge timeout (final review I4).** Daemons refuse a `challengeTimeout` under `minChallengeTimeout`
+    (default 900 s): `createOffer` and `acceptOffer` answer 400, and a match under it is ignored. The offer defaults
+    (`arena offer`, the API, the server's `defaults.challengeTimeout`) are 900 s. The hub's own minimum stays 60 s.
+31. **Bounded approval (final review I2).** The daemon approves exactly `deposit + feePerPlayer` before a deposit,
+    and only when the current allowance is short; never an unlimited allowance. `arena init` warns loudly when the
+    hub, rules or USDC address differs from the canonical deployment for a known chain id (`KNOWN_DEPLOYMENTS`,
+    empty until Plan 6 adds Arc mainnet).
+32. **Flat daemon memory (final review I3).** A settled channel (Finalized, Reclaimed, or retired without our
+    deposit) is dropped from the daemon's live set 10 minutes of chain time after the main pass first sees it
+    settled. `status` still serves it from its cached final status (the latest 1,000) or from disk, and `channels`
+    lists the cached ones. A daemon needs a supervisor that restarts it (see the CLI README).
+33. **Settlement wake.** A channel that reaches Finalized or Reclaimed while the daemon watches it raises a one-shot
+    `settled` attention, consumed by the first `wait` that returns it.
+34. **Server WS frame limits.** The per-connection defaults are 4000 frames burst and 400 per second, twice what
+    the soak needed: one daemon sends every channel's relay traffic over one connection, and a trip closes it
+    (1008). The per-IP caps are unchanged. Outside a local Anvil chain the server refuses to start without an
+    explicit, non-development `audit` string, since `/templates` publishes it.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
@@ -592,16 +703,34 @@ on-chain launch limits, and the §8 test campaign is extended (Plan 4.5) before 
    - Creating a channel that would push `committedEscrow` above the owner-set `maxCommittedEscrow` reverts with
      `EscrowCapReached`.
    - Lowering the cap below the current commitment only stops new channels.
+   - An unfunded channel's reservation cannot outlive `MAX_FUNDING_WINDOW` (a constant, 1 day): `_validateNewParams`
+     reverts `InvalidParams` if `params.fundingDeadline > block.timestamp + MAX_FUNDING_WINDOW`. Without this
+     bound, a self-dealing attacker could set `fundingDeadline` far in the future, fund only their own side,
+     and hold that reservation against `maxCommittedEscrow` indefinitely, since `reclaim` is only callable
+     after the deadline passes. With the bound, a half-funded channel's reservation is always reclaimable
+     within one day. Squatting is not free: the squatter locks its own side (`deposit + feePerPlayer`) for the
+     window.
+   - The worse case is not bounded by the window: a self-dealing channel funded on **both** sides and left Open
+     holds its reservation indefinitely. It costs the squatter the reservation's capital, locked, plus
+     2 · `feePerPlayer` per channel. The owner's response is the same as for any other capacity pressure: raise
+     `maxCommittedEscrow`. Monitor `committedEscrow` against real game activity.
 3. **Pause.**
    - `setPaused(bool)` (owner) blocks every `deposit`: new channels and second-side funding alike.
    - It never blocks `reclaim`, `closeCooperative`, `challenge`, `respond`, `timeout` or `claim`. Every open channel
      can always settle, and a half-funded channel is refunded by `reclaim` after its funding deadline.
 4. **Admin surface.** The owner (a multisig on mainnet) can change only fees, the two caps and the pause flag. None of
    these touch deposits or existing channels, and the hub stays non-upgradeable. §9 "Admin abuse" is extended
-   accordingly. The worst an owner can do is refuse new business.
+   accordingly. The worst an owner can do is refuse new business, with one side effect: a pause blocks the second
+   deposit too, so a player who funded first stays locked until the channel's `fundingDeadline` (at most 1 day
+   on-chain, at most 2 hours through an honest host) and then reclaims. The owner must never renounce ownership:
+   renouncing while paused freezes new business forever (funds are unaffected).
 5. **Off-chain mirrors.**
    - `HubClient` reads the limits.
-   - Daemons refuse to create or accept an offer the hub would reject.
+   - Daemons mirror all three limits in `createOffer` and `acceptOffer`, before anything is posted or signed: the
+     pause (409), `maxDepositPerPlayer` (400), and the escrow cap, `committedEscrow + 2 · (deposit + feePerPlayer) ≤
+     maxCommittedEscrow` with the hub's current fee (409). At match time they re-check the pause and the per-player
+     cap and ignore a match that fails; the commitment is left to the hub, and a deposit it refuses backs off for
+     30 s of chain time.
    - The host lobby refuses such offers.
    - `/templates` publishes the current limits and the pause flag.
 6. **Launch values.** The launch values are deployment parameters, not constants. Suggested starting points:

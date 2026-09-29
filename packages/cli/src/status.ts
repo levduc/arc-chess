@@ -25,9 +25,22 @@ export type ChannelStatus = {
   closing: boolean;
   opponentWantsToClose: boolean;
   challenge: null | { deadline: string; secondsLeft: number; mustMove: boolean; challenger: "me" | "opponent" };
-  attention: null | "your-turn" | "new-game-proposed" | "game-over" | "close-requested" | "opponent-silent";
+  attention:
+    | null
+    | "session-gas-low"
+    | "your-turn"
+    | "new-game-proposed"
+    | "game-over"
+    | "close-requested"
+    | "opponent-silent"
+    | "settled";
   suggestedActions: string[];
   lastError: string | null;
+  /** Plan 4.5 Task 11 fix round (C2): the daemon-wide "too many watched offers" (or other subscribe-refusal)
+   *  message, if the host has ever refused a subscribe on this daemon's connection, else null. Not specific to
+   *  this channel -- it means new offers/accepts are refused until this daemon restarts (see checkLobbyHealthy in
+   *  daemon.ts) -- but every channel's status carries it, since there is no daemon-wide endpoint to put it on. */
+  lobbyError: string | null;
 };
 
 export type StatusInput = {
@@ -41,6 +54,12 @@ export type StatusInput = {
    * phase change), or null if not yet observed. Drives `opponent-silent`.
    */
   lastProgressAt?: bigint | null;
+  /** Plan 4.5 Task 11 fix round (C2): see ChannelStatus.lobbyError. */
+  lobbyError?: string | null;
+  /** Final review C1: why the session key's dispute gas is low and the wallet could not refill it, or null. */
+  sessionGasLow?: string | null;
+  /** Final review m4: the channel settled while the daemon watched it and no `wait()` has woken for it yet. */
+  settled?: boolean;
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -96,13 +115,20 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     waitingOnOpponent && chain !== null && lastProgressAt !== null && chain.now - lastProgressAt > record.params.challengeTimeout;
 
   let attention: ChannelStatus["attention"] = null;
-  if (live && record.controller === "agent") {
+  // Final review C1: first, and whoever controls the channel -- a session key that cannot pay cannot answer a
+  // challenge, and an unanswered one can roll the channel back.
+  const gasLow = live && input.sessionGasLow ? input.sessionGasLow : null;
+  if (gasLow) attention = "session-gas-low";
+  else if (live && record.controller === "agent") {
     if (myTurn) attention = "your-turn";
     else if (newGame === "proposed_by_opponent" && !closing) attention = "new-game-proposed";
     // I2: only a request we can honour — `arena close` works only on a finished game with no proposal pending.
     else if (opponentWantsToClose && over && !closing && newGame === "none") attention = "close-requested";
     else if (over && !closing && newGame === "none") attention = "game-over";
     else if (silent) attention = "opponent-silent";
+  } else if (input.settled && (phase === "Finalized" || phase === "Reclaimed") && record.controller === "agent") {
+    // Final review m4: one wake for the settlement (e.g. after this player's close), consumed by `wait()`.
+    attention = "settled";
   }
 
   const suggestedActions: string[] = [];
@@ -114,6 +140,13 @@ export function buildStatus(input: StatusInput): ChannelStatus {
         ? "done: the funding window closed without this channel opening; nothing is left to do"
         : "wait: the channel is being funded",
     );
+    // Task 2 (spec §13): names the cause when funding is blocked by the hub's pause, rather than leaving the
+    // agent to guess why a channel is not progressing.
+    if (!record.finalized && input.lastError?.startsWith("funding: Paused")) {
+      suggestedActions.push(
+        "wait: the hub is paused; funding resumes automatically when it is unpaused (or reclaim after the funding deadline)",
+      );
+    }
   } else if (phase === "Finalized") suggestedActions.push("done: the channel is settled");
   else if (phase === "Reclaimed") suggestedActions.push("done: the channel was never funded and deposits were returned");
   else if (closing) {
@@ -142,6 +175,14 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   } else if (challengeHint) {
     suggestedActions.push(challengeHint);
   }
+  if (input.lobbyError) {
+    suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
+  }
+  if (gasLow) {
+    suggestedActions.unshift(
+      `fund your wallet: dispute gas for channel ${record.channelId} is low (${gasLow}); the daemon refills it on its next pass`,
+    );
+  }
 
   return {
     channelId: record.channelId,
@@ -167,5 +208,6 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     attention,
     suggestedActions,
     lastError: input.lastError,
+    lobbyError: input.lobbyError ?? null,
   };
 }

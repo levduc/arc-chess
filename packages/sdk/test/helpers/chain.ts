@@ -13,7 +13,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
-import { mockUsdcAbi, type ArenaDomain } from "../../src/index.js";
+import { channelHubAbi, mockUsdcAbi, type ArenaDomain } from "../../src/index.js";
 import { ANVIL_PORT } from "../global-setup.js";
 
 export const RPC = `http://127.0.0.1:${ANVIL_PORT}`;
@@ -49,12 +49,23 @@ async function deploy(name: string, args: unknown[]): Promise<Address> {
   return getAddress(receipt.contractAddress);
 }
 
-/** Deploys a fresh MockUSDC, ChessRules and ChannelHub (fee 5000 per player, max 1e6, host = account 3). */
+/**
+ * Deploys a fresh MockUSDC, ChessRules and ChannelHub (fee 5000 per player, max 1e6, host = account 3).
+ * The launch limits (maxDepositPerPlayer, maxCommittedEscrow) are generous so existing tests are unaffected.
+ */
 export async function deployArena() {
   const host = privateKeyToAccount(ANVIL_KEYS[3]).address;
   const usdc = await deploy("MockUSDC", []);
   const rules = await deploy("ChessRules", []);
-  const hub = await deploy("ChannelHub", [usdc, deployer.account.address, host, 5_000n, 1_000_000n]);
+  const hub = await deploy("ChannelHub", [
+    usdc,
+    deployer.account.address,
+    host,
+    5_000n,
+    1_000_000n,
+    10_000_000n,
+    10n ** 12n,
+  ]);
   const domain: ArenaDomain = { chainId: CHAIN.id, hub };
   return { pub: publicClient(), usdc, rules, hub, host, domain };
 }
@@ -79,4 +90,21 @@ export async function setEthBalance(who: Address, wei: bigint): Promise<void> {
 
 export async function now(): Promise<bigint> {
   return (await publicClient().getBlock()).timestamp;
+}
+
+/** Sets the hub's launch limits (spec §13) from the deployer/owner account. */
+export async function setLimits(hub: Address, maxDepositPerPlayer: bigint, maxCommittedEscrow: bigint): Promise<void> {
+  const hash = await deployer.writeContract({
+    address: hub,
+    abi: channelHubAbi,
+    functionName: "setLimits",
+    args: [maxDepositPerPlayer, maxCommittedEscrow],
+  });
+  await publicClient().waitForTransactionReceipt({ hash });
+}
+
+/** Pauses/unpauses the hub (spec §13) from the deployer/owner account. */
+export async function setPaused(hub: Address, paused: boolean): Promise<void> {
+  const hash = await deployer.writeContract({ address: hub, abi: channelHubAbi, functionName: "setPaused", args: [paused] });
+  await publicClient().waitForTransactionReceipt({ hash });
 }

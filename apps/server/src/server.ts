@@ -121,7 +121,29 @@ async function withLobbyErrors(res: http.ServerResponse, fn: () => Promise<void>
   }
 }
 
-function templateEntry(cfg: ServerConfig, url: string) {
+/** Task 2 (spec §13): the current launch limits for /templates, as decimal strings and a boolean, or `null` if
+ *  the chain read fails -- a host outage must not take down the whole route (the rest of the entry is still
+ *  useful, and is otherwise all static config). */
+async function templateLimits(chain: ChainReader): Promise<{
+  maxDepositPerPlayer: string;
+  maxCommittedEscrow: string;
+  committedEscrow: string;
+  paused: boolean;
+} | null> {
+  try {
+    const l = await chain.limits();
+    return {
+      maxDepositPerPlayer: decStr(l.maxDepositPerPlayer),
+      maxCommittedEscrow: decStr(l.maxCommittedEscrow),
+      committedEscrow: decStr(l.committedEscrow),
+      paused: l.paused,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader) {
   return {
     id: "chess",
     version: "1",
@@ -138,6 +160,7 @@ function templateEntry(cfg: ServerConfig, url: string) {
     fundingWindow: decStr(cfg.fundingWindow),
     skillUrl: `${url}/templates/chess/skill.md`,
     audit: cfg.audit,
+    limits: await templateLimits(chain),
   };
 }
 
@@ -179,6 +202,38 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
   const log = deps.log ?? ((line: string) => console.log(line));
+
+  // Product hardening: a database recorded against one chain/deployment (chain id, hub address, and the chain's
+  // own genesis hash -- chain id alone cannot tell a redeployed local chain apart from the one the database was
+  // last opened against) must never be silently reused against another. Without this, e.g. re-running a local
+  // dev stack against a fresh Anvil instance left the indexer's persisted cursor pointing past the new chain's
+  // head, and it would silently index nothing from then on (see indexer.ts's cursor-ahead-of-head warning).
+  let genesisHash: Hex;
+  try {
+    genesisHash = await chain.genesisHash();
+  } catch (err) {
+    repo.close();
+    throw new Error(`could not read the chain's genesis block to verify database identity: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const recorded = repo.identity();
+  if (recorded === null) {
+    repo.setIdentity({ chainId: cfg.chainId, hub: cfg.hub, genesisHash });
+  } else {
+    const mismatch =
+      recorded.chainId !== cfg.chainId ||
+      recorded.hub.toLowerCase() !== cfg.hub.toLowerCase() ||
+      recorded.genesisHash.toLowerCase() !== genesisHash.toLowerCase();
+    if (mismatch) {
+      repo.close();
+      throw new Error(
+        `database ${cfg.dbPath} belongs to another chain/deployment: it was opened against ` +
+          `chainId=${recorded.chainId} hub=${recorded.hub} genesisHash=${recorded.genesisHash}, but this config is ` +
+          `chainId=${cfg.chainId} hub=${cfg.hub} genesisHash=${genesisHash}. Use a fresh --db, or point this config ` +
+          `back at the original chain/deployment.`,
+      );
+    }
+  }
+
   if (cfg.dbPath === ":memory:") {
     log(
       JSON.stringify({
@@ -300,7 +355,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     },
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/templates") return false;
-      sendJson(ctx.res, 200, [templateEntry(cfg, self.url)]);
+      sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, chain)]);
       return true;
     },
     async (ctx) => {

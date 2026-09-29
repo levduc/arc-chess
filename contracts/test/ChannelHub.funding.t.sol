@@ -154,7 +154,8 @@ contract ChannelHubFundingTest is HubFixture {
     }
 
     function test_channelId_bindsHub() public {
-        ChannelHub other = new ChannelHub(IERC20(address(usdc)), owner, feeRecipient, FEE, MAX_FEE);
+        ChannelHub other =
+            new ChannelHub(IERC20(address(usdc)), owner, feeRecipient, FEE, MAX_FEE, MAX_DEPOSIT, MAX_COMMITTED);
         Params memory p = _params();
         assertTrue(hub.channelId(p) != other.channelId(p));
     }

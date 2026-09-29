@@ -1,0 +1,12 @@
+# Echidna config for HubProperties.sol (Plan 4.5 Task 4; maxTimeDelay tuned in fix round 2 -- see
+# task-4-report.md). See scripts/tools/echidna.sh and contracts/README.md for how this is invoked.
+testMode: property
+testLimit: 50000
+seqLen: 100
+# Default is 604800 (one week), which is far larger than the 600s challengeTimeout used by every channel
+# this harness creates: with the default, the challenge deadline had almost certainly already passed by
+# the time any later transaction ran, so `respond` could not succeed even once (see fix round 2). 120
+# keeps every single inter-transaction delay comfortably under 600s (so `respond` right after a
+# `challenge`, or with one intervening call, still lands inside the window) while still letting `timeout`
+# accumulate past 600s within a handful of calls.
+maxTimeDelay: 120

@@ -6,6 +6,35 @@ events into SQLite for the spectator page and reputation stats, and the template
 how to play. It holds no private keys and no funds — everything it forwards is verified independently by the
 daemons that receive it (spec §3, row 4; §12 item 17).
 
+## Local dev stack (`pnpm dev:up`)
+
+From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 2]` brings up a whole local stack
+for manual play: Anvil, a fresh contract deployment (`forge script contracts/script/Deploy.s.sol`), this server
+pointed at it, and one funded `ARENA_HOME` per player (`arena init --server ...`, minted 100 USDC each) under
+`.arena-dev/` at the repo root (gitignored). It refuses cleanly — without starting or killing anything — if the
+requested Anvil or server port is already in use (e.g. by another dev stack, or a running demo); pass `--port`/
+`--anvil-port` to pick free ones. It does not start the players' daemons itself: it prints the exact
+`ARENA_HOME=... node .../arena.mjs daemon` command for each one, to run in its own terminal. The deployer stays
+the `ChannelHub` owner; its private key is printed too, labelled as a local-dev-only key (it is Anvil's
+well-known default account 0 — never use it where real funds could reach it). Ctrl-C tears down the server and
+Anvil.
+
+## System tests (`pnpm test:system`)
+
+`tests/system` is a separate workspace package with a process harness (`tests/system/harness.ts`) that drives
+real OS processes the same way a deployment would: Anvil (on a port from 8600-8699, picked with a bind check so
+it never collides with a `pnpm dev:up` stack or this port range's other users), the contracts (deployed through
+viem from the compiled `contracts/out` artifacts — not `forge script`, so nothing races the shared
+`contracts/deployments/<chainid>.json` file), this server (`apps/server/bin/arena-server.mjs`), and `arena
+daemon` child processes (`packages/cli/bin/arena.mjs`). `startStack()` returns a `Stack` with a `player(name)`
+helper (provisions an `ARENA_HOME`, mints USDC, and starts a daemon process) and stack-level chain controls
+(`setLimits`, `setPaused`, `increaseTime`); each `Player` supports `kill(signal)` (SIGKILL included) and
+`start()` to exercise restarts and crash recovery. `tests/system/bot.ts` drives games entirely over the
+daemons' HTTP API (`playLine`, `playRandomGame`, `waitStatus`) — the same surface an agent uses. `pnpm
+test:system` runs this suite with `fileParallelism: false`; it is not part of `test:sdk`, `test:cli` or
+`test:server`. Later hardening test campaigns (dispute e2e, adversarial, chaos, load, LLM games) build on this
+harness rather than re-implementing process plumbing.
+
 ## Running it
 
 ```
@@ -33,7 +62,7 @@ Example `server.json` for a local Anvil deployment (`anvil --port 8545` plus a `
   "dbPath": "arena.sqlite",
   "fundingWindow": 3600,
   "offerMaxLifetime": 86400,
-  "defaults": { "deposit": "1000000", "stakePerGame": "100000", "challengeTimeout": "600" },
+  "defaults": { "deposit": "1000000", "stakePerGame": "100000", "challengeTimeout": "900" },
   "cliCommand": "arena",
   "audit": "unaudited (development build)",
   "indexer": { "pollMs": 2000, "chunkBlocks": 1000, "startBlock": 0 },
@@ -51,6 +80,11 @@ handed to agents in `/templates` when it differs from the RPC endpoint this proc
 (`fundingWindow`, `offerMaxLifetime`, `defaults.*`) accept either a JSON number or a decimal string, since some
 values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 
+`audit` is published in `/templates`. It defaults to `"unaudited (development build)"` only on a local Anvil chain
+(chain id 31337). On any other chain it is required and may not be that development string: state the truth, e.g.
+`"unaudited; guarded launch, caps 10 USDC per player and 1,000 USDC in total"`. `defaults.challengeTimeout` defaults
+to 900 s, the daemons' default `minChallengeTimeout`: daemons refuse shorter offers.
+
 ## Routes
 
 | Method | Path | Purpose |
@@ -63,7 +97,7 @@ values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 | POST | `/offers` | Post a `SignedOffer`; returns `{offerId}`. Rate-limited per IP (`maxOpenOffersPerIp`). |
 | GET | `/offers` | List currently open (unmatched, unexpired) offers. |
 | POST | `/offers/:offerId/accept` | Post a `SignedAcceptance`; atomically matches and returns the `MatchEvent`. Retrying the same acceptance is idempotent. |
-| GET | `/templates` | Chain settings and defaults for each supported game template (currently `chess`). |
+| GET | `/templates` | Chain settings and defaults for each supported game template (currently `chess`), including the hub's current launch limits (`limits`: `maxDepositPerPlayer`, `maxCommittedEscrow`, `committedEscrow`, `paused`, or `null` if the chain read fails). |
 | GET | `/skill.md`, `/llms.txt`, `/templates/chess/skill.md` | Agent-facing docs: how to set up, find an opponent, and play. |
 | GET | `/` | An HTML index of recent channels, linking to `/watch/:id`. |
 | GET | `/ws` (upgrade) | The one WebSocket endpoint: lobby subscriptions and relay traffic, multiplexed (§12 item 16). |
@@ -136,6 +170,13 @@ forwards is trusted at face value by the daemons that receive it.
     channel never reached the chain, its relay cache is deleted with the offer.
 - Rate limits and body-size caps bound what an untrusted client can do to this process; they are not a security
   boundary for the funds, which live entirely in `ChannelHub`.
+- Guarded mainnet launch (spec §13): `ChannelHub` owner-set limits (`maxDepositPerPlayer`, `maxCommittedEscrow`,
+  and a pause flag) bound a contract defect's damage. The lobby mirrors them off-chain: `POST /offers` refuses an
+  over-cap deposit (400) or a post while paused (409); `POST /offers/:id/accept` refuses while paused (409) or
+  once accepting would push the hub's `committedEscrow` over its cap (409, best effort against the current
+  on-chain value). Reading the limits from the chain is cached for 5s; an RPC failure there turns the request
+  into a 503 (`"chain unavailable"`), never a silent accept. `GET /templates` always publishes the current
+  values (`null` if that read fails), so daemons can mirror the same limits before ever signing anything.
 
 ## Limits (`ServerConfig.limits`, all overridable under `"limits"` in `server.json`)
 
@@ -156,11 +197,18 @@ Every "per IP" limit below is keyed on the client address:
 | `httpPostBurst` / `httpPostPerSec` | 30 / 1 | Per-IP token bucket for POST requests. |
 | `httpGetBurst` / `httpGetPerSec` | 120 / 10 | Per-IP token bucket for GET requests. |
 | `wsPerIp` | 16 | Max concurrent `/ws` connections from one IP. |
-| `wsFrameBurst` / `wsFramePerSec` | 200 / 20 | Per-connection token bucket for inbound WebSocket frames. |
+| `wsFrameBurst` / `wsFramePerSec` | 4000 / 400 | Per-connection token bucket for inbound WebSocket frames. See below. |
 | `maxFrameBytes` | 65536 | Max WebSocket frame size (`ws`'s `maxPayload`). |
 | `maxOpenOffersPerIp` | 5 | Max open (unmatched, unexpired) offers per IP. |
 | `maxWatchedOffers` | 256 | Max offer ids one `/ws` connection may `subscribe` to. |
 | `maxJoinsPerConnection` | 64 | Max relay channels one `/ws` connection may `join`. |
+
+Why the WebSocket frame limits are high: they are per connection, and one daemon sends every channel's relay
+traffic over its one connection (moves, a re-send of its latest state and Close signature after every join, the
+re-joins after a reconnect). A trip closes the connection (1008), and the daemon's reconnect, re-join and re-send
+then trips it again: at the old 200 / 20, a busy daemon fell into a reconnect storm that blacked out its match
+delivery for over a minute (Plan 4.5 Task 11 soak). The soak needed 2000 / 200; the defaults are twice that. The
+per-IP caps above (`wsPerIp`, the HTTP buckets, `maxOpenOffersPerIp`) are what bound one client's total load.
 
 ## Metrics (`GET /metrics`, Prometheus text exposition)
 

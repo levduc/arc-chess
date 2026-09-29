@@ -54,11 +54,21 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     bytes32 public constant CLOSE_TYPEHASH = keccak256("Close(bytes32 channelId,bytes32 stateHash)");
     uint64 public constant MIN_TIMEOUT = 60;
     uint64 public constant MAX_TIMEOUT = 7 days;
+    /// @notice Furthest a channel's `fundingDeadline` may be set from creation (spec §13 item 2's reservation
+    /// bound). Without it, an unbounded deadline would let a self-dealing creator hold a `committedEscrow`
+    /// reservation forever at roughly gas cost, since `reclaim` is only callable after the deadline passes.
+    uint64 public constant MAX_FUNDING_WINDOW = 1 days;
 
     IERC20 public immutable token;
     uint256 public immutable maxFeePerPlayer;
     uint256 public feePerPlayer;
     address public feeRecipient;
+    /// @notice Spec §13 launch limits. `maxDepositPerPlayer` and `maxCommittedEscrow` are checked only when a
+    /// channel is created; lowering them never affects channels already created. `paused` blocks only `deposit`.
+    uint256 public maxDepositPerPlayer;
+    uint256 public maxCommittedEscrow;
+    uint256 public committedEscrow;
+    bool public paused;
     mapping(address => uint256) public owed;
     mapping(bytes32 => Channel) internal _channels;
 
@@ -75,6 +85,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     // since it always changes together with feePerPlayer.
     // slither-disable-next-line unindexed-event-address
     event FeeUpdated(uint256 feePerPlayer, address feeRecipient);
+    event LimitsUpdated(uint256 maxDepositPerPlayer, uint256 maxCommittedEscrow);
+    event PausedSet(bool paused);
 
     error WrongPhase();
     error InvalidParams();
@@ -92,15 +104,24 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     error BalanceMismatch();
     error InCooldown();
     error NothingToClaim();
+    error DepositTooLarge();
+    error EscrowCapReached();
+    error Paused();
 
-    constructor(IERC20 token_, address owner_, address feeRecipient_, uint256 feePerPlayer_, uint256 maxFeePerPlayer_)
-        EIP712("AgentArena", "1")
-        Ownable(owner_)
-    {
+    constructor(
+        IERC20 token_,
+        address owner_,
+        address feeRecipient_,
+        uint256 feePerPlayer_,
+        uint256 maxFeePerPlayer_,
+        uint256 maxDepositPerPlayer_,
+        uint256 maxCommittedEscrow_
+    ) EIP712("AgentArena", "1") Ownable(owner_) {
         if (address(token_).code.length == 0) revert InvalidParams();
         token = token_;
         maxFeePerPlayer = maxFeePerPlayer_;
         _setFee(feePerPlayer_, feeRecipient_);
+        _setLimits(maxDepositPerPlayer_, maxCommittedEscrow_);
     }
 
     // ----------------------------------------------------------------- views
@@ -152,11 +173,16 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
 
     /// @notice Fund your side of a channel. Calling this is the participant's consent to every field of `params`.
     function deposit(bytes calldata encodedParams) external nonReentrant {
+        if (paused) revert Paused();
         Params memory p = abi.decode(encodedParams, (Params));
         bytes32 id = channelId(p);
         Channel storage c = _channels[id];
         if (c.phase == Phase.None) {
             _validateNewParams(p);
+            if (p.deposit > maxDepositPerPlayer) revert DepositTooLarge();
+            uint256 commit = 2 * (p.deposit + p.feePerPlayer);
+            if (committedEscrow + commit > maxCommittedEscrow) revert EscrowCapReached();
+            committedEscrow += commit;
             c.phase = Phase.Funding;
             c.params = p;
             emit ChannelCreated(id, abi.encode(p));
@@ -187,6 +213,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         // slither-disable-next-line timestamp
         if (block.timestamp <= p.fundingDeadline) revert TooEarly();
         c.phase = Phase.Reclaimed;
+        committedEscrow -= 2 * (p.deposit + p.feePerPlayer);
         emit Reclaimed(id);
         uint256 amount = p.deposit + p.feePerPlayer;
         if (c.funded[0]) _pay(p.participants[0], amount);
@@ -295,6 +322,20 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         _setFee(feePerPlayer_, feeRecipient_);
     }
 
+    /// @notice Set the per-channel deposit cap and the total commitment cap (spec §13). Both are checked only
+    /// when a channel is created, so lowering either never affects a channel already created, and the second
+    /// deposit into an existing channel is never blocked by them.
+    function setLimits(uint256 maxDepositPerPlayer_, uint256 maxCommittedEscrow_) external onlyOwner {
+        _setLimits(maxDepositPerPlayer_, maxCommittedEscrow_);
+    }
+
+    /// @notice Pause or unpause `deposit` (spec §13). Never blocks reclaim, closeCooperative, challenge,
+    /// respond, timeout or claim: every open channel can always settle.
+    function setPaused(bool paused_) external onlyOwner {
+        paused = paused_;
+        emit PausedSet(paused_);
+    }
+
     // -------------------------------------------------------------- internal
 
     function _setFee(uint256 feePerPlayer_, address feeRecipient_) private {
@@ -304,8 +345,16 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         emit FeeUpdated(feePerPlayer_, feeRecipient_);
     }
 
-    // fundingDeadline must simply lie in the future relative to channel creation; miner-scale drift on
-    // block.timestamp is immaterial to a minutes-to-days-long window.
+    function _setLimits(uint256 maxDepositPerPlayer_, uint256 maxCommittedEscrow_) private {
+        maxDepositPerPlayer = maxDepositPerPlayer_;
+        maxCommittedEscrow = maxCommittedEscrow_;
+        emit LimitsUpdated(maxDepositPerPlayer_, maxCommittedEscrow_);
+    }
+
+    // fundingDeadline must lie in the future relative to channel creation, and no further out than
+    // MAX_FUNDING_WINDOW (spec §13 item 2's reservation bound: bounds how long a committedEscrow reservation
+    // can be held by an unfunded channel). Miner-scale drift on block.timestamp is immaterial to a
+    // minutes-to-a-day-long window.
     function _validateNewParams(Params memory p) private view {
         if (
             // slither-disable-next-line timestamp
@@ -313,6 +362,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
                 || p.signers[0] == address(0) || p.signers[1] == address(0) || p.signers[0] == p.signers[1]
                 || p.participants[0] == p.signers[1] || p.participants[1] == p.signers[0] || p.rules.code.length == 0
                 || p.stakePerGame == 0 || p.deposit < p.stakePerGame || p.fundingDeadline <= block.timestamp
+                || p.fundingDeadline > block.timestamp + MAX_FUNDING_WINDOW
                 || p.challengeTimeout < MIN_TIMEOUT || p.challengeTimeout > MAX_TIMEOUT
         ) {
             revert InvalidParams();
@@ -347,6 +397,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     function _finalize(bytes32 id, Channel storage c, Params memory p, uint256 a, uint256 b) private {
         if (a + b != 2 * p.deposit) revert BalanceMismatch();
         c.phase = Phase.Finalized;
+        committedEscrow -= 2 * (p.deposit + p.feePerPlayer);
         uint256 fee = 2 * p.feePerPlayer;
         emit Finalized(id, a, b, fee);
         _pay(p.participants[0], a);
