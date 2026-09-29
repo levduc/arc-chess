@@ -339,8 +339,32 @@ describe("final review C1: the session key's dispute gas is refilled while the c
   });
 
   it("fix round (minor): refillBackoffGate reads the wallet balance only while a back-off is active", async () => {
+    // Root-cause note (coordinator follow-up, on an observed flake in this exact test): this test drives every
+    // pass itself via explicit idle()+tick() calls and counts precisely how many of them read the wallet's own
+    // balance -- but matched()'s daemon still runs its own periodic timer (100ms) throughout. mainPass()
+    // single-flights on `mainTicking`: if the periodic timer's own background mainPass() call starts (during
+    // this same tick's disputePass(), which runs first and does not hold that flag) before this tick's own
+    // mainPass() call reaches it, the *background* one wins the single-flight slot and does the real work
+    // asynchronously, unawaited by this tick() call, while this tick's own mainPass() short-circuits immediately
+    // (mainTicking already true) and returns having done nothing. Confirmed by direct instrumentation (a full
+    // timeline of every mainPass()/ensureSessionGas() invocation, tagged and timestamped) across two independently
+    // captured natural failures: on both, mainPass() was invoked more times than this test called tick(), with
+    // the extra invocations landing exactly where this test's own call was skipped -- the background pass, not
+    // this test's, ends up doing the gate check the final assertion depends on, and nothing here waits for that
+    // background pass to finish before checking `walletBalanceReads` (no `idle()` follows the last `tick()`).
+    // Not a product bug: `mainTicking`'s single-flight is working exactly as designed (the periodic timer's own
+    // next tick would have done the same check moments later regardless, and no work is lost) -- it just makes
+    // this test's precise per-tick counting nondeterministic unless the interfering timer is disabled, the same
+    // reasoning the "fix round I9" back-off test below already applies (there, by never starting matched()'s
+    // periodic timer in the first place; here, by clearing it below, since matched()'s own funding wait needs it
+    // running until the channel actually reaches Open).
     const { alice, id } = await matched();
     const d = alice.daemon;
+    // matched()'s own funding wait needs the periodic timer running (its default pollMs, 100ms) to reach Open at
+    // all; only now, with the channel already Open and matched() done waiting on it, is it disabled -- clearing
+    // the interval directly (not stop(), which would also abort in-flight work and set `stopped`) so every pass
+    // from here on is exactly the one this test's own idle()+tick() calls asked for, no more.
+    clearInterval((d as unknown as { timer?: NodeJS.Timeout }).timer);
     const realGetBalance = d.client.getBalance.bind(d.client);
     let walletBalanceReads = 0;
     d.client.getBalance = (async (args: { address: Hex }) => {
