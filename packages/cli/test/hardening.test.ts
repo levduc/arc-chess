@@ -1036,17 +1036,30 @@ describe("Plan 4.5 Task 10 re-review 2 (minor 5): stop() aborts receipt waits", 
     const pair = await startPair();
     cleanups.push(pair.cleanup);
     const { alice, bob } = pair;
-    // Alice's node never returns a receipt: every wait of hers runs its full 30 s round.
-    alice.daemon.client.getTransactionReceipt = (async ({ hash }: { hash: Hex }) => {
-      throw new TransactionReceiptNotFoundError({ hash });
-    }) as typeof alice.daemon.client.getTransactionReceipt;
+    // Alice's node serves no receipt while `blind`: every wait of hers runs its full 30 s round. The first receipt
+    // read is her funding pass's first wait (the approve's): that is the trigger, not a sleep.
+    const client = alice.daemon.client;
+    const real = client.getTransactionReceipt.bind(client);
+    let blind = true;
+    let entered: () => void = () => undefined;
+    const inWait = new Promise<void>((r) => (entered = r));
+    client.getTransactionReceipt = (async (args: { hash: Hex }) => {
+      if (!blind) return real(args);
+      entered();
+      throw new TransactionReceiptNotFoundError({ hash: args.hash });
+    }) as typeof client.getTransactionReceipt;
     const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await bob.daemon.acceptOffer(offerId);
-    await waitFor(() => alice.daemon.channelIds()[0] ?? null, 10_000, "match");
-    await new Promise((r) => setTimeout(r, 1_500)); // her funding pass is now inside a receipt wait
+    await inWait;
     const t0 = Date.now();
-    await alice.daemon.stop();
-    expect(Date.now() - t0).toBeLessThan(3_000); // before: stop() waited for the pass, i.e. the rest of the round
+    const outcome = await Promise.race([
+      alice.daemon.stop().then(() => "stopped" as const),
+      new Promise<"still waiting">((r) => setTimeout(() => r("still waiting"), 3_000)),
+    ]);
+    blind = false; // a wait that was not aborted now finds its receipt, so the cleanup never hangs either
+    // Before the fix: stop() waited for the pass, i.e. the rest of the 30 s round and its replacements.
+    expect(outcome).toBe("stopped");
+    expect(Date.now() - t0).toBeLessThan(3_000);
   });
 });
 
