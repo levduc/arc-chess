@@ -282,7 +282,7 @@ describe("Task 2: off-chain mirrors of the hub's launch limits (spec §13)", () 
     const offer = { deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n };
     // One base unit short of room for another such channel: both sides refuse, before anything is posted or signed.
     await setLimits(env.hub, 10_000_000n, committed + 2_010_000n - 1n);
-    const own = await alice.daemon.createOffer(offer).catch((e: unknown) => e as DaemonError);
+    const own = (await alice.daemon.createOffer(offer).catch((e: unknown) => e)) as DaemonError;
     expect(own).toBeInstanceOf(DaemonError);
     expect(own.code).toBe(409);
     expect(own.message).toMatch(/escrow cap/);
@@ -290,7 +290,7 @@ describe("Task 2: off-chain mirrors of the hub's launch limits (spec §13)", () 
     await setLimits(env.hub, 10_000_000n, 10n ** 12n);
     const { offerId } = await bob.daemon.createOffer(offer);
     await setLimits(env.hub, 10_000_000n, committed + 2_010_000n - 1n);
-    const acc = await alice.daemon.acceptOffer(offerId).catch((e: unknown) => e as DaemonError);
+    const acc = (await alice.daemon.acceptOffer(offerId).catch((e: unknown) => e)) as DaemonError;
     expect(acc).toBeInstanceOf(DaemonError);
     expect(acc.code).toBe(409);
     expect(acc.message).toMatch(/escrow cap/);
