@@ -37,12 +37,19 @@ const WATCHDOG_MS = 10_000;
 const STALL_MS = 2 * 60_000;
 const WARMUP_MS = 3 * 60_000;
 const RSS_GROWTH_LIMIT_PCT = 50;
-/** The per-step wait budget for every daemon-API poll in the cycle loop (open, play, next-game, close). Found too
- *  short at 20-30s during the Task 11 soak run: with several channel slots hammering a shared daemon continuously,
- *  Node's single-threaded event loop can lag several seconds to tens of seconds behind on CPU-bound work (mostly
- *  signature verification) before it gets to deliver an async event (a lobby match, a relayed move) -- not a hang,
- *  just legitimate scheduling delay under a synthetic load far heavier than any real deployment. Comfortably under
- *  STALL_MS, so a genuine stall is still caught by the watchdog rather than by a step timing out first. */
+/** The per-step wait budget for every daemon-API poll in the cycle loop (open, play, next-game, close). A generous
+ *  margin over the sub-second delivery these steps normally see, comfortably under STALL_MS so a genuine stall is
+ *  still caught by the watchdog rather than by a step timing out first.
+ *
+ *  Correction (Task 11 review, scratchpad/review-task11.md): raised here from 20-30s to 90s, this constant's
+ *  original docstring blamed the match-notification stalls that motivated the raise on Node event-loop lag under
+ *  load (CPU-bound signature verification). That diagnosis was wrong -- the actual cause was a daemon bug: a
+ *  matched offer was never unwatched, so a long-lived daemon's host connection eventually exhausted the server's
+ *  per-connection watch-slot cap and permanently stopped hearing of new matches as an offerer (fixed in
+ *  packages/cli/src/daemon.ts's onMatch; see waitStatus's UNKNOWN_CHANNEL_GRACE_MS in bot.ts for the matching
+ *  correction there). Left at 90s regardless: it is a harmless, generous margin now that a genuinely stuck match
+ *  fails within `UNKNOWN_CHANNEL_GRACE_MS` (10s) independent of this budget, and 90s still comfortably covers
+ *  ordinary, non-leak slowness in the other steps this constant bounds (a move, a close handshake). */
 const OP_TIMEOUT_MS = 90_000;
 /** Every daemon a top-up so a long run of many cycles (each permanently burning 2*FEE) never runs the wallet dry;
  *  the mock USDC has no real value, so this is generous on purpose. */
@@ -217,8 +224,16 @@ async function main(): Promise<void> {
     // approach it -- and tripping it matters more than a dropped frame: the server closes the socket outright
     // (`ws.close(1008, "rate limited")`, ws.ts), and the reconnect backoff only resets after 30s stable
     // (`stableAfterMs`, host.ts), so repeated trips turn into a growing-backoff reconnect storm that can black out
-    // *all* traffic on that socket -- including new-match delivery -- for well over a minute. The Task 11 report's
-    // first 15-minute run found this the hard way (>90s waits for a match, `unknown channel` from the offerer).
+    // *all* traffic on that socket -- including new-match delivery -- for well over a minute.
+    //
+    // Confirmed still necessary, independent of the watched-offer leak (Task 11 review, scratchpad/review-
+    // task11.md, C1): the review correctly found that leak -- not this limit -- caused the *original* 15-minute
+    // run's failures, and questioned whether this raise was still needed once the leak was fixed. Re-tested with
+    // the leak fixed and this raise removed: a 6-minute run at the same daemon/channel counts still failed within
+    // 3 minutes, with the daemon logs showing the exact reconnect-storm signature this comment describes
+    // (`host: reconnecting in ...` climbing 4s -> 8s -> repeatedly ~10s, never stabilizing long enough to reset).
+    // This limit is a genuinely separate, still-real finding: relay message *volume* from several concurrent
+    // channels on one connection, unrelated to how many offers that connection has ever watched.
     serverOverrides: {
       limits: { wsPerIp: 128, maxOpenOffersPerIp: 128, httpPostBurst: 400, httpPostPerSec: 50, wsFrameBurst: 2000, wsFramePerSec: 200 },
     },

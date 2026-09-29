@@ -23,14 +23,33 @@ function statusPath(channelId?: Hex): string {
 
 /** Plan 4.5 Task 11: right after a match, the accepter's own daemon has already created its channel record (that's
  *  how its channel id was found), but the offerer's daemon learns of the match asynchronously (a lobby event
- *  delivered over its host connection, processed by `onMatch`) -- under load-test/soak levels of concurrency on a
- *  shared daemon, that can lag long enough for a `/status` poll to land in the brief window before the record
- *  exists, which the API reports as a 404 "unknown channel". That is a transient "not ready yet", not a real
- *  failure, so it is retried like a false predicate. Anything else (a killed daemon refusing the connection, a 500,
- *  a malformed response) still fails immediately -- unlike a missing-channel race, those never resolve themselves. */
+ *  delivered over its host connection, processed by `onMatch`) -- so a `/status` poll can land in the brief window
+ *  before the record exists, which the API reports as a 404 "unknown channel". That is a transient "not ready yet",
+ *  not a real failure, so it is retried like a false predicate, but only for a short grace window (see
+ *  UNKNOWN_CHANNEL_GRACE_MS) -- a benign async-delivery window is sub-second in practice. Anything else (a killed
+ *  daemon refusing the connection, a 500, a malformed response) still fails immediately -- unlike a missing-channel
+ *  race, those never resolve themselves.
+ *
+ *  Correction (found during Task 11 review, see scratchpad/review-task11.md): a first version of this comment, and
+ *  soak.ts's OP_TIMEOUT_MS/ws-frame-limit changes made alongside it, attributed a much longer version of this same
+ *  404 (tens of seconds to minutes) to load contention -- GC pauses, Anvil/RPC saturation, event-loop lag, or the
+ *  server's ws-frame rate limit. That was wrong. The real cause was a daemon bug (now fixed, packages/cli/src/
+ *  daemon.ts's onMatch): a matched offer was never unwatched, so a long-lived daemon's host connection eventually
+ *  hit the server's per-connection watch-slot cap (`maxWatchedOffers`, default 256) and permanently stopped
+ *  learning of new matches as an offerer -- a silent, one-way liveness failure, not a transient delay. Once that
+ *  leak is fixed, this grace window only ever needs to cover the genuine, brief async-delivery race described
+ *  above. */
 function isUnknownChannelError(err: unknown): boolean {
   return err instanceof Error && /-> 404: unknown channel/.test(err.message);
 }
+
+/** How long a persistent "unknown channel" 404 is tolerated as "not ready yet" before it is treated as a real
+ *  failure. Deliberately short: with the watched-offer leak fixed (see isUnknownChannelError's docstring), a
+ *  match's delivery to the offerer is sub-second in practice, so a 404 that outlives this window is a genuine bug,
+ *  not load -- and a short window here means such a bug fails fast and loud instead of silently eating the
+ *  caller's whole `ms` budget (which is how the leak went unnoticed in the first place: a 20-90s `ms` made a
+ *  permanently-broken match look like "still waiting", not "stalled"). */
+const UNKNOWN_CHANNEL_GRACE_MS = 10_000;
 
 /** Polls `player`'s `/status` until `predicate` is true, or throws (with the last status/error seen) after `ms`. */
 export async function waitStatus(
@@ -42,14 +61,18 @@ export async function waitStatus(
   const end = Date.now() + ms;
   let last: Status | undefined;
   let lastErr: unknown;
+  let unknownSince: number | null = null;
   while (Date.now() < end) {
     try {
       last = (await player.api("GET", statusPath(channelId))) as Status;
       lastErr = undefined;
+      unknownSince = null;
       if (predicate(last)) return last;
     } catch (err) {
       if (!isUnknownChannelError(err)) throw err;
       lastErr = err;
+      unknownSince ??= Date.now();
+      if (Date.now() - unknownSince > UNKNOWN_CHANNEL_GRACE_MS) throw err;
     }
     await sleep(100);
   }

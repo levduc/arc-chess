@@ -1,9 +1,19 @@
 /**
- * Plan 4.5 Task 11 regression: `waitStatus` must tolerate a transient "unknown channel" 404 -- seen for real during
- * the soak run, when a status poll on the offerer's daemon landed in the brief window before its `onMatch` handler
- * had created the channel record (an async lobby event, not yet delivered/processed) -- by retrying like a false
- * predicate, but must still fail immediately on any other error (a killed daemon, a 500, ...), since those never
- * resolve themselves and several suites (chaos.test.ts in particular) rely on `waitStatus` failing fast on them.
+ * Plan 4.5 Task 11 regression: `waitStatus` must tolerate a transient "unknown channel" 404 -- a status poll on the
+ * offerer's daemon can land in the brief window before its `onMatch` handler has created the channel record (an
+ * async lobby event, not yet delivered/processed) -- by retrying like a false predicate, but only for a short grace
+ * window (UNKNOWN_CHANNEL_GRACE_MS in bot.ts), and must still fail immediately on any other error (a killed daemon,
+ * a 500, ...), since those never resolve themselves and several suites (chaos.test.ts in particular) rely on
+ * `waitStatus` failing fast on them.
+ *
+ * Correction (Task 11 review, scratchpad/review-task11.md): the version of this fix that first shipped tolerated
+ * this 404 for the caller's *entire* `ms` budget (20-90s), because the soak run that found it was seeing a much
+ * longer-lived version of the same 404 -- which turned out to be a real daemon bug (a matched offer was never
+ * unwatched, eventually exhausting the host connection's watch-slot cap; see packages/cli/src/daemon.ts's onMatch
+ * and its own Task 11 fix commit), not load. With that leak fixed, a genuine async-delivery race is sub-second in
+ * practice, so tolerating it for tens of seconds no longer buys anything -- it only means a *real* regression of
+ * the same symptom would again silently eat the whole `ms` budget instead of failing fast. The grace window is now
+ * a fixed 10s regardless of `ms`.
  *
  * No real stack: `Player.api` is the only surface `waitStatus` touches, so a fake implementing just that is enough.
  */
@@ -58,6 +68,20 @@ describe("waitStatus tolerates the offerer's transient 'unknown channel' race bu
       throw UNKNOWN_CHANNEL_ERR;
     });
     await expect(waitStatus(player, (s) => s.phase === "Open", 250)).rejects.toThrow(/timed out after 250ms.*unknown channel/s);
+  });
+
+  it("fails fast at the 10s grace window rather than waiting out a much longer ms budget", async () => {
+    // A persistent (not brief) "unknown channel" is a real bug post-fix (see the file header), not load -- it
+    // must surface quickly, not silently consume the whole caller-supplied budget the way it did before this
+    // fix, which is exactly how the underlying daemon leak went unnoticed for as long as it did.
+    const player = fakePlayer(async () => {
+      throw UNKNOWN_CHANNEL_ERR;
+    });
+    const started = Date.now();
+    await expect(waitStatus(player, (s) => s.phase === "Open", 30_000)).rejects.toThrow(/unknown channel/);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(10_000);
+    expect(elapsed).toBeLessThan(15_000); // well short of the 30s `ms` budget
   });
 });
 
