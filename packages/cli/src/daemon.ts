@@ -11,6 +11,10 @@ import {
   RECEIPT_TIMEOUT_MS,
   SerialTxSender,
   TxDroppedError,
+  TxFeeCapError,
+  TxInsufficientFundsError,
+  TxNonceUsedError,
+  TxReceiptMissingError,
   ZERO_HASH,
   channelId as computeChannelId,
   chunkRanges,
@@ -86,8 +90,12 @@ export type ChannelHandle = {
   /** Plan 4.5 Task 10 review: wall-clock ms before which the watchtower does not retry the cooperative close,
    *  set after a submission reverted (the same close would most likely revert again). 0 = no back-off. */
   closeRetryAt: number;
-  /** Plan 4.5 Task 10 re-review (I2): set while this channel's dispute work runs, so it never runs twice at once. */
+  /** Plan 4.5 Task 10 re-review (I2): set while this channel's dispute work runs, so it never runs twice at once.
+   *  Round 4: the move path's respond takes it too, so it never answers beside the dispute pass. */
   disputeBusy: boolean;
+  /** Plan 4.5 Task 10 round 4: set while the main pass or the reclaim API works on this channel, so a reclaim is
+   *  never sent by both at once. */
+  mainBusy: boolean;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -151,7 +159,7 @@ export class ArenaDaemon {
    *  (see `disputePass` / `mainPass`), so a stall in one never delays the other. */
   private mainTicking = false;
   private get ticking(): boolean {
-    return this.mainTicking || [...this.live.values()].some((l) => l.disputeBusy);
+    return this.mainTicking || [...this.live.values()].some((l) => l.disputeBusy || l.mainBusy);
   }
   /** M1: set by stop(); every handler checks this before any side effect (open/join/fund) it hasn't started yet. */
   private stopped = false;
@@ -190,7 +198,10 @@ export class ArenaDaemon {
 
   // ------------------------------------------------------------------ lifecycle
 
+  /** Starts the daemon. Plan 4.5 Task 10 round 4 (M5): a daemon cannot be restarted once stopped -- stop() aborts
+   *  its receipt waits for good -- so a restart creates a new ArenaDaemon on the same home. */
   async start(): Promise<void> {
+    if (this.stopped) throw new Error("a stopped ArenaDaemon cannot be restarted: create a new one on the same home");
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => void this.onMatch(m)));
     this.unsubscribers.push(this.opts.relay.onMessage((m) => void this.onRelay(m)));
     this.unsubscribers.push(this.opts.relay.onJoined((id) => void this.onJoined(id)));
@@ -575,6 +586,7 @@ export class ArenaDaemon {
       submittingClose: false,
       closeRetryAt: 0,
       disputeBusy: false,
+      mainBusy: false,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -713,20 +725,21 @@ export class ArenaDaemon {
   }
 
   /** Spec §6.3: sign RESIGN when checkmated and CLAIM_STALEMATE when stalemated, regardless of controller. */
-  protected async autoPlay(l: ChannelHandle): Promise<void> {
+  /** `inDispute`: called by the dispute pass, which already holds the channel's `disputeBusy`. */
+  protected async autoPlay(l: ChannelHandle, inDispute = false): Promise<void> {
     if (l.autoPlaying) return; // the run in progress will finish the job
     l.autoPlaying = true;
     try {
       if (!l.session.isMyTurn()) return;
       const o = outcome(l.session.latest.state);
-      if (o === "checkmate") await this.sendState(l, await l.session.resign());
-      else if (o === "stalemate") await this.sendState(l, await l.session.claimStalemate());
+      if (o === "checkmate") await this.sendState(l, await l.session.resign(), inDispute);
+      else if (o === "stalemate") await this.sendState(l, await l.session.claimStalemate(), inDispute);
     } finally {
       l.autoPlaying = false;
     }
   }
 
-  protected async sendState(l: ChannelHandle, signed: SignedState): Promise<void> {
+  protected async sendState(l: ChannelHandle, signed: SignedState, inDispute = false): Promise<void> {
     await this.opts.relay.send({ type: "state", channelId: l.record.channelId, signed }).catch((err) => {
       l.lastError = `relay: ${errorText(err)}`;
     });
@@ -735,9 +748,20 @@ export class ArenaDaemon {
     // agent told its move failed retries it and gets "not your turn". The watchtower's Challenged branch answers
     // any pending challenge on its next pass; a failed respond transaction still sets `respond:` (in
     // respondIfChallenged), only the chain reads around it are logged here instead.
-    await this.respondIfChallenged(l).catch((err: unknown) => {
+    // Plan 4.5 Task 10 round 4: one respond per channel at a time. While the dispute pass works on this channel, it
+    // answers any pending challenge itself (on this pass or its next one), so the move path does not.
+    if (!inDispute && l.disputeBusy) {
+      this.log(`channel ${l.record.channelId}: the dispute pass is working on this channel; it answers any challenge`);
+      return;
+    }
+    if (!inDispute) l.disputeBusy = true;
+    try {
+      await this.respondIfChallenged(l);
+    } catch (err) {
       this.log(`channel ${l.record.channelId}: challenge check after sending turn ${signed.state.turnNum} failed (the watchtower retries): ${errorText(err)}`);
-    });
+    } finally {
+      if (!inDispute) l.disputeBusy = false;
+    }
   }
 
   /** If a challenge is pending and we now hold a newer supported state, answer it on-chain from the session key. */
@@ -765,10 +789,16 @@ export class ArenaDaemon {
       // it is always logged, with both turns, because the registered state can legitimately be older than ours
       // (the winner answered with the state it held), which also means a genuinely bad proof of ours would only
       // show up here. A failure that is not a hub revert (transport, our own gas) is always this daemon's problem.
-      // A respond reported dropped may have been replaced by another respond of ours at its nonce (the move path and
-      // the dispute pass racing on one session key) -- the same check applies.
+      // A respond reported dropped, whose nonce turned out used (an earlier transaction of this session key landed
+      // there), or mined with its receipt unreadable, may have answered the challenge after all -- the same check
+      // applies (Plan 4.5 Task 10 round 4).
       const after =
-        err instanceof HubRevertError || err instanceof TxDroppedError ? await this.hub.channelInfo(id).catch(() => null) : null;
+        err instanceof HubRevertError ||
+        err instanceof TxDroppedError ||
+        err instanceof TxNonceUsedError ||
+        err instanceof TxReceiptMissingError
+          ? await this.hub.channelInfo(id).catch(() => null)
+          : null;
       if (after?.phase !== "Open") {
         l.lastError = `respond: ${errorText(err)}`;
         return;
@@ -881,9 +911,16 @@ export class ArenaDaemon {
 
   async reclaim(ref: string | undefined): Promise<void> {
     const l = this.pick(ref);
-    // R9/I1: dispute operations go through the session key (spec §3.1), so they keep working after the
-    // Circle session backing the wallet key has expired.
-    await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId));
+    // Plan 4.5 Task 10 round 4: never beside the main pass (which reclaims after the funding deadline itself).
+    if (l.mainBusy) throw new DaemonError(409, "the watchtower is working on this channel: retry shortly");
+    l.mainBusy = true;
+    try {
+      // R9/I1: dispute operations go through the session key (spec §3.1), so they keep working after the
+      // Circle session backing the wallet key has expired.
+      await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId));
+    } finally {
+      l.mainBusy = false;
+    }
     this.notify();
   }
 
@@ -937,8 +974,14 @@ export class ArenaDaemon {
       await this.pruneOffers();
       for (const l of this.live.values()) {
         if (this.stopped) break;
-        if (l.record.finalized) continue;
-        await this.runWatch(l, "mainPasses", () => this.watch(l));
+        // Round 4: a channel the reclaim API is working on is skipped (the next pass picks it up).
+        if (l.record.finalized || l.mainBusy) continue;
+        l.mainBusy = true;
+        try {
+          await this.runWatch(l, "mainPasses", () => this.watch(l));
+        } finally {
+          l.mainBusy = false;
+        }
       }
       for (const m of [...this.retryMatches.values()]) {
         if (this.stopped) break;
@@ -963,6 +1006,16 @@ export class ArenaDaemon {
       // nothing to retry: the channel is never watched again, so the error would stick. Logged instead.
       if (l.record.finalized) this.log(`channel ${l.record.channelId}: settled; a read after settling failed: ${errorText(err)}`);
       else l.lastError = `watch: ${errorText(err)}`;
+      // Round 4: the nonce manager's own outcomes are logged by kind; each is re-evaluated on the next pass (a used
+      // nonce or a missing receipt: the chain is re-read; the fee cap or the balance: nothing was sent).
+      if (
+        err instanceof TxNonceUsedError ||
+        err instanceof TxFeeCapError ||
+        err instanceof TxInsufficientFundsError ||
+        err instanceof TxReceiptMissingError
+      ) {
+        this.log(`channel ${l.record.channelId}: ${err.name}: ${errorText(err)} (re-evaluated on the next pass)`);
+      }
     }
   }
 
@@ -1105,7 +1158,7 @@ export class ArenaDaemon {
     } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
       // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
       // otherwise leave it for the controller (status shows mustMove).
-      await this.autoPlay(l);
+      await this.autoPlay(l, true);
     } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
       // R9/I2: past the deadline, a newer state we hold is no longer answerable (respond would revert
       // DeadlinePassed), so this is the fallback once the respond branch above is no longer available.

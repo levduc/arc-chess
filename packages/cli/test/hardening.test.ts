@@ -10,6 +10,7 @@ import {
   HubRevertError,
   LocalKeyTxSender,
   TxDroppedError,
+  TxNonceUsedError,
   buildParams,
   hashState,
   offerId as computeOfferId,
@@ -1088,3 +1089,96 @@ describe("Plan 4.5 Task 10 re-review 2 (minor 7): the timer is armed before offe
     await waitFor(async () => (await restarted.hub.channelInfo(id)).phase === "Open", 10_000, "the restarted daemon responds");
   });
 });
+
+describe("Plan 4.5 Task 10 round 4: one respond and one reclaim per channel at a time", () => {
+  /** Alice to move at turn 2; Bob's daemon is stopped; Bob's session key can still challenge. */
+  async function aliceToMove() {
+    const m = await matched();
+    const { alice, bob, id } = m;
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice's turn");
+    const proof = bob.daemon.handle(id).session.challengeProof(); // turn 2
+    const bobSession = bob.daemon.handle(id).sessionSender;
+    await bob.daemon.stop();
+    return { ...m, proof, bobSession };
+  }
+
+  it("a move-path respond while the dispute pass holds the channel sends no second respond", async () => {
+    const { alice, id, proof, bobSession } = await aliceToMove();
+    const h = alice.daemon.handle(id);
+    const hub = alice.daemon.hub;
+    const real = hub.respond.bind(hub);
+    let responds = 0;
+    hub.respond = async (sender, p, opts) => {
+      responds++;
+      return real(sender, p, opts);
+    };
+    await idleDispute(h); // the dispute pass "is working on" this channel from here on
+    try {
+      await new HubClient(hub.hub, alice.daemon.client).challenge(bobSession, proof); // registers turn 2
+      await alice.daemon.move(id, "Nf3", { actor: "agent" }); // turn 3: newer than the challenge
+      // Before the fix the move path answered at once, beside the dispute pass's own respond.
+      expect(responds).toBe(0);
+      expect((await hub.channelInfo(id)).phase).toBe("Challenged");
+    } finally {
+      h.disputeBusy = false; // the dispute pass finishes; its next run answers the challenge
+    }
+    await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 10_000, "the dispute pass responds");
+    expect(responds).toBe(1);
+  });
+
+  it("a respond whose nonce turns out used, on a channel that is Open again, leaves no respond: error", async () => {
+    const { alice, id, proof, bobSession } = await aliceToMove();
+    const hub = alice.daemon.hub;
+    const real = hub.respond.bind(hub);
+    hub.respond = async (sender, p, opts) => {
+      await real(sender, p, opts); // it lands...
+      throw new TxNonceUsedError(0); // ...but the wait saw its nonce taken (e.g. by another respond of ours)
+    };
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    await new HubClient(hub.hub, alice.daemon.client).challenge(bobSession, proof);
+    await waitFor(async () => (await hub.channelInfo(id)).phase === "Open", 10_000, "answered");
+    await new Promise((r) => setTimeout(r, 300));
+    // Before the fix: "respond: nonce 0 is already used ..." stayed as lastError on an answered channel.
+    expect(alice.daemon.handle(id).lastError ?? "").not.toMatch(/^respond:/);
+  });
+
+  it("the reclaim API and the main pass never run on one channel at once", async () => {
+    const { alice, id } = await matched();
+    const h = alice.daemon.handle(id);
+    const hub = alice.daemon.hub;
+    let reclaims = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    hub.reclaim = async () => {
+      reclaims++;
+      await gate;
+      throw new HubRevertError("WrongPhase", new Error("reverted"));
+    };
+    const api = alice.daemon.reclaim(id).catch((e: unknown) => e); // holds the channel while its reclaim waits
+    await new Promise((r) => setTimeout(r, 100));
+    const m0 = h.mainPasses;
+    await new Promise((r) => setTimeout(r, 600)); // ~6 timer ticks at pollMs 100
+    expect(h.mainPasses).toBe(m0); // before the fix: the main pass ran on the channel meanwhile
+    // A second reclaim while the first is in flight is refused, not sent.
+    await expect(alice.daemon.reclaim(id)).rejects.toMatchObject({ code: 409 });
+    expect(reclaims).toBe(1);
+    release();
+    await api;
+    await waitFor(() => h.mainPasses > m0, 5_000, "the main pass resumes");
+  });
+
+  it("a stopped daemon cannot be started again (M5)", async () => {
+    const { alice } = await matched();
+    await alice.daemon.stop();
+    await expect(alice.daemon.start()).rejects.toThrow(/cannot be restarted/);
+  });
+});
+
+/** Waits for the channel's in-flight dispute pass (if any) to finish, then holds the channel as a dispute pass would. */
+async function idleDispute(h: { disputeBusy: boolean }): Promise<void> {
+  await waitFor(() => !h.disputeBusy, 5_000, "no dispute pass in flight");
+  h.disputeBusy = true;
+}
