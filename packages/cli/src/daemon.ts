@@ -27,6 +27,7 @@ import {
   outcome,
   signAcceptance,
   signOffer,
+  verifyOffer,
   waitOrReplace,
   type ArenaDomain,
   type LobbyClient,
@@ -426,6 +427,12 @@ export class ArenaDaemon {
       }
       const so = (await this.opts.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId);
       if (!so) throw new DaemonError(404, `offer ${offerId} not found`);
+      // Final review m6: the offer comes from the host's list. Its signature must be the offerer's session key's
+      // before anything is recorded or signed: the opponent binding (checkMatchParams' `opponent`) then binds to a
+      // seat the offerer really asked for, not to whatever the host says.
+      if (!(await verifyOffer(so))) {
+        throw new DaemonError(409, `offer ${offerId}: its signature does not verify (the host served an offer its signer never signed)`);
+      }
       if (so.offer.player.toLowerCase() === this.wallet.address.toLowerCase()) {
         throw new DaemonError(400, "cannot accept your own offer");
       }

@@ -10,7 +10,7 @@ import { START, startPair, waitFor } from "./helpers/harness.js";
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
 type Internals = {
   onMatch(m: MatchEvent): Promise<void>;
-  records: { saveOffer(r: unknown): void };
+  records: { saveOffer(r: unknown): void; offer(id: Hex): unknown };
   opts: { log?: (line: string) => void };
 };
 const internals = (d: ArenaDaemon): Internals => d as unknown as Internals;
@@ -61,6 +61,27 @@ describe("ArenaDaemon core", () => {
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "funding");
     expect(await allowance(bob.address)).toBe(0n); // approved exactly 1_000_000 + 5_000, all of it spent
     expect(await allowance(alice.address)).toBe(3_000_000n - 1_005_000n); // the exact remainder of her own approval
+  });
+
+  it("final review m6: acceptOffer re-verifies the offer signature before it records or signs anything", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    // A host that lists a forged offer in Alice's name: another session key, and her real signature, which does not
+    // sign this offer.
+    const real = (await bob.client.lobby.listOffers()).find((o) => computeOfferId(o.offer) === offerId)!;
+    const forged = { offer: { ...real.offer, signer: privateKeyToAccount(generatePrivateKey()).address }, sig: real.sig };
+    const forgedId = computeOfferId(forged.offer);
+    const list = bob.client.lobby.listOffers;
+    bob.client.lobby.listOffers = async () => [...(await list()), forged];
+    const err = await bob.daemon.acceptOffer(forgedId).catch((e: unknown) => e as DaemonError);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toMatch(/signature does not verify/);
+    expect(internals(bob.daemon).records.offer(forgedId)).toBeNull(); // nothing recorded, nothing signed
+    expect(bob.client.watched()).not.toContain(forgedId);
+    // The genuine offer is still accepted.
+    await expect(bob.daemon.acceptOffer(offerId)).resolves.toBeUndefined();
   });
 
   it("C2 (Plan 4.5 Task 11 fix round): unwatches an offer once it is matched, on both sides", async () => {
