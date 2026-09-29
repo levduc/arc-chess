@@ -1213,7 +1213,10 @@ export class ArenaDaemon {
    * and retries) rather than declining as dust: a low *value* here is about the dead entry, not a genuinely small
    * balance -- the one case `"dust"` is for.
    */
-  private async performSweep(sender: SerialTxSender): Promise<{ status: "dust" } | { status: "swept"; amount: bigint; hash: Hex }> {
+  private async performSweep(
+    sender: SerialTxSender,
+    giveUpAt?: number,
+  ): Promise<{ status: "dust" } | { status: "swept"; amount: bigint; hash: Hex }> {
     for (let attempt = 0; ; attempt++) {
       if (this.stopped) throw new Error("stopped");
       const balance = await this.client.getBalance({ address: sender.address });
@@ -1247,7 +1250,7 @@ export class ArenaDaemon {
         if (err instanceof TxInsufficientFundsError && attempt === 0) continue; // I7: one immediate retry
         throw err;
       }
-      const receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal });
+      const receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal, giveUpAt });
       if (receipt.status !== "success") throw new Error(`sweep transaction ${receipt.transactionHash} reverted`);
       return { status: "swept", amount: value, hash: receipt.transactionHash };
     }
@@ -1264,7 +1267,9 @@ export class ArenaDaemon {
     sender: SerialTxSender,
     backoff: SweepBackoff,
     save: (r: ChannelRecord) => void,
-    opts: { force?: boolean } = {},
+    // Minor 3: `giveUpAt` bounds this one record's own receipt wait (via `performSweep`), so it can never eat more
+    // than its share of `sweep()`'s overall budget.
+    opts: { force?: boolean; giveUpAt?: number } = {},
   ): Promise<SweepAttemptResult> {
     // Fix round 2, minor 2: a receipt this daemon lost track of (`TxReceiptMissingError`) from a *previous*
     // attempt is checked first, before anything else below -- including the back-off gate just past this block --
@@ -1294,7 +1299,7 @@ export class ArenaDaemon {
     if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
     try {
       if (!(await this.isSweepable(record))) return { kind: "skipped", record };
-      const outcome = await this.performSweep(sender);
+      const outcome = await this.performSweep(sender, opts.giveUpAt);
       if (outcome.status === "dust") {
         const updated: ChannelRecord = { ...record, swept: "dust" };
         save(updated);
@@ -1438,6 +1443,11 @@ export class ArenaDaemon {
     if (this.sweeping) throw new DaemonError(409, "a sweep is already in progress: retry shortly");
     this.sweeping = true;
     try {
+      // Minor 3: this budget now bounds every record's own wait too (via `giveUpAt`, threaded through
+      // `sweepOneNow`/`runSweepAttempt`/`performSweep` down to `waitOrReplace`), not only how many records the
+      // `--channel`-less bulk loop below gets through -- so one record stuck replacing a dead entry can no longer
+      // eat the whole budget (or, for `--channel`, run unbounded) waiting on a receipt that will never come.
+      const deadline = Date.now() + (opts.budgetMs ?? SWEEP_TIME_BUDGET_MS);
       const want = ref?.toLowerCase();
       const allFinalized = this.records.channels().filter((r) => r.finalized);
       if (want) {
@@ -1448,16 +1458,15 @@ export class ArenaDaemon {
         if (isSweptDone(record.swept)) {
           return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
         }
-        return { results: [await this.sweepOneNow(record)], remaining: 0 };
+        return { results: [await this.sweepOneNow(record, deadline)], remaining: 0 };
       }
       const targets = allFinalized.filter((r) => r.swept !== true && r.swept !== "dust");
-      const deadline = Date.now() + (opts.budgetMs ?? SWEEP_TIME_BUDGET_MS);
       const results: Array<{ channelId: Hex; swept: string; hash?: Hex }> = [];
       let processed = 0;
       for (const record of targets) {
         if (Date.now() >= deadline) break;
         processed++;
-        results.push(await this.sweepOneNow(record));
+        results.push(await this.sweepOneNow(record, deadline));
       }
       return { results, remaining: targets.length - processed };
     } finally {
@@ -1480,7 +1489,7 @@ export class ArenaDaemon {
    * racing it (another `sweep()` call cannot: this method is only ever reached while `sweep()` holds its own
    * single-flight lock).
    */
-  private async sweepOneNow(record: ChannelRecord): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
+  private async sweepOneNow(record: ChannelRecord, giveUpAt?: number): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
     const id = record.channelId;
     const l = this.live.get(id);
     if (l) {
@@ -1495,6 +1504,7 @@ export class ArenaDaemon {
       try {
         const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(this.applySweptFields(l.record, r)), {
           force: true,
+          giveUpAt,
         });
         l.record = this.applySweptFields(l.record, result.record);
         return this.sweepResultWithHash(id, result, wasAbandoned);
@@ -1520,7 +1530,7 @@ export class ArenaDaemon {
             queued.record = this.applySweptFields(queued.record, r);
             this.records.saveChannel(queued.record);
           },
-          { force: true },
+          { force: true, giveUpAt },
         );
         queued.record = this.applySweptFields(queued.record, result.record);
         if (queued.record.swept !== undefined) {
@@ -1540,8 +1550,8 @@ export class ArenaDaemon {
     const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
       feeCeiling: NO_FEE_CEILING,
     });
-    const backoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
-    const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true });
+    const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
+    const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt });
     return this.sweepResultWithHash(id, result, wasAbandoned);
   }
 

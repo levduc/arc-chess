@@ -1395,10 +1395,28 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(d.handle(id1).record.swept).toBeUndefined();
 
     // A 1 ms budget: real work (an RPC round trip) always exceeds it, so exactly one of the two targets is
-    // attempted before the loop's own deadline check stops it.
-    const { results, remaining } = await d.sweep(undefined, { budgetMs: 1 });
-    expect(results).toHaveLength(1);
-    expect(remaining).toBe(1);
+    // attempted before the loop's own deadline check stops it. Fix round 2, minor 3 now also threads that same
+    // deadline into the attempted record's own receipt wait (giveUpAt) -- exactly the point of minor 3 -- so a
+    // budget this tiny is no longer harmless to that one record's own success; `sweepOneNow` is stubbed here to
+    // add a deterministic real-time delay around the (otherwise real, unbounded) sweep, so this test keeps
+    // isolating what it always tested -- the loop's own "how many, how much left" bookkeeping -- from minor 3's
+    // own per-record bound, which the dedicated "minor 3" test below covers.
+    const internals = d as unknown as { sweepOneNow(r: ChannelRecord, giveUpAt?: number): Promise<{ channelId: Hex; swept: string; hash?: Hex }> };
+    const realSweepOneNow = internals.sweepOneNow.bind(d);
+    internals.sweepOneNow = async (r) => {
+      const result = await realSweepOneNow(r); // unbounded: always a real, complete sweep attempt
+      await new Promise((resolve) => setTimeout(resolve, 50)); // guarantees the loop's own tiny budget has since passed
+      return result;
+    };
+    try {
+      // 10 ms, not 1: reaching the loop's own first deadline check (after filtering `targets`) can itself
+      // occasionally take a stray millisecond of real wall-clock time; 1 ms was seen to flake to zero attempted.
+      const { results, remaining } = await d.sweep(undefined, { budgetMs: 10 });
+      expect(results).toHaveLength(1);
+      expect(remaining).toBe(1);
+    } finally {
+      internals.sweepOneNow = realSweepOneNow;
+    }
     // A follow-up call (the real budget) finishes what was left.
     const rest = await d.sweep();
     expect(rest.results).toHaveLength(1);
@@ -1571,6 +1589,33 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // with the first, real send above).
     expect(await d.client.getBalance({ address: alice.address })).toBe(walletBefore);
   });
+
+  it(
+    "fix round 2, minor 3: a receipt wait that would never resolve is bounded by sweep()'s own budget, on --channel too",
+    async () => {
+      const { alice, bob, id } = await matched();
+      await settleWithSweepDisabled(alice, bob, id);
+      const d = alice.daemon;
+      const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+      await testClient.setAutomine(false);
+      try {
+        const started = Date.now();
+        // Nothing will ever mine the sweep's own transaction: without a giveUpAt threaded down into
+        // performSweep's waitOrReplace, this would poll for up to RECEIPT_TIMEOUT_MS (30s) per round across
+        // MAX_REPLACEMENTS+1 rounds -- tens of seconds to ~2 minutes -- for this one `--channel` record alone.
+        const { results } = await d.sweep(id, { budgetMs: 300 });
+        const elapsed = Date.now() - started;
+        expect(elapsed).toBeLessThan(10_000); // bounded by the 300ms budget, not the receipt-wait's own timeouts
+        expect(results).toHaveLength(1);
+        expect(results[0].swept).toMatch(/^error:/); // stuck, not abandoned or falsely reported swept
+        expect(alice.daemon.handle(id).record.swept).toBeUndefined();
+      } finally {
+        await testClient.setAutomine(true);
+        await testClient.mine({ blocks: 1 }); // lands the sweep's own stuck send so the key is left clean
+      }
+    },
+    15_000,
+  );
 });
 
 describe("Plan 5 Task 1: settled index", () => {
