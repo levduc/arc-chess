@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, EstimateGasExecutionError, http, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, http, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -981,7 +981,18 @@ export class ArenaDaemon {
     if (target <= 0n || this.stopped) return false;
     const balance = await this.client.getBalance({ address: l.sessionSender.address });
     if (balance >= target || this.stopped) return false;
-    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance };
+    // Fix round (minor, "a failed fee estimate also raises session-gas-low"): checked as its own step, so a
+    // failure here is unambiguously a `SessionGasEstimateError` -- rather than some other, harder-to-classify
+    // error shape surfacing from deep inside the sender's own send path (`SerialTxSender.sendFresh`'s internal
+    // `estimateFees` call, whose failure would otherwise propagate as a raw, unclassified error).
+    try {
+      await this.client.estimateFeesPerGas();
+    } catch (err) {
+      throw new SessionGasEstimateError(err);
+    }
+    // The session key is always an EOA (a generated private key, never a contract): the gas is always 21000, so
+    // it never needs estimating either (and never fails alongside the fee estimate above).
+    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance, gas: 21_000n };
     // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
     // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
     // paid at most once.
@@ -1035,7 +1046,7 @@ export class ArenaDaemon {
         if (
           err instanceof TxInsufficientFundsError ||
           err instanceof TxFeeCapError ||
-          err instanceof EstimateGasExecutionError
+          err instanceof SessionGasEstimateError
         ) {
           const first = l.sessionGasLow === null;
           l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
@@ -1053,8 +1064,11 @@ export class ArenaDaemon {
   /** Plan 5 Task 1: true if `ensureSessionGas` may attempt a refill for `l` right now. False while a prior
    *  failure's back-off has not yet elapsed -- unless the wallet's own balance has risen since it was last
    *  observed, which ends the back-off early (the wallet may have just been topped up). A failed balance read
-   *  never blocks the attempt (the back-off is about the refill itself, not about reading the wallet). */
+   *  never blocks the attempt (the back-off is about the refill itself, not about reading the wallet). Fix round
+   *  (minor): the wallet balance is only worth reading while a back-off is actually in effect -- there is nothing
+   *  to reset otherwise, so the common (not backed off) case costs no RPC call at all. */
   private async refillBackoffGate(l: ChannelHandle): Promise<boolean> {
+    if (!(l.refillBlockedUntil > 0)) return true;
     const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
     if (balance !== null) {
       if (l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance) this.endRefillBackoff(l);

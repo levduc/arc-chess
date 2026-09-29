@@ -8,9 +8,14 @@
  *
  * Refuses cleanly if the requested Anvil or server port is already busy (e.g. the on-machine demo stack on
  * :8545/:8080) -- it never kills another process to make room. Ctrl-C tears down everything it started.
+ *
+ * `--dir` is refused if it already exists, is non-empty, and has no `.arena-dev-marker` file (written on a
+ * successful run) -- so a caller who points `--dir` at something unrelated never has it silently wiped. An
+ * existing `.arena-dev/` from before this guard existed has no marker: remove it once (`rm -rf .arena-dev`), or
+ * pass a fresh `--dir`, and later runs will carry their own marker from then on.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
@@ -151,6 +156,12 @@ async function shutdown(signal: string): Promise<void> {
 async function main(): Promise<void> {
   const { port: serverPort, anvilPort, players: numPlayers, dir: DEV_DIR } = parseArgs(process.argv.slice(2));
 
+  // Fix round (minor): --dir existing as a plain file (not a directory) is a clear, distinct refusal --
+  // readdirSync below would otherwise throw a raw ENOTDIR with a Node stack trace.
+  if (existsSync(DEV_DIR) && !statSync(DEV_DIR).isDirectory()) {
+    process.stderr.write(`dev-up: refusing to start -- --dir ${DEV_DIR} is not a directory. Nothing was started or touched.\n`);
+    process.exit(1);
+  }
   // Plan 5 Task 1: refuse a non-empty --dir that carries no marker from a previous dev-up run -- before the port
   // checks (this refusal needs no ports) and before the wipe below, so nothing of a caller's own directory is ever
   // touched. A directory dev-up itself created keeps the marker across runs (it is never wiped).

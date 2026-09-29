@@ -253,6 +253,28 @@ describe("final review C1: the session key's dispute gas is refilled while the c
     expect((await d.status(id)).attention).not.toBe("session-gas-low");
   });
 
+  it("fix round (minor): a failed fee estimate during a refill also raises session-gas-low", async () => {
+    const { alice, id, config } = await matched();
+    const d = alice.daemon;
+    const session = d.handle(id).sessionSender.address;
+    const target = config.sessionGasWei;
+    const real = d.client.estimateFeesPerGas.bind(d.client);
+    d.client.estimateFeesPerGas = (async () => {
+      throw new Error("RPC unreachable");
+    }) as typeof d.client.estimateFeesPerGas;
+    try {
+      await setEthBalance(session, target / 10n); // below the floor: every pass tries to refill
+      const st = await waitFor(async () => {
+        const s = await d.status(id);
+        return s.attention === "session-gas-low" ? s : null;
+      }, 10_000, "session-gas-low");
+      expect(st.attention).toBe("session-gas-low");
+      expect(d.handle(id).sessionGasLow).toMatch(/fee estimate failed/);
+    } finally {
+      d.client.estimateFeesPerGas = real;
+    }
+  });
+
   it("Plan 5 Task 1: refill back-off bounds attempts, logs once per episode, and resets (with an immediate retry) once the wallet's balance rises", async () => {
     const { alice, id, config } = await matched();
     const d = alice.daemon;
@@ -299,6 +321,39 @@ describe("final review C1: the session key's dispute gas is refilled while the c
     } finally {
       internals.topUpSession = original;
       await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
+    }
+  });
+
+  it("fix round (minor): refillBackoffGate reads the wallet balance only while a back-off is active", async () => {
+    const { alice, id } = await matched();
+    const d = alice.daemon;
+    const realGetBalance = d.client.getBalance.bind(d.client);
+    let walletBalanceReads = 0;
+    d.client.getBalance = (async (args: { address: Hex }) => {
+      if (args.address.toLowerCase() === alice.address.toLowerCase()) walletBalanceReads++;
+      return realGetBalance(args);
+    }) as typeof d.client.getBalance;
+    try {
+      // No back-off active, and the session key is already funded: several passes never need to read the
+      // wallet's own balance at all.
+      for (let i = 0; i < 5; i++) {
+        await d.idle();
+        await d.tick();
+      }
+      expect(walletBalanceReads).toBe(0);
+
+      // A failed refill starts a back-off episode: from here on the gate does read the wallet balance (to detect
+      // an early-ending rise).
+      const internals = d as unknown as { topUpSession(l: unknown): Promise<boolean> };
+      internals.topUpSession = () => Promise.reject(new TxInsufficientFundsError(alice.address));
+      await setEthBalance(d.handle(id).sessionSender.address, 1n); // below the floor: a refill is attempted
+      await d.idle();
+      await d.tick(); // this pass's own attempt starts the back-off (no wallet read yet: nothing to reset before it)
+      await d.idle();
+      await d.tick(); // now backed off: this pass's gate check does read the wallet balance
+      expect(walletBalanceReads).toBeGreaterThan(0);
+    } finally {
+      d.client.getBalance = realGetBalance;
     }
   });
 });
