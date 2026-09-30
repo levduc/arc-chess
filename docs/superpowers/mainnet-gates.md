@@ -40,6 +40,27 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   appends it to `sweeps`). Confirm before mainnet whether this manual step is acceptable, or whether the periodic
   pass should also recheck already-swept channels on some schedule.
 
+### Plan 5 final review (2026-09-29)
+- **A challenge on a human-held seat** — **done in the final fix wave** (spec §12 item 45). The agent's `wait`
+  returns `human-must-move`, and the daemon hands the seat back to the agent once `max(60 s, challengeTimeout / 3)`
+  is left (`autoReturnOnChallenge`, default on). With it turned off, a human who walks away can still forfeit.
+- **Bounded automatic sweep** — **done in the final fix wave** (spec §12 item 46): a 20 s receipt bound per record,
+  3 queued records per main pass, backed-off re-probes of a pending sweep then a same-nonce replacement, RPC read
+  failures not counted toward abandoning, and pending hashes persisted across a restart. Residual: the main pass's
+  loop over *live* settled channels is bounded per record (20 s) but not in count, so N channels settling at once
+  with stuck sweeps can hold the main pass for up to N × 20 s (the dispute pass is unaffected). Measure under a
+  fee spike before mainnet.
+- **The token in browser history** — **done in the final fix wave** (spec §12 item 42): links carry a single-use,
+  120 s code. Residual: an unused link is a full credential for its 120 s; a signed-in tab holds the token in
+  memory until it closes; there is no `arena token rotate` command (the README documents manual rotation). Only
+  Chrome's local History DB was verified; Chrome Sync, Firefox and Safari were not tested.
+- **Still open from that review (Minors, not fixed in Plan 5):** `GET /channels` returns up to 1,000 settled
+  statuses and the board renders them all (M8, pre-mainnet: add `?live=1` or paging); a contract-wallet sweep uses
+  the exact `estimateGas(value: 1n)` as its gas limit (M10, pre-mainnet if Plan 6's Circle wallet is a
+  smart-contract account); refill back-off also throttles a Challenged channel's refill, up to 5 min (M9); `stop()`
+  does not wait for a manual `sweep()` or a busy queue entry (M17); a move-path respond is skipped while the dispute
+  pass holds the channel, landing one `pollMs` later (M18).
+
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
 1. **Arc chain facts verified and written down.**

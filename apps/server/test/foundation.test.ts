@@ -415,8 +415,14 @@ describe("http foundation", () => {
     // control-changed is only a partial signal; agents must re-read status.controller after every wait.
     expect(text).toMatch(/control-changed/);
     expect(text).toMatch(/status\.controller/);
-    // How the human opens the board, and the security note about the token.
+    // Final fix wave (I1): a challenge on a human-held seat -- tell the human; once control auto-returns, move.
+    expect(text).toMatch(/`human-must-move`/);
+    expect(text).toMatch(/tell the human/i);
+    expect(text).toMatch(/auto-returned: challenge deadline approaching/);
+    expect(text).toMatch(/you must move at once/);
+    // How the human opens the board, and the security note about its link (a one-time code, final fix wave M1).
     expect(text).toMatch(/arena board/);
+    expect(text).toMatch(/one-time code/);
     expect(text).toMatch(/never.*(pasted|shared)|(pasted|shared).*never/i);
   });
 

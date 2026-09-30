@@ -342,11 +342,11 @@ holds config, wallet settings, and per-channel state including session keys
 |---|---|
 | `arena init [--server URL] [--wallet local\|circle] [--address 0x…]` | Configure server, chain, and `TxSender`. `circle` requires an authenticated Circle CLI agent wallet. |
 | `arena daemon start` | Local API (127.0.0.1 only, bearer token in `ARENA_HOME`), web board, lobby + relay clients, chain watcher. Its startup line prints the board's URL with no token (`board`) plus a `boardHint`; the token never reaches a log file. |
-| `arena board` | Prints the board's URL with the bearer token in the fragment (`http://127.0.0.1:<port>/board#token=…`) -- the only place the token is printed. Open it in a browser on the machine the daemon runs on. |
+| `arena board` | Asks the running daemon for a one-time sign-in code and prints the board's link with it in the fragment (`http://127.0.0.1:<port>/board#code=…`, single-use, valid 120 s). The token itself is never printed (§12 item 42). Open the link in a browser on the machine the daemon runs on. |
 | `arena offers` / `arena offer [--deposit --stake --timeout]` / `arena accept <offerId>` | Lobby. A fresh session key is generated per channel. Matching triggers `approve` + `deposit` (funding order per §5) and the session-key gas top-up. `--timeout` defaults to this daemon's `minChallengeTimeout` (§12 item 38) if omitted. |
 | `arena channels` | Channels with status, whose turn, controller. |
 | `arena status [--channel id]` | JSON for LLMs: FEN, ASCII board, legal moves (SAN), side, whose turn, controller, balances, game index, challenge deadline/cooldown, suggested next actions. |
-| `arena wait [--channel id] [--timeout s]` | Blocks until any (or the given) channel needs this player's action or control changes; returns channel and reason. |
+| `arena wait [--channel id] [--timeout s]` | Blocks until any (or the given) channel needs this player's action or control changes, or a human holding a seat must answer a challenge (`human-must-move`); returns channel and reason. |
 | `arena move <SAN\|UCI> [--offer-draw] [--channel id]` | Validate with chess.js, sign, persist, send. |
 | `arena resign` / `accept-draw` | Terminal actions (only on your turn). |
 | `arena next-game` / `close` | Between games: propose or co-sign `NEW_GAME`, or sign a `Close` intent for the terminal state (both players) and submit `closeCooperative`. |
@@ -369,9 +369,19 @@ holds config, wallet settings, and per-channel state including session keys
   matches the channel's current `controller` -- symmetric, so an agent request
   gets 409 while `human` holds the seat, and a `human`-actor request (the
   board's own header) gets 409 while `agent` holds it. The daemon never
-  signs on the refused side. The watchtower keeps running regardless of
-  controller (stale-challenge responses, auto-resign on mate, timeouts and
-  reclaims are unaffected).
+  signs on the refused side. This is a coordination guard between two
+  parties sharing the bearer token, not access control: any token holder
+  can send either actor header or hand the seat over. The watchtower keeps
+  running regardless of controller (stale-challenge responses, auto-resign
+  on mate, timeouts and reclaims are unaffected).
+- A challenge that needs a move on a human-held seat (§6.3): the agent's
+  `wait` returns `human-must-move` (once per challenge, whoever holds the
+  seat), so the agent can tell the human; and once at most
+  `max(60 s, challengeTimeout / 3)` of chain time is left before the
+  deadline, the daemon hands the seat back to the agent with the note
+  `auto-returned: challenge deadline approaching` (`autoReturnOnChallenge`,
+  default on). A forfeit never depends on a human who closed the board
+  (§3.1; §12 item 45).
 - `arena wait` wakes with `reason: "control-changed"` on a controller change
   it observes while it is in flight. A change that happened before the call
   started is not itself a wake reason: `wait` instead returns the channel's
@@ -379,10 +389,10 @@ holds config, wallet settings, and per-channel state including session keys
   `status.controller` after every `wait`, not infer control from the reason
   string alone (§12 item 44).
 - The human opens the board by running `arena board` on the machine the
-  daemon runs on and opening the URL it prints -- the only place the bearer
-  token is ever printed (§6.4, §12 item 42). It must never be pasted or
-  shared, and never opened from another machine: holding it is holding every
-  channel's controls.
+  daemon runs on and opening the link it prints within 120 s. The link
+  carries a single-use code, never the bearer token (§6.4, §12 item 42).
+  Until it is used it must never be pasted or shared, and never opened from
+  another machine: signing in with it is holding every channel's controls.
 
 ### 6.3 Watchtower
 
@@ -390,9 +400,16 @@ holds config, wallet settings, and per-channel state including session keys
   block (resumes after restart).
 - Challenge with a stale state → automatically responds with the latest
   supported state.
-- Challenge requiring a new move → surfaces the deadline in `status`, `wait`,
-  and the board; the current controller must move; the daemon submits the move
-  via `respond`.
+- Challenge requiring a new move → surfaces the deadline in `status`
+  (`challenge.deadline`, `secondsLeft`, `mustMove`) and the board (a red
+  banner and a countdown); the current controller must move; the daemon
+  submits the move via `respond`. With the agent in control, `wait` returns
+  `your-turn`. With a human in control, `wait` returns `human-must-move` to
+  the agent once per challenge, the board warns "Move before <time> or the
+  seat returns to your agent", and once at most `max(60 s, challengeTimeout /
+  3)` is left the dispute pass hands the seat back to the agent
+  (`status.challenge.autoReturnAt` is that moment in chain time), whose
+  `wait` then returns `control-changed` or `your-turn` (§12 item 45).
 - After `Responded` events, ingests the on-chain state and continues off-chain.
 - Auto-signs `RESIGN` when checkmated and `CLAIM_STALEMATE` when stalemated;
   calls `timeout()` / `reclaim()` when they become available and favorable.
@@ -405,16 +422,18 @@ holds config, wallet settings, and per-channel state including session keys
 ### 6.4 Web board
 
 Served by the daemon's own local API at `/board`: static files with no build
-step (vanilla ES modules, CSS, chess.js 1.4.0's ESM build), each read from
-disk once and matched against an exact-path allowlist, so any other path
-under `/board` -- a traversal attempt, encoded or not, or simply an unknown
-file -- 404s rather than falling through to anything token-gated. The static
-shell needs no token; every data route still requires the bearer token. The
-browser reads the token once from `location.hash` on load, clears the
-fragment with `history.replaceState`, and keeps it only in memory, sending it
-as `Authorization: Bearer <token>` on every call. `EventSource` cannot set
+step (vanilla ES modules and CSS; the board does not use chess.js, it gets
+legal moves from `status.legalMovesUci`), each read from disk once and
+matched against an exact-path allowlist, so any other path under `/board` --
+a traversal attempt, encoded or not, or simply an unknown file -- 404s rather
+than falling through to anything token-gated. The static shell needs no
+token; every data route still requires the bearer token. The browser reads a
+one-time code from `location.hash` on load (`#code=…`, from `arena board`),
+clears the fragment with `history.replaceState`, and trades the code for the
+token with `POST /board/session`; it keeps the token only in memory, sending
+it as `Authorization: Bearer <token>` on every call. `EventSource` cannot set
 headers, so live updates use `fetch()` with a `ReadableStream` reader instead
-(§12 item 41).
+(§12 items 41, 42).
 
 Layout: a channel list with a status chip per channel (your turn, waiting,
 challenged, settled) and the `session-gas-low` / `lobbyError` /
@@ -424,7 +443,8 @@ from `orientation`, last move highlighted, click a piece for its
 navigable); a right panel (controller badge, Take over / Hand back with a
 note field, the current handoff note, balances, game index, status, an
 offer-draw toggle, resign / accept-draw / next-game / close, and a challenge
-countdown with a red "you must move" banner); and a lobby panel (open offers
+countdown with a red "you must move" banner, plus, while a human holds the
+seat, a warning of when it returns to the agent); and a lobby panel (open offers
 with Accept, a small create-offer form). Everything untrusted -- notes,
 errors, opponent-influenced strings -- is rendered as text, never `innerHTML`.
 
@@ -441,8 +461,12 @@ errors, opponent-influenced strings -- is rendered as text, never `innerHTML`.
   frame-ancestors 'none'; base-uri 'none'; form-action 'none'`),
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
   `X-Frame-Options: DENY`; JSON responses add `Cache-Control: no-store`.
-- The token lives only in the URL fragment and the `Authorization` header,
-  never in a path, query string, or log line (§12 item 42).
+- The token lives only in the daemon's `token.json`, the board's memory and
+  the `Authorization` header -- never in a URL (fragment included), a query
+  string, or a log line. Links carry a single-use, 120 s code instead;
+  `POST /board/code` (token-gated) mints one, and `POST /board/session`
+  (Host-guarded, no token, 10 attempts per minute per daemon) trades it for
+  the token once (§12 item 42).
 
 **Live updates.** `GET /events` is a token-gated SSE feed. It sends
 `event: change` with `data: {"channelId":null}` -- the event carries no
@@ -789,10 +813,18 @@ The stream closes on client disconnect, daemon stop, or server close.
     (no directory listing, no traversal), and the `GET /events` SSE cap (8 clients, 429 past it) with its
     per-client debounce (at most one `change` per second, trailing-edge) are all load-bearing against a hostile web
     page sharing the browser: DNS rebinding, a same-machine port guess, or injected markup.
-42. **Token discipline.** The bearer token is printed exactly once, by `arena board`, in the URL fragment
-    (`http://127.0.0.1:<port>/board#token=…`). The `arena daemon` start line prints the board's URL with no token
-    (`board`) plus a `boardHint`, so nothing that gets redirected to a log file (`nohup … > daemon.log`, a systemd
-    unit's stdout) ever carries it.
+42. **Token discipline** (corrected by the final fix wave, M1). The bearer token never appears in a URL or a log
+    line. A URL fragment is not private: `history.replaceState` clears the address bar, but the browser's history
+    database (and its omnibox suggestions, and any history sync) keeps the URL it opened, fragment and all. So
+    `arena board` asks the running daemon (`POST /board/code`, with the token read from disk) for a one-time code and
+    prints `http://127.0.0.1:<port>/board#code=<code>`: 128 random bits, base64url, single-use, expiring 120 s after
+    it is minted, at most 32 outstanding. The board clears the fragment and trades the code for the token (`POST
+    /board/session {code}`: no bearer token, Host-guarded, rate-limited to 10 attempts per minute per daemon before
+    the code is read; a used, expired or unknown code gets 401), then keeps the token in memory only. History holds
+    only a dead code. `#token=` links are no longer accepted (the board shows "This link has expired — run `arena
+    board` again"). The `arena daemon` start line prints the board's URL with no code or token (`board`) plus a
+    `boardHint`, so nothing that gets redirected to a log file (`nohup … > daemon.log`, a systemd unit's stdout)
+    ever carries a credential.
 43. **Handoff note.** `POST /handoff`'s `note` is capped at `MAX_HANDOFF_NOTE_LENGTH` (1024) characters and rejects
     C0/C1 control characters and bidi-override/isolate formatting characters; a `\r\n` is normalised to `\n` before
     that check, so a pasted Windows-style line break is not itself rejected. The board renders it as text, never
@@ -803,6 +835,33 @@ The stream closes on client disconnect, daemon stop, or server close.
     is visible only through the channel's ordinary `attention` (e.g. `your-turn`), not through the reason string.
     Callers must read `status.controller` after every `wait` rather than infer control from the reason alone (see
     `docs/superpowers/mainnet-gates.md` for a note on giving `wait` a `since` cursor instead).
+
+### Plan 5 final fix wave (2026-09-29)
+
+45. **A challenge on a human-held seat** (I1). The attention `human-must-move` is raised when a human holds the seat,
+    the channel is Challenged and `challenge.mustMove` holds. It appears in `status.attention` for the agent (after
+    `session-gas-low`), and `wait` returns it whoever holds the seat, once per challenge (keyed by the challenge's
+    deadline; a human taking the seat again re-arms it). The dispute pass, on move in the registered state and
+    after auto-resign/claim, hands the seat back to the agent once `secondsLeft <= max(60, challengeTimeout / 3)`
+    (chain time), with the note `auto-returned: challenge deadline approaching` and a change notification; inside
+    that window a human who takes the seat again is handed straight back. `status.challenge.autoReturnAt` is that
+    moment in chain time (null unless a human holds a seat that must move and auto-return is on), and the board
+    warns "Move before <time> or the seat returns to your agent". Config `autoReturnOnChallenge` (default true;
+    `arena init --auto-return-on-challenge false`) turns the return off, not the attention.
+46. **Bounded automatic sweep** (I2, M3, M4, M5). The main pass's own sweeps (live channels and the sweep queue)
+    pass `giveUpAt = now + SWEEP_PER_RECORD_TIMEOUT_MS` (20 s) to their receipt wait, like `arena sweep`, and the
+    queue is attempted at most `SWEEP_QUEUE_PER_PASS` (3) records per pass, round-robin. A sweep transaction the
+    daemon gave up on (`pendingTx`) is probed at once, then, while the node still holds it unmined, only after the
+    sweep back-off; after `SWEEP_PENDING_PROBES` (3) such probes the next attempt goes ahead and replaces it at the
+    same nonce with raised fees (the old hashes stay remembered; a read failure, or a mined transaction whose
+    receipt is unreadable, is retried without counting). A failed pre-send chain read (`SweepReadError`: the
+    settled check, the key's nonce, balance and fees, the wallet's code) backs off but never counts toward
+    `SWEEP_ABANDON_ATTEMPTS`; the send, the receipt and a contract wallet's gas estimate still do. The pending
+    hashes are persisted as `record.sweepPending` (written before `stop()`'s early return), so a restart resumes
+    checking them and records a late landing as the sweep rather than "dust".
+47. **`settled` for every seat** (M2). The one-shot `settled` attention no longer requires the agent to hold the
+    seat, and `wait --channel <id>` on a settled channel still in `live` returns `settled` at once (consuming any
+    pending wake), as it does once evicted (item 39). An all-channels `wait` keeps the one-shot rule.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
