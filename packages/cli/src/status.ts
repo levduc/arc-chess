@@ -44,10 +44,16 @@ export type ChannelStatus = {
   /** Plan 5 fix round (I2): the record's own sweep outcome -- `null` while not finalized or not yet swept,
    *  `true`/`"dust"`/`"abandoned"` once the sweep (or the abandon back-off) has run. See `ChannelRecord.swept`. */
   swept: true | "dust" | "abandoned" | null;
-  /** Plan 5 fix round: the swept amount (base units of native gas), set alongside `swept: true`. */
+  /** Plan 5 fix round: the swept amount (base units of native gas), set alongside `swept: true`. The latest
+   *  entry of `sweeps`, kept for compatibility. */
   sweptAmount: string | null;
-  /** Plan 5 fix round: the sweep transaction's hash, set alongside `swept: true`. */
+  /** Plan 5 fix round: the sweep transaction's hash, set alongside `swept: true`. The latest entry of `sweeps`,
+   *  kept for compatibility. */
   sweptTx: Hex | null;
+  /** Fix round 3, M-4: every real sweep this channel's session key has had, oldest first -- a late top-up
+   *  (minor 4) or a retried-and-succeeded abandoned channel (important 1) can mean more than one over its
+   *  lifetime; `sweptAmount`/`sweptTx` alone only ever show the latest. Empty if it has never been swept. */
+  sweeps: Array<{ amount: string; tx: Hex; at: number }>;
 };
 
 export type StatusInput = {
@@ -219,5 +225,6 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     swept: record.swept ?? null,
     sweptAmount: record.sweptAmount !== undefined ? record.sweptAmount.toString() : null,
     sweptTx: record.sweptTx ?? null,
+    sweeps: (record.sweeps ?? []).map((s) => ({ amount: s.amount.toString(), tx: s.tx, at: s.at })),
   };
 }

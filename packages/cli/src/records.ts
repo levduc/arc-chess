@@ -28,10 +28,18 @@ export type ChannelRecord = {
    *  retried forever. Absent (unset) for a channel not finalized yet, or finalized but not yet swept (including
    *  every record written before this feature existed -- `arena sweep`/`POST /sweep` picks those up too). */
   swept?: true | "dust" | "abandoned";
-  /** Plan 5 fix round (rule 4): the amount swept (base units of native gas), set alongside `swept: true`. */
+  /** Plan 5 fix round (rule 4): the amount swept (base units of native gas), set alongside `swept: true`. Fix
+   *  round 3, M-4: the latest entry of `sweeps`, kept for compatibility. */
   sweptAmount?: bigint;
-  /** Plan 5 fix round (rule 4): the sweep transaction's hash, set alongside `swept: true`. */
+  /** Plan 5 fix round (rule 4): the sweep transaction's hash, set alongside `swept: true`. Fix round 3, M-4: the
+   *  latest entry of `sweeps`, kept for compatibility. */
   sweptTx?: Hex;
+  /** Fix round 3, M-4: every real sweep this channel's session key has had, oldest first, appended to (never
+   *  overwritten) each time `swept: true` is set. A late top-up re-checked and swept again (minor 4), or an
+   *  "abandoned" channel `arena sweep` retries successfully (important 1), means more than one over a channel's
+   *  lifetime -- `sweptAmount`/`sweptTx` alone, overwritten each time, only ever showed the latest. Absent for a
+   *  record written before this field existed, or one never (yet) swept for real. */
+  sweeps?: Array<{ amount: bigint; tx: Hex; at: number }>;
   /** Plan 5 Task 1 (mainnet gates: settled index): wall-clock ms at which this channel was first seen finalized,
    *  set alongside `finalized`. Used to sort the settled index loaded at `start()` by settle time, newest first.
    *  Absent in records written before this field existed (sorts as the oldest). */

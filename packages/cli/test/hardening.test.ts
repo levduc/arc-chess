@@ -1670,6 +1670,16 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(l.record.sweptTx).toBe(second.results[0].hash); // the record now reflects the *new* sweep
     expect(await d.client.getBalance({ address: alice.address })).toBeGreaterThan(walletBefore);
     expect(await d.client.getBalance({ address: session })).toBeLessThan(topUp); // actually swept, not left sitting there
+    // Fix round 3, M-4: both real sweeps are kept, not just the latest -- sweptAmount/sweptTx alone would have
+    // lost all record of the first one the moment the second overwrote them.
+    expect(l.record.sweeps).toHaveLength(2);
+    expect(l.record.sweeps?.[0].tx).toBe(firstTx);
+    expect(l.record.sweeps?.[1].tx).toBe(second.results[0].hash);
+    expect(l.record.sweeps?.[1].amount).toBe(l.record.sweptAmount); // the latest entry matches the compatibility field
+    const status = await d.status(id);
+    expect(status.sweeps).toHaveLength(2);
+    expect(status.sweeps[0].tx).toBe(firstTx);
+    expect(status.sweeps[1].amount).toBe(l.record.sweptAmount?.toString());
   });
 
   it("fix round 2, minor 5: the dust boundary is exact -- gas*(ceil(1.3F)+F) declines, one wei above sweeps", async () => {

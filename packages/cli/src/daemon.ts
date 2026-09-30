@@ -198,6 +198,21 @@ function isSweptDone(swept: ChannelRecord["swept"]): boolean {
   return swept === true || swept === "dust";
 }
 
+/** Fix round 3, M-4: a fresh `ChannelRecord` with `swept: true`, `sweptAmount`/`sweptTx` set to this sweep (kept
+ *  for compatibility -- the latest entry), and `amount`/`tx` appended to `sweeps`, oldest first. A channel's
+ *  session key can be swept for real more than once in its lifetime -- a late top-up re-checked and swept again
+ *  (minor 4), or an "abandoned" channel `arena sweep` retries successfully (important 1) -- and `sweptAmount`/
+ *  `sweptTx` alone, overwritten each time, only ever showed the latest one. */
+function appendSweep(record: ChannelRecord, amount: bigint, tx: Hex): ChannelRecord {
+  return {
+    ...record,
+    swept: true,
+    sweptAmount: amount,
+    sweptTx: tx,
+    sweeps: [...(record.sweeps ?? []), { amount, tx, at: Date.now() }],
+  };
+}
+
 /** Fix round 2, important 5: the fee per gas a set of fees (`SerialTxSender`'s own `Fees` shape) asks for, in the
  *  same style `tx.ts`'s own internal `feeOf` reads it (not exported). */
 function feePerGasOf(f: { maxFeePerGas?: bigint; gasPrice?: bigint }): bigint {
@@ -1319,7 +1334,7 @@ export class ArenaDaemon {
         if (recovered === "pending") return { kind: "skipped", record };
         backoff.pendingTx = undefined;
         if (recovered !== "failed") {
-          const updated: ChannelRecord = { ...record, swept: true, sweptAmount: recovered.amount, sweptTx: recovered.hash };
+          const updated = appendSweep(record, recovered.amount, recovered.hash);
           save(updated);
           this.endSweepBackoff(record.channelId, backoff);
           return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
@@ -1347,7 +1362,7 @@ export class ArenaDaemon {
         this.endSweepBackoff(record.channelId, backoff);
         return { kind: "dust", record: updated };
       }
-      const updated: ChannelRecord = { ...record, swept: true, sweptAmount: outcome.amount, sweptTx: outcome.hash };
+      const updated = appendSweep(record, outcome.amount, outcome.hash);
       save(updated);
       this.endSweepBackoff(record.channelId, backoff);
       return { kind: "swept", record: updated, amount: outcome.amount, hash: outcome.hash };
@@ -1451,12 +1466,12 @@ export class ArenaDaemon {
     }
   }
 
-  /** Fix round 2 (important 3 + minors 1/6): merges only `swept`/`sweptAmount`/`sweptTx` from `updated` onto a
-   *  fresh copy of `current`, so a concurrent change to anything else on the record (a `handoff()`, most notably)
-   *  while the sweep's own async work was in flight is never clobbered by the sweep's -- possibly stale -- copy
-   *  of the rest of it. */
+  /** Fix round 2 (important 3 + minors 1/6): merges only `swept`/`sweptAmount`/`sweptTx`/`sweeps` (fix round 3,
+   *  M-4) from `updated` onto a fresh copy of `current`, so a concurrent change to anything else on the record (a
+   *  `handoff()`, most notably) while the sweep's own async work was in flight is never clobbered by the sweep's
+   *  -- possibly stale -- copy of the rest of it. */
   private applySweptFields(current: ChannelRecord, updated: ChannelRecord): ChannelRecord {
-    return { ...current, swept: updated.swept, sweptAmount: updated.sweptAmount, sweptTx: updated.sweptTx };
+    return { ...current, swept: updated.swept, sweptAmount: updated.sweptAmount, sweptTx: updated.sweptTx, sweeps: updated.sweeps };
   }
 
   /** Fix round 2, minor 1: refreshes the settled-index cache entry for `id` (if any) with `record`'s current
@@ -1470,6 +1485,7 @@ export class ArenaDaemon {
       swept: record.swept ?? null,
       sweptAmount: record.sweptAmount?.toString() ?? null,
       sweptTx: record.sweptTx ?? null,
+      sweeps: (record.sweeps ?? []).map((s) => ({ amount: s.amount.toString(), tx: s.tx, at: s.at })),
     };
   }
 
