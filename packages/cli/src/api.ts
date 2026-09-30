@@ -211,7 +211,15 @@ export async function startApi(
           res.writeHead(405);
           return res.end();
         }
-        const url = new URL(req.url ?? "/", `http://${host}:${boundPort}`);
+        // Plan 5 Task 2 fix round, minor 2: a malformed request target (e.g. "http://[", an unterminated IPv6
+        // literal host) makes `new URL` throw -- caught here and turned into a 400 like any other bad request,
+        // instead of falling through to the generic catch's 500.
+        let url: URL;
+        try {
+          url = new URL(req.url ?? "/", `http://${host}:${boundPort}`);
+        } catch {
+          throw new DaemonError(400, "malformed request target");
+        }
         // Static board files, before anything token-gated: they need no token (Task 2 requirement 3), and any
         // path under /board that isn't one of them must 404, never 401.
         if (isBoardRequest(req.url ?? "/")) return serveBoard(req, res, url.pathname);

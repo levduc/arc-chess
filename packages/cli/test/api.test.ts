@@ -121,6 +121,20 @@ describe("local API", () => {
     expect(listed.find((o) => o.offerId === body.offerId)!.offer.challengeTimeout).toBe(1800n);
   });
 
+  it("Plan 5 Task 2 fix round, minor 2: a malformed request target is 400, not 500", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const port = (server.address() as AddressInfo).port;
+    // "http://[" is not a valid URL (an unterminated IPv6 literal host) -- new URL(req.url, base) throws on it.
+    const res = await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "http://[" });
+    expect(res.status).toBe(400);
+  });
+
   it("Plan 5 Task 2: rejects a Host header that is not exactly 127.0.0.1:<port> or localhost:<port> (421)", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);
