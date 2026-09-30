@@ -27,6 +27,7 @@ const USAGE = `usage: arena <command> [options]
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
+  board   (prints the board's URL, token in the fragment: open it in a browser while the daemon is running)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
@@ -248,7 +249,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (cmd === "daemon") {
       if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
       const proc = await startDaemonProcess(home, { log: io.err });
-      io.out(JSON.stringify({ api: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address }));
+      // Plan 5 Task 2: printed once here on stdout, the same URL `arena board` prints -- never passed to
+      // `io.err` (the log stream) so the token never lands in a log file.
+      io.out(JSON.stringify({ api: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address, board: proc.boardUrl }));
       await new Promise<void>((resolve) => {
         const stop = () => {
           // Only one of SIGINT/SIGTERM fires; `process.once` alone would leave the other one's listener
@@ -260,6 +263,16 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         process.once("SIGINT", stop);
         process.once("SIGTERM", stop);
       });
+      return 0;
+    }
+
+    if (cmd === "board") {
+      // Plan 5 Task 2: read straight from the config/token files, not through the API -- a running daemon isn't
+      // required just to print the URL. Printed on stdout only (io.out), never io.err (the log stream): the
+      // token must never land in a log file.
+      const cfg = loadConfig(home);
+      const token = loadToken(home);
+      io.out(`http://127.0.0.1:${cfg.port}/board#token=${token}`);
       return 0;
     }
 

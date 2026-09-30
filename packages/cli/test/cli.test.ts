@@ -64,6 +64,16 @@ describe("arena CLI", () => {
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({ to: "human", note: "look" });
   });
 
+  it("Plan 5 Task 2: arena board prints the board URL (token in the fragment), with no API call", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const t = io(home);
+    expect(await runCli(["board"], t.io)).toBe(0);
+    expect(t.calls).toHaveLength(0); // no running daemon required
+    expect(t.out).toHaveLength(1);
+    expect(t.out[0]).toMatch(/^http:\/\/127\.0\.0\.1:7010\/board#token=[0-9a-f]{64}$/);
+  });
+
   it("fix round I5: arena sweep maps to POST /sweep and prints a note when channels remain", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     await runCli(INIT, io(home).io);
