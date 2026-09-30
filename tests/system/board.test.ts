@@ -345,8 +345,8 @@ suite(
         await playLine(alice, bob, id, ["b8c6"]);
         await waitStatus(alice, (s) => s.myTurn && s.turnNum === "4", 15_000, id);
 
-        // The agent's long-poll is in flight before the human hands back. The status round trip after it is only
-        // there to let the wait's request reach the daemon first; the wait must still be pending once it is back.
+        // The agent's long-poll is in flight while the human hands back. Nothing wakes it before then (the human
+        // holds the seat), so it is still pending after a status round trip.
         let waitSettled = false;
         const waiting = alice.api("GET", `/wait?channel=${id}&timeout=60`).finally(() => (waitSettled = true));
         await alice.api("GET", `/status?channel=${id}`);
@@ -355,7 +355,12 @@ suite(
         const BACK = "back to you: Bc4 next, then mate on f7";
         await page.getByTestId("hand-back-note").fill(BACK);
         await page.getByTestId("hand-back").click();
-        expect(await waiting).toEqual({ channelId: id, reason: "control-changed" });
+        // Final fix wave (M12): nothing guarantees the daemon registered the wait (its controller baseline) before
+        // the click. Registered first, it sees the change: control-changed; registered after, the agent already
+        // holds the seat on its turn: your-turn (spec §12 item 44). Either way, status says who holds the seat.
+        const woke = (await waiting) as { channelId: Hex; reason: string };
+        expect(woke.channelId).toBe(id);
+        expect(["control-changed", "your-turn"]).toContain(woke.reason);
         await waitText(page, "controller-badge", "Agent");
         const resumed = (await alice.api("GET", `/status?channel=${id}`)) as Status;
         expect(resumed.controller).toBe("agent");
@@ -484,6 +489,9 @@ suite(
 
         await bob.api("POST", "/challenge", { channel: id });
         await waitPhase(hub, id, "Challenged");
+        // Final fix wave (M13): Bob's daemon goes away once his challenge is on chain, so his watchtower cannot
+        // answer it with the relayed move: the only respond that can land is Alice's own, from the human's click.
+        await bob.kill();
         await page.getByTestId("must-move-banner").waitFor({ state: "visible", timeout: 15_000 });
         // Final fix wave (I1): the human is told when the seat goes back to the agent (200 s before the deadline).
         const autoReturn = page.getByTestId("auto-return-banner");
@@ -513,16 +521,14 @@ suite(
         expect(responded).toHaveLength(1);
         expect((await hub.registeredState(id)).turnNum).toBe(3n);
         await waitStatus(alice, (s) => s.phase === "Open" && s.turnNum === "3" && s.challenge === null, 15_000, id);
-        await waitStatus(bob, (s) => s.phase === "Open" && s.turnNum === "3" && s.myTurn, 15_000, id);
         await page.getByTestId("must-move-banner").waitFor({ state: "hidden", timeout: 15_000 });
         await page.getByTestId("auto-return-banner").waitFor({ state: "hidden", timeout: 15_000 });
         await page.getByTestId("countdown").waitFor({ state: "hidden", timeout: 15_000 });
-        // Informational: either daemon may land the respond (Bob's watchtower also holds turn 3 once it is relayed).
+        // The move went through Alice's own respond: sent by her session key.
         const tx = await pub.getTransaction({ hash: responded[0].transactionHash });
         const params = await hub.channelParams(id);
-        const responder = tx.from.toLowerCase() === params.signers[0].toLowerCase() ? "alice" : "bob";
-        console.log(`[board] respond submitted by ${responder}'s session key`);
-        await expectNoErrors(alice, bob);
+        expect(tx.from.toLowerCase()).toBe(params.signers[0].toLowerCase());
+        await expectNoErrors(alice);
 
         expectTokenHygiene(board);
       },
