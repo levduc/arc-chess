@@ -60,6 +60,13 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   smart-contract account); refill back-off also throttles a Challenged channel's refill, up to 5 min (M9); `stop()`
   does not wait for a manual `sweep()` or a busy queue entry (M17); a move-path respond is skipped while the dispute
   pass holds the channel, landing one `pollMs` later (M18).
+- **From the final fix wave's re-review (Minors, 2026-09-30):**
+  - **Pre-mainnet:**
+    - Give the main pass one shared sweep budget per pass, covering both the live settled-channel loop and `sweepQueuePass`, so N stuck sweeps can't hold it for N × 20 s.
+    - Bound the dispute pass's refill wait (`topUpSession` has no `giveUpAt`). A roughly 2-minute refill can otherwise delay the auto-return check past its window when `minChallengeTimeout` is at or below about 300 s.
+  - **Other:**
+    - When the late re-probe of a pending sweep returns "unknown" (an RPC blip), it records `swept: "dust"` and drops the pending hashes, so attribution is lost. The funds are safe. It should instead skip the pass and keep the hashes.
+    - After the auto-return time has passed, the board still offers Take over and shows a deadline that is already past. Disable the button and show "the seat stays with your agent" instead.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 

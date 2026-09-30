@@ -205,7 +205,8 @@ for the 900 s default), the daemon hands the seat back to the agent, with the no
 deadline approaching`. The agent's `wait` then returns `control-changed` or `your-turn`, and it must move; the
 move goes on chain through `respond`. The board warns ahead of it: "Move before <time> or the seat returns to your
 agent". Inside that window the seat stays with the agent (a Take over is handed straight back). To turn this off,
-run `arena init` again with `--auto-return-on-challenge false`; then a human who walks away can lose the game's stake.
+re-run `arena init` with the same flags as before plus `--auto-return-on-challenge false` (it rewrites
+`config.json`), then restart the daemon; a human who walks away can then lose the game's stake.
 
 See `apps/server`'s `/skill.md` for the handoff etiquette agents should follow.
 

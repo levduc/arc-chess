@@ -45,7 +45,8 @@ class UsageError extends Error {}
  * carry the token, even in a URL fragment -- every documented way to run a daemon long-lived (`nohup ... >
  * daemon.log`, README; a systemd unit whose stdout goes to journald) redirects this exact line to a log file,
  * which would defeat the token file's 0600 permissions. `board` here is the URL with no fragment at all; only
- * `arena board` (a human runs it directly, in a foreground terminal) ever prints the token, in the fragment.
+ * `arena board` (a human runs it directly, in a foreground terminal) prints a board link, and that link carries a
+ * single-use, short-lived code, never the token itself (Plan 5 final fix M1).
  * A pure function so a test can check its shape without actually starting a daemon.
  */
 export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: string }): Record<string, unknown> {
@@ -277,7 +278,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
       const proc = await startDaemonProcess(home, { log: io.err });
       // Plan 5 Task 2 fix round, CRITICAL 1: no token anywhere in this line -- see daemonStartLine's own
-      // docstring. Run `arena board` to get the token-bearing URL.
+      // docstring. Run `arena board` for a board link with a one-time code.
       io.out(JSON.stringify(daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address })));
       await new Promise<void>((resolve) => {
         const stop = () => {
