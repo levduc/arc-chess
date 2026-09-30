@@ -1949,6 +1949,16 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       settled: Map<Hex, { status: { swept: unknown }; settledAt: number }>;
     };
     const l = alice.daemon.handle(id);
+    // Root cause of this test's flake (Plan 5 Task 4): the loop below calls sweepChannel(l) directly, without the
+    // `mainBusy` flag the main pass and sweep() both hold around it -- so the daemon's own periodic main pass (every
+    // 100 ms) could start a sweep attempt on the same handle in between. One that read isSweepable before the loop
+    // abandoned the channel, but reached performSweep only after the `finally` below restored the real one, swept
+    // for real and left `swept: true` where this test expects "abandoned". Reproduced deterministically by holding a
+    // background attempt in flight across the last iteration. The fix, as for the refillBackoffGate test above: stop
+    // the periodic timer once settleWithSweepDisabled (which needs it to observe Finalized) has returned, wait out
+    // any pass already running, and drive the eviction passes explicitly below.
+    clearInterval((alice.daemon as unknown as { timer?: NodeJS.Timeout }).timer);
+    await alice.daemon.idle();
     d.sweepChannel = original;
     const internals = alice.daemon as unknown as { performSweep(sender: unknown): Promise<unknown> };
     const realPerformSweep = internals.performSweep.bind(alice.daemon);
@@ -1964,11 +1974,12 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       internals.performSweep = realPerformSweep;
     }
     // Evicted from `live` -- the settled-index cache now holds this abandoned status, as `start()`/evictSettled
-    // would for any other settled channel; this is the orphan/disk path sweepOneNow takes from here on.
-    await alice.daemon.idle();
+    // would for any other settled channel; this is the orphan/disk path sweepOneNow takes from here on. With the
+    // timer stopped, the two passes eviction needs (one to record settledAt, one past the grace period) are explicit.
     await alice.daemon.tick();
     await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
-    await waitFor(() => alice.daemon.channelIds().length === 0, 10_000, "evicted while abandoned");
+    await alice.daemon.tick();
+    expect(alice.daemon.channelIds()).toEqual([]);
     expect(d.settled.get(id)?.status.swept).toBe("abandoned");
 
     // `arena sweep` retries it (important 1) -- via the orphan/disk path, real money this time.
