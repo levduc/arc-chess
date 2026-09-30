@@ -179,7 +179,14 @@ type SweepQueueEntry = {
  *  their receipts first -- before doing anything else -- and recovers a swept amount/tx from whichever one
  *  succeeded, rather than losing track of money that already arrived (and, worse, sending again or recording a
  *  spurious "dust"). */
-type SweepBackoff = { blockedUntil: number; backoffMs: number; attempts: number; pendingTx?: Hex[] };
+type SweepBackoff = {
+  blockedUntil: number;
+  backoffMs: number;
+  attempts: number;
+  pendingTx?: Hex[];
+  /** Final fix wave (M3): how many probes of `pendingTx` in a row found it still pending. */
+  pendingProbes?: number;
+};
 
 /** Plan 5 fix round: what one sweep attempt on a session key resolved to. `"skipped"` covers every reason the
  *  attempt never actually ran (not yet confirmed settled on-chain, a concurrent send in flight, back-off still in
@@ -311,6 +318,11 @@ export const SWEEP_PER_RECORD_TIMEOUT_MS = 20_000;
 /** Final fix wave (I2): the most sweep-queue records one main pass attempts. The next pass continues with the
  *  records after them (round-robin), so one pass never serializes the whole queue. */
 export const SWEEP_QUEUE_PER_PASS = 3;
+
+/** Final fix wave (M3): after this many probes find a sweep transaction still pending (each after the sweep
+ *  back-off), the next attempt goes ahead: its send replaces the released entry at the same nonce with raised
+ *  fees, so a transaction priced under a base fee that stays high is not waited on forever. */
+export const SWEEP_PENDING_PROBES = 3;
 
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
@@ -1383,20 +1395,40 @@ export class ArenaDaemon {
       // the transaction may already have landed and there is nothing to gain by waiting the back-off out before
       // finding that out.
       if (backoff.pendingTx !== undefined && record.swept === undefined) {
-        const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
-        if (recovered === "pending") return { kind: "skipped", record };
-        backoff.pendingTx = undefined;
-        if (recovered !== "failed") {
-          const updated = appendSweep(record, recovered.amount, recovered.hash);
-          save(updated);
-          this.endSweepBackoff(record.channelId, backoff);
-          return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
+        // Final fix wave (M3): the first probe is immediate, but once one has found the transaction still
+        // pending, the next waits out the back-off like any other attempt instead of re-probing every pass.
+        const probed = backoff.pendingProbes ?? 0;
+        if (probed > 0 && !opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) {
+          return { kind: "skipped", record };
         }
-        // Fix round 3, I-2: confirmed gone (reverted, or the node no longer knows it at all) -- nothing to
-        // recover. Charged as a failed attempt (this recovery slot found nothing, same as any other failure
-        // would) and falls through to a fresh attempt below, within this same try -- never an early abandon
-        // from this alone; the normal attempt just below decides that for itself if it also fails.
-        backoff.attempts++;
+        const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
+        // An RPC failure (or a mined transaction whose receipt could not be read) is retried on the next pass,
+        // not counted as a pending probe.
+        if (recovered === "unknown") return { kind: "skipped", record };
+        if (recovered === "pending") {
+          backoff.pendingProbes = probed + 1;
+          // Not a failure (no attempt charged), but backed off. After SWEEP_PENDING_PROBES probes, fall through
+          // to a normal attempt: its send replaces the released entry at the same nonce with raised fees (at
+          // most one of them can land), and `pendingTx` is kept so a later probe still recognizes the old one.
+          if (backoff.pendingProbes < SWEEP_PENDING_PROBES) {
+            this.bumpSweepBackoff(record.channelId, backoff);
+            return { kind: "skipped", record };
+          }
+        } else {
+          backoff.pendingTx = undefined;
+          backoff.pendingProbes = 0;
+          if (recovered !== "failed") {
+            const updated = appendSweep(record, recovered.amount, recovered.hash);
+            save(updated);
+            this.endSweepBackoff(record.channelId, backoff);
+            return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
+          }
+          // Fix round 3, I-2: confirmed gone (reverted, or the node no longer knows it at all) -- nothing to
+          // recover. Charged as a failed attempt (this recovery slot found nothing, same as any other failure
+          // would) and falls through to a fresh attempt below, within this same try -- never an early abandon
+          // from this alone; the normal attempt just below decides that for itself if it also fails.
+          backoff.attempts++;
+        }
       }
       if (this.stopped || (record.swept !== undefined && !retryingAbandoned && !rechecking)) return { kind: "skipped", record };
       if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
@@ -1410,6 +1442,17 @@ export class ArenaDaemon {
         // correctly reflects its prior state (`true`, with its real amount/tx, or already "dust"), and must
         // never be downgraded from a genuine `true` to "dust" just because what is left over now is small.
         if (rechecking) return { kind: "dust", record };
+        // Final fix wave (M3): an attempt that went ahead past a still-pending transaction reads a near-zero
+        // balance if that transaction landed in the meantime -- recognize it as the sweep instead of "dust".
+        if (backoff.pendingTx !== undefined && backoff.pendingTx.length > 0) {
+          const late = await this.recoverPendingSweepTx(backoff.pendingTx);
+          if (typeof late === "object") {
+            const swept = appendSweep(record, late.amount, late.hash);
+            save(swept);
+            this.endSweepBackoff(record.channelId, backoff);
+            return { kind: "swept", record: swept, amount: late.amount, hash: late.hash };
+          }
+        }
         const updated: ChannelRecord = { ...record, swept: "dust" };
         save(updated);
         this.endSweepBackoff(record.channelId, backoff);
@@ -1427,17 +1470,22 @@ export class ArenaDaemon {
         this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
         return { kind: "skipped", record };
       }
+      // Final fix wave (M3): merged with any hashes still remembered from before (an attempt that went ahead after
+      // SWEEP_PENDING_PROBES replaces the old transaction at its nonce; either one may be the one that lands).
+      const remember = (hashes: Hex[]) => {
+        backoff.pendingTx = [...new Set([...(backoff.pendingTx ?? []), ...hashes])];
+      };
       if (err instanceof TxReceiptMissingError) {
         // Minor 2: remember this hash so the very next attempt (see the top of this method) checks it before
         // trying anything else -- the transaction is most likely already mined; only the receipt went missing.
-        backoff.pendingTx = [err.hash];
+        remember([err.hash]);
       } else if (err instanceof TxStuckError || err instanceof TxWaitAbortedError) {
         // Fix round 3, I-1(c): probe E3 -- a sweep this wait gave up on (a tight giveUpAt, or stop()) can still
         // land later: any one of the original send or its fee-bumped replacements might mine after this daemon
         // stopped watching for it. Remembering all of them (not just the last) is what lets the next attempt
         // recognise whichever one actually wins, instead of reading a fresh, near-zero balance and recording a
         // spurious "dust" over what really was a successful, if late, sweep.
-        backoff.pendingTx = err.hashes;
+        remember(err.hashes);
       }
       this.log(`channel ${record.channelId}: sweep failed (retried with back-off): ${errorText(err)}`);
       backoff.attempts++;
@@ -1451,12 +1499,17 @@ export class ArenaDaemon {
         this.log(`channel ${record.channelId}: sweep abandoned after ${backoff.attempts} failed attempts: its session gas is written off`);
         return { kind: "abandoned", record: updated };
       }
-      const starting = backoff.backoffMs === 0;
-      backoff.backoffMs = starting ? BACKOFF_START_MS : Math.min(backoff.backoffMs * 2, BACKOFF_MAX_MS);
-      backoff.blockedUntil = Date.now() + backoff.backoffMs;
-      if (starting) this.log(`channel ${record.channelId}: sweep back-off started (retrying in ${backoff.backoffMs / 1000}s)`);
+      this.bumpSweepBackoff(record.channelId, backoff);
       return { kind: "error", record, error: err };
     }
+  }
+
+  /** Starts (30 s) or doubles (up to 5 min) a sweep back-off; logs once, on the episode's first bump. */
+  private bumpSweepBackoff(channelId: Hex, backoff: SweepBackoff): void {
+    const starting = backoff.backoffMs === 0;
+    backoff.backoffMs = starting ? BACKOFF_START_MS : Math.min(backoff.backoffMs * 2, BACKOFF_MAX_MS);
+    backoff.blockedUntil = Date.now() + backoff.backoffMs;
+    if (starting) this.log(`channel ${channelId}: sweep back-off started (retrying in ${backoff.backoffMs / 1000}s)`);
   }
 
   private endSweepBackoff(channelId: Hex, backoff: SweepBackoff): void {
@@ -1465,6 +1518,7 @@ export class ArenaDaemon {
     backoff.blockedUntil = 0;
     backoff.attempts = 0;
     backoff.pendingTx = undefined;
+    backoff.pendingProbes = 0;
     if (wasBackedOff) this.log(`channel ${channelId}: sweep back-off ended`);
   }
 
@@ -1479,15 +1533,20 @@ export class ArenaDaemon {
    *  now also wraps this call -- see its own note) -- probe F1 found `getTransaction` throwing on a plain RPC
    *  blip (after a successful receipt read) escaping uncaught, all the way out of `runSweepAttempt`, which a
    *  timer-driven `void this.mainPass()` has no catch above; Node exits the whole process on that unhandled
-   *  rejection. Any failure not otherwise classified below is treated as "pending" -- try again next attempt --
-   *  never charged as a failed attempt for what may just be a slow node. */
+   *  rejection. Any failure not otherwise classified below is treated as "unknown" -- try again next attempt --
+   *  never charged as a failed attempt for what may just be a slow node.
+   *
+   *  Final fix wave (M3): `"pending"` now means the node reports the transaction unmined (in its mempool); a
+   *  read failure, or a transaction the node reports mined but whose receipt could not be read, is `"unknown"`,
+   *  so only a genuinely pending transaction counts toward `SWEEP_PENDING_PROBES`. */
   /** Fix round 3, I-1(c): `hashes` is the original send plus every fee-bumped replacement `waitOrReplace` sent
    *  for the one intent this backoff gave up on -- at most one of them can ever mine (they share a nonce), but
    *  it is never necessarily the last one this daemon happened to be watching when it gave up, so every one of
    *  them is checked. */
-  private async recoverPendingSweepTx(hashes: Hex[]): Promise<"pending" | "failed" | { amount: bigint; hash: Hex }> {
+  private async recoverPendingSweepTx(hashes: Hex[]): Promise<"pending" | "unknown" | "failed" | { amount: bigint; hash: Hex }> {
     try {
-      let anyKnown = false;
+      let anyPending = false;
+      let anyMined = false;
       for (const hash of hashes) {
         let receipt: { status: "success" | "reverted" } | null;
         try {
@@ -1510,12 +1569,16 @@ export class ArenaDaemon {
           if (err instanceof TransactionNotFoundError) return null;
           throw err;
         });
-        if (known) anyKnown = true;
+        if (known) {
+          if (known.blockNumber === null) anyPending = true;
+          else anyMined = true; // mined, but its receipt could not be read just now
+        }
       }
-      return anyKnown ? "pending" : "failed";
+      if (anyMined) return "unknown";
+      return anyPending ? "pending" : "failed";
     } catch (err) {
       this.log(`sweep recovery: ${errorText(err)} looking up ${hashes.length} pending hash(es) (retried next attempt)`);
-      return "pending";
+      return "unknown";
     }
   }
 

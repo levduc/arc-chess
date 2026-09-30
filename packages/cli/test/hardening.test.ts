@@ -36,6 +36,7 @@ import {
   SWEEP_ABANDON_ATTEMPTS,
   SWEEP_HEADROOM_DEN,
   SWEEP_HEADROOM_NUM,
+  SWEEP_PENDING_PROBES,
   SWEEP_PER_RECORD_TIMEOUT_MS,
   arenaPaths,
   loadConfig,
@@ -2090,6 +2091,86 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     },
     90_000,
   );
+
+  it("final fix wave, M3: a still-pending sweep transaction is re-probed on the back-off, then replaced after SWEEP_PENDING_PROBES", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await stopPeriodicPasses(d);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    const l = d.handle(id);
+    const pendingHash = ("0x" + "5a".repeat(32)) as Hex;
+    l.sweep.pendingTx = [pendingHash];
+    const internals = d as unknown as {
+      recoverPendingSweepTx(hashes: Hex[]): Promise<unknown>;
+      performSweep(sender: unknown, giveUpAt?: number): Promise<unknown>;
+      sweepChannel(l: unknown): Promise<void>;
+    };
+    let probes = 0;
+    let sends = 0;
+    internals.recoverPendingSweepTx = async () => {
+      probes++;
+      return "pending"; // priced under a base fee that stays high: in the mempool, never mined
+    };
+    internals.performSweep = async () => {
+      sends++;
+      throw new Error("simulated: the replacement did not land either");
+    };
+    // Ten passes in a row: the first probe is immediate (the transaction may already have landed), and every
+    // later one waits out the back-off that probe started. Before the fix: ten probes, never a replacement.
+    for (let i = 0; i < 10; i++) await internals.sweepChannel(l);
+    expect(probes).toBe(1);
+    expect(sends).toBe(0);
+    expect(l.sweep.attempts).toBe(0); // a pending probe is not a failure
+    expect(l.sweep.backoffMs).toBe(30_000);
+    l.sweep.blockedUntil = 0; // the back-off elapses
+    await internals.sweepChannel(l);
+    expect(probes).toBe(2);
+    expect(sends).toBe(0);
+    expect(l.sweep.backoffMs).toBe(60_000); // doubled
+    l.sweep.blockedUntil = 0;
+    await internals.sweepChannel(l);
+    // SWEEP_PENDING_PROBES (3) probes found it still pending: this attempt goes ahead, and its send replaces the
+    // released entry at the same nonce with raised fees. The old hash is still remembered, in case it lands.
+    expect(probes).toBe(SWEEP_PENDING_PROBES);
+    expect(sends).toBe(1);
+    expect(l.sweep.attempts).toBe(1); // the replacement's own failure is charged
+    expect(l.sweep.pendingTx).toContain(pendingHash);
+    expect(l.record.swept).toBeUndefined();
+  });
+
+  it("final fix wave, M3: an attempt that goes ahead past a pending transaction that has since landed records the sweep, not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await stopPeriodicPasses(d);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    // A real sweep-shaped transaction that lands (the same technique as fix round 2's minor-2 test).
+    const balance = await d.client.getBalance({ address: sender.address });
+    const gas = 21_000n;
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const value = balance - gas * ((maxFeePerGas * 13n + 9n) / 10n);
+    const hash = await sender.send({ to: alice.address, data: "0x" as Hex, value, gas });
+    await d.client.waitForTransactionReceipt({ hash });
+    sender.tracker?.settle(hash);
+    l.sweep.pendingTx = [hash];
+    l.sweep.pendingProbes = SWEEP_PENDING_PROBES - 1;
+    // The last probe still saw it pending; it lands right after, before the attempt that goes ahead reads the
+    // (now near-zero) balance.
+    const internals = d as unknown as {
+      recoverPendingSweepTx(hashes: Hex[]): Promise<unknown>;
+      sweepChannel(l: unknown): Promise<void>;
+    };
+    const realRecover = internals.recoverPendingSweepTx.bind(d);
+    let calls = 0;
+    internals.recoverPendingSweepTx = (hashes: Hex[]) => (++calls === 1 ? Promise.resolve("pending") : realRecover(hashes));
+    await internals.sweepChannel(l);
+    expect(l.record.swept).toBe(true); // before: "dust" -- the money arrived, but its attribution was lost
+    expect(l.record.sweptTx).toBe(hash);
+    expect(l.record.sweptAmount).toBe(value);
+  });
 
   it("final fix wave, I2: the sweep queue attempts at most 3 records per main pass, round-robin, each bounded to 20 s", async () => {
     const pair = await startPair();
