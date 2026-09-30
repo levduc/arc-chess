@@ -22,6 +22,37 @@ export type ChannelRecord = {
    *  channel that never opened), recorded with `finalized`, so its status can still be served from disk once the
    *  daemon has let go of it. Absent in records written before it existed. */
   finalPhase?: string;
+  /** Plan 5 Task 1 (mainnet gates: session-gas sweep): `true` once the session key's balance has been swept back
+   *  to the wallet, `"dust"` if it was declined as too small to be worth the send cost, or `"abandoned"` (fix
+   *  round I8) after `SWEEP_ABANDON_ATTEMPTS` failed attempts -- the session gas is written off rather than
+   *  retried forever. Absent (unset) for a channel not finalized yet, or finalized but not yet swept (including
+   *  every record written before this feature existed -- `arena sweep`/`POST /sweep` picks those up too). */
+  swept?: true | "dust" | "abandoned";
+  /** Plan 5 fix round (rule 4): the amount swept (base units of native gas), set alongside `swept: true`. Fix
+   *  round 3, M-4: the latest entry of `sweeps`, kept for compatibility. */
+  sweptAmount?: bigint;
+  /** Plan 5 fix round (rule 4): the sweep transaction's hash, set alongside `swept: true`. Fix round 3, M-4: the
+   *  latest entry of `sweeps`, kept for compatibility. */
+  sweptTx?: Hex;
+  /** Fix round 3, M-4: every real sweep this channel's session key has had, oldest first, appended to (never
+   *  overwritten) each time `swept: true` is set. A late top-up re-checked and swept again (minor 4), or an
+   *  "abandoned" channel `arena sweep` retries successfully (important 1), means more than one over a channel's
+   *  lifetime -- `sweptAmount`/`sweptTx` alone, overwritten each time, only ever showed the latest. Absent for a
+   *  record written before this field existed, or one never (yet) swept for real. */
+  sweeps?: Array<{ amount: bigint; tx: Hex; at: number }>;
+  /** Final fix wave (M5): the hashes of a sweep transaction whose wait gave up (stuck, aborted by `stop()`, or
+   *  its receipt lost) while it could still land -- the original send and every fee-bumped replacement. Kept on
+   *  disk so a restarted daemon checks them first and records a late landing as the sweep, not as "dust".
+   *  Cleared once they are resolved. */
+  sweepPending?: Hex[];
+  /** Plan 5 Task 1 (mainnet gates: settled index): wall-clock ms at which this channel was first seen finalized,
+   *  set alongside `finalized`. Used to sort the settled index loaded at `start()` by settle time, newest first.
+   *  Absent in records written before this field existed (sorts as the oldest). */
+  settledAt?: number;
+  /** Plan 5 Task 2: wall-clock ms at which `handoff()` last changed this record's controller/note, set alongside
+   *  them. Drives `ChannelStatus.handoff.since` (null there for a channel never handed off -- still at its
+   *  initial controller -- including every record written before this field existed). */
+  handoffAt?: number;
 };
 
 /** One entry of `channels/`: its record, or why it could not be read. */

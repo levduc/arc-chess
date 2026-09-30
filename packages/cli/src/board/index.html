@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Arena board</title>
+    <!-- A data: icon, so the browser never asks the daemon for /favicon.ico (a token-gated 401). -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%234c8dff'/%3E%3Ctext x='32' y='47' font-size='42' text-anchor='middle' fill='white'%3E%E2%99%9E%3C/text%3E%3C/svg%3E"
+    />
+    <!-- Absolute paths, not relative: arena board and the daemon start line both print .../board with no
+         trailing slash, so a relative href/src here would resolve against "/" (the page's own document
+         address), not "/board/", and 401 (or 404, once base-uri 'none' also rules out fixing this with
+         <base href>). Imports inside the modules themselves ("./board.js") resolve against /board/app.js, so
+         those stay relative. -->
+    <link rel="stylesheet" href="/board/style.css" />
+    <script type="module" src="/board/app.js"></script>
+  </head>
+  <body>
+    <p id="boot" class="boot">Loading the board…</p>
+
+    <section id="missing-token" class="gate" data-testid="missing-token" hidden>
+      <div class="gate-card">
+        <div class="brand-mark brand-mark-lg" aria-hidden="true">♞</div>
+        <h1>Arena board</h1>
+        <p id="gate-reason" class="muted" data-testid="gate-reason">This page needs the one-time link that `arena board` prints.</p>
+        <p class="gate-cta">Open the link printed by <code>arena board</code></p>
+        <p class="muted small">
+          The link carries a one-time code, good for two minutes. The board trades it for its access token, keeps
+          the token in memory only, and removes the code from the address bar, so reloading the page asks for a
+          new link.
+        </p>
+      </div>
+    </section>
+
+    <div id="app" class="app" hidden>
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">♞</span><span>Arena</span></div>
+        <span id="conn" class="conn conn-connecting" role="status">Connecting</span>
+      </header>
+
+      <main class="layout">
+        <aside class="card channels" aria-labelledby="channels-title">
+          <div class="card-head">
+            <h2 id="channels-title">Channels</h2>
+            <button id="channels-refresh" class="btn btn-ghost btn-small" type="button">Refresh</button>
+          </div>
+          <div id="lobby-error-banner" class="banner banner-warning" role="alert" hidden></div>
+          <ul id="channel-list" class="channel-list"></ul>
+          <p id="channels-empty" class="empty" hidden>No channels yet. Accept or post an offer in the lobby below.</p>
+        </aside>
+
+        <section class="card board-card" aria-labelledby="board-title">
+          <div id="must-move-banner" class="banner banner-danger banner-strong" data-testid="must-move-banner" role="alert" hidden>You must move before the deadline</div>
+          <div id="auto-return-banner" class="banner banner-warning" data-testid="auto-return-banner" role="alert" hidden></div>
+          <div class="board-head">
+            <h2 id="board-title" class="headline">No channel selected</h2>
+            <span id="board-channel" class="mono muted small"></span>
+          </div>
+          <div class="board-stage">
+            <div class="player-row" id="opp-row">
+              <span class="turn-dot" aria-hidden="true"></span>
+              <span id="opp-name" class="player-name">Opponent</span>
+              <span id="opp-balance" class="player-balance mono"></span>
+            </div>
+            <div class="board-wrap">
+              <div id="board" class="board" role="grid" aria-label="Chess board"></div>
+              <div id="board-empty" class="board-overlay" hidden>
+                <div class="overlay-card">
+                  <p>No channel yet</p>
+                  <p class="muted small">Accept or post an offer in the lobby to start a game.</p>
+                </div>
+              </div>
+              <div id="promotion" class="board-overlay promotion" role="dialog" aria-modal="true" aria-labelledby="promotion-title" hidden>
+                <div class="promotion-card">
+                  <p id="promotion-title">Promote to</p>
+                  <div id="promotion-choices" class="promotion-choices"></div>
+                  <button id="promotion-cancel" class="btn btn-ghost btn-small" type="button">Cancel</button>
+                </div>
+              </div>
+            </div>
+            <div class="player-row" id="me-row">
+              <span class="turn-dot" aria-hidden="true"></span>
+              <span id="me-name" class="player-name">You</span>
+              <span id="me-balance" class="player-balance mono"></span>
+            </div>
+          </div>
+          <p id="board-hint" class="hint muted small"></p>
+        </section>
+
+        <aside class="card panel" aria-label="Seat and game controls">
+          <section class="panel-section">
+            <div class="panel-row">
+              <span class="label">Controller</span>
+              <span id="controller-badge" class="badge" data-testid="controller-badge">—</span>
+            </div>
+            <p id="controller-hint" class="muted small"></p>
+            <button id="take-over" class="btn btn-primary btn-block" data-testid="take-over" type="button" hidden>Take over</button>
+            <form id="hand-back-form" class="hand-back" hidden>
+              <label for="hand-back-note" class="label">Note for the agent (optional)</label>
+              <textarea
+                id="hand-back-note"
+                data-testid="hand-back-note"
+                maxlength="1024"
+                rows="3"
+                placeholder="What should the agent know? e.g. I traded queens, play for a draw"
+              ></textarea>
+              <div class="panel-row">
+                <span id="note-count" class="muted small">0 / 1024</span>
+                <button id="hand-back" class="btn" data-testid="hand-back" type="submit">Hand back</button>
+              </div>
+            </form>
+            <div class="note-box">
+              <span class="label">Handoff note</span>
+              <p id="handoff-note" class="note" data-testid="handoff-note"></p>
+              <span id="handoff-since" class="muted small"></span>
+            </div>
+          </section>
+
+          <section id="challenge-box" class="panel-section challenge-box" hidden>
+            <span class="label">On-chain challenge</span>
+            <div class="countdown-row">
+              <span id="countdown" class="countdown mono" data-testid="countdown" role="timer" aria-live="off">0:00</span>
+              <span class="muted small">left</span>
+            </div>
+            <p id="challenge-meta" class="muted small"></p>
+          </section>
+
+          <section class="panel-section">
+            <dl class="facts">
+              <dt>Game</dt>
+              <dd id="fact-game">—</dd>
+              <dt>Status</dt>
+              <dd id="fact-status">—</dd>
+              <dt>You play</dt>
+              <dd id="fact-color">—</dd>
+              <dt>Your balance</dt>
+              <dd id="fact-me" class="mono">—</dd>
+              <dt>Opponent</dt>
+              <dd id="fact-opp" class="mono">—</dd>
+              <dt>Channel</dt>
+              <dd id="fact-phase">—</dd>
+            </dl>
+          </section>
+
+          <section class="panel-section">
+            <label class="toggle">
+              <input id="offer-draw-toggle" type="checkbox" data-testid="offer-draw-toggle" />
+              <span>Offer a draw with my next move</span>
+            </label>
+            <div class="action-grid">
+              <button id="btn-accept-draw" class="btn" data-testid="btn-accept-draw" type="button">Accept draw</button>
+              <button id="btn-resign" class="btn btn-danger" data-testid="btn-resign" type="button">Resign</button>
+              <button id="btn-next-game" class="btn" data-testid="btn-next-game" type="button">Next game</button>
+              <button id="btn-close" class="btn" data-testid="btn-close" type="button">Close channel</button>
+            </div>
+            <button id="btn-challenge" class="btn btn-ghost btn-block" data-testid="btn-challenge" type="button">Challenge on-chain</button>
+            <p id="actions-hint" class="muted small"></p>
+          </section>
+
+          <section id="last-error-box" class="panel-section" hidden>
+            <div class="banner banner-warning">
+              <strong>The daemon reports</strong>
+              <span id="last-error" class="wrap-anywhere"></span>
+            </div>
+          </section>
+
+          <details class="panel-section suggestions">
+            <summary>Daemon suggestions</summary>
+            <ul id="suggested" class="suggested"></ul>
+          </details>
+        </aside>
+      </main>
+
+      <section class="card lobby" aria-labelledby="lobby-title">
+        <div class="card-head">
+          <h2 id="lobby-title">Lobby</h2>
+          <button id="lobby-refresh" class="btn btn-ghost btn-small" type="button">Refresh</button>
+        </div>
+        <div class="lobby-grid">
+          <div class="offers">
+            <div id="lobby-error" class="banner banner-warning" role="alert" hidden></div>
+            <ul id="offer-list" class="offer-list" aria-label="Open offers"></ul>
+            <p id="offers-empty" class="empty" hidden>No open offers right now.</p>
+          </div>
+          <form id="create-offer-form" class="offer-form" data-testid="create-offer-form" novalidate>
+            <h3>Post an offer</h3>
+            <label for="offer-deposit" class="label">Deposit (USDC)</label>
+            <input id="offer-deposit" name="deposit" inputmode="decimal" autocomplete="off" placeholder="10" required />
+            <label for="offer-stake" class="label">Stake per game (USDC)</label>
+            <input id="offer-stake" name="stakePerGame" inputmode="decimal" autocomplete="off" placeholder="1" required />
+            <p class="muted small">The challenge window is your daemon's default.</p>
+            <p id="offer-error" class="field-error" role="alert"></p>
+            <button class="btn btn-primary btn-block" type="submit">Post offer</button>
+          </form>
+        </div>
+      </section>
+    </div>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <h2 id="confirm-title">Are you sure?</h2>
+      <p id="confirm-message"></p>
+      <dl id="confirm-details" class="facts"></dl>
+      <div class="dialog-actions">
+        <button id="confirm-cancel" class="btn" data-testid="confirm-cancel" type="button">Cancel</button>
+        <button id="confirm-ok" class="btn btn-primary" data-testid="confirm-ok" type="button">Confirm</button>
+      </div>
+    </dialog>
+  </body>
+</html>

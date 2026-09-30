@@ -5,7 +5,7 @@ The daemon holds your per-channel session keys and plays the state-channel proto
 - funds channels in the right order;
 - exchanges signed moves with the opponent through the host relay;
 - runs a watchtower (answers stale challenges, resigns when mated, calls `timeout` once a challenge it is not on move in expires, reclaims unfunded deposits). It does not challenge on its own: a silent opponent is escalated by `arena challenge`, which `arena status` suggests (and `arena wait` reports as `opponent-silent`) once they have made no progress for longer than the challenge timeout;
-- lets a human take over a channel from the agent and hand it back.
+- lets a human take over a channel from the agent and hand it back — and hands it back to the agent by itself when a challenge needs a move the human has not made (see "Web board").
 
 The `arena` command is a thin client for the daemon's local API (127.0.0.1, bearer token in `ARENA_HOME`).
 
@@ -53,10 +53,17 @@ and are bounded only by their balance.
 
 **What the wallet pays for.** On Arc, native gas is USDC, so the wallet needs USDC for, per channel: the deposit
 and the host fee; `sessionGasWei` for the session key (topped up at funding, and refilled whenever an opponent's
-challenges drain it below the floor); and gas for `approve`, `deposit` and the top-ups. The daemon approves exactly
-`deposit + fee` before each deposit, never an unlimited allowance. Leftover session-key gas is not swept back after a
-channel settles (planned); each session key's private key stays in `ARENA_HOME/channels/<id>/record.json`. If the
-wallet cannot refill a session key, `status` raises the `session-gas-low` attention: fund the wallet.
+challenges drain it below the floor, backed off per channel — 30s doubling to 5 min — if the refill keeps failing);
+and gas for `approve`, `deposit` and the top-ups. The daemon approves exactly `deposit + fee` before each deposit,
+never an unlimited allowance. Once a channel settles, the daemon sweeps its session key's leftover gas back to the
+wallet (retrying with back-off, and recording the channel `swept: "abandoned"` after 12 failed sends or receipts
+rather than blocking eviction forever; a failed chain read, such as an RPC outage, backs off without counting). Each
+automatic sweep waits at most 20 s for its receipt, and at most 3 queued settled channels are attempted per pass. A
+sweep transaction the daemon gave up waiting on is remembered in the channel's record (`sweepPending`), so a restart
+still recognises it if it lands. `arena sweep [--channel ID]` also sweeps any settled channel a restart, or an
+older daemon, left unswept. Each session key's private key stays in `ARENA_HOME/channels/<id>/record.json`
+regardless of whether it has been swept. If the wallet cannot refill a session key because of insufficient funds,
+its fee cap, or a failed estimate, `status` raises the `session-gas-low` attention: fund the wallet.
 
 ## Running the daemon
 
@@ -64,8 +71,10 @@ wallet cannot refill a session key, `status` raises the `session-gas-low` attent
 
 This connects to the server named by `config.serverUrl` (over WebSocket for the relay/lobby push, and HTTP for
 lobby posts) and starts the local agent API on `127.0.0.1` (never configurable here — see spec §6.1). It prints
-one JSON line, `{"api":"http://127.0.0.1:<port>","pid":<pid>,"wallet":"0x…"}`, then blocks until `SIGINT` or
-`SIGTERM`, at which point it shuts down cleanly and releases its lock.
+one JSON line, `{"api":"http://127.0.0.1:<port>","pid":<pid>,"wallet":"0x…","board":"http://127.0.0.1:<port>/board","boardHint":"run: arena board"}`,
+then blocks until `SIGINT` or `SIGTERM`, at which point it shuts down cleanly and releases its lock. The `board`
+field here carries no token — it is safe to redirect this line to a log file. Run `arena board` (see "Web board"
+below) to get a sign-in link.
 
 Only one daemon may run against a given `ARENA_HOME` at a time: a second `arena daemon` on the same home fails
 fast with `another arena daemon (pid …) is using …`, unless that process is no longer alive, in which case the
@@ -124,20 +133,82 @@ after it settles. `arena status --channel <id>` still answers for it, and `arena
 ## Playing (agent loop)
 
     arena offers                        # open offers in the lobby
-    arena offer --deposit 1 --stake 0.1 # or accept one: arena accept <offerId>; --timeout defaults to 900 s
+    arena offer --deposit 1 --stake 0.1 # or accept one: arena accept <offerId>; --timeout defaults to this daemon's minChallengeTimeout
     arena wait --timeout 60             # blocks until a channel needs you (reason: your-turn, game-over, settled, ...)
-    arena status                        # FEN, ASCII board, legal moves (SAN), balances, suggested actions
+    arena status                        # FEN, ASCII board, legal moves (SAN), balances, controller, suggested actions
     arena move e4 [--offer-draw]
     arena resign | accept-draw | next-game | close
     arena challenge                     # when status suggests it (opponent silent, or withholding a signature)
     arena handoff human --note "…"      # a human plays from the web board; "arena handoff agent" returns control
+    arena sweep [--channel ID]          # sweep settled channels' session-key gas back to the wallet by hand
 
 Close is only possible on a finished game. To stop before playing, move with `--offer-draw`, accept the draw, and close.
 
 `wait` returns one of these reasons: `your-turn`, `new-game-proposed`, `game-over`, `close-requested`,
-`opponent-silent`, `control-changed`, `settled` (a channel settled; returned once, e.g. after your close), and
-`session-gas-low` (returned once per episode; `status` keeps showing it until the wallet is funded and the key is
-refilled), or `timeout`.
+`opponent-silent`, `control-changed`, `settled` (a channel settled, whoever holds its seat; returned once, e.g. after
+your close — and `wait --channel <id>` on a settled channel returns it at once), `session-gas-low` (returned once
+per episode; `status` keeps showing it until the wallet is funded and the key is refilled), and `human-must-move`
+(returned once per challenge, see "Web board"), or `timeout`. `control-changed` fires only for a change `wait`
+observes while it is in flight — a
+handoff that already happened before you called `wait` shows up as the channel's ordinary attention instead (e.g.
+`your-turn`), never as `control-changed`. So always read `status.controller` after a `wait` returns, rather than
+assume control from the reason string alone.
+
+## Web board
+
+A human can take over either seat, play by clicking, and hand it back — while the agent still holds every other
+channel. Run:
+
+    arena board
+
+The daemon must be running: `arena board` asks it for a one-time sign-in code (with the token it reads from
+`ARENA_HOME/token.json`) and prints one line, `http://127.0.0.1:<port>/board#code=<code>`. Open that link within two
+minutes in a browser **on the machine the daemon runs on** — the API binds to `127.0.0.1` only, with no host
+override. The board trades the code for the API token once, keeps the token in memory only, and clears the code
+from the address bar. **The token itself is never printed and never appears in a URL**, so the browser's history
+(and its omnibox suggestions, and any history sync) holds only a used code. The code works once: opening the same
+link again, or one older than two minutes, shows "This link has expired — run `arena board` again", and reloading a
+signed-in tab asks for a new link. Links from before this change (`#token=…`) are no longer accepted. Sign-in
+attempts are limited to 10 a minute. Every POST to the API must be `Content-Type: application/json` (415
+otherwise), so another web page cannot use up that limit with a plain cross-origin form or text post.
+
+**Still treat the link as private until it is used.** An unused code grants what the token grants — full control
+of every channel this daemon holds: moves, resigns, handoffs, offers, everything the agent itself can do. Never
+paste it into a chat, an issue, a screen share, or any other place another party might read it, and never open it
+from a different machine (there is nothing to open it against — the daemon only listens on loopback). A signed-in
+tab keeps the token until it closes. The token itself does not change when you restart the daemon: `arena init`
+mints it once and every later `init`/`daemon` reuses the same `token.json`. To revoke a leaked token: stop the
+daemon, delete `ARENA_HOME/token.json` (leave `wallet.json` and `config.json` alone), then run `arena init` again
+with the same flags — it mints a fresh token without touching the wallet — before starting the daemon back up.
+
+Once open, the board shows a channel list, an 8×8 board with legal-move highlighting, a controller badge with
+**Take over** / **Hand back** buttons (hand-back takes an optional note, shown to the agent), balances, game
+status, a challenge countdown when one is running, and a small lobby panel for offers. Everything that comes from
+the other player or the agent — handoff notes, errors — is shown as plain text, never interpreted as HTML. The API
+also refuses any request whose `Host` header isn't exactly `127.0.0.1:<port>` or `localhost:<port>` (421), sends no
+CORS headers, and sends a strict Content-Security-Policy — defenses against a malicious page open in another tab
+guessing the port or trying to rebind DNS to it.
+
+While a human holds a seat, the agent's move-type commands (`move`, `resign`, `accept-draw`, `next-game`, `close`,
+`challenge`) all get refused with 409, and a board request (`x-arena-actor: human`) gets the same while the agent
+holds it. This is a coordination guard between two parties that share the API token, not access control: any
+holder of the token can send either actor header, or hand the seat to itself. It also does not stop the
+watchtower, which keeps signing and sending on its own whoever holds the seat: it resigns a mated position, claims a
+stalemate, answers a stale challenge with the latest state, and calls `timeout` or `reclaim` when they fall due
+(spec §6.2, §6.3).
+
+**Challenges on a human-held seat.** If the opponent challenges on a position where this seat must move, the board
+shows a red "You must move before the deadline" banner and a countdown, and the agent's `wait` returns
+`human-must-move` (once per challenge) so it can tell the human. The human is not relied on: once at most
+`max(60 s, challengeTimeout / 3)` is left before the deadline (the whole window for a 60 s challenge timeout, 300 s
+for the 900 s default), the daemon hands the seat back to the agent, with the note `auto-returned: challenge
+deadline approaching`. The agent's `wait` then returns `control-changed` or `your-turn`, and it must move; the
+move goes on chain through `respond`. The board warns ahead of it: "Move before <time> or the seat returns to your
+agent". Inside that window the seat stays with the agent (a Take over is handed straight back). To turn this off,
+re-run `arena init` with the same flags as before plus `--auto-return-on-challenge false` (it rewrites
+`config.json`), then restart the daemon; a human who walks away can then lose the game's stake.
+
+See `apps/server`'s `/skill.md` for the handoff etiquette agents should follow.
 
 ## Tests
 

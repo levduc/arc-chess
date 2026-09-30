@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, http, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, http, TransactionNotFoundError, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -17,6 +17,8 @@ import {
   TxInsufficientFundsError,
   TxNonceUsedError,
   TxReceiptMissingError,
+  TxStuckError,
+  TxWaitAbortedError,
   ZERO_HASH,
   channelId as computeChannelId,
   chunkRanges,
@@ -40,6 +42,8 @@ import {
 } from "@arena/sdk";
 import {
   arenaPaths,
+  autoReturnOnChallengeOf,
+  autoReturnSecondsOf,
   isCanonicalId,
   minChallengeTimeoutOf,
   sessionGasFloorOf,
@@ -59,6 +63,27 @@ export class DaemonError extends Error {
   ) {
     super(message);
     this.name = "DaemonError";
+  }
+}
+
+/** Plan 5 fix round ("a failed fee estimate also raises session-gas-low"): thrown by `topUpSession` when its own
+ *  `estimateFeesPerGas` pre-check fails, so `ensureSessionGas` can classify it unambiguously -- rather than a
+ *  refill's failed fee estimate surfacing as some other, harder-to-classify error shape from deep inside the
+ *  sender's own send path. */
+export class SessionGasEstimateError extends Error {
+  constructor(cause?: unknown) {
+    super(`fee estimate failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "SessionGasEstimateError";
+  }
+}
+
+/** Final fix wave (M4): a chain read a sweep attempt makes before it sends anything (the on-chain settled check,
+ *  the key's nonce, balance and fees, the wallet's code) failed. An RPC blip, not a failure of the sweep itself:
+ *  backed off like any failure, but never counted toward `SWEEP_ABANDON_ATTEMPTS`. */
+export class SweepReadError extends Error {
+  constructor(cause?: unknown) {
+    super(`a read failed before anything was sent: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
+    this.name = "SweepReadError";
   }
 }
 
@@ -114,19 +139,122 @@ export type ChannelHandle = {
   /** Final review C1: set while the session key is below `sessionGasFloor` and the wallet could not refill it
    *  (the reason); drives the `session-gas-low` attention. Null otherwise. */
   sessionGasLow: string | null;
+  /** Plan 5 Task 1 (mainnet gates: refill back-off): wall-clock ms before which `ensureSessionGas` does not retry
+   *  a refill for this channel, set after a failed refill. 0 = no back-off in effect. */
+  refillBlockedUntil: number;
+  /** Plan 5 Task 1: the current refill back-off episode's duration in ms (0 = no episode): 30s on the first
+   *  failure, doubled on each one after, capped at 5 minutes; reset to 0 on a successful refill or once the
+   *  wallet's balance rises above `refillLastWalletBalance`. */
+  refillBackoffMs: number;
+  /** Plan 5 Task 1: the wallet's native balance as last observed by the refill back-off gate, or null before the
+   *  first observation -- a rise above this ends the back-off early (the wallet may have just been funded). */
+  refillLastWalletBalance: bigint | null;
   /** Final review C1: `wait()` has already woken for the current `sessionGasLow` episode (so it does not return at
    *  once on every call while the wallet stays empty). */
   sessionGasLowWoken: boolean;
   /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
    *  woken for it yet: drives the one-shot `settled` attention. */
   settledWake: boolean;
+  /** Final fix wave (I1): the deadline of the challenge whose `human-must-move` a `wait()` has already woken for
+   *  (one wake per challenge), or null. Cleared when a human takes the seat again. */
+  humanMustMoveWoken: string | null;
   /** Final review I3: chain time at which the main pass first saw this channel settled; it is evicted from `live`
    *  `SETTLED_GRACE_SECONDS` later. */
   settledAt: bigint | null;
+  /** Plan 5 fix round (rules 1-5, I8): this channel's sweep back-off state -- `blockedUntil`/`backoffMs` mirror
+   *  the refill back-off's shape (wall-clock ms; 0 = no episode); `attempts` counts consecutive failures and
+   *  drives `SWEEP_ABANDON_ATTEMPTS`. Passed by reference to `runSweepAttempt`, shared with the sweep queue's
+   *  identically-shaped per-entry state (see `SweepQueueEntry`). */
+  sweep: SweepBackoff;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
 export type DegradedChannel = { channelId: string; degraded: true; error: string };
+
+/** Plan 5 fix round (I2): a finalized-but-unswept channel found at `start()` (a restart, or a record written
+ *  before this feature existed) -- never opened into `live` (no session, no relay join: it's settled, there is
+ *  nothing left to watch), just a session sender and the same back-off shape `ChannelHandle.sweep` uses, so the
+ *  main pass can sweep it without a full `openChannel`. Removed from the queue once `record.swept` is set. */
+type SweepQueueEntry = {
+  record: ChannelRecord;
+  sender: SerialTxSender;
+  sweep: SweepBackoff;
+  /** True while either the queue's own pass or a manual `sweep()` call is working on this entry, so the two never
+   *  send at once (I1's busy-wait pattern, mirrored from `reclaim()`/`l.mainBusy`). */
+  busy: boolean;
+};
+
+/** Shared shape of a channel's (or sweep-queue entry's) sweep back-off state. `pendingTx` (fix round 2, minor 2;
+ *  fix round 3, I-1(c): a list, not one hash) is set when a sweep attempt's own `waitOrReplace` gave up on a
+ *  transaction it cannot fully rule out having landed anyway -- `TxReceiptMissingError` (the node stopped serving
+ *  a receipt after treating it as mined), `TxStuckError` or `TxWaitAbortedError` (the wait gave up -- on
+ *  `giveUpAt`, or `stop()` -- while the transaction, or one of its fee-bumped replacements, could still land
+ *  later). Every hash `waitOrReplace` ever sent for that one intent (the original plus every replacement) is
+ *  kept, since any one of them, not just the last, could be the one that mines. The *next* attempt reads all of
+ *  their receipts first -- before doing anything else -- and recovers a swept amount/tx from whichever one
+ *  succeeded, rather than losing track of money that already arrived (and, worse, sending again or recording a
+ *  spurious "dust"). */
+type SweepBackoff = {
+  blockedUntil: number;
+  backoffMs: number;
+  attempts: number;
+  pendingTx?: Hex[];
+  /** Final fix wave (M3): how many probes of `pendingTx` in a row found it still pending. */
+  pendingProbes?: number;
+};
+
+/** Plan 5 fix round: what one sweep attempt on a session key resolved to. `"skipped"` covers every reason the
+ *  attempt never actually ran (not yet confirmed settled on-chain, a concurrent send in flight, back-off still in
+ *  effect) -- the record is unchanged and the caller simply tries again on a later pass. */
+type SweepAttemptResult =
+  | { kind: "swept"; record: ChannelRecord; amount: bigint; hash: Hex }
+  | { kind: "dust"; record: ChannelRecord }
+  | { kind: "abandoned"; record: ChannelRecord }
+  | { kind: "skipped"; record: ChannelRecord }
+  | { kind: "error"; record: ChannelRecord; error: unknown };
+
+/** True once a record's sweep is done (either way). Wrapped in a function (fix round 2, important 3) rather than
+ *  an inline `swept === true || swept === "dust"` so re-checking it a second time, after an `await`, is never
+ *  narrowed by TypeScript against the first check -- `l.record`/`queued.record` really can change in between. */
+function isSweptDone(swept: ChannelRecord["swept"]): boolean {
+  return swept === true || swept === "dust";
+}
+
+/** Fix round 3, M-4: a fresh `ChannelRecord` with `swept: true`, `sweptAmount`/`sweptTx` set to this sweep (kept
+ *  for compatibility -- the latest entry), and `amount`/`tx` appended to `sweeps`, oldest first. A channel's
+ *  session key can be swept for real more than once in its lifetime -- a late top-up re-checked and swept again
+ *  (minor 4), or an "abandoned" channel `arena sweep` retries successfully (important 1) -- and `sweptAmount`/
+ *  `sweptTx` alone, overwritten each time, only ever showed the latest one. */
+function appendSweep(record: ChannelRecord, amount: bigint, tx: Hex): ChannelRecord {
+  return {
+    ...record,
+    swept: true,
+    sweptAmount: amount,
+    sweptTx: tx,
+    sweeps: [...(record.sweeps ?? []), { amount, tx, at: Date.now() }],
+    sweepPending: undefined, // final fix wave (M5): resolved
+  };
+}
+
+/** Fix round 2, important 5: the fee per gas a set of fees (`SerialTxSender`'s own `Fees` shape) asks for, in the
+ *  same style `tx.ts`'s own internal `feeOf` reads it (not exported). */
+function feePerGasOf(f: { maxFeePerGas?: bigint; gasPrice?: bigint }): bigint {
+  return f.maxFeePerGas ?? f.gasPrice ?? 0n;
+}
+
+/** True once a fee set names an actual value (as opposed to `{}`, e.g. an adopted-after-restart entry whose fees
+ *  were never observed). Mirrors `tx.ts`'s own internal `hasFees` (not exported). */
+function hasKnownFee(f: { maxFeePerGas?: bigint; gasPrice?: bigint }): boolean {
+  return f.maxFeePerGas !== undefined || f.gasPrice !== undefined;
+}
+
+/** Fix round 2, important 5: the same "raise a fee by at least 12.5%, rounded up" rule `SerialTxSender`'s own
+ *  same-nonce replacement path uses internally (`tx.ts`'s `bump`, not exported) -- needed here to size the
+ *  sweep's reserve against a dead entry's own last fee, not just the current market estimate. */
+function bumpFeePerGas(x: bigint): bigint {
+  const raised = (x * 1125n + 999n) / 1000n;
+  return raised > x ? raised : x + 1n;
+}
 
 export type DaemonOptions = {
   home: string;
@@ -175,6 +303,43 @@ export const SETTLED_GRACE_SECONDS = 600n;
  *  from disk (`status`), and no longer listed by `channels()`. */
 export const SETTLED_CACHE_MAX = 1000;
 
+/** Plan 5 Task 1 (mainnet gates: refill and sweep back-off): the first back-off, in wall-clock ms, after a failed
+ *  refill or sweep -- doubled on each further failure, up to `BACKOFF_MAX_MS`. */
+export const BACKOFF_START_MS = 30_000;
+/** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
+export const BACKOFF_MAX_MS = 300_000;
+
+/** Plan 5 fix round (I8): after this many failed sweep attempts (the back-off has long since reached its cap by
+ *  then), the channel's session gas is written off -- `swept: "abandoned"` -- so eviction can proceed instead of
+ *  a permanently-stuck channel occupying memory forever over gas that will apparently never sweep. */
+export const SWEEP_ABANDON_ATTEMPTS = 12;
+
+/** Plan 5 fix round (rule 3): the value a sweep sends reserves `gas * ceil(feePerGas * SWEEP_HEADROOM_NUM /
+ *  SWEEP_HEADROOM_DEN)` for gas, so a single 12.5% same-nonce replacement bump still fits the balance bound
+ *  (`SerialTxSender.affordable`) -- sending exactly `gas * feePerGas` would leave a same-nonce replacement unable
+ *  to afford any bump at all. 13/10 = 1.3x. */
+export const SWEEP_HEADROOM_NUM = 13n;
+export const SWEEP_HEADROOM_DEN = 10n;
+
+/** Plan 5 fix round (I5): the wall-clock budget one `sweep()` call (with no `--channel`) spends attempting
+ *  records before returning, reporting `remaining` for whatever is left rather than hanging the caller. */
+export const SWEEP_TIME_BUDGET_MS = 60_000;
+
+/** Fix round 3, M-2: the most one record's own receipt wait (`giveUpAt`, threaded down to `waitOrReplace`) may
+ *  claim out of `SWEEP_TIME_BUDGET_MS`, even when the budget has much more of it left -- so one record stuck
+ *  replacing a dead entry cannot eat the whole budget (or, for `--channel`, the whole of a much larger
+ *  `budgetMs`) and starve every other record a bulk sweep would otherwise have gotten through. */
+export const SWEEP_PER_RECORD_TIMEOUT_MS = 20_000;
+
+/** Final fix wave (I2): the most sweep-queue records one main pass attempts. The next pass continues with the
+ *  records after them (round-robin), so one pass never serializes the whole queue. */
+export const SWEEP_QUEUE_PER_PASS = 3;
+
+/** Final fix wave (M3): after this many probes find a sweep transaction still pending (each after the sweep
+ *  back-off), the next attempt goes ahead: its send replaces the released entry at the same nonce with raised
+ *  fees, so a transaction priced under a base fee that stays high is not waited on forever. */
+export const SWEEP_PENDING_PROBES = 3;
+
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
@@ -182,6 +347,35 @@ export const MAX_OPEN_ATTEMPTS = 5;
 /** The hub error names that mean "this deposit cannot go through right now because of a launch limit" (spec §13),
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
+
+/** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
+ *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
+ *  cosmetic. */
+export const MAX_HANDOFF_NOTE_LENGTH = 1024;
+
+/** Final fix wave (I1): the handoff note the daemon leaves when it hands a human-held seat back to the agent because
+ *  a challenge deadline is near. */
+export const AUTO_RETURN_NOTE = "auto-returned: challenge deadline approaching";
+
+/**
+ * Plan 5 Task 2 fix round, minor 4: every character class a handoff note refuses, beyond the length cap above --
+ * C0 controls other than tab (U+0009) and newline (U+000A), DEL (U+007F), C1 controls (U+0080-U+009F), and the
+ * bidi-override/isolate formatting characters (U+202A-U+202E, U+2066-U+2069) that can make rendered text read in
+ * an order different from its bytes. The board shows this note as plain text (never innerHTML, per Global
+ * Constraints), so this is not an XSS defense -- it's aimed at a note that would otherwise corrupt the terminal
+ * or the board's own layout (a bidi override flips visual order; C0/C1 controls include things like backspace,
+ * form feed, or an ANSI escape's own controls) rather than at markup, which plain-text rendering already defeats.
+ */
+const FORBIDDEN_NOTE_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F‪-‮⁦-⁩]/;
+
+function checkHandoffNote(note: string): void {
+  if (note.length > MAX_HANDOFF_NOTE_LENGTH) {
+    throw new DaemonError(400, `note must be at most ${MAX_HANDOFF_NOTE_LENGTH} characters (got ${note.length})`);
+  }
+  if (FORBIDDEN_NOTE_CHARS.test(note)) {
+    throw new DaemonError(400, "note contains a disallowed control or bidi-override character");
+  }
+}
 
 export class ArenaDaemon {
   readonly client: PublicClient;
@@ -191,11 +385,17 @@ export class ArenaDaemon {
   protected readonly domain: ArenaDomain;
   protected readonly records: RecordStore;
   protected readonly live = new Map<Hex, ChannelHandle>();
-  /** Final review I3: the final status of each settled channel evicted from `live`, oldest first (capped at
-   *  `SETTLED_CACHE_MAX`). */
-  protected readonly settled = new Map<Hex, ChannelStatus>();
+  /** Final review I3 / Plan 5 fix round (I4): the final status of each settled channel evicted from `live` (or
+   *  loaded at `start()`), keyed with its `settledAt` (wall-clock ms) so `insertSettled` can trim by settle time
+   *  rather than insertion order once the map exceeds `SETTLED_CACHE_MAX`. */
+  protected readonly settled = new Map<Hex, { status: ChannelStatus; settledAt: number }>();
   /** I1: channel entries that could not be loaded at start(), by directory name, with the reason. Never watched or picked. */
   protected readonly degraded = new Map<string, string>();
+  /** Plan 5 fix round (I2): finalized-but-unswept channels found at `start()`, processed by the main pass. See
+   *  `SweepQueueEntry`. */
+  protected readonly sweepQueue = new Map<Hex, SweepQueueEntry>();
+  /** Plan 5 fix round (I5): `sweep()` is single-flight -- a concurrent call is refused with 409. */
+  private sweeping = false;
   protected readonly changes = new EventEmitter();
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
@@ -257,9 +457,9 @@ export class ArenaDaemon {
    *  its receipt waits for good -- so a restart creates a new ArenaDaemon on the same home. */
   async start(): Promise<void> {
     if (this.stopped) throw new Error("a stopped ArenaDaemon cannot be restarted: create a new one on the same home");
-    this.unsubscribers.push(this.opts.lobby.onMatch((m) => void this.onMatch(m)));
-    this.unsubscribers.push(this.opts.relay.onMessage((m) => void this.onRelay(m)));
-    this.unsubscribers.push(this.opts.relay.onJoined((id) => void this.onJoined(id)));
+    this.unsubscribers.push(this.opts.lobby.onMatch((m) => this.fireAndForget("onMatch", this.onMatch(m))));
+    this.unsubscribers.push(this.opts.relay.onMessage((m) => this.fireAndForget("onRelay", this.onRelay(m))));
+    this.unsubscribers.push(this.opts.relay.onJoined((id) => this.fireAndForget("onJoined", this.onJoined(id))));
     // Plan 4.5 Task 11 fix round (C2): make a subscribe refusal visible instead of a silent, permanent loss of
     // match notifications. Sticky (see `lobbyError`'s docstring): this daemon refuses new offers/accepts from
     // here on, and every channel's status carries the message, until it is restarted.
@@ -273,6 +473,10 @@ export class ArenaDaemon {
     // I1: every channel entry is loaded in isolation. A corrupt record or session file, or a record that does not
     // match this hub/chain, is logged and reported as degraded (see channels()) instead of aborting start() —
     // which would leave every other channel, including ones mid-dispute, unwatched.
+    // Plan 5 Task 1 (mainnet gates: settled index): finalized records collected here, loaded into `this.settled`
+    // (and, fix round I2, `this.sweepQueue`) below (once the whole scan is done, so the index can be sorted by
+    // settle time and capped first).
+    const finalizedRecords: ChannelRecord[] = [];
     for (const entry of this.records.scanChannels()) {
       if (this.stopped) break;
       if (entry.record === null) {
@@ -284,7 +488,10 @@ export class ArenaDaemon {
       if (typeof entry.record.offerId === "string") {
         this.offerIdIndex.set(entry.record.offerId.toLowerCase() as Hex, entry.record.channelId);
       }
-      if (entry.record.finalized) continue;
+      if (entry.record.finalized) {
+        finalizedRecords.push(entry.record);
+        continue;
+      }
       try {
         await this.openChannel(entry.record);
       } catch (err) {
@@ -297,12 +504,39 @@ export class ArenaDaemon {
     // Plan 4.5 Task 10 re-review (C1): the timer is armed before anything else can wait. start() used to await a
     // first full tick first -- so a main pass stalled on a receipt wait right after a restart held back every
     // dispute pass (and start() itself, with the API behind it) until it finished. Re-review 2 (minor 7): before
-    // offer pruning too, which reads the chain and could hang on a slow RPC.
+    // offer pruning too, which reads the chain and could hang on a slow RPC. Plan 5 fix round (minor): also before
+    // the settled index/sweep queue loads just below -- a home with a lot of settled history must not hold up the
+    // first dispute pass on a restart either.
     // The two passes are started independently: a dispute pass never waits for a main pass still in flight.
     this.timer = setInterval(() => {
-      void this.disputePass();
-      void this.mainPass();
+      this.fireAndForget("disputePass", this.disputePass());
+      this.fireAndForget("mainPass", this.mainPass());
     }, this.opts.config.pollMs);
+    // Plan 5 Task 1: the settled index -- newest `SETTLED_CACHE_MAX` finalized channels by `settledAt` (a record
+    // with none, written before this field existed, sorts as the oldest). Older ones are still served from disk
+    // by `status`/`settledStatus`, just not listed by `channels()`.
+    finalizedRecords.sort((a, b) => (b.settledAt ?? 0) - (a.settledAt ?? 0));
+    for (const record of finalizedRecords.slice(0, SETTLED_CACHE_MAX)) {
+      if (this.stopped) return;
+      const status = await this.loadSettledStatus(record).catch(() => null);
+      if (status) this.insertSettled(record.channelId, status, record.settledAt ?? 0);
+    }
+    // Plan 5 fix round (I2): every finalized record still unswept (unset only -- "abandoned" ones wait for an
+    // explicit `arena sweep`, not an automatic retry) is queued for the main pass to sweep, without a full
+    // openChannel: a settled channel has nothing else left to watch (no session, no relay join needed).
+    for (const record of finalizedRecords) {
+      if (this.stopped) return;
+      if (record.swept !== undefined) continue;
+      this.sweepQueue.set(record.channelId, {
+        record,
+        sender: new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
+          feeCeiling: NO_FEE_CEILING,
+        }),
+        // Final fix wave (M5): a sweep transaction the last run gave up on is checked first.
+        sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
+        busy: false,
+      });
+    }
     // Records that can no longer produce a fundable match go first, so they are never subscribed at all.
     if (!this.stopped) await this.pruneOffers();
     // Replays match events for offers this daemon posted/accepted while it was down.
@@ -319,7 +553,7 @@ export class ArenaDaemon {
       await this.refreshChain(l).catch((err: unknown) => this.log(`channel ${l.record.channelId}: first refresh failed: ${errorText(err)}`));
     }
     // The first round starts now, without start() waiting for it.
-    if (!this.stopped) void this.tick();
+    if (!this.stopped) this.fireAndForget("tick", this.tick());
   }
 
   /** Stops the daemon. Bounded by the transport timeouts of RPC calls already in flight (round 5, m3). */
@@ -332,7 +566,31 @@ export class ArenaDaemon {
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
     while (this.ticking) await new Promise((r) => setTimeout(r, 10));
+    // Plan 5 Task 2: told before the listeners it's about for are dropped -- the SSE feed's onStop subscriber
+    // ends its open responses here; removeAllListeners() alone would just silently drop that subscriber, leaving
+    // its HTTP response open forever with nothing left to ever write to or close it.
+    try {
+      this.changes.emit("stop");
+    } catch {
+      // M8 (see notify()): a throwing listener must never break stop().
+    }
     this.changes.removeAllListeners();
+  }
+
+  /** Plan 5 Task 2: subscribes to every `notify()` (a new state, a tick, a handoff, …) -- used by the SSE feed
+   *  (`GET /events`). `changes` is protected; this is the one public door onto it. Returns an unsubscribe
+   *  function. */
+  onChange(listener: () => void): () => void {
+    this.changes.on("change", listener);
+    return () => this.changes.off("change", listener);
+  }
+
+  /** Plan 5 Task 2: subscribes to this daemon stopping (see `stop()`) -- the SSE feed closes its streams then,
+   *  since `changes.removeAllListeners()` alone would silently drop the "change" listener without ending the
+   *  open HTTP response. Returns an unsubscribe function. */
+  onStop(listener: () => void): () => void {
+    this.changes.on("stop", listener);
+    return () => this.changes.off("stop", listener);
   }
 
   /** R9/3b: resolves once no tick is currently in flight — call before an explicit `tick()` in a test that needs it deterministic, so that call isn't a no-op against the periodic timer's own concurrent tick. */
@@ -399,7 +657,7 @@ export class ArenaDaemon {
     }
   }
 
-  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint }): Promise<{ offerId: Hex }> {
+  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout?: bigint }): Promise<{ offerId: Hex }> {
     // Plan 4.5 Task 11 fix round (C2): once the host has refused a subscribe, this connection's match delivery is
     // broken until restart -- a new offer would post fine (200) and then silently never learn of its match if it
     // is the offerer. Refuse up front instead of returning a false 200.
@@ -408,11 +666,15 @@ export class ArenaDaemon {
     // matched channel can never sit unfundable while its deposit reverts on every tick.
     if (o.stakePerGame <= 0n) throw new DaemonError(400, "stakePerGame must be greater than 0");
     if (o.deposit < o.stakePerGame) throw new DaemonError(400, "deposit must be at least stakePerGame");
+    // Plan 5 Task 1 (mainnet gates: offer default timeout): an omitted challengeTimeout takes this daemon's own
+    // minChallengeTimeout -- always at or above the floor `checkChallengeTimeout` enforces just below, so this
+    // daemon's own default offer is always accepted by itself and by any peer at the same floor.
+    const challengeTimeout = o.challengeTimeout ?? minChallengeTimeoutOf(this.opts.config);
     const bounds = await this.hub.timeoutBounds();
-    if (o.challengeTimeout < bounds.min || o.challengeTimeout > bounds.max) {
+    if (challengeTimeout < bounds.min || challengeTimeout > bounds.max) {
       throw new DaemonError(400, `challengeTimeout must be between ${bounds.min} and ${bounds.max} seconds`);
     }
-    this.checkChallengeTimeout(o.challengeTimeout);
+    this.checkChallengeTimeout(challengeTimeout);
     await this.checkDepositAllowed(o.deposit, { escrow: true });
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
@@ -426,7 +688,7 @@ export class ArenaDaemon {
       signer: privateKeyToAccount(sessionKey).address,
       deposit: o.deposit,
       stakePerGame: o.stakePerGame,
-      challengeTimeout: o.challengeTimeout,
+      challengeTimeout,
       expiresAt: chainNow + 3600n,
       nonce: `0x${randomBytes(32).toString("hex")}`,
     };
@@ -565,7 +827,7 @@ export class ArenaDaemon {
             return release();
           }
           this.notify();
-          void this.tick();
+          this.fireAndForget("tick", this.tick());
         }
         return release();
       }
@@ -666,7 +928,7 @@ export class ArenaDaemon {
       if (this.stopped) return;
       await this.openChannel(record);
       this.notify();
-      void this.tick();
+      this.fireAndForget("tick", this.tick());
     } catch (err) {
       release();
       if (!this.stopped) this.retryMatches.set(offerId, m);
@@ -740,9 +1002,14 @@ export class ArenaDaemon {
       refilling: null,
       refills: 0,
       sessionGasLow: null,
+      refillBlockedUntil: 0,
+      refillBackoffMs: 0,
+      refillLastWalletBalance: null,
       sessionGasLowWoken: false,
       settledWake: false,
+      humanMustMoveWoken: null,
       settledAt: null,
+      sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -863,7 +1130,18 @@ export class ArenaDaemon {
     if (target <= 0n || this.stopped) return false;
     const balance = await this.client.getBalance({ address: l.sessionSender.address });
     if (balance >= target || this.stopped) return false;
-    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance };
+    // Fix round (minor, "a failed fee estimate also raises session-gas-low"): checked as its own step, so a
+    // failure here is unambiguously a `SessionGasEstimateError` -- rather than some other, harder-to-classify
+    // error shape surfacing from deep inside the sender's own send path (`SerialTxSender.sendFresh`'s internal
+    // `estimateFees` call, whose failure would otherwise propagate as a raw, unclassified error).
+    try {
+      await this.client.estimateFeesPerGas();
+    } catch (err) {
+      throw new SessionGasEstimateError(err);
+    }
+    // The session key is always an EOA (a generated private key, never a contract): the gas is always 21000, so
+    // it never needs estimating either (and never fails alongside the fee estimate above).
+    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance, gas: 21_000n };
     // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
     // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
     // paid at most once.
@@ -882,6 +1160,10 @@ export class ArenaDaemon {
    */
   protected async ensureSessionGas(l: ChannelHandle): Promise<void> {
     if (this.opts.config.sessionGasWei <= 0n || this.stopped || l.record.finalized) return;
+    // Plan 5 Task 1 (mainnet gates: refill back-off): back off retrying a channel whose refills keep failing,
+    // unless the wallet's own balance has just risen (it may have just been funded) -- checked before the shared
+    // top-up below so a blocked channel costs nothing beyond one balance read per pass.
+    if (!(await this.refillBackoffGate(l))) return;
     // (A funding top-up in flight that fails is fund()'s to report, not this caller's.)
     await this.sharedTopUp(l, async () => {
       const floor = sessionGasFloorOf(this.opts.config);
@@ -894,6 +1176,7 @@ export class ArenaDaemon {
       }
       if (balance >= floor) {
         this.clearSessionGasLow(l);
+        this.endRefillBackoff(l);
         return;
       }
       try {
@@ -902,14 +1185,65 @@ export class ArenaDaemon {
           this.log(`channel ${l.record.channelId}: refilled the session key's dispute gas (it was at ${balance} wei, floor ${floor})`);
         }
         this.clearSessionGasLow(l);
+        this.endRefillBackoff(l);
       } catch (err) {
         if (this.stopped) return;
-        const first = l.sessionGasLow === null;
-        l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
-        this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
-        if (first) this.notify();
+        // Plan 5 Task 1 (mainnet gates: session-gas-low precision): raised only when the wallet itself cannot pay
+        // (insufficient funds, over its fee cap) or a gas/fee estimate for the refill failed outright -- every
+        // other refill error (a nonce race, a dropped/stuck/aborted send, a missing receipt) is transient and
+        // re-evaluated on the next pass without alarming the agent over something the daemon may resolve on its own.
+        if (
+          err instanceof TxInsufficientFundsError ||
+          err instanceof TxFeeCapError ||
+          err instanceof SessionGasEstimateError
+        ) {
+          const first = l.sessionGasLow === null;
+          l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
+          this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
+          if (first) this.notify();
+        } else {
+          const name = err instanceof Error ? err.name : "Error";
+          this.log(`channel ${l.record.channelId}: refill failed, ${name}: ${errorText(err)} (re-evaluated on the next pass)`);
+        }
+        this.startOrBumpRefillBackoff(l);
       }
     }).catch(() => undefined);
+  }
+
+  /** Plan 5 Task 1: true if `ensureSessionGas` may attempt a refill for `l` right now. False while a prior
+   *  failure's back-off has not yet elapsed -- unless the wallet's own balance has risen since it was last
+   *  observed, which ends the back-off early (the wallet may have just been topped up). A failed balance read
+   *  never blocks the attempt (the back-off is about the refill itself, not about reading the wallet). Fix round
+   *  (minor): the wallet balance is only worth reading while a back-off is actually in effect -- there is nothing
+   *  to reset otherwise, so the common (not backed off) case costs no RPC call at all. */
+  private async refillBackoffGate(l: ChannelHandle): Promise<boolean> {
+    if (!(l.refillBlockedUntil > 0)) return true;
+    const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
+    if (balance !== null) {
+      if (l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance) this.endRefillBackoff(l);
+      l.refillLastWalletBalance = balance;
+    }
+    return !(l.refillBlockedUntil > 0 && Date.now() < l.refillBlockedUntil);
+  }
+
+  /** Plan 5 Task 1: starts (30 s) or doubles (up to 5 min) this channel's refill back-off; logs once, on the
+   *  episode's first failure. */
+  private startOrBumpRefillBackoff(l: ChannelHandle): void {
+    const starting = l.refillBackoffMs === 0;
+    l.refillBackoffMs = starting ? BACKOFF_START_MS : Math.min(l.refillBackoffMs * 2, BACKOFF_MAX_MS);
+    l.refillBlockedUntil = Date.now() + l.refillBackoffMs;
+    if (starting) {
+      this.log(`channel ${l.record.channelId}: refill back-off started (retrying in ${l.refillBackoffMs / 1000}s)`);
+    }
+  }
+
+  /** Plan 5 Task 1: ends this channel's refill back-off episode, if one is running (a successful refill, a
+   *  balance already at/above the floor, or the wallet's balance rising); logs once, when it actually ends. */
+  private endRefillBackoff(l: ChannelHandle): void {
+    if (l.refillBackoffMs === 0) return;
+    l.refillBackoffMs = 0;
+    l.refillBlockedUntil = 0;
+    this.log(`channel ${l.record.channelId}: refill back-off ended`);
   }
 
   private clearSessionGasLow(l: ChannelHandle): void {
@@ -917,6 +1251,697 @@ export class ArenaDaemon {
     l.sessionGasLow = null;
     l.sessionGasLowWoken = false;
     this.notify();
+  }
+
+  // ------------------------------------------------------------------ sweep (Plan 5 Task 1)
+
+  /** Cached once (round 4, m7): whether `this.wallet.address` holds contract code, so `performSweep` doesn't read
+   *  it again for every channel it sweeps. `undefined` = not yet read. */
+  private walletHasCode: boolean | undefined;
+
+  private async gasForSweep(sender: SerialTxSender): Promise<bigint> {
+    if (this.walletHasCode === undefined) {
+      const code = await this.sweepRead(() => this.client.getCode({ address: this.wallet.address }));
+      this.walletHasCode = code !== undefined && code !== "0x";
+    }
+    // A plain transfer to an EOA always costs exactly 21000 gas; a contract wallet may run more logic (a proxy, a
+    // multisig's fallback), so its cost is estimated instead of assumed. That estimate is the sweep's own dry run,
+    // so its failure (e.g. a wallet that rejects the transfer) is charged like a failed send, not a read (M4).
+    if (!this.walletHasCode) return 21_000n;
+    return this.client.estimateGas({ account: sender.address, to: this.wallet.address, value: 1n });
+  }
+
+  private async currentFeePerGas(): Promise<bigint> {
+    try {
+      const fees = (await this.client.estimateFeesPerGas()) as { maxFeePerGas?: bigint };
+      if (fees.maxFeePerGas !== undefined) return fees.maxFeePerGas;
+    } catch {
+      // fall through to the legacy estimate below
+    }
+    const legacy = (await this.client.estimateFeesPerGas({ type: "legacy" } as Parameters<PublicClient["estimateFeesPerGas"]>[0])) as {
+      gasPrice?: bigint;
+    };
+    return legacy.gasPrice ?? 0n;
+  }
+
+  /**
+   * Fix round rule 1: a channel's session gas is only ever swept once a *fresh* on-chain read confirms it is
+   * actually settled -- Finalized/Reclaimed, or an unfunded channel (`!funded[record.me]`) past its funding
+   * deadline (retired -- see `watch`'s None/Funding branch). `record.finalized` (a local flag, set the moment
+   * *this* daemon last observed it) is not enough on its own to authorize sending: it is what the reviewer's
+   * repro exploited to make the old `performSweep` operate against a session key another in-flight transaction
+   * (a stale respond) still owned.
+   */
+  /** Final fix wave (M4): runs one pre-send chain read of a sweep attempt, turning its failure into a
+   *  `SweepReadError`. */
+  private async sweepRead<T>(read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (err) {
+      throw new SweepReadError(err);
+    }
+  }
+
+  private async isSweepable(record: ChannelRecord): Promise<boolean> {
+    const info = await this.hub.channelInfo(record.channelId);
+    if (info.phase === "Finalized" || info.phase === "Reclaimed") return true;
+    if ((info.phase === "None" || info.phase === "Funding") && !info.funded[record.me]) {
+      const now = (await this.client.getBlock()).timestamp;
+      return now > record.params.fundingDeadline;
+    }
+    return false;
+  }
+
+  /**
+   * Fix round rules 2-4, I7: sends `sender`'s whole balance, minus reserved gas headroom, to this daemon's
+   * wallet. **Rule 2**: once the channel is confirmed settled (the caller has already checked `isSweepable`), any
+   * pending or released transaction on `sender`'s key is a dead intent -- respond/challenge/timeout would all now
+   * revert -- so this always sends through `sender.send(req)`, never `waitOrReplace` on a hash it did not just get
+   * back from `send`: the nonce manager's own "replace the lowest released entry" path (or "adopt a pool nonce")
+   * does the right thing on its own, and a genuine race with something that lands first at that nonce surfaces as
+   * `TxNonceUsedError`, not a false success (the reviewer's scenario B: waiting on a stale respond's hash reported
+   * that respond's own receipt as if it were the sweep). **Rule 3**: reserves `gas * ceil(feePerGas *
+   * SWEEP_HEADROOM_NUM/DEN)` (1.3x) by default -- so a single 12.5% same-nonce replacement bump still fits the
+   * balance bound; dust if that leaves `<= gas * feePerGas` *and* the key has no dead entry to answer for (see
+   * important 5 below). Throws if the fee estimate is 0 (nothing reliable to reserve a bump against). **Rule 4**:
+   * success requires the mined receipt's `status` to be `"success"` -- a reverted send (a contract-wallet
+   * recipient that rejects it) must never be recorded as swept -- and its hash is, structurally, always one this
+   * call's own `send`/its replacements produced (waitOrReplace only ever follows the entry seeded by *this*
+   * `hash`). **I7**: at most one immediate retry, with fresh reads, on `TxInsufficientFundsError`.
+   *
+   * **Fix round 2, important 5**: a dead (released) entry already on this key -- there should be at most one,
+   * since rule 1's gate above already refuses to run while any entry is still `"waiting"` -- needs its own last
+   * fee bumped by at least 12.5% to be replaceable at all (`SerialTxSender.replaceReleased`'s own
+   * `affordable(bumpFees(e.lastFees), room)` check). If that bump exceeds the normal 1.3x reserve, the sweep
+   * reserves for it instead, or its own replacement send below could never afford to outbid it -- the channel
+   * would just back off, retry, and fail the same way forever, eventually abandoning gas it could have swept.
+   * When the reserve is elevated for this reason and the balance still can't clear it, this throws (backs off
+   * and retries) rather than declining as dust: a low *value* here is about the dead entry, not a genuinely small
+   * balance -- the one case `"dust"` is for.
+   */
+  private async performSweep(
+    sender: SerialTxSender,
+    giveUpAt?: number,
+  ): Promise<{ status: "dust" } | { status: "swept"; amount: bigint; hash: Hex }> {
+    for (let attempt = 0; ; attempt++) {
+      if (this.stopped) throw new Error("stopped");
+      // Fix round 3, I-1(a): tracked() alone never notices a released entry has since mined -- refresh() re-runs
+      // the same prune() send() itself would, so a stale entry (probe E1/E2: released, then explicitly mined,
+      // with nothing of ours ever reading it in between) is gone from tracked() below, not mistaken for a still-
+      // live dead transaction that needs answering for.
+      await this.sweepRead(() => sender.refresh());
+      const balance = await this.sweepRead(() => this.client.getBalance({ address: sender.address }));
+      const gasLimit = await this.gasForSweep(sender);
+      const feePerGas = await this.sweepRead(() => this.currentFeePerGas());
+      if (feePerGas === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
+      const baseReserve = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+      // Fix round 3, I-1(b): dust is decided against the plain reserve first, regardless of any tracked entry --
+      // a balance this low has nothing worth sending whether or not there is a dead transaction to answer for
+      // (this is the regression Important 5 introduced: it threw/backed off forever here instead, even for a
+      // balance that was independently already dust). Only once the plain reserve leaves it genuinely sweepable
+      // does a stuck entry's own, possibly higher, reserve requirement get a say -- and only then, if *that*
+      // alone pushes the value back down to the dust line, does this throw (back off, retry) rather than send.
+      const plainValue = balance - gasLimit * baseReserve;
+      if (plainValue <= gasLimit * feePerGas) return { status: "dust" };
+      const stuck = sender
+        .tracked()
+        .filter((t) => t.state === "released")
+        .sort((a, b) => a.nonce - b.nonce)[0];
+      // An unknown-fee entry (e.g. adopted from a pending nonce after a restart) is replaced with `2 x` the
+      // market estimate (`SerialTxSender.replaceReleased`'s own `doubled(estimate)` path, which skips the
+      // `affordable` check but still prices the send there); a known one needs at least its own fee bumped.
+      const stuckReserve = !stuck ? 0n : hasKnownFee(stuck.lastFees) ? bumpFeePerGas(feePerGasOf(stuck.lastFees)) : 2n * feePerGas;
+      const reservePerGas = stuck && stuckReserve > baseReserve ? stuckReserve : baseReserve;
+      const value = balance - gasLimit * reservePerGas;
+      if (stuck && stuckReserve > baseReserve && value <= gasLimit * feePerGas) {
+        throw new Error(
+          `a dead transaction on this key (nonce ${stuck.nonce}, last fee ${feePerGasOf(stuck.lastFees)}) needs more reserve than this balance affords to replace`,
+        );
+      }
+      const req = { to: this.wallet.address, data: "0x" as Hex, value, gas: gasLimit };
+      let hash: Hex;
+      try {
+        hash = await sender.send(req);
+      } catch (err) {
+        if (err instanceof TxInsufficientFundsError && attempt === 0) continue; // I7: one immediate retry
+        throw err;
+      }
+      const receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal, giveUpAt });
+      if (receipt.status !== "success") throw new Error(`sweep transaction ${receipt.transactionHash} reverted`);
+      return { status: "swept", amount: value, hash: receipt.transactionHash };
+    }
+  }
+
+  /**
+   * Runs one sweep attempt for `record` through `isSweepable` (rule 1) and `performSweep` (rules 2-4, I7),
+   * updating `record`/`backoff` and persisting via `save` on every outcome but a skip. `force` (fix round I5, a
+   * manual `arena sweep`/`POST /sweep`) bypasses the back-off's own timing, never the concurrency checks. Never
+   * throws.
+   */
+  private async runSweepAttempt(
+    input: ChannelRecord,
+    sender: SerialTxSender,
+    backoff: SweepBackoff,
+    save: (r: ChannelRecord) => void,
+    opts: {
+      force?: boolean;
+      // Minor 3: bounds this one record's own receipt wait (via `performSweep`), so it can never eat more than
+      // its share of `sweep()`'s overall budget.
+      giveUpAt?: number;
+      // Minor 4: a re-check of an already-`isSweptDone` channel that `sweep()`'s `--channel` branch found a
+      // non-dust balance sitting on -- lets this one call through the "already done" skip guard just below.
+      recheck?: boolean;
+    } = {},
+  ): Promise<SweepAttemptResult> {
+    let record = input;
+    // Final fix wave (M5): `sweepPending` on disk mirrors `backoff.pendingTx`, so a restarted daemon resumes
+    // checking the same hashes instead of reading a landed sweep's leftover balance as "dust".
+    const persistPending = () => {
+      const want = backoff.pendingTx !== undefined && backoff.pendingTx.length > 0 ? [...backoff.pendingTx] : undefined;
+      if ((record.sweepPending ?? []).join() === (want ?? []).join()) return;
+      record = { ...record, sweepPending: want };
+      save(record);
+    };
+    // Fix round 2, important 1: a manual sweep (force) on an "abandoned" channel gets a fresh episode -- I8's own
+    // write-off must never be permanent for `arena sweep`/`POST /sweep`, or every bulk sweep just reports every
+    // abandoned channel as "not sweepable yet" forever. Computed before the try below (the catch block, at the
+    // bottom, also reads `rechecking`) but does not itself do anything that can throw.
+    const retryingAbandoned = opts.force === true && record.swept === "abandoned";
+    if (retryingAbandoned) backoff.attempts = 0;
+    const rechecking = opts.recheck === true && isSweptDone(record.swept);
+    try {
+      // Fix round 2, minor 2 (fix round 3, C-1: moved inside this try -- it used to sit before it, so any throw
+      // out of `recoverPendingSweepTx` -- e.g. a `getTransaction` RPC blip -- escaped this method entirely; with
+      // no catch anywhere above a timer-driven `void this.mainPass()`, that crashed the whole daemon process).
+      // Checked first, before anything else below -- including the back-off gate just past this block -- since
+      // the transaction may already have landed and there is nothing to gain by waiting the back-off out before
+      // finding that out.
+      // Final fix wave (M5): also when `arena sweep` retries an abandoned channel -- its last send may have landed.
+      if (backoff.pendingTx !== undefined && (record.swept === undefined || retryingAbandoned)) {
+        // Final fix wave (M3): the first probe is immediate, but once one has found the transaction still
+        // pending, the next waits out the back-off like any other attempt instead of re-probing every pass.
+        const probed = backoff.pendingProbes ?? 0;
+        if (probed > 0 && !opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) {
+          return { kind: "skipped", record };
+        }
+        const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
+        // An RPC failure (or a mined transaction whose receipt could not be read) is retried on the next pass,
+        // not counted as a pending probe.
+        if (recovered === "unknown") return { kind: "skipped", record };
+        if (recovered === "pending") {
+          backoff.pendingProbes = probed + 1;
+          // Not a failure (no attempt charged), but backed off. After SWEEP_PENDING_PROBES probes, fall through
+          // to a normal attempt: its send replaces the released entry at the same nonce with raised fees (at
+          // most one of them can land), and `pendingTx` is kept so a later probe still recognizes the old one.
+          if (backoff.pendingProbes < SWEEP_PENDING_PROBES) {
+            this.bumpSweepBackoff(record.channelId, backoff);
+            return { kind: "skipped", record };
+          }
+        } else {
+          backoff.pendingTx = undefined;
+          backoff.pendingProbes = 0;
+          if (recovered !== "failed") {
+            const updated = appendSweep(record, recovered.amount, recovered.hash);
+            save(updated);
+            this.endSweepBackoff(record.channelId, backoff);
+            return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
+          }
+          // Fix round 3, I-2: confirmed gone (reverted, or the node no longer knows it at all) -- nothing to
+          // recover. Charged as a failed attempt (this recovery slot found nothing, same as any other failure
+          // would) and falls through to a fresh attempt below, within this same try -- never an early abandon
+          // from this alone; the normal attempt just below decides that for itself if it also fails.
+          persistPending();
+          backoff.attempts++;
+        }
+      }
+      if (this.stopped || (record.swept !== undefined && !retryingAbandoned && !rechecking)) return { kind: "skipped", record };
+      if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
+      // Rule 1: never beside a transaction actively being waited on elsewhere on this same session key.
+      if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
+      if (!(await this.sweepRead(() => this.isSweepable(record)))) return { kind: "skipped", record };
+      const outcome = await this.performSweep(sender, opts.giveUpAt);
+      if (outcome.status === "dust") {
+        // Minor 4: a recheck of an already-done channel finding only dust residue (typically the previous
+        // sweep's own untouched fee reserve, never truly zero) is not new information -- the record already
+        // correctly reflects its prior state (`true`, with its real amount/tx, or already "dust"), and must
+        // never be downgraded from a genuine `true` to "dust" just because what is left over now is small.
+        if (rechecking) return { kind: "dust", record };
+        // Final fix wave (M3): an attempt that went ahead past a still-pending transaction reads a near-zero
+        // balance if that transaction landed in the meantime -- recognize it as the sweep instead of "dust".
+        if (backoff.pendingTx !== undefined && backoff.pendingTx.length > 0) {
+          const late = await this.recoverPendingSweepTx(backoff.pendingTx);
+          if (typeof late === "object") {
+            const swept = appendSweep(record, late.amount, late.hash);
+            save(swept);
+            this.endSweepBackoff(record.channelId, backoff);
+            return { kind: "swept", record: swept, amount: late.amount, hash: late.hash };
+          }
+        }
+        const updated: ChannelRecord = { ...record, swept: "dust", sweepPending: undefined };
+        save(updated);
+        this.endSweepBackoff(record.channelId, backoff);
+        return { kind: "dust", record: updated };
+      }
+      const updated = appendSweep(record, outcome.amount, outcome.hash);
+      save(updated);
+      this.endSweepBackoff(record.channelId, backoff);
+      return { kind: "swept", record: updated, amount: outcome.amount, hash: outcome.hash };
+    } catch (err) {
+      // Final fix wave (M3): merged with any hashes still remembered from before (an attempt that went ahead after
+      // SWEEP_PENDING_PROBES replaces the old transaction at its nonce; either one may be the one that lands).
+      const remember = (hashes: Hex[]) => {
+        backoff.pendingTx = [...new Set([...(backoff.pendingTx ?? []), ...hashes])];
+      };
+      if (err instanceof TxReceiptMissingError) {
+        // Minor 2: remember this hash so the very next attempt (see the top of this method) checks it before
+        // trying anything else -- the transaction is most likely already mined; only the receipt went missing.
+        remember([err.hash]);
+      } else if (err instanceof TxStuckError || err instanceof TxWaitAbortedError) {
+        // Fix round 3, I-1(c): probe E3 -- a sweep this wait gave up on (a tight giveUpAt, or stop()) can still
+        // land later: any one of the original send or its fee-bumped replacements might mine after this daemon
+        // stopped watching for it. Remembering all of them (not just the last) is what lets the next attempt
+        // recognise whichever one actually wins, instead of reading a fresh, near-zero balance and recording a
+        // spurious "dust" over what really was a successful, if late, sweep.
+        remember(err.hashes);
+      }
+      // Final fix wave (M5): persisted before the stopped check -- a wait stop() aborted is exactly the case whose
+      // transaction can land after this daemon is gone.
+      persistPending();
+      if (this.stopped) return { kind: "skipped", record };
+      if (err instanceof TxNonceUsedError) {
+        // Rule 4: a foreign transaction landed at that nonce first -- not a failure of ours, just stale info; the
+        // next pass re-reads the chain and, if still unswept, tries again fresh. No back-off, no attempt charged.
+        this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
+        return { kind: "skipped", record };
+      }
+      if (err instanceof SweepReadError) {
+        // Final fix wave (M4): an RPC blip before anything was sent -- backed off, never charged, so an RPC outage
+        // does not abandon every channel that settles during it.
+        this.log(`channel ${record.channelId}: sweep: ${errorText(err)} (retried with back-off, not counted toward abandoning)`);
+        this.bumpSweepBackoff(record.channelId, backoff);
+        return { kind: "error", record, error: err };
+      }
+      this.log(`channel ${record.channelId}: sweep failed (retried with back-off): ${errorText(err)}`);
+      backoff.attempts++;
+      if (backoff.attempts >= SWEEP_ABANDON_ATTEMPTS) {
+        // Minor 4: a recheck's own repeated failures (e.g. a stuck entry that turned up only after the channel
+        // was already fully swept) must never downgrade an already-done record to "abandoned" -- same principle
+        // as the dust case above.
+        if (rechecking) return { kind: "error", record, error: err };
+        const updated: ChannelRecord = { ...record, swept: "abandoned" };
+        save(updated);
+        this.log(`channel ${record.channelId}: sweep abandoned after ${backoff.attempts} failed attempts: its session gas is written off`);
+        return { kind: "abandoned", record: updated };
+      }
+      this.bumpSweepBackoff(record.channelId, backoff);
+      return { kind: "error", record, error: err };
+    }
+  }
+
+  /** Starts (30 s) or doubles (up to 5 min) a sweep back-off; logs once, on the episode's first bump. */
+  private bumpSweepBackoff(channelId: Hex, backoff: SweepBackoff): void {
+    const starting = backoff.backoffMs === 0;
+    backoff.backoffMs = starting ? BACKOFF_START_MS : Math.min(backoff.backoffMs * 2, BACKOFF_MAX_MS);
+    backoff.blockedUntil = Date.now() + backoff.backoffMs;
+    if (starting) this.log(`channel ${channelId}: sweep back-off started (retrying in ${backoff.backoffMs / 1000}s)`);
+  }
+
+  private endSweepBackoff(channelId: Hex, backoff: SweepBackoff): void {
+    const wasBackedOff = backoff.backoffMs !== 0;
+    backoff.backoffMs = 0;
+    backoff.blockedUntil = 0;
+    backoff.attempts = 0;
+    backoff.pendingTx = undefined;
+    backoff.pendingProbes = 0;
+    if (wasBackedOff) this.log(`channel ${channelId}: sweep back-off ended`);
+  }
+
+  /** Fix round 2, minor 2: looks up a transaction this daemon lost track of (its receipt went missing after
+   *  `waitOrReplace` treated it as mined). Returns `"pending"` if the receipt still cannot be read but the node
+   *  still knows the transaction at all (try again next attempt), `"failed"` if a receipt was read but it did not
+   *  succeed, *or* if no receipt exists and the node no longer knows the transaction either (fix round 3, I-2:
+   *  genuinely gone -- charge the attempt and fall through to a fresh one, rather than skip forever), or the
+   *  amount and hash to record as swept if it did succeed.
+   *
+   *  Fix round 3, C-1: the whole body is inside its own try/catch (in addition to `runSweepAttempt`'s own, which
+   *  now also wraps this call -- see its own note) -- probe F1 found `getTransaction` throwing on a plain RPC
+   *  blip (after a successful receipt read) escaping uncaught, all the way out of `runSweepAttempt`, which a
+   *  timer-driven `void this.mainPass()` has no catch above; Node exits the whole process on that unhandled
+   *  rejection. Any failure not otherwise classified below is treated as "unknown" -- try again next attempt --
+   *  never charged as a failed attempt for what may just be a slow node.
+   *
+   *  Final fix wave (M3): `"pending"` now means the node reports the transaction unmined (in its mempool); a
+   *  read failure, or a transaction the node reports mined but whose receipt could not be read, is `"unknown"`,
+   *  so only a genuinely pending transaction counts toward `SWEEP_PENDING_PROBES`. */
+  /** Fix round 3, I-1(c): `hashes` is the original send plus every fee-bumped replacement `waitOrReplace` sent
+   *  for the one intent this backoff gave up on -- at most one of them can ever mine (they share a nonce), but
+   *  it is never necessarily the last one this daemon happened to be watching when it gave up, so every one of
+   *  them is checked. */
+  private async recoverPendingSweepTx(hashes: Hex[]): Promise<"pending" | "unknown" | "failed" | { amount: bigint; hash: Hex }> {
+    try {
+      let anyPending = false;
+      let anyMined = false;
+      for (const hash of hashes) {
+        let receipt: { status: "success" | "reverted" } | null;
+        try {
+          receipt = await this.client.getTransactionReceipt({ hash });
+        } catch {
+          receipt = null;
+        }
+        if (receipt) {
+          if (receipt.status === "success") {
+            const tx = await this.client.getTransaction({ hash });
+            return { amount: tx.value, hash };
+          }
+          continue; // this one reverted (or never existed) -- another hash in the list may still have landed
+        }
+        // Fix round 3, I-2: probe F2 -- a receipt that will never exist (the transaction was replaced, or the
+        // node's mempool simply forgot it) previously meant "pending" forever: every attempt from here on
+        // skipped, the channel's session gas never swept, with no way out short of a restart. `getTransaction`
+        // tells still-in-flight (worth trying again) apart from truly gone (nothing left to wait for).
+        const known = await this.client.getTransaction({ hash }).catch((err: unknown) => {
+          if (err instanceof TransactionNotFoundError) return null;
+          throw err;
+        });
+        if (known) {
+          if (known.blockNumber === null) anyPending = true;
+          else anyMined = true; // mined, but its receipt could not be read just now
+        }
+      }
+      if (anyMined) return "unknown";
+      return anyPending ? "pending" : "failed";
+    } catch (err) {
+      this.log(`sweep recovery: ${errorText(err)} looking up ${hashes.length} pending hash(es) (retried next attempt)`);
+      return "unknown";
+    }
+  }
+
+  /** Fix round 2 (important 3 + minors 1/6): merges only `swept`/`sweptAmount`/`sweptTx`/`sweeps` (fix round 3,
+   *  M-4) from `updated` onto a fresh copy of `current`, so a concurrent change to anything else on the record (a
+   *  `handoff()`, most notably) while the sweep's own async work was in flight is never clobbered by the sweep's
+   *  -- possibly stale -- copy of the rest of it. */
+  private applySweptFields(current: ChannelRecord, updated: ChannelRecord): ChannelRecord {
+    return {
+      ...current,
+      swept: updated.swept,
+      sweptAmount: updated.sweptAmount,
+      sweptTx: updated.sweptTx,
+      sweeps: updated.sweeps,
+      sweepPending: updated.sweepPending, // final fix wave (M5)
+    };
+  }
+
+  /** Fix round 2, minor 1: refreshes the settled-index cache entry for `id` (if any) with `record`'s current
+   *  swept fields -- called at every site that dequeues a swept record from `this.sweepQueue`, so `status()`/
+   *  `channels()` never keep serving the pre-sweep status `start()` cached for it. */
+  private refreshSettledCache(id: Hex, record: ChannelRecord): void {
+    const cached = this.settled.get(id);
+    if (!cached) return;
+    cached.status = {
+      ...cached.status,
+      swept: record.swept ?? null,
+      sweptAmount: record.sweptAmount?.toString() ?? null,
+      sweptTx: record.sweptTx ?? null,
+      sweeps: (record.sweeps ?? []).map((s) => ({ amount: s.amount.toString(), tx: s.tx, at: s.at })),
+    };
+  }
+
+  /** The main pass's own sweep of one live, finalized, not-yet-swept channel -- never sets `lastError` (the
+   *  channel is already settled; nothing would ever clear it again -- see `markFinalized`'s own note on the same
+   *  point). Rule 1: skipped (no attempt, no back-off charged) while a refill or the dispute pass is still
+   *  working this channel's session key. */
+  protected async sweepChannel(l: ChannelHandle): Promise<void> {
+    if (this.stopped || l.record.swept !== undefined) return;
+    if (l.refilling || l.disputeBusy) return;
+    // Nit: `l.record` is updated inside the save callback itself, not only after runSweepAttempt returns (as
+    // sweepQueuePass's own entry.record already did) -- so a concurrent reader sees the disk and the in-memory
+    // handle update together, not disk first and l.record only once this whole call unwinds.
+    // Final fix wave (I2): the receipt wait is bounded like a manual sweep's, so a stuck sweep holds the main
+    // pass for at most SWEEP_PER_RECORD_TIMEOUT_MS, not waitOrReplace's own ~2 minutes.
+    const result = await this.runSweepAttempt(
+      l.record,
+      l.sessionSender,
+      l.sweep,
+      (r) => {
+        l.record = this.applySweptFields(l.record, r);
+        this.records.saveChannel(l.record);
+      },
+      { giveUpAt: Date.now() + SWEEP_PER_RECORD_TIMEOUT_MS },
+    );
+    l.record = this.applySweptFields(l.record, result.record);
+  }
+
+  /** Plan 5 fix round (I2): the sweep queue -- finalized-but-unswept records found at start() (a restart, or a
+   *  record written before this feature existed), never opened into `live`. Removed once swept. A separate,
+   *  protected method (like `sweepChannel`) so a test can stub it out, e.g. to keep a manual `sweep()` call from
+   *  racing the periodic main pass's own processing of the very record it is about to sweep. */
+  protected async sweepQueuePass(): Promise<void> {
+    // Final fix wave (I2): at most SWEEP_QUEUE_PER_PASS records per pass, each bounded to
+    // SWEEP_PER_RECORD_TIMEOUT_MS. An attempted record moves to the back of the queue (Map order is insertion
+    // order), so the next pass starts with the records this one did not reach.
+    let attempted = 0;
+    for (const [qid, entry] of [...this.sweepQueue]) {
+      if (this.stopped || attempted >= SWEEP_QUEUE_PER_PASS) break;
+      // Skipped if a manual sweep is on it, or already took it off the queue since the snapshot above.
+      if (entry.busy || this.sweepQueue.get(qid) !== entry) continue;
+      attempted++;
+      this.sweepQueue.delete(qid);
+      this.sweepQueue.set(qid, entry);
+      entry.busy = true;
+      try {
+        const result = await this.runSweepAttempt(
+          entry.record,
+          entry.sender,
+          entry.sweep,
+          (r) => {
+            entry.record = this.applySweptFields(entry.record, r);
+            this.records.saveChannel(entry.record);
+          },
+          { giveUpAt: Date.now() + SWEEP_PER_RECORD_TIMEOUT_MS },
+        );
+        entry.record = this.applySweptFields(entry.record, result.record);
+        if (entry.record.swept !== undefined) {
+          this.sweepQueue.delete(qid);
+          // The settled index cached a status for this record at start() (before it was swept); refresh it in
+          // place so `status`/`channels()` show the outcome without waiting for a restart.
+          this.refreshSettledCache(qid, entry.record);
+        }
+      } finally {
+        entry.busy = false;
+      }
+    }
+  }
+
+  /**
+   * `arena sweep` / `POST /sweep`: sweeps every settled channel whose record has `swept` unset or `"abandoned"`
+   * (`true`/`"dust"` are done already) -- live ones (their existing session sender/back-off), queued ones (the
+   * sweep queue's own sender/back-off), and legacy ones tracked in neither (a fresh, one-shot sender built from
+   * the record's `sessionKey`). `ref`, if given, narrows to a single channel id starting with it, exactly as
+   * `pick` does: none matching is 404, more than one is 400 (ambiguous); a channel already swept reports
+   * `"already"` rather than an error. **I5**: single-flight -- a concurrent call is refused with 409 -- and
+   * spends at most `SWEEP_TIME_BUDGET_MS` attempting records (with no `--channel`), reporting `remaining` for
+   * whatever is left rather than hanging the caller. Never throws for one channel's own failure.
+   */
+  async sweep(
+    ref?: string,
+    // `budgetMs` is test-only (never set by the CLI/API): lets a test exercise the `remaining` mechanism without
+    // waiting out the real SWEEP_TIME_BUDGET_MS.
+    opts: { budgetMs?: number } = {},
+  ): Promise<{ results: Array<{ channelId: Hex; swept: string; hash?: Hex }>; remaining: number }> {
+    if (this.sweeping) throw new DaemonError(409, "a sweep is already in progress: retry shortly");
+    this.sweeping = true;
+    try {
+      // Minor 3: this budget bounds every record's own wait too (via `giveUpAt`, threaded through
+      // `sweepOneNow`/`runSweepAttempt`/`performSweep` down to `waitOrReplace`), not only how many records the
+      // `--channel`-less bulk loop below gets through. Fix round 3, M-2: `giveUpAt` for any one record is
+      // `min(deadline, its own start + SWEEP_PER_RECORD_TIMEOUT_MS)`, computed fresh per record below -- not
+      // `deadline` itself, which one record stuck replacing a dead entry could otherwise still claim in full
+      // (correcting an earlier version of this comment, which overclaimed exactly that: with a single shared
+      // `giveUpAt`, one such record *could* eat the whole remaining budget, starving every record after it in
+      // the same bulk sweep -- this bounds each one's own share instead).
+      const deadline = Date.now() + (opts.budgetMs ?? SWEEP_TIME_BUDGET_MS);
+      const perRecordDeadline = () => Math.min(deadline, Date.now() + SWEEP_PER_RECORD_TIMEOUT_MS);
+      const want = ref?.toLowerCase();
+      const allFinalized = this.records.channels().filter((r) => r.finalized);
+      if (want) {
+        const matches = allFinalized.filter((r) => r.channelId.toLowerCase().startsWith(want));
+        if (matches.length === 0) throw new DaemonError(404, `no settled channel matches ${ref}`);
+        if (matches.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+        const record = matches[0];
+        if (isSweptDone(record.swept)) {
+          // Minor 4: the wallet-side session key can receive money again after a sweep already reported "true"
+          // or "dust" -- a refill that was in flight and landed late, a manual top-up, a slightly-off dust read.
+          // `--channel` re-checks the key's current balance before answering "already"; anything above dust
+          // falls through to a real attempt, which does the precise dust math itself (and may still, correctly,
+          // decline it and record "dust" again).
+          const balance = await this.client.getBalance({ address: this.senderFor(record.channelId, record).address });
+          if (balance === 0n) return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
+          return { results: [await this.sweepOneNow(record, perRecordDeadline(), true)], remaining: 0 };
+        }
+        return { results: [await this.sweepOneNow(record, perRecordDeadline())], remaining: 0 };
+      }
+      const targets = allFinalized.filter((r) => r.swept !== true && r.swept !== "dust");
+      const results: Array<{ channelId: Hex; swept: string; hash?: Hex }> = [];
+      let processed = 0;
+      for (const record of targets) {
+        if (Date.now() >= deadline) break;
+        processed++;
+        results.push(await this.sweepOneNow(record, perRecordDeadline()));
+      }
+      return { results, remaining: targets.length - processed };
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  /**
+   * One record's sweep, right now (`force`, bypassing the back-off's own timing) -- guarded by the same
+   * busy-wait pattern `reclaim()` uses against the main pass (**I1**): a live channel's `mainBusy` (and, fix
+   * round 2 important 2, `refilling`/`disputeBusy` -- the same rule-1 guards `sweepChannel` applies, which this
+   * method must honour too since it calls `runSweepAttempt` directly), or a queued record's own `busy` flag, so
+   * a manual sweep and the periodic pass never send on the same key at once.
+   *
+   * Fix round 2, important 3: `record` (the caller's snapshot -- `sweep()`'s bulk loop reads every record once
+   * at the top) can go stale if the main pass's own queue/watch sweeps this same record before reaching it here,
+   * including *during* the busy-wait below. For a live or queued record, `l.record`/`queued.record` -- the
+   * shared, mutable copy the main pass itself updates in place -- is checked instead of `record`, both before
+   * and after the wait; an orphan record (tracked in neither) is re-read from disk, since nothing else could be
+   * racing it (another `sweep()` call cannot: this method is only ever reached while `sweep()` holds its own
+   * single-flight lock).
+   */
+  /** Fix round 2, minor 4: the sender already associated with a channel id, if it is live or queued, otherwise a
+   *  fresh one-shot sender built from the record's own session key -- never registered anywhere; used only to
+   *  read a balance before deciding whether a re-check attempt is worth running at all. */
+  private senderFor(id: Hex, record: ChannelRecord): SerialTxSender {
+    return (
+      this.live.get(id)?.sessionSender ??
+      this.sweepQueue.get(id)?.sender ??
+      new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, { feeCeiling: NO_FEE_CEILING })
+    );
+  }
+
+  private async sweepOneNow(
+    record: ChannelRecord,
+    giveUpAt?: number,
+    // Minor 4: `sweep()`'s `--channel` branch sets this once it has found a non-dust balance still sitting on an
+    // already-`isSweptDone` channel's key -- bypasses every "already" short-circuit below (and, correspondingly,
+    // `runSweepAttempt`'s own skip guard) for exactly this one call, so a real attempt actually runs; if there
+    // turns out to be nothing worth sending after all, `performSweep`'s own precise dust math still declines it.
+    recheck = false,
+  ): Promise<{ channelId: Hex; swept: string; hash?: Hex }> {
+    const id = record.channelId;
+    const l = this.live.get(id);
+    if (l) {
+      if (isSweptDone(l.record.swept) && !recheck) return { channelId: id, swept: "already" };
+      const wasAbandoned = l.record.swept === "abandoned";
+      const busy = () => l.mainBusy || l.refilling || l.disputeBusy;
+      const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
+      while (busy() && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
+      if (busy()) return { channelId: id, swept: "error: the watchtower is working on this channel: retry shortly" };
+      if (isSweptDone(l.record.swept) && !recheck) return { channelId: id, swept: "already" }; // settled while we waited
+      l.mainBusy = true;
+      try {
+        // Nit: `l.record` is updated inside the save callback itself (matching sweepChannel and the queued
+        // branch below), not only after runSweepAttempt returns.
+        const result = await this.runSweepAttempt(
+          l.record,
+          l.sessionSender,
+          l.sweep,
+          (r) => {
+            l.record = this.applySweptFields(l.record, r);
+            this.records.saveChannel(l.record);
+          },
+          { force: true, giveUpAt, recheck },
+        );
+        l.record = this.applySweptFields(l.record, result.record);
+        return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
+      } finally {
+        l.mainBusy = false;
+      }
+    }
+    const queued = this.sweepQueue.get(id);
+    if (queued) {
+      if (isSweptDone(queued.record.swept) && !recheck) return { channelId: id, swept: "already" };
+      const wasAbandoned = queued.record.swept === "abandoned";
+      const until = Date.now() + RECLAIM_BUSY_WAIT_MS;
+      while (queued.busy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
+      if (queued.busy) return { channelId: id, swept: "error: a sweep pass is already working on this channel: retry shortly" };
+      if (isSweptDone(queued.record.swept) && !recheck) return { channelId: id, swept: "already" }; // settled while we waited
+      queued.busy = true;
+      try {
+        const result = await this.runSweepAttempt(
+          queued.record,
+          queued.sender,
+          queued.sweep,
+          (r) => {
+            queued.record = this.applySweptFields(queued.record, r);
+            this.records.saveChannel(queued.record);
+          },
+          { force: true, giveUpAt, recheck },
+        );
+        queued.record = this.applySweptFields(queued.record, result.record);
+        if (queued.record.swept !== undefined) {
+          this.sweepQueue.delete(id);
+          this.refreshSettledCache(id, queued.record);
+        }
+        return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
+      } finally {
+        queued.busy = false;
+      }
+    }
+    // Not tracked anywhere in memory (a record from another process, or predating this daemon's own start()): a
+    // fresh disk read, and a fresh, one-shot sender and back-off.
+    const fresh = this.records.channel(id) ?? record;
+    if (isSweptDone(fresh.swept) && !recheck) return { channelId: id, swept: "already" };
+    const wasAbandoned = fresh.swept === "abandoned";
+    const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
+      feeCeiling: NO_FEE_CEILING,
+    });
+    const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: fresh.sweepPending };
+    const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt, recheck });
+    // Fix round 3, M-1: this record may already be in the settled-index cache (evicted from `live` some time
+    // ago, or loaded straight into it at start() -- either way, never through `live`/`sweepQueue`, so neither of
+    // those two paths' own `refreshSettledCache` calls above ever reach it). Without this, `status()`/`channels()`
+    // for an evicted channel kept serving the pre-sweep (or pre-retry) cached status forever, even once the sweep
+    // above genuinely landed -- e.g. an "abandoned" channel `arena sweep` retries successfully (important 1) still
+    // read back as "abandoned" from the cache.
+    if (result.record.swept !== undefined) this.refreshSettledCache(id, result.record);
+    return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
+  }
+
+  private sweepResultWithHash(
+    id: Hex,
+    result: SweepAttemptResult,
+    wasAbandoned = false,
+    recheck = false,
+  ): { channelId: Hex; swept: string; hash?: Hex } {
+    const base = this.sweepResultToString(id, result, wasAbandoned, recheck);
+    return result.kind === "swept" ? { ...base, hash: result.hash } : base;
+  }
+
+  private sweepResultToString(id: Hex, result: SweepAttemptResult, wasAbandoned = false, recheck = false): { channelId: Hex; swept: string } {
+    // Minor 4: a recheck finding only dust (the common case -- the prior sweep's own untouched reserve, not a
+    // real top-up) reports the same "already" a caller would have seen without minor 4 at all: nothing new
+    // happened, and `runSweepAttempt` deliberately left the record untouched (see the `rechecking` branch there).
+    if (recheck && result.kind === "dust") return { channelId: id, swept: "already" };
+    // Fix round 2, important 1: a manual retry of a previously-"abandoned" channel gets its own distinct result
+    // string, so `arena sweep`'s output tells that case apart from an ordinary first-time sweep.
+    const prefix = wasAbandoned ? "retried: " : "";
+    switch (result.kind) {
+      case "swept":
+        return { channelId: id, swept: `${prefix}0x${result.amount.toString(16)}` };
+      case "dust":
+        return { channelId: id, swept: `${prefix}dust` };
+      case "abandoned":
+        return { channelId: id, swept: "abandoned" };
+      case "error":
+        return { channelId: id, swept: `${prefix}error: ${errorText(result.error)}` };
+      case "skipped":
+        return {
+          channelId: id,
+          swept: "error: not sweepable yet (on-chain state doesn't show it settled, or another send is in flight): retry shortly",
+        };
+    }
   }
 
   // ------------------------------------------------------------------ relay
@@ -1153,10 +2178,38 @@ export class ArenaDaemon {
   }
 
   async handoff(ref: string | undefined, to: Controller, note: string): Promise<void> {
-    const l = this.pick(ref);
-    l.record = { ...l.record, controller: to, note };
+    // Plan 5 Task 2 fix round, minor 4: checked before touching the channel or the record, like every other
+    // input validation in this class.
+    checkHandoffNote(note);
+    this.setController(this.pick(ref), to, note);
+  }
+
+  /** Sets a channel's controller and note, persists them, and tells every waiter. Plan 5 Task 2: handoffAt drives
+   *  ChannelStatus.handoff.since -- set every time, even human -> human or agent -> agent, so the board can show
+   *  "handed off just now" regardless of whether the controller actually changed. */
+  private setController(l: ChannelHandle, to: Controller, note: string): void {
+    l.record = { ...l.record, controller: to, note, handoffAt: Date.now() };
     this.records.saveChannel(l.record);
+    // Final fix wave (I1): a human taking the seat (again) under a challenge earns the agent a fresh wake.
+    if (to === "human") l.humanMustMoveWoken = null;
     this.notify();
+  }
+
+  /**
+   * Final fix wave (I1): hands a human-held seat back to the agent when a challenge needs this seat's move and at
+   * most `autoReturnSecondsOf(challengeTimeout)` of chain time is left before its deadline (and
+   * `autoReturnOnChallenge` is on) -- so a forfeit never depends on a human who closed the board or walked away
+   * (spec §3.1). Leaves `AUTO_RETURN_NOTE`; the agent's `wait` then sees `control-changed` or `your-turn`. Called by
+   * the dispute pass, on move in the registered state, after autoPlay (which may already have resigned or claimed).
+   */
+  private autoReturnIfDeadlineNear(l: ChannelHandle, deadline: bigint, now: bigint): void {
+    if (l.record.controller !== "human" || l.record.finalized || !autoReturnOnChallengeOf(this.opts.config)) return;
+    const latest = l.session.latest.state;
+    if (isGameOver(latest) || mover(latest) !== l.record.me) return; // resigned, claimed, or the human just moved
+    const left = deadline > now ? deadline - now : 0n;
+    if (left > BigInt(autoReturnSecondsOf(l.record.params.challengeTimeout))) return;
+    this.setController(l, "agent", AUTO_RETURN_NOTE);
+    this.log(`channel ${l.record.channelId}: a challenge needs this seat's move with ${left}s left: handed the seat back to the agent`);
   }
 
   // ------------------------------------------------------------------ watchtower (Task 6)
@@ -1220,8 +2273,25 @@ export class ArenaDaemon {
       for (const m of [...this.retryMatches.values()]) {
         if (this.stopped) break;
         this.retryMatches.delete(m.offerId);
-        await this.onMatch(m);
+        // Fix round 3, C-1, defense in depth: onMatch already catches its own errors internally, but this is
+        // awaited directly inside mainPass()'s own try (no catch of its own) -- one more layer, in case that
+        // ever changes, so a single bad retried match can never take the whole pass down with it.
+        await this.onMatch(m).catch((err: unknown) => this.log(`retryMatches: onMatch failed for offer ${m.offerId}: ${errorText(err)}`));
       }
+      // Plan 5 Task 1 (mainnet gates: session-gas sweep): every settled channel not yet swept, before eviction --
+      // eviction waits on `swept` being set (see evictSettled), so this must run first in the same pass a channel
+      // is first seen settled for the sweep to have a chance to complete inside the grace period.
+      for (const l of this.live.values()) {
+        if (this.stopped) break;
+        if (!l.record.finalized || l.record.swept !== undefined || l.mainBusy) continue;
+        l.mainBusy = true;
+        try {
+          await this.sweepChannel(l);
+        } finally {
+          l.mainBusy = false;
+        }
+      }
+      await this.sweepQueuePass();
       if (!this.stopped) await this.evictSettled();
     } finally {
       this.mainTicking = false;
@@ -1251,29 +2321,44 @@ export class ArenaDaemon {
         continue;
       }
       if (now - l.settledAt < SETTLED_GRACE_SECONDS) continue;
+      // Plan 5 Task 1: eviction waits until the sweep is done (`swept: true`) or declined as dust (`"dust"`) --
+      // a channel still unswept (e.g. its sweep is back-off-blocked) is left for a later pass instead of losing
+      // its session key (and the gas still on it) with no chance to sweep it again.
+      if (l.record.swept === undefined) continue;
       if (l.disputeBusy || l.mainBusy || l.autoPlaying || l.submittingClose || l.refilling) continue;
       const id = l.record.channelId;
       // An unconsumed `settled` wake is dropped with the handle: an agent that has not waited in ten minutes of chain
       // time reads the final phase from status.
-      this.settled.set(id, { ...this.statusOf(l), attention: null });
+      this.insertSettled(id, { ...this.statusOf(l), attention: null }, l.record.settledAt ?? 0);
       this.live.delete(id);
-      while (this.settled.size > SETTLED_CACHE_MAX) this.settled.delete(this.settled.keys().next().value!);
     }
   }
 
-  /** Final review I3: the status of a settled channel no longer in `live` -- its cached final status, or, for one
-   *  evicted before this process started (or pushed out of the cache), rebuilt from its files on disk. */
-  private async settledStatus(ref: string): Promise<ChannelStatus | null> {
-    const want = ref.toLowerCase();
-    const cached = [...this.settled.values()].filter((st) => st.channelId.toLowerCase().startsWith(want));
-    if (cached.length === 1) return cached[0];
-    if (cached.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
-    const recs = this.records.channels().filter((r) => r.finalized && r.channelId.toLowerCase().startsWith(want));
-    if (recs.length !== 1) {
-      if (recs.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
-      return null;
+  /** Plan 5 fix round (I4): inserts `status` for `id`, keyed with `settledAt` (wall-clock ms), then trims the
+   *  index down to `SETTLED_CACHE_MAX` by dropping the SMALLEST `settledAt` entries -- not insertion order, which
+   *  no longer tracks settle time once eviction timing varies (a channel something was still busy with, evicted
+   *  later than one that settled after it, would otherwise be the one kept). Protected so a test can exercise the
+   *  trim at scale without needing thousands of real channels. */
+  protected insertSettled(id: Hex, status: ChannelStatus, settledAt: number): void {
+    this.settled.set(id, { status, settledAt });
+    while (this.settled.size > SETTLED_CACHE_MAX) {
+      let oldestId: Hex | undefined;
+      let oldestAt = Infinity;
+      for (const [k, v] of this.settled) {
+        if (v.settledAt < oldestAt) {
+          oldestAt = v.settledAt;
+          oldestId = k;
+        }
+      }
+      if (oldestId === undefined) break;
+      this.settled.delete(oldestId);
     }
-    const record = recs[0];
+  }
+
+  /** Final review I3 / Plan 5 Task 1: rebuilds a finalized channel's status from its files on disk (no chain
+   *  reads) -- used both by `settledStatus`'s disk fallback and by `start()`'s settled index. Null for a record
+   *  with no session snapshot, or one for another hub/chain (see `openChannel`'s identical check). */
+  private async loadSettledStatus(record: ChannelRecord): Promise<ChannelStatus | null> {
     // Read only: restored into a memory store (open() would create a session file if there were none).
     const snapshot = await new FileSessionStore(arenaPaths(this.opts.home).channelSession(record.channelId)).load();
     if (!snapshot) return null;
@@ -1298,6 +2383,21 @@ export class ArenaDaemon {
         }
       : null;
     return buildStatus({ record, snapshot: session.snapshot(), myTurn: session.isMyTurn(), chain, lastError: null });
+  }
+
+  /** Final review I3: the status of a settled channel no longer in `live` -- its cached final status, or, for one
+   *  evicted before this process started (or pushed out of the cache), rebuilt from its files on disk. */
+  private async settledStatus(ref: string): Promise<ChannelStatus | null> {
+    const want = ref.toLowerCase();
+    const cached = [...this.settled.values()].map((v) => v.status).filter((st) => st.channelId.toLowerCase().startsWith(want));
+    if (cached.length === 1) return cached[0];
+    if (cached.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+    const recs = this.records.channels().filter((r) => r.finalized && r.channelId.toLowerCase().startsWith(want));
+    if (recs.length !== 1) {
+      if (recs.length > 1) throw new DaemonError(400, `ambiguous channel ${ref}`);
+      return null;
+    }
+    return this.loadSettledStatus(recs[0]);
   }
 
   /** Runs one pass over one channel. `pass` resolves true when it did that channel's full work for its phase. */
@@ -1362,7 +2462,8 @@ export class ArenaDaemon {
     // Final review m4: an agent waiting after its close (or on a dispute) is woken once by the settlement. A channel
     // retired without our deposit (None/Funding) never opened: nothing to report.
     if (phase === "Finalized" || phase === "Reclaimed") l.settledWake = true;
-    l.record = { ...l.record, finalized: true, finalPhase: phase };
+    // Plan 5 Task 1 (mainnet gates: settled index): recorded so the index start() loads can sort by settle time.
+    l.record = { ...l.record, finalized: true, finalPhase: phase, settledAt: Date.now() };
     this.records.saveChannel(l.record);
     this.opts.relay.leave(l.record.channelId);
   }
@@ -1468,8 +2569,10 @@ export class ArenaDaemon {
       await this.respondIfChallenged(l);
     } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
       // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
-      // otherwise leave it for the controller (status shows mustMove).
+      // otherwise leave it for the controller (status shows mustMove) -- or, final fix wave (I1), return a
+      // human-held seat to the agent once the deadline is near.
       await this.autoPlay(l, true);
+      this.autoReturnIfDeadlineNear(l, info.deadline, now);
     } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
       // R9/I2: past the deadline, a newer state we hold is no longer answerable (respond would revert
       // DeadlinePassed), so this is the fallback once the respond branch above is no longer available.
@@ -1579,7 +2682,7 @@ export class ArenaDaemon {
       out.push(this.statusOf(l));
     }
     // Final review I3: settled channels no longer watched, from their cached final status.
-    for (const st of this.settled.values()) out.push(st);
+    for (const v of this.settled.values()) out.push(v.status);
     for (const [channelId, error] of this.degraded) out.push({ channelId, degraded: true, error });
     return out;
   }
@@ -1595,13 +2698,40 @@ export class ArenaDaemon {
     // trips a spurious control-changed, but a real change on any watched channel does.
     const controllers = new Map<Hex, Controller>();
     for (;;) {
-      const targets = opts.ref ? [this.pick(opts.ref)] : [...this.live.values()];
+      let targets: ChannelHandle[];
+      if (opts.ref) {
+        try {
+          targets = [this.pick(opts.ref)];
+        } catch (err) {
+          // Plan 5 Task 1 (mainnet gates: wait on evicted channels): a settled channel this daemon has already
+          // let go of (evicted from `live` after SETTLED_GRACE_SECONDS) is not an error to wait for -- it
+          // resolves with reason "settled" at once, the same way status()/channels() already serve it, instead
+          // of surfacing pick()'s 409. Re-checked inside the loop: a channel can be evicted mid-wait too.
+          if (err instanceof DaemonError && (err.code === 404 || err.code === 409)) {
+            const st = await this.settledStatus(opts.ref);
+            if (st) return { channelId: st.channelId, reason: "settled" };
+          }
+          throw err;
+        }
+        // Final fix wave (M2): a settled channel waited on by name answers "settled" at once, whether or not its
+        // one-shot wake is still pending -- the same answer it gets once evicted, rather than blocking for the
+        // whole timeout until eviction. (Only here: an all-channels wait keeps the one-shot rule, or every
+        // settled-but-not-evicted channel would wake it at once, forever.)
+        const only = targets[0];
+        if (only.record.finalized) {
+          only.settledWake = false;
+          return { channelId: only.record.channelId, reason: "settled" };
+        }
+      } else {
+        targets = [...this.live.values()];
+      }
       for (const l of targets) {
         const id = l.record.channelId;
         const prev = controllers.get(id);
         if (prev === undefined) controllers.set(id, l.record.controller);
         else if (prev !== l.record.controller) return { channelId: id, reason: "control-changed" };
         let st = this.statusOf(l);
+        let ignoreSessionGasLow = false;
         if (st.attention === "session-gas-low") {
           // Final review C1: one wake per low-gas episode. While the wallet stays empty, later waits see the
           // channel's other attention instead of returning at once on every call (status keeps showing it).
@@ -1609,7 +2739,17 @@ export class ArenaDaemon {
             l.sessionGasLowWoken = true;
             return { channelId: id, reason: st.attention };
           }
-          st = this.statusOf(l, { ignoreSessionGasLow: true });
+          ignoreSessionGasLow = true;
+          st = this.statusOf(l, { ignoreSessionGasLow });
+        }
+        if (st.attention === "human-must-move") {
+          // Final fix wave (I1): whoever holds the seat, one wake per challenge (keyed by its deadline).
+          const deadline = st.challenge?.deadline ?? "";
+          if (l.humanMustMoveWoken !== deadline) {
+            l.humanMustMoveWoken = deadline;
+            return { channelId: id, reason: st.attention };
+          }
+          st = this.statusOf(l, { ignoreSessionGasLow, ignoreHumanMustMove: true });
         }
         // Final review m4: `settled` wakes one wait, then is gone.
         if (st.attention === "settled") l.settledWake = false;
@@ -1621,7 +2761,7 @@ export class ArenaDaemon {
     }
   }
 
-  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean } = {}): ChannelStatus {
+  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean } = {}): ChannelStatus {
     return buildStatus({
       record: l.record,
       snapshot: l.session.snapshot(),
@@ -1632,6 +2772,8 @@ export class ArenaDaemon {
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
       settled: l.settledWake,
+      autoReturnSeconds: autoReturnOnChallengeOf(this.opts.config) ? autoReturnSecondsOf(l.record.params.challengeTimeout) : null,
+      ignoreHumanMustMove: opts.ignoreHumanMustMove,
     });
   }
 
@@ -1703,7 +2845,8 @@ export class ArenaDaemon {
       const broken = hits.length === 0 ? [...this.degraded].filter(([id]) => id.toLowerCase().startsWith(ref.toLowerCase())) : [];
       if (broken.length === 1) throw new DaemonError(409, `channel ${broken[0][0]} could not be loaded: ${broken[0][1]}`);
       // Final review I3: a settled channel the daemon has let go of (status still serves it).
-      const done = hits.length === 0 ? [...this.settled.values()].filter((st) => st.channelId.toLowerCase().startsWith(ref.toLowerCase())) : [];
+      const done =
+        hits.length === 0 ? [...this.settled.values()].map((v) => v.status).filter((st) => st.channelId.toLowerCase().startsWith(ref.toLowerCase())) : [];
       if (done.length === 1) throw new DaemonError(409, `channel ${done[0].channelId} is settled (${done[0].phase}): nothing more can be done on it`);
       throw new DaemonError(hits.length === 0 ? 404 : 400, hits.length === 0 ? `unknown channel ${ref}` : `ambiguous channel ${ref}`);
     }
@@ -1732,6 +2875,16 @@ export class ArenaDaemon {
     } catch {
       // M8: a throwing listener must never break the caller (a move, a relay message, a tick).
     }
+  }
+
+  /** Fix round 3, C-1, defense in depth: every timer-driven or fire-and-forget call in this class (the periodic
+   *  timer's own dispute/main passes, the initial and post-match `tick()`s, the lobby/relay event subscriptions)
+   *  goes through this instead of a bare `void this.foo()`. A single stray, uncaught rejection on one of these --
+   *  probe F1 found one inside the sweep's own receipt-recovery path, since fixed at its source too -- reaches
+   *  Node with no `.catch` anywhere above it; recent Node versions exit the process on an unhandled rejection.
+   *  This is the backstop for every such call, present and future, not a substitute for fixing the source. */
+  private fireAndForget(label: string, p: Promise<unknown>): void {
+    p.catch((err: unknown) => this.log(`${label} failed (this daemon keeps running): ${errorText(err)}`));
   }
 
   private markDegraded(channelId: string, error: string): void {

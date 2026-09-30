@@ -326,8 +326,10 @@ export type Player = {
   address: Address;
   apiUrl: string;
   token: string;
-  /** Talks to this daemon's local HTTP API (the same surface an agent uses). Throws on a non-2xx response. */
-  api(method: "GET" | "POST", path: string, body?: object): Promise<any>;
+  /** Talks to this daemon's local HTTP API (the same surface an agent uses). Throws on a non-2xx response, with the
+   *  status code in the message. `actor` is the `x-arena-actor` header (default "agent"; the web board sends
+   *  "human"). */
+  api(method: "GET" | "POST", path: string, body?: object, actor?: "agent" | "human"): Promise<any>;
   /** Sends `signal` (default SIGTERM) to the daemon's process group and waits for it to exit. */
   kill(signal?: NodeJS.Signals): Promise<void>;
   /** Restarts `arena daemon` on this player's existing ARENA_HOME (same wallet, config, and API port). */
@@ -541,10 +543,10 @@ export async function startStack(
 
     players.push({ home, getTracked: () => tracked });
 
-    const api = async (method: "GET" | "POST", path: string, body?: object): Promise<any> => {
+    const api = async (method: "GET" | "POST", path: string, body?: object, actor: "agent" | "human" = "agent"): Promise<any> => {
       const res = await fetch(`${apiUrl}${path}`, {
         method,
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": actor },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const payload = await res.json().catch(() => ({}));

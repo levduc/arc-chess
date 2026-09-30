@@ -3,7 +3,7 @@ import { erc20Abi, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, HubRevertError, LocalKeyTxSender, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
-import { ArenaDaemon, DaemonError, SETTLED_GRACE_SECONDS, loadConfig } from "../src/index.js";
+import { ArenaDaemon, DaemonError, SETTLED_GRACE_SECONDS, loadConfig, type ArenaConfig } from "../src/index.js";
 import { CHAIN, RPC, increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
@@ -201,7 +201,8 @@ describe("ArenaDaemon core", () => {
     expect(listed.map((c) => c.channelId).sort()).toEqual([...ids].sort());
     expect(listed.every((c) => "phase" in c && c.phase === "Finalized")).toBe(true);
     await expect(alice.daemon.move(ids[0], "e4", { actor: "agent" })).rejects.toThrow(/is settled/);
-    // After a restart (nothing cached, settled channels are never loaded), status is served from disk.
+    // After a restart, status is served from the settled index loaded at start() (Plan 5 Task 1) rather than from
+    // any cache carried over from the old process (there is none -- each ArenaDaemon starts with an empty one).
     await alice.daemon.stop();
     const again = new ArenaDaemon({
       home: alice.home,
@@ -222,6 +223,36 @@ describe("ArenaDaemon core", () => {
     expect(fromDisk.gameStatus).toBe("draw");
   });
 
+  it("Plan 5 Task 1: wait({ ref }) on an evicted settled channel resolves 'settled' at once, not a 409", async () => {
+    const pair = await startPair();
+    cleanup = pair.cleanup;
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "open");
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
+    await alice.daemon.idle();
+    await alice.daemon.tick(); // a pass that sees it settled: the grace period starts
+    await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+    await waitFor(() => alice.daemon.channelIds().length === 0, 10_000, "evicted");
+
+    // Before the fix: pick() throws 409 ("is settled"), and wait() never catches it -- the API would answer 409
+    // instead of the 200 `{ channelId, reason: "settled" }` a client polling `wait` expects.
+    const t0 = Date.now();
+    await expect(alice.daemon.wait({ ref: id, timeoutMs: 5_000 })).resolves.toEqual({ channelId: id, reason: "settled" });
+    expect(Date.now() - t0).toBeLessThan(1_000); // resolves at once, not after the timeout
+    // An unknown (never-existed) ref is still a real 404, unaffected by this fix.
+    await expect(alice.daemon.wait({ ref: `0x${"ab".repeat(32)}`, timeoutMs: 300 })).rejects.toThrow(/unknown channel/);
+  });
+
   it("relays moves between daemons and enforces turn order", async () => {
     const { alice, bob, id } = await matched();
     await expect(bob.daemon.move(undefined, "e7e5", { actor: "agent" })).rejects.toThrow(DaemonError);
@@ -238,6 +269,25 @@ describe("ArenaDaemon core", () => {
     await alice.daemon.move(undefined, "e4", { actor: "human" });
     await alice.daemon.handoff(undefined, "agent", "");
     await expect(alice.daemon.move(undefined, "d4", { actor: "human" })).rejects.toThrow(/agent is in control|not your turn/);
+  });
+
+  it("Plan 5 Task 2 fix round, minor 4: refuses a handoff note that is too long or carries a control/bidi character", async () => {
+    const { alice } = await matched();
+    await expect(alice.daemon.handoff(undefined, "human", "x".repeat(1025))).rejects.toThrow(/1024/);
+    await alice.daemon.handoff(undefined, "human", "x".repeat(1024)); // exactly the cap: allowed
+    for (const bad of [
+      "back\u0000stab", // NUL
+      "line\u0001break", // a C0 control other than \t/\n
+      "del\u007Fete", // DEL
+      "c1\u0085control", // a C1 control (NEL)
+      "bidi‮override", // RLO
+      "isolate⁦start", // LRI
+    ]) {
+      await expect(alice.daemon.handoff(undefined, "agent", bad)).rejects.toThrow(/control|bidi/);
+    }
+    // Newline and tab are exactly the two control characters this note allows through.
+    await alice.daemon.handoff(undefined, "human", "line one\nline two\tindented");
+    expect((await alice.daemon.status()).note).toBe("line one\nline two\tindented");
   });
 
   it("rejects a mismatched match without funding", async () => {
@@ -384,6 +434,29 @@ describe("ArenaDaemon core", () => {
     expect((await bob.daemon.status(id)).attention).toBeNull();
   });
 
+  it("final fix wave, M2: 'settled' wakes the agent whoever holds the seat, and wait --channel on a settled channel returns it at once", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    // The human takes the seat before the agent starts waiting: settlement leaves no seat to protect, so the
+    // agent's wait must still wake for it (before: `settled` required controller === "agent").
+    await alice.daemon.handoff(id, "human", "watching the close");
+    const waiting = alice.daemon.wait({ timeoutMs: 20_000 });
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "settled" });
+    // The one-shot wake is consumed: an all-channels wait stays quiet (no hot loop) ...
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    // ... but a wait on this channel answers "settled" at once, as it does once the channel is evicted.
+    expect(alice.daemon.channelIds()).toContain(id); // not evicted yet
+    const t0 = Date.now();
+    await expect(alice.daemon.wait({ ref: id, timeoutMs: 5_000 })).resolves.toEqual({ channelId: id, reason: "settled" });
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+
   it("R8.4c: wait() resolves control-changed on a handoff even without new attention", async () => {
     const { alice, bob, id } = await matched();
     // Make it bob's turn, so alice has no `attention` for wait() to notice first.
@@ -406,6 +479,49 @@ describe("ArenaDaemon core", () => {
 });
 
 describe("watchtower", () => {
+  it("final fix wave I1: a challenge on a human-held seat wakes the agent once, the seat returns at the threshold, and the agent answers", async () => {
+    const { alice, bob, id } = await matched(); // challengeTimeout 600: the seat returns with max(60, 600/3) = 200 s left
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn");
+    await alice.daemon.handoff(id, "human", "your call");
+    await bob.daemon.challenge(id, "agent"); // registers turn 2: Alice's seat, held by her human, must move
+    await bob.daemon.stop(); // from here on, only Alice's own respond can answer it
+    // Before: the agent's wait stayed silent (attention was agent-only) until its own timeout.
+    await expect(alice.daemon.wait({ timeoutMs: 10_000 })).resolves.toEqual({ channelId: id, reason: "human-must-move" });
+    const st = await alice.daemon.status(id);
+    expect(st.controller).toBe("human");
+    expect(st.attention).toBe("human-must-move");
+    expect(st.challenge).toMatchObject({ mustMove: true, autoReturnAt: (BigInt(st.challenge!.deadline) - 200n).toString() });
+    // One wake per challenge, like session-gas-low.
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    await expect(alice.daemon.move(id, "Nf3", { actor: "agent" })).rejects.toThrow(/the human is in control/);
+    // More than 200 s left: the seat stays with the human.
+    await alice.daemon.idle();
+    await alice.daemon.tick();
+    expect(alice.daemon.handle(id).record.controller).toBe("human");
+    // Turned off (autoReturnOnChallenge: false): not even inside the window.
+    const config = (alice.daemon as unknown as { opts: { config: ArenaConfig } }).opts.config;
+    config.autoReturnOnChallenge = false;
+    await increaseTime(401); // under 200 s left now
+    await alice.daemon.idle();
+    await alice.daemon.tick();
+    expect(alice.daemon.handle(id).record.controller).toBe("human");
+    // On (the default): the next dispute pass hands the seat back, and a wait in flight sees it.
+    const waiting = alice.daemon.wait({ timeoutMs: 10_000 });
+    delete config.autoReturnOnChallenge;
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "control-changed" });
+    const back = await alice.daemon.status(id);
+    expect(back.controller).toBe("agent");
+    expect(back.note).toBe("auto-returned: challenge deadline approaching");
+    expect(back.attention).toBe("your-turn");
+    // The agent answers in time, through respond.
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "the challenge answered");
+    expect((await alice.daemon.hub.registeredState(id)).turnNum).toBe(3n);
+  });
+
   it("answers a stale challenge automatically", async () => {
     const { alice, bob, id } = await matched();
     await alice.daemon.move(undefined, "e4", { actor: "agent" });

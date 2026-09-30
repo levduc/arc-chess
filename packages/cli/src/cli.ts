@@ -6,7 +6,6 @@ import {
   loadConfig,
   loadToken,
   DEFAULT_LOG_CHUNK_BLOCKS,
-  DEFAULT_MIN_CHALLENGE_TIMEOUT,
   defaultSessionGasWei,
   knownDeploymentWarnings,
   type ArenaConfig,
@@ -23,20 +22,42 @@ export type CliIo = {
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
-       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS]
+       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false]
        (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
+       (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
+        agent once max(60 s, challengeTimeout / 3) is left)
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
-  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default 900)] | accept <offerId>
+  board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
+  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
-  resign | accept-draw | next-game | close | challenge | reclaim  [--channel ID]
+  resign | accept-draw | next-game | close | challenge | reclaim | sweep [--channel ID]
   handoff human|agent [--note TEXT] [--channel ID]`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 class UsageError extends Error {}
+
+/**
+ * Plan 5 Task 2 fix round, CRITICAL 1: the JSON line `arena daemon` prints on stdout at startup. This must never
+ * carry the token, even in a URL fragment -- every documented way to run a daemon long-lived (`nohup ... >
+ * daemon.log`, README; a systemd unit whose stdout goes to journald) redirects this exact line to a log file,
+ * which would defeat the token file's 0600 permissions. `board` here is the URL with no fragment at all; only
+ * `arena board` (a human runs it directly, in a foreground terminal) prints a board link, and that link carries a
+ * single-use, short-lived code, never the token itself (Plan 5 final fix M1).
+ * A pure function so a test can check its shape without actually starting a daemon.
+ */
+export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: string }): Record<string, unknown> {
+  return {
+    api: proc.apiUrl,
+    pid: proc.pid,
+    wallet: proc.wallet,
+    board: `${proc.apiUrl}/board`,
+    boardHint: "run: arena board",
+  };
+}
 
 /** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors. */
 async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]): Promise<unknown> {
@@ -203,6 +224,17 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         }
         sessionGasWei = defaultSessionGasWei(feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI, BigInt(price));
       }
+      // Plan 5 Task 1: a floor above the target would refill to a target the check itself never sees as "enough".
+      const sessionGasFloor = flag("session-gas-floor") !== undefined ? BigInt(flag("session-gas-floor")!) : undefined;
+      if (sessionGasFloor !== undefined && sessionGasFloor > sessionGasWei) {
+        throw new UsageError(`--session-gas-floor (${sessionGasFloor}) must not exceed --session-gas-wei (${sessionGasWei})`);
+      }
+      // Final fix wave (I1): on unless explicitly turned off.
+      const autoReturnRaw = flag("auto-return-on-challenge");
+      if (autoReturnRaw !== undefined && autoReturnRaw !== "true" && autoReturnRaw !== "false") {
+        throw new UsageError("--auto-return-on-challenge must be true or false");
+      }
+      const autoReturn = autoReturnRaw === undefined ? undefined : autoReturnRaw === "true";
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,
@@ -213,11 +245,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         port: Number(flag("port") ?? "7070"),
         maxFeePerPlayer: BigInt(flag("max-fee") ?? "10000"),
         sessionGasWei,
-        ...(flag("session-gas-floor") !== undefined ? { sessionGasFloor: BigInt(flag("session-gas-floor")!) } : {}),
+        ...(sessionGasFloor !== undefined ? { sessionGasFloor } : {}),
         pollMs: Number(flag("poll-ms") ?? "2000"),
         logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
         ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),
         ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
+        ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
       const { privateKeyToAccount } = await import("viem/accounts");
@@ -244,7 +277,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (cmd === "daemon") {
       if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
       const proc = await startDaemonProcess(home, { log: io.err });
-      io.out(JSON.stringify({ api: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address }));
+      // Plan 5 Task 2 fix round, CRITICAL 1: no token anywhere in this line -- see daemonStartLine's own
+      // docstring. Run `arena board` for a board link with a one-time code.
+      io.out(JSON.stringify(daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address })));
       await new Promise<void>((resolve) => {
         const stop = () => {
           // Only one of SIGINT/SIGTERM fires; `process.once` alone would leave the other one's listener
@@ -259,6 +294,31 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       return 0;
     }
 
+    if (cmd === "board") {
+      // Final fix wave (M1): the link carries a one-time code, never the token -- a browser keeps every URL it
+      // opens in its history (and omnibox autocomplete, and maybe cloud sync), which replaceState cannot undo.
+      // The running daemon mints the code (POST /board/code, with the token read from disk); the board trades it
+      // once for the token, which it keeps in memory only. The code expires 120 s after it is minted.
+      const cfg = loadConfig(home);
+      const token = loadToken(home);
+      let res: Response;
+      try {
+        res = await io.fetch(`http://127.0.0.1:${cfg.port}/board/code`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        });
+      } catch {
+        throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "arena daemon", then run "arena board" again`);
+      }
+      const payload = (await res.json().catch(() => ({}))) as { code?: unknown; error?: string };
+      if (!res.ok || typeof payload.code !== "string") {
+        io.err(`error: ${payload.error ?? res.statusText}`);
+        return 1;
+      }
+      io.out(`http://127.0.0.1:${cfg.port}/board#code=${payload.code}`);
+      return 0;
+    }
+
     const channel = flag("channel");
     const withChannel = (b: Record<string, unknown>) => (channel ? { ...b, channel } : b);
     let request: { method: "GET" | "POST"; path: string; body?: Record<string, unknown> };
@@ -270,10 +330,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         request = {
           method: "POST",
           path: "/offers",
+          // Plan 5 Task 1: omitted unless --timeout is given -- the daemon applies its own minChallengeTimeoutOf.
           body: {
             deposit: usdcAmount("deposit"),
             stakePerGame: usdcAmount("stake"),
-            challengeTimeout: flag("timeout") ?? DEFAULT_MIN_CHALLENGE_TIMEOUT.toString(),
+            ...(flag("timeout") !== undefined ? { challengeTimeout: flag("timeout") } : {}),
           },
         };
         break;
@@ -308,6 +369,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       case "close":
       case "challenge":
       case "reclaim":
+      case "sweep":
         request = { method: "POST", path: `/${cmd}`, body: withChannel({}) };
         break;
       case "handoff":
@@ -331,6 +393,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       return 1;
     }
     io.out(JSON.stringify(payload, null, 2));
+    // Plan 5 fix round (I5): a daemon-wide sweep may not finish everything within its own time budget.
+    if (cmd === "sweep" && typeof (payload as { remaining?: unknown }).remaining === "number") {
+      const remaining = (payload as { remaining: number }).remaining;
+      if (remaining > 0) io.err(`note: ${remaining} channel(s) still need sweeping; rerun "arena sweep" to continue`);
+    }
     return 0;
   } catch (err) {
     if (err instanceof UsageError) {

@@ -572,6 +572,45 @@ describe("SerialTxSender tracks its outstanding transaction (Task 10 re-review 2
     expect(broke).toBeInstanceOf(Error);
     expect(isNonceUsedError(broke)).toBe(false);
   });
+
+  it("fix round 3, I-1(a): refresh() re-checks a released entry against the chain -- a mined one is no longer tracked", () =>
+    manual(async () => {
+      const { sender } = await fresh();
+      const pub = publicClient();
+      const req: TxRequest = { to: recipient(), data: "0x", value: 1n };
+      const h1 = await sender.send(req);
+      await waitOrReplace(pub, sender, req, h1, { timeoutMs: 200, pollMs: 50, maxReplacements: 0 }).catch(() => undefined);
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]);
+      await anvil("evm_mine", []); // it lands anyway, despite the wait having already given up on it
+      expect((await pub.getTransactionReceipt({ hash: h1 })).status).toBe("success");
+      // tracked() alone never notices this on its own -- nothing but a send (or waitOrReplace's own settle/
+      // release calls) ever touches an entry once created.
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]);
+      await sender.refresh();
+      expect(sender.tracked()).toEqual([]); // prune() (the same one send() runs) sees the receipt and drops it
+    }));
+
+  it("fix round 3, I-1(a): refresh() is a no-op on a sender that is not tracking (no reader, or replacement unsupported)", async () => {
+    const stub: TxSender = { address: recipient(), supportsReplacement: false, send: async () => h(0) };
+    const sender = new SerialTxSender(stub); // no reader passed, and the inner sender opts out of tracking anyway
+    await expect(sender.refresh()).resolves.toBeUndefined();
+    expect(sender.tracked()).toEqual([]);
+  });
+
+  it("fix round 3, I-1(a): refresh() is serialized through the same queue send() uses -- an in-flight send is not disturbed", () =>
+    manual(async () => {
+      const { sender } = await fresh();
+      const pub = publicClient();
+      const req: TxRequest = { to: recipient(), data: "0x", value: 1n };
+      // Queued back to back, exactly as two sends would be: refresh() runs after send()'s own nonce-picking work,
+      // never concurrently with it (both go through the same `this.tail` queue `send()` itself uses).
+      const sendPromise = sender.send(req);
+      const refreshPromise = sender.refresh();
+      const [h1] = await Promise.all([sendPromise, refreshPromise]);
+      expect(sender.tracked().map((t) => t.nonce)).toEqual([0]); // refresh() never adopted or disturbed this nonce
+      await anvil("evm_mine", []);
+      expect((await pub.getTransactionReceipt({ hash: h1 })).status).toBe("success");
+    }));
 });
 
 describe("a replacement that would revert against the pending state (Task 10 re-review 2)", () => {

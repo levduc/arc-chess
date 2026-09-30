@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import { ChannelSession, MemoryStore, signClose, type ArenaDomain } from "@arena/sdk";
-import { buildStatus, type ChainView, type ChannelRecord } from "../src/index.js";
+import { buildStatus, type ChainView, type ChannelRecord, type StatusInput } from "../src/index.js";
 import { makeParams, SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
 
 const domain: ArenaDomain = { chainId: 31337, hub: "0x000000000000000000000000000000000000beef" };
@@ -104,9 +104,36 @@ describe("buildStatus", () => {
       registeredTurn: 1n,
       cooldownUntil: [1900n, 1300n],
     });
-    expect(s.challenge).toEqual({ deadline: "1600", secondsLeft: 600, mustMove: true, challenger: "opponent" });
+    expect(s.challenge).toEqual({ deadline: "1600", secondsLeft: 600, mustMove: true, challenger: "opponent", autoReturnAt: null });
     expect(s.attention).toBe("your-turn");
     expect(s.cooldown).toEqual({ meSeconds: 300, opponentSeconds: 900 });
+  });
+
+  it("final fix wave I1: human-must-move -- the agent learns that the human holding the seat must move under a challenge", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4"));
+    const challenged: ChainView = { ...OPEN, phase: "Challenged", deadline: 1600n, challenger: 0, registeredTurn: 1n };
+    const human = { ...rec(1), controller: "human" as const };
+    const at = (over: Partial<StatusInput> = {}, record: ChannelRecord = human) =>
+      buildStatus({ record, snapshot: b.snapshot(), myTurn: b.isMyTurn(), chain: challenged, lastError: null, ...over });
+    const s = at({ autoReturnSeconds: 200 });
+    expect(s.attention).toBe("human-must-move");
+    // The daemon hands the seat back to the agent at deadline - 200 (chain time).
+    expect(s.challenge).toEqual({ deadline: "1600", secondsLeft: 600, mustMove: true, challenger: "opponent", autoReturnAt: "1400" });
+    expect(s.suggestedActions[0]).toMatch(/^tell your human/);
+    // Auto-return turned off: still raised, with no return time.
+    expect(at({ autoReturnSeconds: null }).attention).toBe("human-must-move");
+    expect(at({ autoReturnSeconds: null }).challenge?.autoReturnAt).toBeNull();
+    // wait()'s one wake per challenge: once it is taken, nothing else is left for the agent here.
+    expect(at({ autoReturnSeconds: 200, ignoreHumanMustMove: true }).attention).toBeNull();
+    // session-gas-low still comes first.
+    expect(at({ autoReturnSeconds: 200, sessionGasLow: "empty wallet" }).attention).toBe("session-gas-low");
+    // The agent holding the seat: your-turn as before, and no return time.
+    const agent = at({ autoReturnSeconds: 200 }, rec(1));
+    expect(agent.attention).toBe("your-turn");
+    expect(agent.challenge?.autoReturnAt).toBeNull();
+    // The challenger's side (not on move in the registered state): nothing to do.
+    expect(view(a, { ...rec(0), controller: "human" }, challenged).attention).toBeNull();
   });
 
   it("stays quiet while a human controls the channel", async () => {
@@ -195,6 +222,24 @@ describe("buildStatus", () => {
     expect(view(a, rec(0), { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n }, OPEN.now - 601n).attention).toBeNull();
   });
 
+  it("Plan 5 Task 3 fix round: humanAttention raises opponent-silent for a human in control, leaving attention (and so wait) unchanged", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4")); // a waits on b's move
+    const human = { ...rec(0), controller: "human" as const };
+    const s = view(a, human, OPEN, OPEN.now - 601n);
+    // The agent's channel: attention stays null while the human holds the seat, so `wait` stays quiet.
+    expect(s.attention).toBeNull();
+    expect(s.humanAttention).toBe("opponent-silent");
+    expect(s.suggestedActions[0]).toMatch(/^arena challenge .*no progress for over 600s/);
+    // Not yet silent, the agent in control, or an ongoing challenge: no humanAttention.
+    expect(view(a, human, OPEN, OPEN.now - 600n).humanAttention).toBeNull();
+    expect(view(a, human, OPEN, null).humanAttention).toBeNull();
+    const agent = view(a, rec(0), OPEN, OPEN.now - 601n);
+    expect(agent.attention).toBe("opponent-silent");
+    expect(agent.humanAttention).toBeNull();
+    expect(view(a, human, { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n }, OPEN.now - 601n).humanAttention).toBeNull();
+  });
+
   it("I2: opponent-silent also covers an unanswered proposal and a withheld Close, but not our own game-over decision", async () => {
     const x = await finished();
     expect(view(x.a, x.rec(0), OPEN, OPEN.now - 601n).attention).toBe("game-over"); // our call, not their silence
@@ -203,6 +248,44 @@ describe("buildStatus", () => {
     const y = await finished();
     await y.a.signClose();
     expect(view(y.a, y.rec(0), OPEN, OPEN.now - 601n).attention).toBe("opponent-silent");
+  });
+
+  it("Plan 5 Task 2: legalMovesUci mirrors legalMoves (UCI strings), only on my turn", async () => {
+    const { a, b, rec } = await sessions();
+    const sa = view(a, rec(0));
+    expect(sa.legalMovesUci).toContain("e2e4");
+    expect(sa.legalMovesUci).toHaveLength(20);
+    expect(view(b, rec(1)).legalMovesUci).toEqual([]);
+  });
+
+  it("Plan 5 Task 2: orientation matches color", async () => {
+    const { a, b, rec } = await sessions();
+    expect(view(a, rec(0)).orientation).toBe("white");
+    expect(view(b, rec(1)).orientation).toBe("black");
+  });
+
+  it("Plan 5 Task 2: lastMove is null at the start of a game, and {from, to, san} right after a move", async () => {
+    const { a, b, rec } = await sessions();
+    expect(view(a, rec(0)).lastMove).toBeNull();
+    expect(view(b, rec(1)).lastMove).toBeNull();
+    await b.receive(await a.move("e2e4"));
+    expect(view(a, rec(0)).lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    expect(view(b, rec(1)).lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    await a.receive(await b.move("g8f6")); // Nf6 -- exercises a piece move's SAN, not just a pawn push
+    expect(view(a, rec(0)).lastMove).toEqual({ from: "g8", to: "f6", san: "Nf6" });
+  });
+
+  it("Plan 5 Task 2: lastMove is null for a non-move kind (resign)", async () => {
+    const x = await finished(); // x.a's latest is b's RESIGN, not a move
+    expect(view(x.a, x.rec(0)).lastMove).toBeNull();
+  });
+
+  it("Plan 5 Task 2: handoff carries controller/note/since -- since is null until handoffAt is set", async () => {
+    const { a, rec } = await sessions();
+    expect(view(a, rec(0)).handoff).toEqual({ controller: "agent", note: "", since: null });
+    const handoffAt = 1_700_000_000_000;
+    const s = view(a, { ...rec(0), controller: "human", note: "mine now", handoffAt });
+    expect(s.handoff).toEqual({ controller: "human", note: "mine now", since: new Date(handoffAt).toISOString() });
   });
 
   it("I4: a channel retired unfunded reports done instead of waiting for funding", async () => {

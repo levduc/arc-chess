@@ -76,6 +76,66 @@ async function waitForJsonLine(target: ChildProcess, predicate: (o: Record<strin
 
 describe("pnpm dev:up", () => {
   it(
+    "Plan 5 Task 1: refuses a non-empty --dir with no marker, without starting anything, and leaves it untouched",
+    async () => {
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+      const junkPath = join(devDir, "junk.txt");
+      writeFileSync(junkPath, "pre-existing, unrelated state");
+
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+
+      child = spawn(
+        TSX_BIN,
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--players", "1", "--dir", devDir],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stderr = "";
+      child.stderr?.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+      const code = await new Promise<number | null>((resolvePromise) => child!.once("exit", (c) => resolvePromise(c)));
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/refus.*non-empty/i);
+      expect(readFileSync(junkPath, "utf8")).toBe("pre-existing, unrelated state"); // untouched
+      expect(existsSync(join(devDir, ".arena-dev-marker"))).toBe(false); // never created on a refusal
+      // Nothing was started: both ports are still free.
+      expect(await isPortFree(anvilPort)).toBe(true);
+      expect(await isPortFree(serverPort)).toBe(true);
+      child = undefined;
+    },
+    20_000,
+  );
+
+  it(
+    "fix round (minor): --dir pointing at a plain file fails with a clear error, not a raw ENOTDIR crash",
+    async () => {
+      const parent = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+      devDir = parent;
+      const filePath = join(parent, "not-a-directory");
+      writeFileSync(filePath, "I am a file, not a directory");
+
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+
+      child = spawn(
+        TSX_BIN,
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--players", "1", "--dir", filePath],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stderr = "";
+      child.stderr?.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+      const code = await new Promise<number | null>((resolvePromise) => child!.once("exit", (c) => resolvePromise(c)));
+      expect(code).not.toBe(0);
+      expect(stderr).toMatch(/--dir .* is not a directory/i);
+      expect(stderr).not.toMatch(/ENOTDIR/); // a clear message, not a raw fs error/stack trace
+      expect(readFileSync(filePath, "utf8")).toBe("I am a file, not a directory"); // untouched
+      await isPortFree(anvilPort).then((free) => expect(free).toBe(true));
+      await isPortFree(serverPort).then((free) => expect(free).toBe(true));
+      child = undefined;
+    },
+    20_000,
+  );
+
+  it(
     "starts anvil + server on free ports, prints a ready line, and Ctrl-C frees both ports",
     async () => {
       deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
