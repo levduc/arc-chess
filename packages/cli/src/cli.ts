@@ -38,6 +38,24 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 class UsageError extends Error {}
 
+/**
+ * Plan 5 Task 2 fix round, CRITICAL 1: the JSON line `arena daemon` prints on stdout at startup. This must never
+ * carry the token, even in a URL fragment -- every documented way to run a daemon long-lived (`nohup ... >
+ * daemon.log`, README; a systemd unit whose stdout goes to journald) redirects this exact line to a log file,
+ * which would defeat the token file's 0600 permissions. `board` here is the URL with no fragment at all; only
+ * `arena board` (a human runs it directly, in a foreground terminal) ever prints the token, in the fragment.
+ * A pure function so a test can check its shape without actually starting a daemon.
+ */
+export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: string }): Record<string, unknown> {
+  return {
+    api: proc.apiUrl,
+    pid: proc.pid,
+    wallet: proc.wallet,
+    board: `${proc.apiUrl}/board`,
+    boardHint: "run: arena board",
+  };
+}
+
 /** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors. */
 async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]): Promise<unknown> {
   let res: Response;
@@ -249,9 +267,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (cmd === "daemon") {
       if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
       const proc = await startDaemonProcess(home, { log: io.err });
-      // Plan 5 Task 2: printed once here on stdout, the same URL `arena board` prints -- never passed to
-      // `io.err` (the log stream) so the token never lands in a log file.
-      io.out(JSON.stringify({ api: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address, board: proc.boardUrl }));
+      // Plan 5 Task 2 fix round, CRITICAL 1: no token anywhere in this line -- see daemonStartLine's own
+      // docstring. Run `arena board` to get the token-bearing URL.
+      io.out(JSON.stringify(daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address })));
       await new Promise<void>((resolve) => {
         const stop = () => {
           // Only one of SIGINT/SIGTERM fires; `process.once` alone would leave the other one's listener

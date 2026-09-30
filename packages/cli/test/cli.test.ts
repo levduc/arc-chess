@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadConfig, runCli } from "../src/index.js";
+import { daemonStartLine, loadConfig, runCli } from "../src/index.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = []) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -72,6 +72,20 @@ describe("arena CLI", () => {
     expect(t.calls).toHaveLength(0); // no running daemon required
     expect(t.out).toHaveLength(1);
     expect(t.out[0]).toMatch(/^http:\/\/127\.0\.0\.1:7010\/board#token=[0-9a-f]{64}$/);
+  });
+
+  it("Plan 5 Task 2 fix round, CRITICAL 1: the daemon start line never carries the token fragment", () => {
+    const line = daemonStartLine({ apiUrl: "http://127.0.0.1:7010", pid: 4242, wallet: "0xabc123" });
+    const json = JSON.stringify(line);
+    expect(json).not.toContain("#token=");
+    expect(json).not.toContain("token");
+    expect(line).toEqual({
+      api: "http://127.0.0.1:7010",
+      pid: 4242,
+      wallet: "0xabc123",
+      board: "http://127.0.0.1:7010/board",
+      boardHint: "run: arena board",
+    });
   });
 
   it("fix round I5: arena sweep maps to POST /sweep and prints a note when channels remain", async () => {

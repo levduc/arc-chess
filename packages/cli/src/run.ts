@@ -8,10 +8,6 @@ import { acquireHomeLock } from "./lock.js";
 export type DaemonProcess = {
   daemon: ArenaDaemon;
   apiUrl: string;
-  /** Plan 5 Task 2: the board's own URL, token in the fragment (never a path or query string -- Global
-   *  Constraints) -- printed once in `arena daemon`'s start line, and by `arena board`. Never written to a log
-   *  file: nothing here ever passes it to `opts.log`. */
-  boardUrl: string;
   host: HostConnection;
   stop(): Promise<void>;
 };
@@ -50,7 +46,6 @@ export async function startDaemonProcess(
     return {
       daemon: daemonRef,
       apiUrl: api.url,
-      boardUrl: `${api.url}/board#token=${token}`,
       host: hostRef,
       stop: async () => {
         if (stopped) return;
