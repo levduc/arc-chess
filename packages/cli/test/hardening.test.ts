@@ -1713,6 +1713,55 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       expect(l.record.sweptAmount).toBeGreaterThan(0n);
     }
   });
+
+  it("fix round 3, C-1: a thrown getTransaction inside pendingTx recovery never crashes the daemon; the next pass still works", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+
+    // A real, sweep-shaped transaction, sent and mined directly (bypassing performSweep) -- same technique as
+    // fix round 2's minor-2 test -- so there is a genuine landed hash to "remember" as pendingTx and recover.
+    const balance = await d.client.getBalance({ address: sender.address });
+    const gas = 21_000n;
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const value = balance - gas * ((maxFeePerGas * 13n + 9n) / 10n);
+    const req = { to: alice.address, data: "0x" as Hex, value, gas };
+    const hash = await sender.send(req);
+    await d.client.waitForTransactionReceipt({ hash });
+    sender.tracker?.settle(hash);
+    l.sweep.pendingTx = hash;
+
+    // getTransaction (called by recoverPendingSweepTx only after a successful receipt read) throws a few times
+    // in a row -- not a single manual call, but left for the daemon's own real periodic timer (a fire-and-forget
+    // `void this.mainPass()` in production) to hit repeatedly, since that is exactly the call path probe F1
+    // found crashing the whole process: no catch anywhere between it and Node's own unhandled-rejection handler.
+    const realGetTransaction = d.client.getTransaction.bind(d.client);
+    let throwCount = 0;
+    const THROWS = 3;
+    d.client.getTransaction = (async (args: { hash: Hex }) => {
+      if (args.hash === hash && throwCount < THROWS) {
+        throwCount++;
+        throw new Error("simulated RPC blip on eth_getTransactionByHash");
+      }
+      return realGetTransaction(args);
+    }) as typeof d.client.getTransaction;
+    try {
+      (d as unknown as SweepableDaemon).sweepChannel = original;
+      await waitFor(() => throwCount >= THROWS, 10_000, "getTransaction threw repeatedly via the daemon's own periodic timer");
+      // Still alive: the record was never falsely resolved while recovery kept failing, and the daemon answers
+      // an ordinary call (status()) rather than having taken the whole process down with it.
+      expect(l.record.swept).toBeUndefined();
+      expect(await d.status(id)).toMatchObject({ channelId: id });
+      await waitFor(() => l.record.swept !== undefined, 20_000, "recovered once getTransaction stopped throwing");
+      expect(l.record.swept).toBe(true);
+      expect(l.record.sweptAmount).toBe(value);
+      expect(l.record.sweptTx).toBe(hash);
+    } finally {
+      d.client.getTransaction = realGetTransaction;
+    }
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {

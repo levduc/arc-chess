@@ -368,9 +368,9 @@ export class ArenaDaemon {
    *  its receipt waits for good -- so a restart creates a new ArenaDaemon on the same home. */
   async start(): Promise<void> {
     if (this.stopped) throw new Error("a stopped ArenaDaemon cannot be restarted: create a new one on the same home");
-    this.unsubscribers.push(this.opts.lobby.onMatch((m) => void this.onMatch(m)));
-    this.unsubscribers.push(this.opts.relay.onMessage((m) => void this.onRelay(m)));
-    this.unsubscribers.push(this.opts.relay.onJoined((id) => void this.onJoined(id)));
+    this.unsubscribers.push(this.opts.lobby.onMatch((m) => this.fireAndForget("onMatch", this.onMatch(m))));
+    this.unsubscribers.push(this.opts.relay.onMessage((m) => this.fireAndForget("onRelay", this.onRelay(m))));
+    this.unsubscribers.push(this.opts.relay.onJoined((id) => this.fireAndForget("onJoined", this.onJoined(id))));
     // Plan 4.5 Task 11 fix round (C2): make a subscribe refusal visible instead of a silent, permanent loss of
     // match notifications. Sticky (see `lobbyError`'s docstring): this daemon refuses new offers/accepts from
     // here on, and every channel's status carries the message, until it is restarted.
@@ -420,8 +420,8 @@ export class ArenaDaemon {
     // first dispute pass on a restart either.
     // The two passes are started independently: a dispute pass never waits for a main pass still in flight.
     this.timer = setInterval(() => {
-      void this.disputePass();
-      void this.mainPass();
+      this.fireAndForget("disputePass", this.disputePass());
+      this.fireAndForget("mainPass", this.mainPass());
     }, this.opts.config.pollMs);
     // Plan 5 Task 1: the settled index -- newest `SETTLED_CACHE_MAX` finalized channels by `settledAt` (a record
     // with none, written before this field existed, sorts as the oldest). Older ones are still served from disk
@@ -463,7 +463,7 @@ export class ArenaDaemon {
       await this.refreshChain(l).catch((err: unknown) => this.log(`channel ${l.record.channelId}: first refresh failed: ${errorText(err)}`));
     }
     // The first round starts now, without start() waiting for it.
-    if (!this.stopped) void this.tick();
+    if (!this.stopped) this.fireAndForget("tick", this.tick());
   }
 
   /** Stops the daemon. Bounded by the transport timeouts of RPC calls already in flight (round 5, m3). */
@@ -713,7 +713,7 @@ export class ArenaDaemon {
             return release();
           }
           this.notify();
-          void this.tick();
+          this.fireAndForget("tick", this.tick());
         }
         return release();
       }
@@ -814,7 +814,7 @@ export class ArenaDaemon {
       if (this.stopped) return;
       await this.openChannel(record);
       this.notify();
-      void this.tick();
+      this.fireAndForget("tick", this.tick());
     } catch (err) {
       release();
       if (!this.stopped) this.retryMatches.set(offerId, m);
@@ -1277,34 +1277,37 @@ export class ArenaDaemon {
       recheck?: boolean;
     } = {},
   ): Promise<SweepAttemptResult> {
-    // Fix round 2, minor 2: a receipt this daemon lost track of (`TxReceiptMissingError`) from a *previous*
-    // attempt is checked first, before anything else below -- including the back-off gate just past this block --
-    // since the transaction may already have landed and there is nothing to gain by waiting the back-off out
-    // before finding that out.
-    if (backoff.pendingTx !== undefined && record.swept === undefined) {
-      const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
-      if (recovered === "pending") return { kind: "skipped", record };
-      backoff.pendingTx = undefined;
-      if (recovered !== "failed") {
-        const updated: ChannelRecord = { ...record, swept: true, sweptAmount: recovered.amount, sweptTx: recovered.hash };
-        save(updated);
-        this.endSweepBackoff(record.channelId, backoff);
-        return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
-      }
-      // Confirmed not a success (reverted, or never mined at all): nothing to recover -- fall through below for a
-      // fresh attempt, same as any other failure.
-    }
-    // Fix round 2, important 1: a manual sweep (force) on an "abandoned" channel gets a fresh episode -- I8's
-    // own write-off must never be permanent for `arena sweep`/`POST /sweep`, or every bulk sweep just reports
-    // every abandoned channel as "not sweepable yet" forever.
+    // Fix round 2, important 1: a manual sweep (force) on an "abandoned" channel gets a fresh episode -- I8's own
+    // write-off must never be permanent for `arena sweep`/`POST /sweep`, or every bulk sweep just reports every
+    // abandoned channel as "not sweepable yet" forever. Computed before the try below (the catch block, at the
+    // bottom, also reads `rechecking`) but does not itself do anything that can throw.
     const retryingAbandoned = opts.force === true && record.swept === "abandoned";
     if (retryingAbandoned) backoff.attempts = 0;
     const rechecking = opts.recheck === true && isSweptDone(record.swept);
-    if (this.stopped || (record.swept !== undefined && !retryingAbandoned && !rechecking)) return { kind: "skipped", record };
-    if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
-    // Rule 1: never beside a transaction actively being waited on elsewhere on this same session key.
-    if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
     try {
+      // Fix round 2, minor 2 (fix round 3, C-1: moved inside this try -- it used to sit before it, so any throw
+      // out of `recoverPendingSweepTx` -- e.g. a `getTransaction` RPC blip -- escaped this method entirely; with
+      // no catch anywhere above a timer-driven `void this.mainPass()`, that crashed the whole daemon process).
+      // Checked first, before anything else below -- including the back-off gate just past this block -- since
+      // the transaction may already have landed and there is nothing to gain by waiting the back-off out before
+      // finding that out.
+      if (backoff.pendingTx !== undefined && record.swept === undefined) {
+        const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
+        if (recovered === "pending") return { kind: "skipped", record };
+        backoff.pendingTx = undefined;
+        if (recovered !== "failed") {
+          const updated: ChannelRecord = { ...record, swept: true, sweptAmount: recovered.amount, sweptTx: recovered.hash };
+          save(updated);
+          this.endSweepBackoff(record.channelId, backoff);
+          return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
+        }
+        // Fix round 3, I-2: confirmed gone (reverted, or the node no longer knows it at all) -- nothing to
+        // recover. Falls through to a fresh attempt below, same as any other failure, within this same try.
+      }
+      if (this.stopped || (record.swept !== undefined && !retryingAbandoned && !rechecking)) return { kind: "skipped", record };
+      if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
+      // Rule 1: never beside a transaction actively being waited on elsewhere on this same session key.
+      if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
       if (!(await this.isSweepable(record))) return { kind: "skipped", record };
       const outcome = await this.performSweep(sender, opts.giveUpAt);
       if (outcome.status === "dust") {
@@ -1367,17 +1370,29 @@ export class ArenaDaemon {
   /** Fix round 2, minor 2: looks up a transaction this daemon lost track of (its receipt went missing after
    *  `waitOrReplace` treated it as mined). Returns `"pending"` if the receipt still cannot be read at all (try
    *  again next attempt), `"failed"` if it can be read but did not succeed (nothing to recover), or the amount and
-   *  hash to record as swept if it did. */
+   *  hash to record as swept if it did.
+   *
+   *  Fix round 3, C-1: the whole body is now inside its own try/catch (in addition to `runSweepAttempt`'s own,
+   *  which now also wraps this call -- see its own note) -- probe F1 found `getTransaction` throwing on a plain
+   *  RPC blip (after a successful receipt read) escaping uncaught, all the way out of `runSweepAttempt`, which a
+   *  timer-driven `void this.mainPass()` has no catch above; Node exits the whole process on that unhandled
+   *  rejection. Treated as "pending" (try again next attempt), like any other transient read failure here --
+   *  never charged as a failed attempt for what may just be a slow node. */
   private async recoverPendingSweepTx(hash: Hex): Promise<"pending" | "failed" | { amount: bigint; hash: Hex }> {
-    let receipt: { status: "success" | "reverted" };
     try {
-      receipt = await this.client.getTransactionReceipt({ hash });
-    } catch {
+      let receipt: { status: "success" | "reverted" };
+      try {
+        receipt = await this.client.getTransactionReceipt({ hash });
+      } catch {
+        return "pending";
+      }
+      if (receipt.status !== "success") return "failed";
+      const tx = await this.client.getTransaction({ hash });
+      return { amount: tx.value, hash };
+    } catch (err) {
+      this.log(`sweep recovery: ${errorText(err)} looking up ${hash} (retried next attempt)`);
       return "pending";
     }
-    if (receipt.status !== "success") return "failed";
-    const tx = await this.client.getTransaction({ hash });
-    return { amount: tx.value, hash };
   }
 
   /** Fix round 2 (important 3 + minors 1/6): merges only `swept`/`sweptAmount`/`sweptTx` from `updated` onto a
@@ -1934,7 +1949,10 @@ export class ArenaDaemon {
       for (const m of [...this.retryMatches.values()]) {
         if (this.stopped) break;
         this.retryMatches.delete(m.offerId);
-        await this.onMatch(m);
+        // Fix round 3, C-1, defense in depth: onMatch already catches its own errors internally, but this is
+        // awaited directly inside mainPass()'s own try (no catch of its own) -- one more layer, in case that
+        // ever changes, so a single bad retried match can never take the whole pass down with it.
+        await this.onMatch(m).catch((err: unknown) => this.log(`retryMatches: onMatch failed for offer ${m.offerId}: ${errorText(err)}`));
       }
       // Plan 5 Task 1 (mainnet gates: session-gas sweep): every settled channel not yet swept, before eviction --
       // eviction waits on `swept` being set (see evictSettled), so this must run first in the same pass a channel
@@ -2509,6 +2527,16 @@ export class ArenaDaemon {
     } catch {
       // M8: a throwing listener must never break the caller (a move, a relay message, a tick).
     }
+  }
+
+  /** Fix round 3, C-1, defense in depth: every timer-driven or fire-and-forget call in this class (the periodic
+   *  timer's own dispute/main passes, the initial and post-match `tick()`s, the lobby/relay event subscriptions)
+   *  goes through this instead of a bare `void this.foo()`. A single stray, uncaught rejection on one of these --
+   *  probe F1 found one inside the sweep's own receipt-recovery path, since fixed at its source too -- reaches
+   *  Node with no `.catch` anywhere above it; recent Node versions exit the process on an unhandled rejection.
+   *  This is the backstop for every such call, present and future, not a substitute for fixing the source. */
+  private fireAndForget(label: string, p: Promise<unknown>): void {
+    p.catch((err: unknown) => this.log(`${label} failed (this daemon keeps running): ${errorText(err)}`));
   }
 
   private markDegraded(channelId: string, error: string): void {
