@@ -358,7 +358,10 @@ export async function startApi(
           case "POST /handoff": {
             const to = b.to;
             if (to !== "agent" && to !== "human") throw new DaemonError(400, 'to must be "agent" or "human"');
-            await daemon.handoff(ch, to, typeof b.note === "string" ? b.note : "");
+            // Plan 5 Task 3: CRLF -> LF before the daemon's control-character check, so a pasted Windows-style line
+            // break is not refused as a stray "\r"; a lone "\r" still is.
+            const note = typeof b.note === "string" ? b.note.replace(/\r\n/g, "\n") : "";
+            await daemon.handoff(ch, to, note);
             return send(res, 200, await daemon.status(ch));
           }
           default:

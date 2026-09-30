@@ -121,6 +121,12 @@ describe("local API", () => {
     // Plan 5 Task 2 fix round, minor 4: an over-long or control/bidi-carrying note is refused end to end too.
     expect((await call(url, token, "POST", "/handoff", { to: "agent", note: "x".repeat(1025) })).status).toBe(400);
     expect((await call(url, token, "POST", "/handoff", { to: "agent", note: "bidi‮override" })).status).toBe(400);
+    // Plan 5 Task 3: a CRLF line break (a pasted note, or a client that sends one) is normalized to "\n" before the
+    // control-character check; a lone "\r" is still refused.
+    const crlf = await call(url, token, "POST", "/handoff", { to: "human", note: "line one\r\nline two" }, "human");
+    expect(crlf.status).toBe(200);
+    expect(crlf.body.handoff.note).toBe("line one\nline two");
+    expect((await call(url, token, "POST", "/handoff", { to: "human", note: "lone\rcr" })).status).toBe(400);
   });
 
   it("Plan 5 Task 1: POST /offers without challengeTimeout defaults to minChallengeTimeoutOf(config)", async () => {
