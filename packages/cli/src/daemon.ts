@@ -308,6 +308,10 @@ export const SWEEP_TIME_BUDGET_MS = 60_000;
  *  `budgetMs`) and starve every other record a bulk sweep would otherwise have gotten through. */
 export const SWEEP_PER_RECORD_TIMEOUT_MS = 20_000;
 
+/** Final fix wave (I2): the most sweep-queue records one main pass attempts. The next pass continues with the
+ *  records after them (round-robin), so one pass never serializes the whole queue. */
+export const SWEEP_QUEUE_PER_PASS = 3;
+
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
@@ -1548,10 +1552,18 @@ export class ArenaDaemon {
     // Nit: `l.record` is updated inside the save callback itself, not only after runSweepAttempt returns (as
     // sweepQueuePass's own entry.record already did) -- so a concurrent reader sees the disk and the in-memory
     // handle update together, not disk first and l.record only once this whole call unwinds.
-    const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => {
-      l.record = this.applySweptFields(l.record, r);
-      this.records.saveChannel(l.record);
-    });
+    // Final fix wave (I2): the receipt wait is bounded like a manual sweep's, so a stuck sweep holds the main
+    // pass for at most SWEEP_PER_RECORD_TIMEOUT_MS, not waitOrReplace's own ~2 minutes.
+    const result = await this.runSweepAttempt(
+      l.record,
+      l.sessionSender,
+      l.sweep,
+      (r) => {
+        l.record = this.applySweptFields(l.record, r);
+        this.records.saveChannel(l.record);
+      },
+      { giveUpAt: Date.now() + SWEEP_PER_RECORD_TIMEOUT_MS },
+    );
     l.record = this.applySweptFields(l.record, result.record);
   }
 
@@ -1560,15 +1572,29 @@ export class ArenaDaemon {
    *  protected method (like `sweepChannel`) so a test can stub it out, e.g. to keep a manual `sweep()` call from
    *  racing the periodic main pass's own processing of the very record it is about to sweep. */
   protected async sweepQueuePass(): Promise<void> {
+    // Final fix wave (I2): at most SWEEP_QUEUE_PER_PASS records per pass, each bounded to
+    // SWEEP_PER_RECORD_TIMEOUT_MS. An attempted record moves to the back of the queue (Map order is insertion
+    // order), so the next pass starts with the records this one did not reach.
+    let attempted = 0;
     for (const [qid, entry] of [...this.sweepQueue]) {
-      if (this.stopped) break;
-      if (entry.busy) continue;
+      if (this.stopped || attempted >= SWEEP_QUEUE_PER_PASS) break;
+      // Skipped if a manual sweep is on it, or already took it off the queue since the snapshot above.
+      if (entry.busy || this.sweepQueue.get(qid) !== entry) continue;
+      attempted++;
+      this.sweepQueue.delete(qid);
+      this.sweepQueue.set(qid, entry);
       entry.busy = true;
       try {
-        const result = await this.runSweepAttempt(entry.record, entry.sender, entry.sweep, (r) => {
-          entry.record = this.applySweptFields(entry.record, r);
-          this.records.saveChannel(entry.record);
-        });
+        const result = await this.runSweepAttempt(
+          entry.record,
+          entry.sender,
+          entry.sweep,
+          (r) => {
+            entry.record = this.applySweptFields(entry.record, r);
+            this.records.saveChannel(entry.record);
+          },
+          { giveUpAt: Date.now() + SWEEP_PER_RECORD_TIMEOUT_MS },
+        );
         entry.record = this.applySweptFields(entry.record, result.record);
         if (entry.record.swept !== undefined) {
           this.sweepQueue.delete(qid);

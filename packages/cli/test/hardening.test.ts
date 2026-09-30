@@ -13,6 +13,7 @@ import {
   TxInsufficientFundsError,
   TxNonceUsedError,
   TxReceiptMissingError,
+  TxStuckError,
   NO_FEE_CEILING,
   DEFAULT_FEE_CEILING_WEI,
   buildParams,
@@ -2051,6 +2052,79 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       recordsInternals.saveChannel = realSaveChannel;
     }
     expect(sweptAtSaveTime).toBe(true);
+  });
+
+  /** Stops the daemon's periodic passes (the `285c4c1` pattern) so a test drives every pass itself. */
+  async function stopPeriodicPasses(d: ArenaDaemon): Promise<void> {
+    clearInterval((d as unknown as { timer?: NodeJS.Timeout }).timer);
+    await d.idle();
+  }
+
+  it(
+    "final fix wave, I2: a stuck automatic sweep holds the main pass for at most SWEEP_PER_RECORD_TIMEOUT_MS",
+    async () => {
+      const { alice, bob, id } = await matched();
+      const original = await settleWithSweepDisabled(alice, bob, id);
+      const d = alice.daemon;
+      await stopPeriodicPasses(d);
+      (d as unknown as SweepableDaemon).sweepChannel = original;
+      // A sweep whose receipt never comes: the stub waits until the giveUpAt it is handed, the way waitOrReplace
+      // does, and without one for STUCK_WITHOUT_BOUND_MS -- standing in for waitOrReplace's own defaults (4 rounds
+      // of 30 s, about 2 minutes) that the automatic path used before this fix.
+      const STUCK_WITHOUT_BOUND_MS = 40_000;
+      const internals = d as unknown as { performSweep(sender: unknown, giveUpAt?: number): Promise<unknown> };
+      const realPerformSweep = internals.performSweep.bind(d);
+      internals.performSweep = async (_sender: unknown, giveUpAt?: number) => {
+        const until = giveUpAt ?? Date.now() + STUCK_WITHOUT_BOUND_MS;
+        await new Promise((r) => setTimeout(r, Math.max(0, until - Date.now())));
+        throw new TxStuckError([], giveUpAt !== undefined);
+      };
+      try {
+        const t0 = Date.now();
+        await d.mainPass();
+        expect(Date.now() - t0).toBeLessThan(SWEEP_PER_RECORD_TIMEOUT_MS + 5_000);
+      } finally {
+        internals.performSweep = realPerformSweep;
+      }
+      expect(d.handle(id).record.swept).toBeUndefined(); // gave up and backed off; nothing recorded
+    },
+    90_000,
+  );
+
+  it("final fix wave, I2: the sweep queue attempts at most 3 records per main pass, round-robin, each bounded to 20 s", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    const d = pair.alice.daemon;
+    await stopPeriodicPasses(d);
+    const internals = d as unknown as {
+      sweepQueue: Map<Hex, unknown>;
+      sweepQueuePass(): Promise<void>;
+      runSweepAttempt(r: ChannelRecord, s: unknown, b: unknown, save: unknown, opts?: { giveUpAt?: number }): Promise<unknown>;
+    };
+    const ids = ["1", "2", "3", "4", "5"].map((c) => `0x${c.repeat(64)}` as Hex);
+    for (const channelId of ids) {
+      internals.sweepQueue.set(channelId, {
+        record: { channelId } as ChannelRecord,
+        sender: {},
+        sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0 },
+        busy: false,
+      });
+    }
+    const calls: Array<{ id: Hex; budgetMs: number | undefined }> = [];
+    internals.runSweepAttempt = async (record, _s, _b, _save, opts = {}) => {
+      calls.push({ id: record.channelId, budgetMs: opts.giveUpAt === undefined ? undefined : opts.giveUpAt - Date.now() });
+      return { kind: "skipped", record };
+    };
+    await internals.sweepQueuePass();
+    expect(calls.map((c) => c.id)).toEqual(ids.slice(0, 3));
+    await internals.sweepQueuePass();
+    // Round-robin: the next pass starts where the last one stopped, then wraps.
+    expect(calls.slice(3).map((c) => c.id)).toEqual([ids[3], ids[4], ids[0]]);
+    for (const c of calls) {
+      expect(c.budgetMs).toBeDefined();
+      expect(c.budgetMs!).toBeLessThanOrEqual(SWEEP_PER_RECORD_TIMEOUT_MS);
+      expect(c.budgetMs!).toBeGreaterThan(SWEEP_PER_RECORD_TIMEOUT_MS - 5_000);
+    }
   });
 });
 
