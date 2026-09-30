@@ -397,6 +397,69 @@ describe("local API", () => {
     expect(done).toBe(true);
   });
 
+  it("Plan 5 Task 2 fix round, minor 6: daemon.stop() ends open /events streams", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup(); // idempotent: alice's daemon is already stopped by the test itself below
+    };
+    const res = await fetch(`${url}/events`, { headers: { authorization: `Bearer ${token}` } });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    await reader.read(); // the initial "retry: 3000" line -- confirms the stream is actually open
+    await pair.alice.daemon.stop();
+    const { done } = await reader.read();
+    expect(done).toBe(true);
+  });
+
+  it("Plan 5 Task 2 fix round, minor 6: the /events cap slot is freed after a client disconnects", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    const controllers: AbortController[] = [];
+    stop = async () => {
+      for (const c of controllers) c.abort();
+      server.close();
+      await pair.cleanup();
+    };
+    const open = async (): Promise<Response> => {
+      const c = new AbortController();
+      controllers.push(c);
+      return fetch(`${url}/events`, { headers: { authorization: `Bearer ${token}` }, signal: c.signal });
+    };
+    const eight = await Promise.all(Array.from({ length: 8 }, () => open()));
+    expect((await open()).status).toBe(429); // the cap is full
+
+    // Disconnect one of the eight; cleanup() runs on the server's own "close" event for that request, which is
+    // asynchronous relative to the abort() call itself -- poll for the freed slot rather than assume it's instant.
+    eight[0].body?.cancel().catch(() => undefined);
+    controllers[0].abort();
+    await waitFor(async () => (await open()).status === 200, 5_000, "a freed /events slot");
+  });
+
+  it("Plan 5 Task 2 fix round, minor 6: /events sends a periodic ping comment", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token, sse: { pingIntervalMs: 50 } });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const res = await fetch(`${url}/events`, { headers: { authorization: `Bearer ${token}` } });
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const deadline = Date.now() + 5_000;
+    while (!text.includes(": ping") && Date.now() < deadline) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    expect(text).toContain(": ping\n\n");
+  });
+
   it("fix round I5: POST /sweep returns {results, remaining}", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);
