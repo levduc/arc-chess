@@ -326,6 +326,9 @@ describe("channel list chips and banners", () => {
     expect(channelBanners(status())).toEqual([]);
     expect(channelBanners(status({ attention: "session-gas-low" })).map((b: any) => b.kind)).toEqual(["session-gas-low"]);
     expect(channelBanners(status({ attention: "opponent-silent" })).map((b: any) => b.kind)).toEqual(["opponent-silent"]);
+    // A human holding the seat sees it through humanAttention (attention stays null so the agent's wait is quiet).
+    const humanSilent = status({ controller: "human", attention: null, humanAttention: "opponent-silent" });
+    expect(channelBanners(humanSilent).map((b: any) => b.kind)).toEqual(["opponent-silent"]);
     const must = status({ phase: "Challenged", challenge: { deadline: "1", secondsLeft: 60, mustMove: true, challenger: "opponent" } });
     expect(channelBanners(must).map((b: any) => b.kind)).toEqual(["must-move"]);
   });

@@ -951,6 +951,9 @@ function renderPanel() {
 
   let hint = "";
   if (st && !human && isLive(st)) hint = "Take over to use these controls.";
+  else if (st && st.humanAttention === "opponent-silent" && a?.challenge) {
+    hint = "Your opponent has stopped responding. A challenge forces them to answer on-chain before the deadline.";
+  }
   else if (st && human && (st.cooldown?.meSeconds ?? 0) > 0) hint = `Challenge available again in ${formatDuration(st.cooldown.meSeconds)}.`;
   setText($("actions-hint"), hint);
 

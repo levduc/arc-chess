@@ -61,6 +61,11 @@ export type ChannelStatus = {
     | "close-requested"
     | "opponent-silent"
     | "settled";
+  /** Plan 5 Task 3 fix round: what a human holding the seat should see that `attention` deliberately leaves out.
+   *  `attention` stays agent-only apart from session-gas-low, because `wait()` wakes on any `attention` and must stay
+   *  quiet while a human controls the channel (spec §6.2). Today that is `opponent-silent` alone, with
+   *  `arena challenge` first in `suggestedActions` exactly as for the agent. Null while the agent is in control. */
+  humanAttention: null | "opponent-silent";
   suggestedActions: string[];
   lastError: string | null;
   /** Plan 4.5 Task 11 fix round (C2): the daemon-wide "too many watched offers" (or other subscribe-refusal)
@@ -196,6 +201,8 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     attention = "settled";
   }
 
+  const humanAttention: ChannelStatus["humanAttention"] = record.controller === "human" && silent ? "opponent-silent" : null;
+
   const suggestedActions: string[] = [];
   // I2: the on-chain escape from a stalled or withheld state (only while Open; once Challenged it is under way).
   let challengeHint: string | null = null;
@@ -279,6 +286,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     opponentWantsToClose,
     challenge,
     attention,
+    humanAttention,
     suggestedActions,
     lastError: input.lastError,
     lobbyError: input.lobbyError ?? null,

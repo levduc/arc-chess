@@ -281,7 +281,10 @@ export function channelBanners(status) {
   const out = [];
   if (status.attention === "session-gas-low") out.push({ kind: "session-gas-low", text: "Session gas low: fund your wallet" });
   if (status.challenge?.mustMove) out.push({ kind: "must-move", text: "You must move before the deadline" });
-  if (status.attention === "opponent-silent") out.push({ kind: "opponent-silent", text: "Opponent silent: consider a challenge" });
+  // humanAttention carries it while a human holds the seat (attention stays agent-only; see status.ts).
+  if (status.attention === "opponent-silent" || status.humanAttention === "opponent-silent") {
+    out.push({ kind: "opponent-silent", text: "Opponent silent: consider a challenge" });
+  }
   return out;
 }
 

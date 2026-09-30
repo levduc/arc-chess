@@ -195,6 +195,24 @@ describe("buildStatus", () => {
     expect(view(a, rec(0), { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n }, OPEN.now - 601n).attention).toBeNull();
   });
 
+  it("Plan 5 Task 3 fix round: humanAttention raises opponent-silent for a human in control, leaving attention (and so wait) unchanged", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4")); // a waits on b's move
+    const human = { ...rec(0), controller: "human" as const };
+    const s = view(a, human, OPEN, OPEN.now - 601n);
+    // The agent's channel: attention stays null while the human holds the seat, so `wait` stays quiet.
+    expect(s.attention).toBeNull();
+    expect(s.humanAttention).toBe("opponent-silent");
+    expect(s.suggestedActions[0]).toMatch(/^arena challenge .*no progress for over 600s/);
+    // Not yet silent, the agent in control, or an ongoing challenge: no humanAttention.
+    expect(view(a, human, OPEN, OPEN.now - 600n).humanAttention).toBeNull();
+    expect(view(a, human, OPEN, null).humanAttention).toBeNull();
+    const agent = view(a, rec(0), OPEN, OPEN.now - 601n);
+    expect(agent.attention).toBe("opponent-silent");
+    expect(agent.humanAttention).toBeNull();
+    expect(view(a, human, { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n }, OPEN.now - 601n).humanAttention).toBeNull();
+  });
+
   it("I2: opponent-silent also covers an unanswered proposal and a withheld Close, but not our own game-over decision", async () => {
     const x = await finished();
     expect(view(x.a, x.rec(0), OPEN, OPEN.now - 601n).attention).toBe("game-over"); // our call, not their silence
