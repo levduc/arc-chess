@@ -4,13 +4,17 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Arena board</title>
-    <link rel="stylesheet" href="style.css" />
+    <!-- Absolute paths, not relative: arena board and the daemon start line both print .../board with no
+         trailing slash, so a relative href/src here would resolve against "/" (the page's own document
+         address), not "/board/", and 401 (or 404, once base-uri 'none' also rules out fixing this with
+         <base href>). Keep this absolute in Task 3 too. -->
+    <link rel="stylesheet" href="/board/style.css" />
   </head>
   <body>
     <!-- Plan 5 Task 2 placeholder: Task 3 replaces this page with the real board (channel list, the 8x8 grid,
          the controller/handoff/lobby panels -- see the plan's Task 3 "Layout"). This placeholder exists only so
          Task 2's static-serving route can be tested end to end. -->
     <p id="placeholder">Arena board placeholder -- Task 3 fills this in.</p>
-    <script type="module" src="app.js"></script>
+    <script type="module" src="/board/app.js"></script>
   </body>
 </html>

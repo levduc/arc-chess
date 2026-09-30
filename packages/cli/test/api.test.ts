@@ -18,7 +18,7 @@ afterEach(async () => {
 function rawRequest(
   port: number,
   opts: { hostHeader?: string; method?: string; path?: string; headers?: Record<string, string> } = {},
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers: Record<string, string | string[] | undefined> }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
       {
@@ -32,7 +32,9 @@ function rawRequest(
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        res.on("end", () =>
+          resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8"), headers: res.headers }),
+        );
       },
     );
     req.on("error", reject);
@@ -174,6 +176,24 @@ describe("local API", () => {
 
     const opt = await fetch(`${url}/channels`, { method: "OPTIONS" });
     expect(opt.status).toBe(405);
+
+    // The load-bearing case: a board *document* -- the one response the browser actually enforces the CSP
+    // against -- carries it too, not just the JSON paths through send() above.
+    const board = await fetch(`${url}/board`);
+    expect(board.headers.get("content-security-policy")).toBe(
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    );
+    expect(board.headers.get("x-frame-options")).toBe("DENY");
+
+    // And on the 421 short-circuit itself (headersSent-free path, before any route dispatch).
+    const port = (server.address() as AddressInfo).port;
+    const rejected = await rawRequest(port, { hostHeader: `evil.example:${port}` });
+    expect(rejected.status).toBe(421);
+    expect(rejected.headers["content-security-policy"]).toBe(
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    );
   });
 
   it("Plan 5 Task 2: serves the static board with no token, and 404s anything else under /board", async () => {
