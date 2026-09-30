@@ -364,9 +364,12 @@ holds config, wallet settings, and per-channel state including session keys
   control and bidi-override/isolate characters, with a `\r\n` normalised to
   `\n` before that check (§12 item 43); `status.handoff` reports
   `{controller, note, since}` for whoever holds the seat.
-- While `human` holds a channel, every move-type command (`move`, `resign`,
-  `accept-draw`, `next-game`, `close`, `challenge`), from either actor header,
-  gets 409; the daemon never signs. The watchtower keeps running regardless of
+- Every move-type command (`move`, `resign`, `accept-draw`, `next-game`,
+  `close`, `challenge`) is refused with 409 unless its `x-arena-actor` header
+  matches the channel's current `controller` -- symmetric, so an agent request
+  gets 409 while `human` holds the seat, and a `human`-actor request (the
+  board's own header) gets 409 while `agent` holds it. The daemon never
+  signs on the refused side. The watchtower keeps running regardless of
   controller (stale-challenge responses, auto-resign on mate, timeouts and
   reclaims are unaffected).
 - `arena wait` wakes with `reason: "control-changed"` on a controller change

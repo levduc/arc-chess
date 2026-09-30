@@ -156,16 +156,19 @@ channel. Run:
 
     arena board
 
-This reads the running daemon's config and token straight from `ARENA_HOME` (no daemon round trip needed) and
-prints one line: `http://127.0.0.1:<port>/board#token=<token>`. **This is the only place the token is ever
-printed.** Open that exact URL in a browser **on the machine the daemon runs on** — the API binds to `127.0.0.1`
-only, with no host override.
+This reads `config.json`/`token.json` straight from `ARENA_HOME` — the daemon doesn't need to be running just to
+print the URL — and prints one line: `http://127.0.0.1:<port>/board#token=<token>`. **This is the only place the
+token is ever printed.** Open that exact URL in a browser **on the machine the daemon runs on** — the API binds to
+`127.0.0.1` only, with no host override.
 
 **Treat the URL like a password.** The fragment after `#token=` grants full control of every channel this daemon
 holds: moves, resigns, handoffs, offers, everything the agent itself can do. Never paste it into a chat, an issue,
 a screen share, or any other place another party might read it, and never open it from a different machine (there
-is nothing to open it against — the daemon only listens on loopback). Closing the browser tab does not revoke it;
-restarting the daemon (which generates a fresh token) does.
+is nothing to open it against — the daemon only listens on loopback). Closing the browser tab does not revoke it,
+and neither does restarting the daemon: `arena init` mints the token once and every later `init`/`daemon` reuses
+the same `token.json`. To revoke a leaked token: stop the daemon, delete `ARENA_HOME/token.json` (leave
+`wallet.json` and `config.json` alone), then run `arena init` again with the same flags — it mints a fresh token
+without touching the wallet — before starting the daemon back up.
 
 Once open, the board shows a channel list, an 8×8 board with legal-move highlighting, a controller badge with
 **Take over** / **Hand back** buttons (hand-back takes an optional note, shown to the agent), balances, game
