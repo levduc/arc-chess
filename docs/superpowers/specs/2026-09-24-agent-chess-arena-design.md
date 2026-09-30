@@ -92,10 +92,17 @@ The daemon sends on-chain transactions (`approve`, `deposit`, `challenge`,
   to `sessionGasWei` (on Arc, gas is paid in USDC) from the player's wallet.
   While the channel is Open or Challenged, the daemon refills the key from the
   wallet back to `sessionGasWei` whenever it drops below `sessionGasFloor`
-  (§12 item 29). Leftover session-key gas is **not** swept back after finalize:
-  this is not implemented (deferred to Plan 5). Up to `sessionGasWei` per
-  settled channel stays on its session key, whose private key remains in
-  `ARENA_HOME`. `owed` payouts are not claimed by the daemon either.
+  (§12 item 29), backed off per channel on repeated failure (§12 item 36).
+  Once a channel reaches Finalized or Reclaimed, the main pass sweeps the
+  session key's balance back to the wallet, reserving headroom for a same-nonce
+  fee bump and declining as dust when nothing worth sending is left (§12 item
+  35, Plan 5). `arena sweep` / `POST /sweep` additionally sweep settled
+  channels found still unswept at start -- legacy records, or ones a restart
+  interrupted mid-sweep. A record that cannot be swept after
+  `SWEEP_ABANDON_ATTEMPTS` (12) retries is recorded `swept: "abandoned"` so
+  eviction proceeds anyway; its balance is stranded, not lost, and a later
+  `arena sweep --channel <id>` retries it. `owed` payouts are still not
+  claimed by the daemon.
 
 `deposit` and `approve` must come from the participant wallet (primary sender).
 Session-key signing of states is always local and independent of `TxSender`.
@@ -334,8 +341,9 @@ holds config, wallet settings, and per-channel state including session keys
 | Command | Description |
 |---|---|
 | `arena init [--server URL] [--wallet local\|circle] [--address 0x…]` | Configure server, chain, and `TxSender`. `circle` requires an authenticated Circle CLI agent wallet. |
-| `arena daemon start` | Local API (127.0.0.1 only, bearer token in `ARENA_HOME`), web board, lobby + relay clients, chain watcher. |
-| `arena offers` / `arena offer [--deposit --stake --timeout]` / `arena accept <offerId>` | Lobby. A fresh session key is generated per channel. Matching triggers `approve` + `deposit` (funding order per §5) and the session-key gas top-up. |
+| `arena daemon start` | Local API (127.0.0.1 only, bearer token in `ARENA_HOME`), web board, lobby + relay clients, chain watcher. Its startup line prints the board's URL with no token (`board`) plus a `boardHint`; the token never reaches a log file. |
+| `arena board` | Prints the board's URL with the bearer token in the fragment (`http://127.0.0.1:<port>/board#token=…`) -- the only place the token is printed. Open it in a browser on the machine the daemon runs on. |
+| `arena offers` / `arena offer [--deposit --stake --timeout]` / `arena accept <offerId>` | Lobby. A fresh session key is generated per channel. Matching triggers `approve` + `deposit` (funding order per §5) and the session-key gas top-up. `--timeout` defaults to this daemon's `minChallengeTimeout` (§12 item 38) if omitted. |
 | `arena channels` | Channels with status, whose turn, controller. |
 | `arena status [--channel id]` | JSON for LLMs: FEN, ASCII board, legal moves (SAN), side, whose turn, controller, balances, game index, challenge deadline/cooldown, suggested next actions. |
 | `arena wait [--channel id] [--timeout s]` | Blocks until any (or the given) channel needs this player's action or control changes; returns channel and reason. |
@@ -344,19 +352,34 @@ holds config, wallet settings, and per-channel state including session keys
 | `arena next-game` / `close` | Between games: propose or co-sign `NEW_GAME`, or sign a `Close` intent for the terminal state (both players) and submit `closeCooperative`. |
 | `arena challenge [--channel id]` | Force the opponent on-chain (respects cooldown). |
 | `arena reclaim [--channel id]` | Recover a deposit from a channel that never fully funded. |
+| `arena sweep [--channel id]` | Sweeps settled channels' session-key gas back to the wallet; backed by `POST /sweep` (single-flight, 60 s budget, reports `remaining`). |
 | `arena handoff human\|agent [--channel id] [--note text]` | Switch controller. |
 
 `--channel` may be omitted when exactly one channel is active.
 
 ### 6.2 Handoff
 
-- Per-channel `controller ∈ {agent, human}`, default `agent`.
-- When `human`: CLI move-type commands return an error stating the human is in
-  control; `arena wait` returns when control returns to the agent.
-- Web board at `http://127.0.0.1:<port>/board` (token-protected link printed by
-  the daemon) lists channels; each has **Take over** / **Hand back** buttons.
-  The agent's handoff note is displayed.
-- The watchtower runs regardless of controller.
+- Per-channel `controller ∈ {agent, human}`, default `agent`. `POST /handoff
+  {to, note}` switches it. `note` is capped at 1024 characters and rejects
+  control and bidi-override/isolate characters, with a `\r\n` normalised to
+  `\n` before that check (§12 item 43); `status.handoff` reports
+  `{controller, note, since}` for whoever holds the seat.
+- While `human` holds a channel, every move-type command (`move`, `resign`,
+  `accept-draw`, `next-game`, `close`, `challenge`), from either actor header,
+  gets 409; the daemon never signs. The watchtower keeps running regardless of
+  controller (stale-challenge responses, auto-resign on mate, timeouts and
+  reclaims are unaffected).
+- `arena wait` wakes with `reason: "control-changed"` on a controller change
+  it observes while it is in flight. A change that happened before the call
+  started is not itself a wake reason: `wait` instead returns the channel's
+  ordinary `attention` (e.g. `your-turn`), so callers must read
+  `status.controller` after every `wait`, not infer control from the reason
+  string alone (§12 item 44).
+- The human opens the board by running `arena board` on the machine the
+  daemon runs on and opening the URL it prints -- the only place the bearer
+  token is ever printed (§6.4, §12 item 42). It must never be pasted or
+  shared, and never opened from another machine: holding it is holding every
+  channel's controls.
 
 ### 6.3 Watchtower
 
@@ -378,9 +401,54 @@ holds config, wallet settings, and per-channel state including session keys
 
 ### 6.4 Web board
 
-Chessboard with legal-move highlighting (chess.js), controller badge, balances,
-game index, challenge countdown, an offer-draw toggle on moves, and resign /
-accept-draw / next-game / close buttons.
+Served by the daemon's own local API at `/board`: static files with no build
+step (vanilla ES modules, CSS, chess.js 1.4.0's ESM build), each read from
+disk once and matched against an exact-path allowlist, so any other path
+under `/board` -- a traversal attempt, encoded or not, or simply an unknown
+file -- 404s rather than falling through to anything token-gated. The static
+shell needs no token; every data route still requires the bearer token. The
+browser reads the token once from `location.hash` on load, clears the
+fragment with `history.replaceState`, and keeps it only in memory, sending it
+as `Authorization: Bearer <token>` on every call. `EventSource` cannot set
+headers, so live updates use `fetch()` with a `ReadableStream` reader instead
+(§12 item 41).
+
+Layout: a channel list with a status chip per channel (your turn, waiting,
+challenged, settled) and the `session-gas-low` / `lobbyError` /
+`opponent-silent` attention banners; a center 8x8 CSS-grid board (orientation
+from `orientation`, last move highlighted, click a piece for its
+`legalMovesUci` targets, a small promotion picker for q/r/b/n, keyboard
+navigable); a right panel (controller badge, Take over / Hand back with a
+note field, the current handoff note, balances, game index, status, an
+offer-draw toggle, resign / accept-draw / next-game / close, and a challenge
+countdown with a red "you must move" banner); and a lobby panel (open offers
+with Accept, a small create-offer form). Everything untrusted -- notes,
+errors, opponent-influenced strings -- is rendered as text, never `innerHTML`.
+
+**Security model** (§12 item 41):
+- Host guard: any request whose `Host` header is not exactly
+  `127.0.0.1:<port>` or `localhost:<port>` gets 421, on every route including
+  `/health` and `/board` -- the DNS-rebinding defense. A duplicate `Host`
+  header also gets 421; a non-origin-form request-target (an absolute-form or
+  asterisk-form URL, a shape a same-origin browser never sends) gets 400.
+- No CORS: no `Access-Control-*` header is ever sent, and a preflight
+  `OPTIONS` gets 405.
+- Every response carries the board's CSP (`default-src 'self'; script-src
+  'self'; style-src 'self'; img-src 'self' data:; connect-src 'self';
+  frame-ancestors 'none'; base-uri 'none'; form-action 'none'`),
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
+  `X-Frame-Options: DENY`; JSON responses add `Cache-Control: no-store`.
+- The token lives only in the URL fragment and the `Authorization` header,
+  never in a path, query string, or log line (§12 item 42).
+
+**Live updates.** `GET /events` is a token-gated SSE feed. It sends
+`event: change` with `data: {"channelId":null}` -- the event carries no
+payload; the board reacts by re-fetching `/channels` and the selected
+`/status` -- whenever the daemon's state changes, debounced per client to at
+most one send per second (trailing-edge: a burst collapses to one send right
+away, plus one more at the window's end if anything changed during it), plus
+a `: ping` comment every 15 s. At most 8 concurrent clients; a 9th gets 429.
+The stream closes on client disconnect, daemon stop, or server close.
 
 ## 7. Error handling
 
@@ -685,6 +753,53 @@ accept-draw / next-game / close buttons.
     the soak needed: one daemon sends every channel's relay traffic over one connection, and a trip closes it
     (1008). The per-IP caps are unchanged. Outside a local Anvil chain the server refuses to start without an
     explicit, non-development `audit` string, since `/templates` publishes it.
+
+### Plan 5 refinements (web board and handoff, 2026-09-29)
+
+35. **Session-gas sweep.** See §3.1: once a channel reaches Finalized or Reclaimed, the main pass sweeps the
+    session key's balance back to the wallet, reserving `gas * ceil(feePerGas * 1.3)` headroom for a same-nonce fee
+    bump and declining as dust when nothing worth sending is left. `arena sweep` / `POST /sweep` additionally sweep
+    settled channels found still unswept at start (legacy records, or ones a restart interrupted mid-sweep). A
+    record that cannot be swept after `SWEEP_ABANDON_ATTEMPTS` (12) retries is recorded `swept: "abandoned"` so
+    eviction proceeds anyway; a later `arena sweep --channel <id>` retries it. `POST /sweep` with no `--channel` is
+    single-flight (a concurrent call gets 409) and spends at most `SWEEP_TIME_BUDGET_MS` (60 s) attempting records,
+    reporting `remaining` rather than hanging the caller.
+36. **Refill back-off.** A channel whose dispute-gas refill keeps failing gets a per-channel
+    `refillBlockedUntil`: 30 s after the first failure, doubling on each further one up to 5 min, reset by a
+    successful refill, a balance already at the floor, or the wallet's own balance rising since it was last
+    observed (it may have just been funded). One log line opens the episode and one closes it.
+37. **`session-gas-low` precision.** Raised only when the wallet itself cannot pay for a refill --
+    `TxInsufficientFundsError`, `TxFeeCapError`, or a failed fee/gas estimate for it -- never for a transient refill
+    error (a nonce race, a dropped/stuck send, a missing receipt), which is logged and re-evaluated on the next
+    pass without alarming the agent.
+38. **Offer default timeout** (supersedes item 30 for the daemon's own defaults). When `POST /offers` omits
+    `challengeTimeout`, the daemon now defaults it to its own `minChallengeTimeoutOf(config)` rather than a fixed
+    900 s; `arena offer` omits the field unless `--timeout` is given. The server's `/templates`
+    `defaults.challengeTimeout` (item 30) is a separate value and is unaffected.
+39. **`wait --channel` on an evicted settled channel** returns `{channelId, reason: "settled"}` at once instead of
+    surfacing `pick()`'s 409, re-checked on every iteration of the poll loop too (a channel can be evicted mid-wait).
+40. **`dev-up --dir` guard.** `--dir` is refused when the directory already exists, is non-empty, and carries no
+    `.arena-dev-marker` file; the marker is written on first successful use, so later runs against the same
+    directory are unaffected.
+41. **Board security model.** See §6.4: the Host guard (421, including a duplicate `Host` header; 400 for a
+    non-origin-form request-target), the CSP and other security headers, the static board's exact-match allowlist
+    (no directory listing, no traversal), and the `GET /events` SSE cap (8 clients, 429 past it) with its
+    per-client debounce (at most one `change` per second, trailing-edge) are all load-bearing against a hostile web
+    page sharing the browser: DNS rebinding, a same-machine port guess, or injected markup.
+42. **Token discipline.** The bearer token is printed exactly once, by `arena board`, in the URL fragment
+    (`http://127.0.0.1:<port>/board#token=…`). The `arena daemon` start line prints the board's URL with no token
+    (`board`) plus a `boardHint`, so nothing that gets redirected to a log file (`nohup … > daemon.log`, a systemd
+    unit's stdout) ever carries it.
+43. **Handoff note.** `POST /handoff`'s `note` is capped at `MAX_HANDOFF_NOTE_LENGTH` (1024) characters and rejects
+    C0/C1 control characters and bidi-override/isolate formatting characters; a `\r\n` is normalised to `\n` before
+    that check, so a pasted Windows-style line break is not itself rejected. The board renders it as text, never
+    `innerHTML` -- this cap is about denial-of-service and layout, not XSS, since text rendering already defeats
+    markup.
+44. **`wait()`'s controller baseline.** Each call records, per channel, the controller it first observes; a change
+    after that baseline returns `{reason: "control-changed"}`, but a change that happened before the call started
+    is visible only through the channel's ordinary `attention` (e.g. `your-turn`), not through the reason string.
+    Callers must read `status.controller` after every `wait` rather than infer control from the reason alone (see
+    `docs/superpowers/mainnet-gates.md` for a note on giving `wait` a `since` cursor instead).
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
