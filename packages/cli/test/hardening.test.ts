@@ -2172,6 +2172,42 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(l.record.sweptAmount).toBe(value);
   });
 
+  it("final fix wave, M4: RPC read failures never count toward SWEEP_ABANDON_ATTEMPTS; a failed send still does", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await stopPeriodicPasses(d);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    const l = d.handle(id);
+    const callSweepChannel = () => (d as unknown as { sweepChannel(x: unknown): Promise<void> }).sweepChannel(l);
+    // An RPC outage: the on-chain settled check (channelInfo) fails on every attempt.
+    const hub = d.hub as unknown as { channelInfo(id: Hex): Promise<unknown> };
+    const realChannelInfo = hub.channelInfo.bind(d.hub);
+    hub.channelInfo = () => Promise.reject(new Error("HTTP request failed: fetch failed"));
+    try {
+      for (let i = 0; i < SWEEP_ABANDON_ATTEMPTS + 2; i++) {
+        l.sweep.blockedUntil = 0; // the back-off elapses between attempts
+        await callSweepChannel();
+      }
+    } finally {
+      hub.channelInfo = realChannelInfo;
+    }
+    expect(l.record.swept).toBeUndefined(); // before: "abandoned" after 12 blips
+    expect(l.sweep.attempts).toBe(0);
+    expect(l.sweep.backoffMs).toBeGreaterThan(0); // still backed off, so an outage is not hammered
+    // A definitive failure (the send itself) is still charged.
+    const internals = d as unknown as { performSweep(sender: unknown, giveUpAt?: number): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    internals.performSweep = () => Promise.reject(new Error("simulated: the send was refused"));
+    try {
+      l.sweep.blockedUntil = 0;
+      await callSweepChannel();
+    } finally {
+      internals.performSweep = realPerformSweep;
+    }
+    expect(l.sweep.attempts).toBe(1);
+  });
+
   it("final fix wave, I2: the sweep queue attempts at most 3 records per main pass, round-robin, each bounded to 20 s", async () => {
     const pair = await startPair();
     cleanups.push(pair.cleanup);

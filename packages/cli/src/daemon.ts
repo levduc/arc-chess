@@ -75,6 +75,16 @@ export class SessionGasEstimateError extends Error {
   }
 }
 
+/** Final fix wave (M4): a chain read a sweep attempt makes before it sends anything (the on-chain settled check,
+ *  the key's nonce, balance and fees, the wallet's code) failed. An RPC blip, not a failure of the sweep itself:
+ *  backed off like any failure, but never counted toward `SWEEP_ABANDON_ATTEMPTS`. */
+export class SweepReadError extends Error {
+  constructor(cause?: unknown) {
+    super(`a read failed before anything was sent: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
+    this.name = "SweepReadError";
+  }
+}
+
 export type ChainView = {
   phase: string;
   funded: readonly [boolean, boolean];
@@ -1239,11 +1249,12 @@ export class ArenaDaemon {
 
   private async gasForSweep(sender: SerialTxSender): Promise<bigint> {
     if (this.walletHasCode === undefined) {
-      const code = await this.client.getCode({ address: this.wallet.address });
+      const code = await this.sweepRead(() => this.client.getCode({ address: this.wallet.address }));
       this.walletHasCode = code !== undefined && code !== "0x";
     }
     // A plain transfer to an EOA always costs exactly 21000 gas; a contract wallet may run more logic (a proxy, a
-    // multisig's fallback), so its cost is estimated instead of assumed.
+    // multisig's fallback), so its cost is estimated instead of assumed. That estimate is the sweep's own dry run,
+    // so its failure (e.g. a wallet that rejects the transfer) is charged like a failed send, not a read (M4).
     if (!this.walletHasCode) return 21_000n;
     return this.client.estimateGas({ account: sender.address, to: this.wallet.address, value: 1n });
   }
@@ -1269,6 +1280,16 @@ export class ArenaDaemon {
    * repro exploited to make the old `performSweep` operate against a session key another in-flight transaction
    * (a stale respond) still owned.
    */
+  /** Final fix wave (M4): runs one pre-send chain read of a sweep attempt, turning its failure into a
+   *  `SweepReadError`. */
+  private async sweepRead<T>(read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (err) {
+      throw new SweepReadError(err);
+    }
+  }
+
   private async isSweepable(record: ChannelRecord): Promise<boolean> {
     const info = await this.hub.channelInfo(record.channelId);
     if (info.phase === "Finalized" || info.phase === "Reclaimed") return true;
@@ -1316,10 +1337,10 @@ export class ArenaDaemon {
       // the same prune() send() itself would, so a stale entry (probe E1/E2: released, then explicitly mined,
       // with nothing of ours ever reading it in between) is gone from tracked() below, not mistaken for a still-
       // live dead transaction that needs answering for.
-      await sender.refresh();
-      const balance = await this.client.getBalance({ address: sender.address });
+      await this.sweepRead(() => sender.refresh());
+      const balance = await this.sweepRead(() => this.client.getBalance({ address: sender.address }));
       const gasLimit = await this.gasForSweep(sender);
-      const feePerGas = await this.currentFeePerGas();
+      const feePerGas = await this.sweepRead(() => this.currentFeePerGas());
       if (feePerGas === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
       const baseReserve = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
       // Fix round 3, I-1(b): dust is decided against the plain reserve first, regardless of any tracked entry --
@@ -1434,7 +1455,7 @@ export class ArenaDaemon {
       if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
       // Rule 1: never beside a transaction actively being waited on elsewhere on this same session key.
       if (sender.tracked().some((t) => t.state === "waiting")) return { kind: "skipped", record };
-      if (!(await this.isSweepable(record))) return { kind: "skipped", record };
+      if (!(await this.sweepRead(() => this.isSweepable(record)))) return { kind: "skipped", record };
       const outcome = await this.performSweep(sender, opts.giveUpAt);
       if (outcome.status === "dust") {
         // Minor 4: a recheck of an already-done channel finding only dust residue (typically the previous
@@ -1486,6 +1507,13 @@ export class ArenaDaemon {
         // recognise whichever one actually wins, instead of reading a fresh, near-zero balance and recording a
         // spurious "dust" over what really was a successful, if late, sweep.
         remember(err.hashes);
+      }
+      if (err instanceof SweepReadError) {
+        // Final fix wave (M4): an RPC blip before anything was sent -- backed off, never charged, so an RPC outage
+        // does not abandon every channel that settles during it.
+        this.log(`channel ${record.channelId}: sweep: ${errorText(err)} (retried with back-off, not counted toward abandoning)`);
+        this.bumpSweepBackoff(record.channelId, backoff);
+        return { kind: "error", record, error: err };
       }
       this.log(`channel ${record.channelId}: sweep failed (retried with back-off): ${errorText(err)}`);
       backoff.attempts++;
