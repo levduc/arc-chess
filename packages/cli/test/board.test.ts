@@ -32,7 +32,15 @@ import {
   targetsFrom,
   usdcToBaseUnits,
 } from "../src/board/board.js";
-import { backoffDelay, createActionGate, createCoalescer, createErrorGate, createThrottle, parseSse } from "../src/board/api.js";
+import {
+  backoffDelay,
+  createActionGate,
+  createClient,
+  createCoalescer,
+  createErrorGate,
+  createThrottle,
+  parseSse,
+} from "../src/board/api.js";
 
 // Plan 5 Task 3: the web board's pure helpers (no DOM, no fetch) -- see packages/cli/src/board/board.js.
 
@@ -513,6 +521,23 @@ describe("api.js helpers", () => {
     expect(gate.isBusy("0xaaa")).toBe(false);
     expect(gate.isBusy("0xbbb")).toBe(true);
     expect(gate.isBusy(null)).toBe(false);
+  });
+
+  it("sends every request, the event stream included, with the token, the human actor, and redirect: error", async () => {
+    const calls: Array<{ url: string; init: any }> = [];
+    const fetchImpl = async (url: string, init: any) => {
+      calls.push({ url, init });
+      return new Response(url === "/events" ? "" : "[]", { status: 200 });
+    };
+    const client = createClient("tok", { fetchImpl });
+    await client.channels();
+    await client.events({});
+    expect(calls.map((c) => c.url)).toEqual(["/channels", "/events"]);
+    for (const { init } of calls) {
+      expect(init.redirect).toBe("error");
+      expect(init.headers.authorization).toBe("Bearer tok");
+      expect(init.headers["x-arena-actor"]).toBe("human");
+    }
   });
 
   it("backs off exponentially up to a cap", () => {

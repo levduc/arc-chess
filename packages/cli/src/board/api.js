@@ -78,7 +78,7 @@ export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (..
     async events({ onOpen = () => {}, onEvent = () => {}, onActivity = () => {}, signal } = {}) {
       let res;
       try {
-        res = await fetchImpl("/events", { headers: headers(false), cache: "no-store", signal });
+        res = await fetchImpl("/events", { headers: headers(false), cache: "no-store", redirect: "error", signal });
       } catch (err) {
         if (signal?.aborted) return;
         throw new ApiError(0, `event stream failed: ${err instanceof Error ? err.message : String(err)}`);
