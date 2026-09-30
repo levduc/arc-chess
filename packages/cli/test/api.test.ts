@@ -205,6 +205,68 @@ describe("local API", () => {
     expect((await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "/board/..%2fconfig.json" })).status).toBe(404);
   });
 
+  it("Plan 5 Task 2: GET /events requires the token, streams a retry line and change events, and caps at 8 clients", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    const controllers: AbortController[] = [];
+    stop = async () => {
+      for (const c of controllers) c.abort();
+      server.close();
+      await pair.cleanup();
+    };
+
+    expect((await fetch(`${url}/events`)).status).toBe(401);
+
+    const open = async (): Promise<Response> => {
+      const c = new AbortController();
+      controllers.push(c);
+      return fetch(`${url}/events`, { headers: { authorization: `Bearer ${token}` }, signal: c.signal });
+    };
+    const eight = await Promise.all(Array.from({ length: 8 }, () => open()));
+    for (const res of eight) {
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("text/event-stream");
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    }
+    expect((await open()).status).toBe(429); // the 9th client
+
+    const reader = eight[0].body!.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const until = Date.now() + 10_000;
+    while (!text.includes("event: change") && Date.now() < until) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    expect(text).toContain("retry: 3000");
+    expect(text).toContain("event: change");
+    expect(text).toContain('data: {"channelId":null}');
+  });
+
+  it("Plan 5 Task 2: server.close() ends open /events streams instead of hanging", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      await pair.cleanup(); // the server itself is closed by the test below
+    };
+    const res = await fetch(`${url}/events`, { headers: { authorization: `Bearer ${token}` } });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    await reader.read(); // the initial "retry: 3000" line -- confirms the stream is actually open
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("server.close() hung with an open SSE stream")), 10_000);
+      server.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    const { done } = await reader.read();
+    expect(done).toBe(true);
+  });
+
   it("fix round I5: POST /sweep returns {results, remaining}", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);

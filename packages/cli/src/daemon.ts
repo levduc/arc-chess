@@ -504,7 +504,31 @@ export class ArenaDaemon {
     for (const u of this.unsubscribers) u();
     this.unsubscribers = [];
     while (this.ticking) await new Promise((r) => setTimeout(r, 10));
+    // Plan 5 Task 2: told before the listeners it's about for are dropped -- the SSE feed's onStop subscriber
+    // ends its open responses here; removeAllListeners() alone would just silently drop that subscriber, leaving
+    // its HTTP response open forever with nothing left to ever write to or close it.
+    try {
+      this.changes.emit("stop");
+    } catch {
+      // M8 (see notify()): a throwing listener must never break stop().
+    }
     this.changes.removeAllListeners();
+  }
+
+  /** Plan 5 Task 2: subscribes to every `notify()` (a new state, a tick, a handoff, …) -- used by the SSE feed
+   *  (`GET /events`). `changes` is protected; this is the one public door onto it. Returns an unsubscribe
+   *  function. */
+  onChange(listener: () => void): () => void {
+    this.changes.on("change", listener);
+    return () => this.changes.off("change", listener);
+  }
+
+  /** Plan 5 Task 2: subscribes to this daemon stopping (see `stop()`) -- the SSE feed closes its streams then,
+   *  since `changes.removeAllListeners()` alone would silently drop the "change" listener without ending the
+   *  open HTTP response. Returns an unsubscribe function. */
+  onStop(listener: () => void): () => void {
+    this.changes.on("stop", listener);
+    return () => this.changes.off("stop", listener);
   }
 
   /** R9/3b: resolves once no tick is currently in flight — call before an explicit `tick()` in a test that needs it deterministic, so that call isn't a no-op against the periodic timer's own concurrent tick. */

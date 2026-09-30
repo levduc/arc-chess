@@ -141,6 +141,57 @@ export async function startApi(
   // real bound port. No request can reach the handler before that assignment (nothing can connect before listen
   // returns), so the closure below always sees the real value once traffic starts flowing.
   let boundPort = opts.port;
+  // Plan 5 Task 2: open GET /events streams for this one server (per-instance, not module-wide -- a test, or a
+  // real host, may run several daemons' APIs at once and each has its own cap). Also drained by server.close()
+  // below, so a long-lived SSE connection never keeps that call from resolving.
+  const sseClients = new Set<ServerResponse>();
+  const MAX_SSE_CLIENTS = 8;
+  const SSE_PING_INTERVAL_MS = 15_000;
+
+  /**
+   * GET /events (spec: Plan 5 Task 2 requirement 4). Browsers cannot set an `Authorization` header on
+   * `EventSource`, so the board's own client uses `fetch()` (with the bearer token, like every other route) and
+   * reads the body through a `ReadableStream` reader instead of the `EventSource` API. Requires the token like
+   * every data route; capped at `MAX_SSE_CLIENTS` concurrent streams (the caller checks that and sends 429).
+   * Closes when the client disconnects, when this daemon stops (`daemon.onStop`), or when this server closes
+   * (the `sseClients` sweep in the patched `close` below).
+   */
+  function handleSse(req: IncomingMessage, res: ServerResponse): void {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+    res.write("retry: 3000\n\n");
+    sseClients.add(res);
+    const ping = setInterval(() => {
+      try {
+        res.write(": ping\n\n");
+      } catch {
+        // The client is already gone; req's own "close" below runs cleanup() shortly.
+      }
+    }, SSE_PING_INTERVAL_MS);
+    const unsubscribeChange = daemon.onChange(() => {
+      try {
+        res.write('event: change\ndata: {"channelId":null}\n\n');
+      } catch {
+        // See the ping's own catch above.
+      }
+    });
+    let unsubscribeStop = (): void => undefined;
+    const cleanup = () => {
+      clearInterval(ping);
+      unsubscribeChange();
+      unsubscribeStop();
+      sseClients.delete(res);
+    };
+    unsubscribeStop = daemon.onStop(() => {
+      cleanup();
+      try {
+        res.end();
+      } catch {
+        // already closed
+      }
+    });
+    req.on("close", cleanup);
+  }
+
   // requireHostHeader: false -- Node's own HTTP/1.1 parser otherwise answers a request with no Host header with
   // a bare 400 before this handler ever runs (RFC 7230 section 5.4), which would make the DNS-rebinding guard
   // below (hostAllowed) unreachable for exactly the "no Host header" case the ruling calls out for 421.
@@ -166,6 +217,11 @@ export async function startApi(
         if (isBoardRequest(req.url ?? "/")) return serveBoard(req, res, url.pathname);
         const route = `${req.method} ${url.pathname}`;
         if (route === "GET /health") return send(res, 200, { ok: true });
+        if (route === "GET /events") {
+          if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
+          if (sseClients.size >= MAX_SSE_CLIENTS) return send(res, 429, { error: `too many /events clients (max ${MAX_SSE_CLIENTS})` });
+          return handleSse(req, res);
+        }
         if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
         const actor: Actor = req.headers["x-arena-actor"] === "human" ? "human" : "agent";
         const q = url.searchParams;
@@ -247,5 +303,26 @@ export async function startApi(
   });
   await new Promise<void>((resolve) => server.listen(opts.port, host, resolve));
   boundPort = (server.address() as AddressInfo).port;
+  // Plan 5 Task 2: server.close() otherwise hangs -- an open SSE response is a keep-alive connection that never
+  // ends on its own, and http.Server#close() only finishes once every connection has. Force each one closed
+  // first (end() the response, then destroy() its socket so the underlying connection actually drops), then
+  // defer to the real close().
+  const rawClose = server.close.bind(server);
+  server.close = ((callback?: (err?: Error) => void) => {
+    for (const client of sseClients) {
+      try {
+        client.end();
+      } catch {
+        // already ending
+      }
+      try {
+        client.socket?.destroy();
+      } catch {
+        // already gone
+      }
+    }
+    sseClients.clear();
+    return rawClose(callback);
+  }) as typeof server.close;
   return { server, url: `http://${host}:${boundPort}` };
 }
