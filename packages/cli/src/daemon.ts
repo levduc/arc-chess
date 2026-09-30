@@ -2565,6 +2565,15 @@ export class ArenaDaemon {
           }
           throw err;
         }
+        // Final fix wave (M2): a settled channel waited on by name answers "settled" at once, whether or not its
+        // one-shot wake is still pending -- the same answer it gets once evicted, rather than blocking for the
+        // whole timeout until eviction. (Only here: an all-channels wait keeps the one-shot rule, or every
+        // settled-but-not-evicted channel would wake it at once, forever.)
+        const only = targets[0];
+        if (only.record.finalized) {
+          only.settledWake = false;
+          return { channelId: only.record.channelId, reason: "settled" };
+        }
       } else {
         targets = [...this.live.values()];
       }

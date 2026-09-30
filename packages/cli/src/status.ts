@@ -196,8 +196,9 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     else if (opponentWantsToClose && over && !closing && newGame === "none") attention = "close-requested";
     else if (over && !closing && newGame === "none") attention = "game-over";
     else if (silent) attention = "opponent-silent";
-  } else if (input.settled && (phase === "Finalized" || phase === "Reclaimed") && record.controller === "agent") {
-    // Final review m4: one wake for the settlement (e.g. after this player's close), consumed by `wait()`.
+  } else if (input.settled && (phase === "Finalized" || phase === "Reclaimed")) {
+    // Final review m4: one wake for the settlement (e.g. after this player's close), consumed by `wait()`. Final
+    // fix wave (M2): whoever holds the seat -- a settled channel has no seat left to protect.
     attention = "settled";
   }
 

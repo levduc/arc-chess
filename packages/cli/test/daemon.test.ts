@@ -434,6 +434,29 @@ describe("ArenaDaemon core", () => {
     expect((await bob.daemon.status(id)).attention).toBeNull();
   });
 
+  it("final fix wave, M2: 'settled' wakes the agent whoever holds the seat, and wait --channel on a settled channel returns it at once", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await alice.daemon.close(id, "agent");
+    // The human takes the seat before the agent starts waiting: settlement leaves no seat to protect, so the
+    // agent's wait must still wake for it (before: `settled` required controller === "agent").
+    await alice.daemon.handoff(id, "human", "watching the close");
+    const waiting = alice.daemon.wait({ timeoutMs: 20_000 });
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await bob.daemon.close(id, "agent");
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "settled" });
+    // The one-shot wake is consumed: an all-channels wait stays quiet (no hot loop) ...
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    // ... but a wait on this channel answers "settled" at once, as it does once the channel is evicted.
+    expect(alice.daemon.channelIds()).toContain(id); // not evicted yet
+    const t0 = Date.now();
+    await expect(alice.daemon.wait({ ref: id, timeoutMs: 5_000 })).resolves.toEqual({ channelId: id, reason: "settled" });
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+
   it("R8.4c: wait() resolves control-changed on a handoff even without new attention", async () => {
     const { alice, bob, id } = await matched();
     // Make it bob's turn, so alice has no `attention` for wait() to notice first.
