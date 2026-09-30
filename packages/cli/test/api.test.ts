@@ -342,6 +342,39 @@ describe("local API", () => {
     expect(text).toContain('data: {"channelId":null}');
   });
 
+  it("Plan 5 Task 2 fix round, minor 5: /events change events are rate-limited to 1/sec per client, trailing edge", async () => {
+    const pair = await startPair({ pollMs: 20 }); // fast ticks: mainPass()'s own notify() fires roughly every 20ms
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token, sse: { changeDebounceMs: 300 } });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const res = await fetch(`${url}/events`, { headers: { authorization: `Bearer ${token}` } });
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const changeAt: number[] = [];
+    const deadline = Date.now() + 5_000;
+    while (changeAt.length < 3 && Date.now() < deadline) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value);
+      let idx: number;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const evt = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (evt.startsWith("event: change")) changeAt.push(Date.now());
+      }
+    }
+    // Despite notify() firing every ~20ms, at most one "event: change" arrives per ~300ms window -- and the
+    // stream is never simply silent instead (a real change always lands, at worst at the trailing edge).
+    expect(changeAt.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < changeAt.length; i++) {
+      expect(changeAt[i] - changeAt[i - 1]).toBeGreaterThanOrEqual(250); // ~300ms window, some scheduling slack
+    }
+  });
+
   it("Plan 5 Task 2: server.close() ends open /events streams instead of hanging", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);

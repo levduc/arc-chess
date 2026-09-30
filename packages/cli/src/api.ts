@@ -156,7 +156,13 @@ function amount(v: unknown, name: string): bigint {
 
 export async function startApi(
   daemon: ArenaDaemon,
-  opts: { port: number; token: string; host?: string },
+  opts: {
+    port: number;
+    token: string;
+    host?: string;
+    /** Test-only overrides for the SSE feed's own timing; production never sets either (the defaults below). */
+    sse?: { pingIntervalMs?: number; changeDebounceMs?: number };
+  },
 ): Promise<{ server: Server; url: string }> {
   const host = opts.host ?? "127.0.0.1";
   // Set once listen() resolves, below -- read from server.address() so a caller-requested port 0 still guards the
@@ -168,7 +174,10 @@ export async function startApi(
   // below, so a long-lived SSE connection never keeps that call from resolving.
   const sseClients = new Set<ServerResponse>();
   const MAX_SSE_CLIENTS = 8;
-  const SSE_PING_INTERVAL_MS = 15_000;
+  const SSE_PING_INTERVAL_MS = opts.sse?.pingIntervalMs ?? 15_000;
+  // Plan 5 Task 2 fix round, minor 5: `notify()` fires on every watchtower tick (as often as `pollMs`), not only
+  // on a change a human would care about -- an unthrottled feed would push far more than the board ever needs.
+  const CHANGE_DEBOUNCE_MS = opts.sse?.changeDebounceMs ?? 1_000;
 
   /**
    * GET /events (spec: Plan 5 Task 2 requirement 4). Browsers cannot set an `Authorization` header on
@@ -189,16 +198,38 @@ export async function startApi(
         // The client is already gone; req's own "close" below runs cleanup() shortly.
       }
     }, SSE_PING_INTERVAL_MS);
-    const unsubscribeChange = daemon.onChange(() => {
+    const sendChange = () => {
       try {
         res.write('event: change\ndata: {"channelId":null}\n\n');
       } catch {
         // See the ping's own catch above.
       }
-    });
+    };
+    // Plan 5 Task 2 fix round, minor 5: rate-limited to at most one `event: change` per CHANGE_DEBOUNCE_MS, per
+    // client -- trailing edge, so the first change after a quiet spell sends immediately, but a burst within the
+    // window collapses to one send right away plus (if any further change arrived during the window) exactly one
+    // more at the window's end. A change is never silently dropped: at most delayed to that trailing edge.
+    let lastSentAt = 0;
+    let trailing: NodeJS.Timeout | null = null;
+    const onChange = () => {
+      const elapsed = Date.now() - lastSentAt;
+      if (elapsed >= CHANGE_DEBOUNCE_MS) {
+        lastSentAt = Date.now();
+        sendChange();
+      } else if (!trailing) {
+        trailing = setTimeout(() => {
+          trailing = null;
+          lastSentAt = Date.now();
+          sendChange();
+        }, CHANGE_DEBOUNCE_MS - elapsed);
+      }
+      // else: a trailing send is already scheduled -- it will pick up this (and any later) change.
+    };
+    const unsubscribeChange = daemon.onChange(onChange);
     let unsubscribeStop = (): void => undefined;
     const cleanup = () => {
       clearInterval(ping);
+      if (trailing) clearTimeout(trailing);
       unsubscribeChange();
       unsubscribeStop();
       sseClients.delete(res);
