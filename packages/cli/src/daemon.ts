@@ -1496,7 +1496,13 @@ export class ArenaDaemon {
   protected async sweepChannel(l: ChannelHandle): Promise<void> {
     if (this.stopped || l.record.swept !== undefined) return;
     if (l.refilling || l.disputeBusy) return;
-    const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(this.applySweptFields(l.record, r)));
+    // Nit: `l.record` is updated inside the save callback itself, not only after runSweepAttempt returns (as
+    // sweepQueuePass's own entry.record already did) -- so a concurrent reader sees the disk and the in-memory
+    // handle update together, not disk first and l.record only once this whole call unwinds.
+    const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => {
+      l.record = this.applySweptFields(l.record, r);
+      this.records.saveChannel(l.record);
+    });
     l.record = this.applySweptFields(l.record, result.record);
   }
 
@@ -1636,11 +1642,18 @@ export class ArenaDaemon {
       if (isSweptDone(l.record.swept) && !recheck) return { channelId: id, swept: "already" }; // settled while we waited
       l.mainBusy = true;
       try {
-        const result = await this.runSweepAttempt(l.record, l.sessionSender, l.sweep, (r) => this.records.saveChannel(this.applySweptFields(l.record, r)), {
-          force: true,
-          giveUpAt,
-          recheck,
-        });
+        // Nit: `l.record` is updated inside the save callback itself (matching sweepChannel and the queued
+        // branch below), not only after runSweepAttempt returns.
+        const result = await this.runSweepAttempt(
+          l.record,
+          l.sessionSender,
+          l.sweep,
+          (r) => {
+            l.record = this.applySweptFields(l.record, r);
+            this.records.saveChannel(l.record);
+          },
+          { force: true, giveUpAt, recheck },
+        );
         l.record = this.applySweptFields(l.record, result.record);
         return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
       } finally {

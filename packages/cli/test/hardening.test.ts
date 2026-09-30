@@ -2016,6 +2016,31 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       internals.performSweep = realPerformSweep;
     }
   });
+
+  it("fix round 3, nit: l.record reflects a sweep's own update inside the save callback itself, not only after", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const recordsInternals = (d as unknown as { records: { saveChannel(r: unknown): void } }).records;
+    const realSaveChannel = recordsInternals.saveChannel.bind(recordsInternals);
+    let sweptAtSaveTime: unknown;
+    recordsInternals.saveChannel = (r: unknown) => {
+      // Read l.record from inside the save callback's own synchronous execution -- exactly the moment a
+      // concurrent reader (a status() call, say) could also read it. Before this fix, l.record was only ever
+      // updated after runSweepAttempt's whole call returned, so this would still have read `undefined` here even
+      // though the disk write (about to happen on the next line) already carries the new swept state.
+      sweptAtSaveTime = l.record.swept;
+      realSaveChannel(r);
+    };
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    try {
+      await waitFor(() => l.record.swept !== undefined, 20_000, "swept");
+    } finally {
+      recordsInternals.saveChannel = realSaveChannel;
+    }
+    expect(sweptAtSaveTime).toBe(true);
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {
