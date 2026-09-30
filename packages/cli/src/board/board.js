@@ -286,6 +286,42 @@ export function pickDefaultChannel(list) {
   return pick ? pick.channelId : null;
 }
 
+// ---------------------------------------------------------------- keyed lists
+
+/**
+ * How to turn a keyed list of DOM nodes (in `currentKeys` order) into `nextKeys`, touching as little as possible:
+ * which keys to remove, which to create, and the inserts/moves (`key` goes before `before`, or at the end for
+ * null) to apply after removing and creating. Unchanged keys in unchanged order produce no moves at all, so a
+ * refresh never detaches a node under the pointer (a click whose mousedown and mouseup straddle a re-render
+ * would otherwise be lost). Duplicate keys in `nextKeys` after the first are ignored.
+ * @param {string[]} currentKeys
+ * @param {string[]} nextKeys
+ * @returns {{ remove: string[], create: string[], moves: Array<{ key: string, before: string | null }> }}
+ */
+export function planKeyedList(currentKeys, nextKeys) {
+  const target = [...new Set(nextKeys)];
+  const wanted = new Set(target);
+  const had = new Set(currentKeys);
+  const remove = currentKeys.filter((k) => !wanted.has(k));
+  const create = target.filter((k) => !had.has(k));
+  const dom = currentKeys.filter((k) => wanted.has(k));
+  const moves = [];
+  let i = 0;
+  for (const key of target) {
+    if (dom[i] === key) {
+      i++;
+      continue;
+    }
+    const before = dom[i] ?? null;
+    const at = dom.indexOf(key);
+    if (at >= 0) dom.splice(at, 1);
+    dom.splice(i, 0, key);
+    i++;
+    moves.push({ key, before });
+  }
+  return { remove, create, moves };
+}
+
 // ---------------------------------------------------------------- text
 
 export function gameStatusText(status) {

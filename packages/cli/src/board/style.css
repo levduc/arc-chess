@@ -527,6 +527,11 @@ input[type="checkbox"] {
   background: color-mix(in srgb, var(--accent-strong) 12%, var(--surface-2));
 }
 
+/* Clicks always target the button itself, never a child span that a refresh may rewrite. */
+.channel-item * {
+  pointer-events: none;
+}
+
 .channel-item.is-degraded {
   cursor: default;
   opacity: 0.8;

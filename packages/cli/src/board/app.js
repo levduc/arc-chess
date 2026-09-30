@@ -23,6 +23,7 @@ import {
   normalizeNote,
   noteError,
   pickDefaultChannel,
+  planKeyedList,
   pieceGlyph,
   piecesFromFen,
   secondsUntil,
@@ -573,7 +574,7 @@ function renderBoard() {
   const enabled = canMove(st) && !state.busy;
   for (const v of view) {
     const e = squares.get(v.square);
-    e.cell.className = cls(
+    setClass(e.cell, cls(
       "sq",
       v.dark ? "sq-dark" : "sq-light",
       v.lastMove && "is-last",
@@ -581,15 +582,16 @@ function renderBoard() {
       v.target && (v.capture ? "is-capture" : "is-target"),
       v.check && "is-check",
       enabled && v.movable && "is-movable",
-    );
-    e.cell.dataset.piece = v.piece;
-    e.cell.setAttribute("aria-label", v.label);
-    e.cell.setAttribute("aria-selected", String(v.selected));
-    e.cell.tabIndex = v.square === state.focus ? 0 : -1;
-    e.piece.textContent = v.piece ? pieceGlyph(v.piece) : "";
-    e.piece.className = v.piece ? cls("piece", v.piece === v.piece.toUpperCase() ? "piece-w" : "piece-b") : "piece";
-    e.rank.textContent = v.rankLabel;
-    e.file.textContent = v.fileLabel;
+    ));
+    if (e.cell.dataset.piece !== v.piece) e.cell.dataset.piece = v.piece;
+    setAttr(e.cell, "aria-label", v.label);
+    setAttr(e.cell, "aria-selected", String(v.selected));
+    const tabIndex = v.square === state.focus ? 0 : -1;
+    if (e.cell.tabIndex !== tabIndex) e.cell.tabIndex = tabIndex;
+    setText(e.piece, v.piece ? pieceGlyph(v.piece) : "");
+    setClass(e.piece, v.piece ? cls("piece", v.piece === v.piece.toUpperCase() ? "piece-w" : "piece-b") : "piece");
+    setText(e.rank, v.rankLabel);
+    setText(e.file, v.fileLabel);
   }
   const board = $("board");
   board.classList.toggle("is-idle", !st);
@@ -676,6 +678,58 @@ function closePromotion() {
 }
 
 // ------------------------------------------------------------------ rendering
+//
+// Renders run on every status refresh (about once a second while a game is live), so they update nodes in
+// place: text and attributes are written only when they change (rewriting identical text drops a user's text
+// selection), and the two lists are reconciled by key (planKeyedList) instead of rebuilt, so a click whose
+// mousedown and mouseup straddle a refresh still lands on the same, still-attached node.
+
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+function setClass(node, className) {
+  if (node.className !== className) node.className = className;
+}
+
+/** Sets an attribute, or removes it for null; a no-op when nothing changes. */
+function setAttr(node, name, value) {
+  if (value === null) {
+    if (node.hasAttribute(name)) node.removeAttribute(name);
+  } else if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+}
+
+/** Per-node references for the keyed list items, so an update never has to query its own children. */
+const refs = new WeakMap();
+
+/**
+ * Reconciles `container`'s children (each carrying `data-key`) with `items`: gone keys are removed, new ones
+ * created, every node updated in place, and only out-of-place nodes moved. Focus inside the list survives a move.
+ */
+function syncList(container, items, keyOf, create, update) {
+  const children = /** @type {HTMLElement[]} */ ([...container.children]);
+  const byKey = new Map(children.map((n) => [n.dataset.key ?? "", n]));
+  const keyed = new Map();
+  for (const item of items) {
+    const k = keyOf(item);
+    if (!keyed.has(k)) keyed.set(k, item);
+  }
+  const plan = planKeyedList(children.map((n) => n.dataset.key ?? ""), [...keyed.keys()]);
+  const active = document.activeElement;
+  const hadFocus = active instanceof HTMLElement && container.contains(active);
+  for (const k of plan.remove) {
+    byKey.get(k)?.remove();
+    byKey.delete(k);
+  }
+  for (const k of plan.create) {
+    const node = create(keyed.get(k));
+    node.dataset.key = k;
+    byKey.set(k, node);
+  }
+  for (const [k, item] of keyed) update(byKey.get(k), item);
+  for (const { key, before } of plan.moves) container.insertBefore(byKey.get(key), before === null ? null : byKey.get(before) ?? null);
+  if (hadFocus && plan.moves.length > 0 && active.isConnected && document.activeElement !== active) active.focus();
+}
 
 function renderAll() {
   if (state.stopped) return;
@@ -685,42 +739,49 @@ function renderAll() {
   renderLobbyBusy();
 }
 
-function channelItem(s) {
-  const chip = channelChip(s);
-  const selected = s.channelId === state.selectedId;
+function createChannelItem(s) {
+  const id = h("span", { className: "ci-id mono" });
+  const chip = h("span");
+  const meta = h("span", { className: "ci-meta" });
+  const balances = h("span", { className: "ci-meta mono" });
+  const banners = h("span", { className: "ci-banners" });
   const btn = h(
     "button",
-    {
-      className: cls("channel-item", selected && "is-selected"),
-      testid: `channel-item-${s.channelId}`,
-      attrs: { type: "button", title: s.channelId },
-    },
-    h(
-      "span",
-      { className: "ci-top" },
-      h("span", { className: "ci-id mono", text: shortHex(s.channelId) }),
-      h("span", { className: `chip chip-${chip.kind}`, text: chip.label }),
-    ),
-    h("span", {
-      className: "ci-meta",
-      text: `${cap(s.color)} · Game ${Number(s.gameIndex) + 1} · ${s.controller === "human" ? "Human" : "Agent"}`,
-    }),
-    h("span", {
-      className: "ci-meta mono",
-      text: `You ${formatUsdc(s.balances?.me ?? "")} · Opp ${formatUsdc(s.balances?.opponent ?? "")}`,
-    }),
+    { testid: `channel-item-${s.channelId}`, attrs: { type: "button", title: s.channelId } },
+    h("span", { className: "ci-top" }, id, chip),
+    meta,
+    balances,
+    banners,
   );
   btn.dataset.channelId = s.channelId;
-  if (selected) btn.setAttribute("aria-current", "true");
-  const banners = channelBanners(s);
-  if (banners.length > 0) {
-    btn.append(h("span", { className: "ci-banners" }, ...banners.map((b) => h("span", { className: `mini-banner mini-${b.kind}`, text: b.text }))));
-  }
   btn.addEventListener("click", () => selectChannel(s.channelId));
-  return h("li", {}, btn);
+  const li = h("li", {}, btn);
+  refs.set(li, { btn, id, chip, meta, balances, banners, bannerKey: null });
+  return li;
 }
 
-function degradedItem(c) {
+function updateChannelItem(li, s) {
+  const r = refs.get(li);
+  const chip = channelChip(s);
+  const selected = s.channelId === state.selectedId;
+  setClass(r.btn, cls("channel-item", selected && "is-selected"));
+  setAttr(r.btn, "aria-current", selected ? "true" : null);
+  setText(r.id, shortHex(s.channelId));
+  setClass(r.chip, `chip chip-${chip.kind}`);
+  setText(r.chip, chip.label);
+  setText(r.meta, `${cap(s.color)} · Game ${Number(s.gameIndex) + 1} · ${s.controller === "human" ? "Human" : "Agent"}`);
+  setText(r.balances, `You ${formatUsdc(s.balances?.me ?? "")} · Opp ${formatUsdc(s.balances?.opponent ?? "")}`);
+  const banners = channelBanners(s);
+  const bannerKey = banners.map((b) => `${b.kind}:${b.text}`).join("|");
+  if (r.bannerKey !== bannerKey) {
+    r.bannerKey = bannerKey;
+    r.banners.replaceChildren(...banners.map((b) => h("span", { className: `mini-banner mini-${b.kind}`, text: b.text })));
+  }
+  r.banners.hidden = banners.length === 0;
+}
+
+function createDegradedItem(c) {
+  const error = h("span", { className: "ci-meta wrap-anywhere" });
   const btn = h(
     "button",
     { className: "channel-item is-degraded", testid: `channel-item-${c.channelId}`, attrs: { type: "button", title: String(c.channelId) } },
@@ -730,34 +791,43 @@ function degradedItem(c) {
       h("span", { className: "ci-id mono", text: shortHex(c.channelId) }),
       h("span", { className: "chip chip-degraded", text: "Unavailable" }),
     ),
-    h("span", { className: "ci-meta wrap-anywhere", text: String(c.error ?? "could not be loaded") }),
+    error,
   );
   btn.disabled = true;
-  return h("li", {}, btn);
+  const li = h("li", {}, btn);
+  refs.set(li, { error });
+  return li;
+}
+
+function updateDegradedItem(li, c) {
+  setText(refs.get(li).error, String(c.error ?? "could not be loaded"));
 }
 
 function renderChannels() {
-  const list = $("channel-list");
-  const active = document.activeElement instanceof HTMLElement ? document.activeElement.dataset.channelId : undefined;
-  const items = state.channels.map((c) => {
-    if (c.degraded) return degradedItem(c);
-    const fresh = c.channelId === state.selectedId && state.status?.channelId === c.channelId ? state.status : c;
-    return channelItem(fresh);
-  });
-  list.replaceChildren(...items);
-  if (active) /** @type {HTMLElement | null} */ (list.querySelector(`[data-channel-id="${CSS.escape(active)}"]`))?.focus();
+  // A degraded entry and a loaded one are different node shapes, so the kind is part of the key.
+  syncList(
+    $("channel-list"),
+    state.channels,
+    (c) => `${c.degraded ? "degraded" : "channel"}:${c.channelId}`,
+    (c) => (c.degraded ? createDegradedItem(c) : createChannelItem(c)),
+    (li, c) => {
+      if (c.degraded) return updateDegradedItem(li, c);
+      const fresh = c.channelId === state.selectedId && state.status?.channelId === c.channelId ? state.status : c;
+      updateChannelItem(li, fresh);
+    },
+  );
   $("channels-empty").hidden = !state.channelsLoaded || state.channels.length > 0;
   const lobbyError = state.channels.find((c) => !c.degraded && c.lobbyError)?.lobbyError ?? null;
   for (const id of ["lobby-error-banner", "lobby-error"]) {
     const banner = $(id);
     banner.hidden = !lobbyError;
-    banner.textContent = lobbyError ? `Lobby unavailable until the daemon restarts: ${lobbyError}` : "";
+    setText(banner, lobbyError ? `Lobby unavailable until the daemon restarts: ${lobbyError}` : "");
   }
 }
 
 function setPlayerRow(rowId, nameId, balanceId, name, balance, toMove) {
-  $(nameId).textContent = name;
-  $(balanceId).textContent = balance;
+  setText($(nameId), name);
+  setText($(balanceId), balance);
   $(rowId).classList.toggle("is-to-move", toMove);
 }
 
@@ -765,10 +835,10 @@ function renderBoardArea() {
   const st = state.status;
   $("board-empty").hidden = !!st || !state.channelsLoaded;
   $("must-move-banner").hidden = !st?.challenge?.mustMove;
-  $("board-title").textContent = st ? turnText(st) : state.channelsLoaded ? "No channel selected" : "Loading";
+  setText($("board-title"), st ? turnText(st) : state.channelsLoaded ? "No channel selected" : "Loading");
   const chan = $("board-channel");
-  chan.textContent = st ? shortHex(st.channelId) : "";
-  chan.title = st ? st.channelId : "";
+  setText(chan, st ? shortHex(st.channelId) : "");
+  setAttr(chan, "title", st ? st.channelId : null);
   if (st) {
     const oppColor = st.color === "white" ? "black" : "white";
     const playing = isLive(st) && !isGameOver(st);
@@ -782,9 +852,11 @@ function renderBoardArea() {
   let hint = "";
   if (st && canMove(st)) hint = "Click a piece, then a highlighted square. Keyboard: arrow keys to move around, Enter to pick.";
   else if (st && st.myTurn && isLive(st) && st.controller !== "human") hint = "The agent is choosing this move. Take over to play it yourself.";
-  $("board-hint").textContent = hint;
+  setText($("board-hint"), hint);
   renderBoard();
 }
+
+let suggestedKey = null;
 
 function renderPanel() {
   const st = state.status;
@@ -792,13 +864,16 @@ function renderPanel() {
   const human = st?.controller === "human";
 
   const badge = $("controller-badge");
-  badge.textContent = st ? (human ? "Human" : "Agent") : "—";
-  badge.className = cls("badge", st && (human ? "badge-human" : "badge-agent"));
-  $("controller-hint").textContent = !st
-    ? ""
-    : human
-      ? "You control this seat. The agent will not move until you hand it back."
-      : "Your agent is playing this seat. Take over to play it yourself.";
+  setText(badge, st ? (human ? "Human" : "Agent") : "—");
+  setClass(badge, cls("badge", st && (human ? "badge-human" : "badge-agent")));
+  setText(
+    $("controller-hint"),
+    !st
+      ? ""
+      : human
+        ? "You control this seat. The agent will not move until you hand it back."
+        : "Your agent is playing this seat. Take over to play it yourself.",
+  );
 
   const takeOver = /** @type {HTMLButtonElement} */ ($("take-over"));
   takeOver.hidden = !a?.takeOver;
@@ -809,25 +884,28 @@ function renderPanel() {
   /** @type {HTMLTextAreaElement} */ ($("hand-back-note")).disabled = !a?.handBack || state.busy;
 
   const note = st?.handoff?.note ?? st?.note ?? "";
-  $("handoff-note").textContent = note;
+  setText($("handoff-note"), note);
   const since = st?.handoff?.since ? new Date(st.handoff.since) : null;
-  $("handoff-since").textContent = since && !Number.isNaN(since.getTime()) ? `Handed to the ${st.handoff.controller} ${since.toLocaleString()}` : "";
+  setText($("handoff-since"), since && !Number.isNaN(since.getTime()) ? `Handed to the ${st.handoff.controller} ${since.toLocaleString()}` : "");
 
   const ch = st?.challenge ?? null;
   $("challenge-box").hidden = !ch;
   if (ch) {
-    $("challenge-meta").textContent = `${ch.challenger === "me" ? "You challenged" : "Your opponent challenged"}. ${
-      ch.mustMove ? "You must move before the deadline." : "Waiting for the other side to answer."
-    }`;
+    setText(
+      $("challenge-meta"),
+      `${ch.challenger === "me" ? "You challenged" : "Your opponent challenged"}. ${
+        ch.mustMove ? "You must move before the deadline." : "Waiting for the other side to answer."
+      }`,
+    );
     tickCountdown();
   }
 
-  $("fact-game").textContent = st ? `${Number(st.gameIndex) + 1} (index ${st.gameIndex})` : "—";
-  $("fact-status").textContent = st ? gameStatusText(st) : "—";
-  $("fact-color").textContent = st ? cap(st.color) : "—";
-  $("fact-me").textContent = st ? `${formatUsdc(st.balances.me)} USDC` : "—";
-  $("fact-opp").textContent = st ? `${formatUsdc(st.balances.opponent)} USDC` : "—";
-  $("fact-phase").textContent = st ? st.phase : "—";
+  setText($("fact-game"), st ? `${Number(st.gameIndex) + 1} (index ${st.gameIndex})` : "—");
+  setText($("fact-status"), st ? gameStatusText(st) : "—");
+  setText($("fact-color"), st ? cap(st.color) : "—");
+  setText($("fact-me"), st ? `${formatUsdc(st.balances.me)} USDC` : "—");
+  setText($("fact-opp"), st ? `${formatUsdc(st.balances.opponent)} USDC` : "—");
+  setText($("fact-phase"), st ? st.phase : "—");
 
   const setBtn = (id, enabled) => {
     /** @type {HTMLButtonElement | HTMLInputElement} */ ($(id)).disabled = !enabled || state.busy;
@@ -844,69 +922,77 @@ function renderPanel() {
   let hint = "";
   if (st && !human && isLive(st)) hint = "Take over to use these controls.";
   else if (st && human && (st.cooldown?.meSeconds ?? 0) > 0) hint = `Challenge available again in ${formatDuration(st.cooldown.meSeconds)}.`;
-  $("actions-hint").textContent = hint;
+  setText($("actions-hint"), hint);
 
   const lastError = st?.lastError ?? null;
   $("last-error-box").hidden = !lastError;
-  $("last-error").textContent = lastError ?? "";
+  setText($("last-error"), lastError ?? "");
 
-  $("suggested").replaceChildren(...(st?.suggestedActions ?? []).map((s) => h("li", {}, h("code", { text: s }))));
+  const suggestions = st?.suggestedActions ?? [];
+  const key = suggestions.join("\n");
+  if (key !== suggestedKey) {
+    suggestedKey = key;
+    $("suggested").replaceChildren(...suggestions.map((s) => h("li", {}, h("code", { text: s }))));
+  }
 }
 
 function tickCountdown() {
   if (!state.status?.challenge || !state.deadline) return;
   const left = secondsUntil(state.deadline.endsAt, Date.now());
   const node = $("countdown");
-  node.textContent = formatCountdown(left);
+  setText(node, formatCountdown(left));
   node.classList.toggle("is-urgent", left <= 60);
 }
 
-function offerCell(label, value, extra) {
-  return h(
-    "span",
-    { className: cls("offer-cell", extra) },
-    h("span", { className: "offer-label", text: label }),
-    h("span", { className: "offer-value wrap-anywhere", text: value }),
-  );
+function offerCell(label, extra) {
+  const value = h("span", { className: "offer-value wrap-anywhere" });
+  const node = h("span", { className: cls("offer-cell", extra) }, h("span", { className: "offer-label", text: label }), value);
+  return { node, value };
 }
 
-function offerRow(o) {
-  const offer = o.offer ?? {};
+function createOfferRow(o) {
   const id = String(o.offerId);
-  const row = h(
-    "li",
-    { className: cls("offer-row", o.mine && "is-mine"), testid: `lobby-offer-${id}`, attrs: { title: id } },
-    offerCell("Deposit", `${baseUnitsToUsdc(offer.deposit)} USDC`),
-    offerCell("Stake / game", `${baseUnitsToUsdc(offer.stakePerGame)} USDC`),
-    offerCell("Challenge window", formatDuration(offer.challengeTimeout)),
-    offerCell("Player", o.mine ? "You" : shortHex(offer.player), "mono"),
-  );
-  const btn = h("button", {
-    className: cls("btn btn-small", o.mine ? "btn-ghost" : "btn-primary"),
-    text: o.mine ? "Yours" : "Accept",
-    testid: `accept-offer-${id}`,
-    attrs: { type: "button", "aria-label": o.mine ? "Your own offer" : `Accept offer from ${String(offer.player ?? "unknown")}` },
-  });
-  btn.disabled = !!o.mine || state.busy;
-  btn.addEventListener("click", () => acceptOffer(o));
-  row.append(btn);
-  return row;
+  const deposit = offerCell("Deposit");
+  const stake = offerCell("Stake / game");
+  const timeout = offerCell("Challenge window");
+  const player = offerCell("Player", "mono");
+  const btn = h("button", { testid: `accept-offer-${id}`, attrs: { type: "button" } });
+  const li = h("li", { testid: `lobby-offer-${id}`, attrs: { title: id } }, deposit.node, stake.node, timeout.node, player.node, btn);
+  const r = { btn, deposit: deposit.value, stake: stake.value, timeout: timeout.value, player: player.value, offer: o };
+  btn.addEventListener("click", () => acceptOffer(r.offer));
+  refs.set(li, r);
+  return li;
+}
+
+function updateOfferRow(li, o) {
+  const r = refs.get(li);
+  r.offer = o;
+  const offer = o.offer ?? {};
+  setClass(li, cls("offer-row", o.mine && "is-mine"));
+  setText(r.deposit, `${baseUnitsToUsdc(offer.deposit)} USDC`);
+  setText(r.stake, `${baseUnitsToUsdc(offer.stakePerGame)} USDC`);
+  setText(r.timeout, formatDuration(offer.challengeTimeout));
+  setText(r.player, o.mine ? "You" : shortHex(offer.player));
+  setClass(r.btn, cls("btn btn-small", o.mine ? "btn-ghost" : "btn-primary"));
+  setText(r.btn, o.mine ? "Yours" : "Accept");
+  setAttr(r.btn, "aria-label", o.mine ? "Your own offer" : `Accept offer from ${String(offer.player ?? "unknown")}`);
+  r.btn.disabled = !!o.mine || state.busy;
 }
 
 function renderLobby() {
   if (state.stopped) return;
   const mineLast = [...state.offers].sort((x, y) => Number(!!x.mine) - Number(!!y.mine));
-  $("offer-list").replaceChildren(...mineLast.map(offerRow));
+  syncList($("offer-list"), mineLast, (o) => String(o.offerId), createOfferRow, updateOfferRow);
   const empty = $("offers-empty");
   empty.hidden = !state.offersLoaded || state.offers.length > 0;
-  empty.textContent = state.offersError ? `Could not load offers: ${state.offersError}` : "No open offers right now.";
+  setText(empty, state.offersError ? `Could not load offers: ${state.offersError}` : "No open offers right now.");
 }
 
-/** Keeps the lobby's buttons in step with `busy` without rebuilding the list on every status render. */
+/** Keeps the lobby's buttons in step with `busy` between offer refreshes. */
 function renderLobbyBusy() {
-  for (const b of $("offer-list").querySelectorAll("button")) {
-    const row = b.closest(".offer-row");
-    /** @type {HTMLButtonElement} */ (b).disabled = state.busy || !!row?.classList.contains("is-mine");
+  for (const li of $("offer-list").children) {
+    const r = refs.get(li);
+    if (r) r.btn.disabled = state.busy || !!r.offer?.mine;
   }
   const submit = $("create-offer-form").querySelector("button[type=submit]");
   if (submit) /** @type {HTMLButtonElement} */ (submit).disabled = state.busy;

@@ -18,6 +18,7 @@ import {
   normalizeNote,
   noteError,
   pickDefaultChannel,
+  planKeyedList,
   piecesFromFen,
   secondsUntil,
   shortHex,
@@ -480,5 +481,54 @@ describe("api.js helpers", () => {
     expect(backoffDelay(1)).toBe(2_000);
     expect(backoffDelay(4)).toBe(16_000);
     expect(backoffDelay(10)).toBe(30_000);
+  });
+});
+
+/** Applies a planKeyedList() plan to a plain array, the way app.js applies it to a container's children. */
+function applyPlan(current: string[], plan: { remove: string[]; create: string[]; moves: Array<{ key: string; before: string | null }> }) {
+  const dom = current.filter((k) => !plan.remove.includes(k));
+  for (const { key, before } of plan.moves) {
+    const at = dom.indexOf(key);
+    if (at >= 0) dom.splice(at, 1);
+    dom.splice(before === null ? dom.length : dom.indexOf(before), 0, key);
+  }
+  return dom;
+}
+
+describe("keyed list reconciliation", () => {
+  it("touches nothing when the keys and their order are unchanged", () => {
+    expect(planKeyedList(["a", "b", "c"], ["a", "b", "c"])).toEqual({ remove: [], create: [], moves: [] });
+    expect(planKeyedList([], [])).toEqual({ remove: [], create: [], moves: [] });
+  });
+
+  it("creates new keys and removes gone ones without moving the rest", () => {
+    const plan = planKeyedList(["a", "b", "c"], ["a", "c", "d"]);
+    expect(plan.remove).toEqual(["b"]);
+    expect(plan.create).toEqual(["d"]);
+    expect(plan.moves).toEqual([{ key: "d", before: null }]);
+    expect(applyPlan(["a", "b", "c"], plan)).toEqual(["a", "c", "d"]);
+  });
+
+  it("inserts at the front and moves only what is out of place", () => {
+    const front = planKeyedList(["a", "b"], ["z", "a", "b"]);
+    expect(front.moves).toEqual([{ key: "z", before: "a" }]);
+    expect(applyPlan(["a", "b"], front)).toEqual(["z", "a", "b"]);
+    const swap = planKeyedList(["a", "b", "c"], ["b", "a", "c"]);
+    expect(swap.moves).toHaveLength(1);
+    expect(applyPlan(["a", "b", "c"], swap)).toEqual(["b", "a", "c"]);
+  });
+
+  it("always converges to the target order", () => {
+    const cases: Array<[string[], string[]]> = [
+      [["a", "b", "c", "d"], ["d", "c", "b", "a"]],
+      [["a", "b", "c"], []],
+      [[], ["x", "y"]],
+      [["a", "b", "c", "d", "e"], ["e", "a", "x", "c", "b"]],
+    ];
+    for (const [from, to] of cases) expect(applyPlan(from, planKeyedList(from, to))).toEqual(to);
+  });
+
+  it("ignores duplicate target keys after the first", () => {
+    expect(applyPlan(["a"], planKeyedList(["a"], ["a", "b", "a"]))).toEqual(["a", "b"]);
   });
 });
