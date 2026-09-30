@@ -40,6 +40,11 @@ export type ChannelRecord = {
    *  lifetime -- `sweptAmount`/`sweptTx` alone, overwritten each time, only ever showed the latest. Absent for a
    *  record written before this field existed, or one never (yet) swept for real. */
   sweeps?: Array<{ amount: bigint; tx: Hex; at: number }>;
+  /** Final fix wave (M5): the hashes of a sweep transaction whose wait gave up (stuck, aborted by `stop()`, or
+   *  its receipt lost) while it could still land -- the original send and every fee-bumped replacement. Kept on
+   *  disk so a restarted daemon checks them first and records a late landing as the sweep, not as "dust".
+   *  Cleared once they are resolved. */
+  sweepPending?: Hex[];
   /** Plan 5 Task 1 (mainnet gates: settled index): wall-clock ms at which this channel was first seen finalized,
    *  set alongside `finalized`. Used to sort the settled index loaded at `start()` by settle time, newest first.
    *  Absent in records written before this field existed (sorts as the oldest). */

@@ -227,6 +227,7 @@ function appendSweep(record: ChannelRecord, amount: bigint, tx: Hex): ChannelRec
     sweptAmount: amount,
     sweptTx: tx,
     sweeps: [...(record.sweeps ?? []), { amount, tx, at: Date.now() }],
+    sweepPending: undefined, // final fix wave (M5): resolved
   };
 }
 
@@ -522,7 +523,8 @@ export class ArenaDaemon {
         sender: new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
           feeCeiling: NO_FEE_CEILING,
         }),
-        sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0 },
+        // Final fix wave (M5): a sweep transaction the last run gave up on is checked first.
+        sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
         busy: false,
       });
     }
@@ -997,7 +999,7 @@ export class ArenaDaemon {
       sessionGasLowWoken: false,
       settledWake: false,
       settledAt: null,
-      sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0 },
+      sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -1387,7 +1389,7 @@ export class ArenaDaemon {
    * throws.
    */
   private async runSweepAttempt(
-    record: ChannelRecord,
+    input: ChannelRecord,
     sender: SerialTxSender,
     backoff: SweepBackoff,
     save: (r: ChannelRecord) => void,
@@ -1401,6 +1403,15 @@ export class ArenaDaemon {
       recheck?: boolean;
     } = {},
   ): Promise<SweepAttemptResult> {
+    let record = input;
+    // Final fix wave (M5): `sweepPending` on disk mirrors `backoff.pendingTx`, so a restarted daemon resumes
+    // checking the same hashes instead of reading a landed sweep's leftover balance as "dust".
+    const persistPending = () => {
+      const want = backoff.pendingTx !== undefined && backoff.pendingTx.length > 0 ? [...backoff.pendingTx] : undefined;
+      if ((record.sweepPending ?? []).join() === (want ?? []).join()) return;
+      record = { ...record, sweepPending: want };
+      save(record);
+    };
     // Fix round 2, important 1: a manual sweep (force) on an "abandoned" channel gets a fresh episode -- I8's own
     // write-off must never be permanent for `arena sweep`/`POST /sweep`, or every bulk sweep just reports every
     // abandoned channel as "not sweepable yet" forever. Computed before the try below (the catch block, at the
@@ -1415,7 +1426,8 @@ export class ArenaDaemon {
       // Checked first, before anything else below -- including the back-off gate just past this block -- since
       // the transaction may already have landed and there is nothing to gain by waiting the back-off out before
       // finding that out.
-      if (backoff.pendingTx !== undefined && record.swept === undefined) {
+      // Final fix wave (M5): also when `arena sweep` retries an abandoned channel -- its last send may have landed.
+      if (backoff.pendingTx !== undefined && (record.swept === undefined || retryingAbandoned)) {
         // Final fix wave (M3): the first probe is immediate, but once one has found the transaction still
         // pending, the next waits out the back-off like any other attempt instead of re-probing every pass.
         const probed = backoff.pendingProbes ?? 0;
@@ -1448,6 +1460,7 @@ export class ArenaDaemon {
           // recover. Charged as a failed attempt (this recovery slot found nothing, same as any other failure
           // would) and falls through to a fresh attempt below, within this same try -- never an early abandon
           // from this alone; the normal attempt just below decides that for itself if it also fails.
+          persistPending();
           backoff.attempts++;
         }
       }
@@ -1474,7 +1487,7 @@ export class ArenaDaemon {
             return { kind: "swept", record: swept, amount: late.amount, hash: late.hash };
           }
         }
-        const updated: ChannelRecord = { ...record, swept: "dust" };
+        const updated: ChannelRecord = { ...record, swept: "dust", sweepPending: undefined };
         save(updated);
         this.endSweepBackoff(record.channelId, backoff);
         return { kind: "dust", record: updated };
@@ -1484,13 +1497,6 @@ export class ArenaDaemon {
       this.endSweepBackoff(record.channelId, backoff);
       return { kind: "swept", record: updated, amount: outcome.amount, hash: outcome.hash };
     } catch (err) {
-      if (this.stopped) return { kind: "skipped", record };
-      if (err instanceof TxNonceUsedError) {
-        // Rule 4: a foreign transaction landed at that nonce first -- not a failure of ours, just stale info; the
-        // next pass re-reads the chain and, if still unswept, tries again fresh. No back-off, no attempt charged.
-        this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
-        return { kind: "skipped", record };
-      }
       // Final fix wave (M3): merged with any hashes still remembered from before (an attempt that went ahead after
       // SWEEP_PENDING_PROBES replaces the old transaction at its nonce; either one may be the one that lands).
       const remember = (hashes: Hex[]) => {
@@ -1507,6 +1513,16 @@ export class ArenaDaemon {
         // recognise whichever one actually wins, instead of reading a fresh, near-zero balance and recording a
         // spurious "dust" over what really was a successful, if late, sweep.
         remember(err.hashes);
+      }
+      // Final fix wave (M5): persisted before the stopped check -- a wait stop() aborted is exactly the case whose
+      // transaction can land after this daemon is gone.
+      persistPending();
+      if (this.stopped) return { kind: "skipped", record };
+      if (err instanceof TxNonceUsedError) {
+        // Rule 4: a foreign transaction landed at that nonce first -- not a failure of ours, just stale info; the
+        // next pass re-reads the chain and, if still unswept, tries again fresh. No back-off, no attempt charged.
+        this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
+        return { kind: "skipped", record };
       }
       if (err instanceof SweepReadError) {
         // Final fix wave (M4): an RPC blip before anything was sent -- backed off, never charged, so an RPC outage
@@ -1615,7 +1631,14 @@ export class ArenaDaemon {
    *  `handoff()`, most notably) while the sweep's own async work was in flight is never clobbered by the sweep's
    *  -- possibly stale -- copy of the rest of it. */
   private applySweptFields(current: ChannelRecord, updated: ChannelRecord): ChannelRecord {
-    return { ...current, swept: updated.swept, sweptAmount: updated.sweptAmount, sweptTx: updated.sweptTx, sweeps: updated.sweeps };
+    return {
+      ...current,
+      swept: updated.swept,
+      sweptAmount: updated.sweptAmount,
+      sweptTx: updated.sweptTx,
+      sweeps: updated.sweeps,
+      sweepPending: updated.sweepPending, // final fix wave (M5)
+    };
   }
 
   /** Fix round 2, minor 1: refreshes the settled-index cache entry for `id` (if any) with `record`'s current
@@ -1864,7 +1887,7 @@ export class ArenaDaemon {
     const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
       feeCeiling: NO_FEE_CEILING,
     });
-    const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
+    const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: fresh.sweepPending };
     const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt, recheck });
     // Fix round 3, M-1: this record may already be in the settled-index cache (evicted from `live` some time
     // ago, or loaded straight into it at start() -- either way, never through `live`/`sweepQueue`, so neither of

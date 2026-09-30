@@ -2208,6 +2208,48 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(l.sweep.attempts).toBe(1);
   });
 
+  it("final fix wave, M5: a sweep whose wait stop() aborted persists its hashes; after a restart it is recorded as the sweep, not dust", async () => {
+    const { alice, bob, id } = await matched();
+    await settleWithSweepDisabled(alice, bob, id); // the automatic sweep stays off on this daemon
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    let onDisk: ChannelRecord | null;
+    try {
+      const sweeping = d.sweep(id); // its receipt wait is in flight when the daemon stops
+      await waitFor(() => l.sessionSender.tracked().some((t) => t.state === "waiting"), 10_000, "the sweep sent and waiting");
+      await d.stop();
+      await sweeping;
+      onDisk = new RecordStore(alice.home).channel(id);
+    } finally {
+      await testClient.setAutomine(true);
+      await testClient.mine({ blocks: 1 }); // the aborted sweep lands after the daemon stopped
+    }
+    expect(onDisk!.swept).toBeUndefined();
+    expect(onDisk!.sweepPending?.length).toBeGreaterThan(0); // before: nothing persisted (in memory only, and lost)
+
+    const restarted = new ArenaDaemon({
+      home: alice.home,
+      config: loadConfig(alice.home),
+      walletKey: alice.walletKey,
+      lobby: alice.client.lobby,
+      relay: alice.client.relay,
+    });
+    cleanups.push(() => restarted.stop());
+    await restarted.start();
+    // The sweep queue's first probe recognizes the landed transaction (before: its balance read as dust).
+    const swept = await waitFor(() => {
+      const r = new RecordStore(alice.home).channel(id);
+      return r?.swept !== undefined ? r : null;
+    }, 20_000, "the queued record resolved");
+    expect(swept.swept).toBe(true);
+    expect(onDisk!.sweepPending).toContain(swept.sweptTx);
+    const tx = await restarted.client.getTransaction({ hash: swept.sweptTx! });
+    expect(swept.sweptAmount).toBe(tx.value);
+    expect(swept.sweepPending).toBeUndefined();
+  });
+
   it("final fix wave, I2: the sweep queue attempts at most 3 records per main pass, round-robin, each bounded to 20 s", async () => {
     const pair = await startPair();
     cleanups.push(pair.cleanup);
