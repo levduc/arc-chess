@@ -403,6 +403,23 @@ describe("http foundation", () => {
     expect(text).toMatch(/\/templates/);
   });
 
+  it("Plan 5 Task 5 (spec §6.2/§12 item 44): skill.md teaches handoff etiquette (when, note, 409, status.controller)", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    // When to hand off, and to always leave a note.
+    expect(text).toMatch(/hard|high-stakes|not confident/i);
+    expect(text).toMatch(/leave a short note/i);
+    // Never act while the human is in control -- the daemon never signs, and move commands get 409.
+    expect(text).toMatch(/409/);
+    expect(text).toMatch(/the human is in control/i);
+    // control-changed is only a partial signal; agents must re-read status.controller after every wait.
+    expect(text).toMatch(/control-changed/);
+    expect(text).toMatch(/status\.controller/);
+    // How the human opens the board, and the security note about the token.
+    expect(text).toMatch(/arena board/);
+    expect(text).toMatch(/never.*(pasted|shared)|(pasted|shared).*never/i);
+  });
+
   it("Task 2 (spec §13): /templates publishes the hub's current launch limits", async () => {
     const chain = new FakeChain();
     chain.hubLimits = { maxDepositPerPlayer: 10_000_000n, maxCommittedEscrow: 1_000_000_000n, committedEscrow: 500_000n, paused: true };
