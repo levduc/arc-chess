@@ -304,7 +304,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       try {
         res = await io.fetch(`http://127.0.0.1:${cfg.port}/board/code`, {
           method: "POST",
-          headers: { authorization: `Bearer ${token}` },
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         });
       } catch {
         throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "arena daemon", then run "arena board" again`);

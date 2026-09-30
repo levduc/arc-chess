@@ -320,7 +320,8 @@ describe("local API", () => {
       server.close();
       await pair.cleanup();
     };
-    const mint = () => fetch(`${url}/board/code`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
+    const mint = () =>
+      fetch(`${url}/board/code`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" } });
     const exchange = (code: unknown) =>
       fetch(`${url}/board/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
 
@@ -364,7 +365,11 @@ describe("local API", () => {
       await pair.cleanup();
     };
     const mint = async () =>
-      ((await (await fetch(`${url}/board/code`, { method: "POST", headers: { authorization: `Bearer ${token}` } })).json()) as { code: string }).code;
+      (
+        (await (
+          await fetch(`${url}/board/code`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" } })
+        ).json()) as { code: string }
+      ).code;
     const exchange = (code: unknown) =>
       fetch(`${url}/board/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
     for (let i = 0; i < 10; i++) expect((await exchange(`guess-${i}`)).status).toBe(401);
@@ -375,6 +380,47 @@ describe("local API", () => {
     expect(JSON.stringify(await limited.json())).not.toContain(token);
     now += 60_001; // the window slides
     expect((await exchange(valid)).status).toBe(200); // not consumed by the refused attempt
+  });
+
+  it("final fix wave M1 follow-up: every POST needs Content-Type: application/json (415), so a no-cors page cannot drain /board/session", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const post = (path: string, headers: Record<string, string>, body?: string) => fetch(`${url}${path}`, { method: "POST", headers, body });
+    // The "simple" (preflight-free) shapes a cross-origin no-cors page can send: text/plain, a form, or no body type.
+    const simple: Array<Record<string, string>> = [
+      { "content-type": "text/plain;charset=UTF-8" },
+      { "content-type": "application/x-www-form-urlencoded" },
+      { "content-type": "multipart/form-data; boundary=x" },
+      {},
+    ];
+    for (let round = 0; round < 5; round++) {
+      for (const h of simple) {
+        const r = await post("/board/session", h, '{"code":"guess"}');
+        expect(r.status).toBe(415);
+      }
+    }
+    // Twenty refused simple POSTs later, the whole budget is still there: 10 JSON attempts get their 401, the 11th
+    // is rate-limited.
+    for (let i = 0; i < 10; i++) {
+      expect((await post("/board/session", { "content-type": "application/json" }, JSON.stringify({ code: `g${i}` }))).status).toBe(401);
+    }
+    expect((await post("/board/session", { "content-type": "application/json" }, JSON.stringify({ code: "g" }))).status).toBe(429);
+
+    // Every other POST too, after the token check (a request with no token still gets 401 first).
+    const auth = { authorization: `Bearer ${token}` };
+    expect((await post("/board/code", { ...auth, "content-type": "text/plain" })).status).toBe(415);
+    expect((await post("/board/code", auth)).status).toBe(415);
+    expect((await post("/handoff", { ...auth, "content-type": "text/plain" }, '{"to":"human"}')).status).toBe(415);
+    expect((await post("/sweep", auth)).status).toBe(415);
+    expect((await post("/handoff", { "content-type": "text/plain" }, '{"to":"human"}')).status).toBe(401);
+    // JSON with a charset parameter is still JSON.
+    expect((await post("/sweep", { ...auth, "content-type": "application/json; charset=utf-8" })).status).toBe(200);
+    expect((await post("/board/code", { ...auth, "Content-Type": "Application/JSON" })).status).toBe(200);
   });
 
   it("Plan 5 Task 2: GET /events requires the token, streams a retry line and change events, and caps at 8 clients", async () => {

@@ -129,6 +129,19 @@ async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
   }
 }
 
+/**
+ * Final fix wave (M1 follow-up): true only for `Content-Type: application/json` (a parameter such as `charset` is
+ * allowed). Every POST here requires it, and answers 415 otherwise. A cross-origin page can send that type only
+ * after a CORS preflight, which this API always refuses (405), so it is left with the "simple" no-cors shapes
+ * (text/plain, form types, no type) -- which now reach no POST handler, and in particular cannot use up
+ * `POST /board/session`'s rate-limit budget, since it is checked before the attempt is counted.
+ */
+function isJsonRequest(req: IncomingMessage): boolean {
+  return (req.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase() === "application/json";
+}
+
+const NOT_JSON = { error: "Content-Type must be application/json" };
+
 function authorized(req: IncomingMessage, token: string): boolean {
   const header = req.headers.authorization ?? "";
   const given = Buffer.from(header.startsWith("Bearer ") ? header.slice(7) : "");
@@ -198,6 +211,7 @@ export async function startApi(
   /** `POST /board/session {code}`: no bearer token -- the code is the credential. Host-guarded like every route,
    *  rate-limited before the code is even read, and single-use: a used, expired or unknown code gets 401. */
   async function handleBoardSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!isJsonRequest(req)) return send(res, 415, NOT_JSON); // before the attempt is counted
     const now = boardNow();
     while (sessionAttempts.length > 0 && sessionAttempts[0] <= now - 60_000) sessionAttempts.shift();
     if (sessionAttempts.length >= BOARD_SESSION_ATTEMPTS_PER_MINUTE) {
@@ -325,6 +339,7 @@ export async function startApi(
         const rawPath = (req.url ?? "/").split("?")[0];
         if (req.method === "POST" && rawPath === "/board/code") {
           if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
+          if (!isJsonRequest(req)) return send(res, 415, NOT_JSON);
           return send(res, 200, { code: mintBoardCode() });
         }
         if (req.method === "POST" && rawPath === "/board/session") return await handleBoardSession(req, res);
@@ -339,6 +354,7 @@ export async function startApi(
           return handleSse(req, res);
         }
         if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
+        if (req.method === "POST" && !isJsonRequest(req)) return send(res, 415, NOT_JSON);
         const actor: Actor = req.headers["x-arena-actor"] === "human" ? "human" : "agent";
         const q = url.searchParams;
         const b = req.method === "POST" ? await body(req) : {};

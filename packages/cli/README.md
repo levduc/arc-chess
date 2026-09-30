@@ -169,7 +169,8 @@ from the address bar. **The token itself is never printed and never appears in a
 (and its omnibox suggestions, and any history sync) holds only a used code. The code works once: opening the same
 link again, or one older than two minutes, shows "This link has expired — run `arena board` again", and reloading a
 signed-in tab asks for a new link. Links from before this change (`#token=…`) are no longer accepted. Sign-in
-attempts are limited to 10 a minute.
+attempts are limited to 10 a minute. Every POST to the API must be `Content-Type: application/json` (415
+otherwise), so another web page cannot use up that limit with a plain cross-origin form or text post.
 
 **Still treat the link as private until it is used.** An unused code grants what the token grants — full control
 of every channel this daemon holds: moves, resigns, handoffs, offers, everything the agent itself can do. Never

@@ -83,6 +83,7 @@ describe("arena CLI", () => {
     expect(t.calls).toHaveLength(1);
     expect(t.calls[0].url).toBe("http://127.0.0.1:7010/board/code");
     expect(t.calls[0].init.method).toBe("POST");
+    expect(new Headers(t.calls[0].init.headers).get("content-type")).toBe("application/json");
     const token = new Headers(t.calls[0].init.headers).get("authorization")?.replace(/^Bearer /, "");
     expect(token).toMatch(/^[0-9a-f]{64}$/);
     expect(t.out).toEqual(["http://127.0.0.1:7010/board#code=Zm9vYmFyYmF6cXV4MTIzNA"]);

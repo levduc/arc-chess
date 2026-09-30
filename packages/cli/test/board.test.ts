@@ -592,6 +592,31 @@ describe("api.js helpers", () => {
     await expect(exchangeCode("any", down)).rejects.toMatchObject({ status: 0 });
   });
 
+  it("final fix wave M1 follow-up: every POST the board sends is application/json (the daemon answers 415 otherwise)", async () => {
+    const calls: Array<{ url: string; init: any }> = [];
+    const fetchImpl = async (url: string, init: any) => {
+      calls.push({ url, init });
+      return new Response("{}", { status: 200 });
+    };
+    const client = createClient("tok", { fetchImpl });
+    const id = `0x${"ab".repeat(32)}`;
+    await client.createOffer("1000000", "100000");
+    await client.acceptOffer(id);
+    await client.move(id, "e2e4", false);
+    for (const action of [client.resign, client.acceptDraw, client.nextGame, client.close, client.challenge]) await action(id);
+    await client.handoff(id, "agent", "note");
+    await exchangeCode("c0de", async (url: string, init: any) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ token: "tok" }), { status: 200 });
+    });
+    expect(calls).toHaveLength(10); // 9 client POSTs and the code exchange
+    for (const { url, init } of calls) {
+      expect(init.method, url).toBe("POST");
+      expect(init.headers["content-type"], url).toBe("application/json");
+      expect(() => JSON.parse(init.body), url).not.toThrow();
+    }
+  });
+
   it("backs off exponentially up to a cap", () => {
     expect(backoffDelay(0)).toBe(1_000);
     expect(backoffDelay(1)).toBe(2_000);

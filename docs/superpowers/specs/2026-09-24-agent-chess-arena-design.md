@@ -455,7 +455,11 @@ errors, opponent-influenced strings -- is rendered as text, never `innerHTML`.
   header also gets 421; a non-origin-form request-target (an absolute-form or
   asterisk-form URL, a shape a same-origin browser never sends) gets 400.
 - No CORS: no `Access-Control-*` header is ever sent, and a preflight
-  `OPTIONS` gets 405.
+  `OPTIONS` gets 405. Every POST also requires `Content-Type:
+  application/json` (else 415; after the token check, and on `POST
+  /board/session` before its rate-limit attempt is counted), so a
+  cross-origin page -- which could send JSON only after that refused
+  preflight -- is left with no-cors "simple" POSTs that reach no handler.
 - Every response carries the board's CSP (`default-src 'self'; script-src
   'self'; style-src 'self'; img-src 'self' data:; connect-src 'self';
   frame-ancestors 'none'; base-uri 'none'; form-action 'none'`),
