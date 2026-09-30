@@ -205,6 +205,44 @@ describe("buildStatus", () => {
     expect(view(y.a, y.rec(0), OPEN, OPEN.now - 601n).attention).toBe("opponent-silent");
   });
 
+  it("Plan 5 Task 2: legalMovesUci mirrors legalMoves (UCI strings), only on my turn", async () => {
+    const { a, b, rec } = await sessions();
+    const sa = view(a, rec(0));
+    expect(sa.legalMovesUci).toContain("e2e4");
+    expect(sa.legalMovesUci).toHaveLength(20);
+    expect(view(b, rec(1)).legalMovesUci).toEqual([]);
+  });
+
+  it("Plan 5 Task 2: orientation matches color", async () => {
+    const { a, b, rec } = await sessions();
+    expect(view(a, rec(0)).orientation).toBe("white");
+    expect(view(b, rec(1)).orientation).toBe("black");
+  });
+
+  it("Plan 5 Task 2: lastMove is null at the start of a game, and {from, to, san} right after a move", async () => {
+    const { a, b, rec } = await sessions();
+    expect(view(a, rec(0)).lastMove).toBeNull();
+    expect(view(b, rec(1)).lastMove).toBeNull();
+    await b.receive(await a.move("e2e4"));
+    expect(view(a, rec(0)).lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    expect(view(b, rec(1)).lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    await a.receive(await b.move("g8f6")); // Nf6 -- exercises a piece move's SAN, not just a pawn push
+    expect(view(a, rec(0)).lastMove).toEqual({ from: "g8", to: "f6", san: "Nf6" });
+  });
+
+  it("Plan 5 Task 2: lastMove is null for a non-move kind (resign)", async () => {
+    const x = await finished(); // x.a's latest is b's RESIGN, not a move
+    expect(view(x.a, x.rec(0)).lastMove).toBeNull();
+  });
+
+  it("Plan 5 Task 2: handoff carries controller/note/since -- since is null until handoffAt is set", async () => {
+    const { a, rec } = await sessions();
+    expect(view(a, rec(0)).handoff).toEqual({ controller: "agent", note: "", since: null });
+    const handoffAt = 1_700_000_000_000;
+    const s = view(a, { ...rec(0), controller: "human", note: "mine now", handoffAt });
+    expect(s.handoff).toEqual({ controller: "human", note: "mine now", since: new Date(handoffAt).toISOString() });
+  });
+
   it("I4: a channel retired unfunded reports done instead of waiting for funding", async () => {
     const { a, rec } = await sessions();
     const none: ChainView = { ...OPEN, phase: "None", funded: [false, false] };

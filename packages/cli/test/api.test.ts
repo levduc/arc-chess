@@ -82,12 +82,21 @@ describe("local API", () => {
     const moved = await call(url, token, "POST", "/move", { move: "e4" });
     expect(moved.status).toBe(200);
     expect(moved.body.turnNum).toBe("1");
+    // Plan 5 Task 2: the new status fields flow through the real API response too, not just buildStatus() in
+    // isolation.
+    expect(moved.body.lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    expect(moved.body.orientation).toBe(moved.body.color);
+    expect(moved.body.legalMovesUci).toEqual([]); // just moved: it's the opponent's turn now
     expect((await call(url, token, "POST", "/move", { move: "d4" })).status).toBe(409);
 
     const w = await call(bobApi.url, bobToken, "GET", "/wait?timeout=10");
     expect(w.body.reason).toBe("your-turn");
 
-    expect((await call(url, token, "POST", "/handoff", { to: "human", note: "n" })).body.controller).toBe("human");
+    const handoff = await call(url, token, "POST", "/handoff", { to: "human", note: "n" });
+    expect(handoff.body.controller).toBe("human");
+    expect(handoff.body.handoff.controller).toBe("human");
+    expect(handoff.body.handoff.note).toBe("n");
+    expect(typeof handoff.body.handoff.since).toBe("string");
     expect((await call(url, token, "POST", "/handoff", { to: "robot" })).status).toBe(400);
   });
 

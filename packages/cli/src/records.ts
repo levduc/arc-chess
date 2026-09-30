@@ -44,6 +44,10 @@ export type ChannelRecord = {
    *  set alongside `finalized`. Used to sort the settled index loaded at `start()` by settle time, newest first.
    *  Absent in records written before this field existed (sorts as the oldest). */
   settledAt?: number;
+  /** Plan 5 Task 2: wall-clock ms at which `handoff()` last changed this record's controller/note, set alongside
+   *  them. Drives `ChannelStatus.handoff.since` (null there for a channel never handed off -- still at its
+   *  initial controller -- including every record written before this field existed). */
+  handoffAt?: number;
 };
 
 /** One entry of `channels/`: its record, or why it could not be read. */

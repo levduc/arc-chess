@@ -1,6 +1,20 @@
 import { Chess } from "chess.js";
 import type { Hex } from "viem";
-import { STATUS, fenOf, isGameOver, outcome, unpackMeta, type Outcome, type PlayerIndex, type SessionSnapshot } from "@arena/sdk";
+import {
+  KIND,
+  PROMO_LETTER,
+  STATUS,
+  decodeMove,
+  fenOf,
+  isGameOver,
+  legalMoves,
+  outcome,
+  squareName,
+  unpackMeta,
+  type Outcome,
+  type PlayerIndex,
+  type SessionSnapshot,
+} from "@arena/sdk";
 import type { ChainView } from "./daemon.js";
 import type { ChannelRecord, Controller } from "./records.js";
 
@@ -9,13 +23,26 @@ export type ChannelStatus = {
   phase: string;
   me: PlayerIndex;
   color: "white" | "black";
+  /** Plan 5 Task 2: the board's own orientation for this seat -- always equal to `color`. */
+  orientation: "white" | "black";
   controller: Controller;
   note: string;
+  /** Plan 5 Task 2: the last move applied to reach `fen` from the state before it, as `{from, to, san}` (computed
+   *  with chess.js from the previous FEN and the decoded move). `null` at the start of a game (no previous state)
+   *  and for a non-move latest state (resign, accept-draw, claim-stalemate, a new-game checkpoint). */
+  lastMove: { from: string; to: string; san: string } | null;
+  /** Plan 5 Task 2: who controls this seat, this seat's handoff note, and when that was last set (ISO 8601), or
+   *  `null` if this channel has never been handed off. `controller`/`note` duplicate the top-level fields of the
+   *  same name (kept there for existing callers); this groups them with `since` for the board's controller panel. */
+  handoff: { controller: Controller; note: string; since: string | null };
   gameIndex: number;
   turnNum: string;
   fen: string;
   board: string;
   legalMoves: string[];
+  /** Plan 5 Task 2: the same legal moves as `legalMoves`, as UCI strings (e.g. "e7e8q") -- for the board's click
+   *  targets. Empty unless it is my turn, exactly like `legalMoves`. */
+  legalMovesUci: string[];
   myTurn: boolean;
   gameStatus: "playing" | "draw_offered" | "white_won" | "black_won" | "draw";
   outcome: Outcome;
@@ -81,6 +108,31 @@ export function usdc(amount: bigint): string {
   const whole = amount / 1_000_000n;
   const frac = (amount % 1_000_000n).toString().padStart(6, "0");
   return `${whole}.${frac}`;
+}
+
+/**
+ * Plan 5 Task 2: `latest`'s move, described against `prev` (the state directly before it) as `{from, to, san}`,
+ * or `null` when there is nothing to describe -- no `prev` at all (the opening state), a non-move latest state
+ * (resign, accept-draw, claim-stalemate, or a NEW_GAME checkpoint), or (defensively) a `prev` that turns out not
+ * to be latest's immediate predecessor after all. `ChannelSession.advanceLatest` sets `prev` to the old `latest`
+ * on every normal move, so the turnNum/gameIndex check below should never actually fail in practice; it exists so
+ * an unexpected shape falls back to `null` instead of feeding chess.js a mismatched position.
+ */
+function lastMoveOf(snapshot: SessionSnapshot): ChannelStatus["lastMove"] {
+  const { prev, latest } = snapshot;
+  if (!prev) return null;
+  const decoded = decodeMove(latest.state.move);
+  if (decoded.kind !== KIND.NORMAL && decoded.kind !== KIND.NORMAL_OFFER_DRAW) return null;
+  if (prev.state.turnNum + 1n !== latest.state.turnNum || prev.state.gameIndex !== latest.state.gameIndex) return null;
+  const from = squareName(decoded.from);
+  const to = squareName(decoded.to);
+  try {
+    const game = new Chess(fenOf(prev.state));
+    const played = game.move({ from, to, ...(decoded.promo ? { promotion: PROMO_LETTER[decoded.promo] } : {}) });
+    return { from, to, san: played.san };
+  } catch {
+    return null;
+  }
 }
 
 export function buildStatus(input: StatusInput): ChannelStatus {
@@ -202,13 +254,21 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     phase,
     me,
     color,
+    orientation: color,
     controller: record.controller,
     note: record.note,
+    lastMove: lastMoveOf(snapshot),
+    handoff: {
+      controller: record.controller,
+      note: record.note,
+      since: record.handoffAt !== undefined ? new Date(record.handoffAt).toISOString() : null,
+    },
     gameIndex: s.gameIndex,
     turnNum: s.turnNum.toString(),
     fen: game.fen(),
     board: game.ascii(),
     legalMoves: myTurn ? game.moves() : [],
+    legalMovesUci: myTurn ? legalMoves(s) : [],
     myTurn,
     gameStatus: GAME_STATUS[status] ?? "playing",
     outcome: outcome(s),

@@ -2004,7 +2004,10 @@ export class ArenaDaemon {
 
   async handoff(ref: string | undefined, to: Controller, note: string): Promise<void> {
     const l = this.pick(ref);
-    l.record = { ...l.record, controller: to, note };
+    // Plan 5 Task 2: handoffAt drives ChannelStatus.handoff.since -- set every time, even human -> human or
+    // agent -> agent, so the board can show "handed off just now" regardless of whether the controller actually
+    // changed.
+    l.record = { ...l.record, controller: to, note, handoffAt: Date.now() };
     this.records.saveChannel(l.record);
     this.notify();
   }
