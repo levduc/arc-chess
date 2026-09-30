@@ -30,7 +30,7 @@ import {
   targetsFrom,
   usdcToBaseUnits,
 } from "../src/board/board.js";
-import { backoffDelay, createCoalescer, createThrottle, parseSse } from "../src/board/api.js";
+import { backoffDelay, createCoalescer, createErrorGate, createThrottle, parseSse } from "../src/board/api.js";
 
 // Plan 5 Task 3: the web board's pure helpers (no DOM, no fetch) -- see packages/cli/src/board/board.js.
 
@@ -474,6 +474,19 @@ describe("api.js helpers", () => {
     th.now();
     expect(calls).toBe(3);
     expect(timers).toHaveLength(0);
+  });
+
+  it("gates background errors per route: one toast per new message, re-armed only by that route's success", () => {
+    const gate = createErrorGate();
+    expect(gate.report("status", "boom")).toBe(true);
+    expect(gate.report("status", "boom")).toBe(false);
+    expect(gate.report("channels", "boom")).toBe(true);
+    // Another route's success does not re-arm this one.
+    gate.clear("channels");
+    expect(gate.report("status", "boom")).toBe(false);
+    expect(gate.report("status", "worse")).toBe(true);
+    gate.clear("status");
+    expect(gate.report("status", "worse")).toBe(true);
   });
 
   it("backs off exponentially up to a cap", () => {

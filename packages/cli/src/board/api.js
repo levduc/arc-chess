@@ -207,6 +207,28 @@ export function createThrottle(fn, intervalMs, clock = globalThis) {
   };
 }
 
+/**
+ * De-duplicates background-refresh errors per route (status, channels, offers): `report` is true only when a
+ * route's message differs from the last one it reported, and only that route's own success (`clear`) re-arms it.
+ * One route recovering must not make another, still-failing route toast again on its next poll.
+ */
+export function createErrorGate() {
+  /** @type {Map<string, string>} */
+  const last = new Map();
+  return {
+    /** @param {string} route @param {string} message */
+    report(route, message) {
+      if (last.get(route) === message) return false;
+      last.set(route, message);
+      return true;
+    },
+    /** @param {string} route */
+    clear(route) {
+      last.delete(route);
+    },
+  };
+}
+
 /** Reconnect delay for the event stream: 1 s, 2 s, 4 s, ... capped at 30 s. */
 export function backoffDelay(attempt) {
   return Math.min(30_000, 1_000 * 2 ** Math.max(0, attempt));

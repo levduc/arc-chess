@@ -35,7 +35,7 @@ import {
   turnText,
   usdcToBaseUnits,
 } from "./board.js";
-import { ApiError, backoffDelay, createClient, createCoalescer, createThrottle } from "./api.js";
+import { ApiError, backoffDelay, createClient, createCoalescer, createErrorGate, createThrottle } from "./api.js";
 
 const STATUS_POLL_MS = 5_000; // fallback while the event stream is down
 const CHANNELS_MIN_INTERVAL_MS = 10_000;
@@ -125,6 +125,9 @@ window.addEventListener("hashchange", () => {
 
 function toast(kind, title, message, timeoutMs = kind === "error" ? 0 : 6_000) {
   const box = $("toasts");
+  // The same toast already on screen is replaced (moved to the newest slot), not stacked.
+  const same = `${kind}|${title}|${message}`;
+  for (const old of [...box.children]) if (/** @type {HTMLElement} */ (old).dataset.toastKey === same) old.remove();
   const close = h("button", { className: "toast-close", text: "×", attrs: { type: "button", "aria-label": "Dismiss" } });
   const node = h(
     "div",
@@ -132,6 +135,7 @@ function toast(kind, title, message, timeoutMs = kind === "error" ? 0 : 6_000) {
     h("div", { className: "toast-body" }, h("strong", { text: title }), h("span", { className: "wrap-anywhere", text: message })),
     close,
   );
+  node.dataset.toastKey = same;
   const remove = () => node.remove();
   close.addEventListener("click", remove);
   if (timeoutMs > 0) setTimeout(remove, timeoutMs);
@@ -188,7 +192,7 @@ function wireConfirm() {
 
 // ------------------------------------------------------------------ connection state
 
-let lastBackgroundError = "";
+const backgroundErrors = createErrorGate();
 
 function setConn(kind) {
   const labels = { connecting: "Connecting", live: "Live", polling: "Reconnecting, polling every 5 s", offline: "Daemon unreachable" };
@@ -197,19 +201,20 @@ function setConn(kind) {
   node.textContent = labels[kind];
 }
 
-function markReachable() {
-  lastBackgroundError = "";
+/** A background refresh of `route` succeeded: re-arm that route's error toast (only that route's). */
+function markReachable(route) {
+  backgroundErrors.clear(route);
   if ($("conn").classList.contains("conn-offline")) setConn(state.sseOpen ? "live" : "polling");
 }
 
-/** A failed background refresh: one toast per distinct message, not one per poll. */
-function backgroundError(err) {
-  if (state.stopped || (err instanceof ApiError && err.status === 401)) return;
-  if (err instanceof ApiError && err.status === 0) setConn("offline");
-  const message = errorText(err);
-  if (message === lastBackgroundError) return;
-  lastBackgroundError = message;
-  toast("error", "Could not refresh", message);
+/** The error handler for background refreshes of `route`: one toast per new message per route, not one per poll. */
+function backgroundError(route) {
+  return (err) => {
+    if (state.stopped || (err instanceof ApiError && err.status === 401)) return;
+    if (err instanceof ApiError && err.status === 0) setConn("offline");
+    const message = errorText(err);
+    if (backgroundErrors.report(route, message)) toast("error", "Could not refresh", message);
+  };
 }
 
 // ------------------------------------------------------------------ data refresh
@@ -218,14 +223,14 @@ const refreshStatus = createCoalescer(async () => {
   const id = state.selectedId;
   if (!id || state.stopped) return;
   const st = await state.client.status(id);
-  markReachable();
+  markReachable("status");
   if (state.selectedId === id && st && st.channelId) applyStatus(st);
-}, backgroundError);
+}, backgroundError("status"));
 
 const loadChannels = createCoalescer(async () => {
   if (state.stopped) return;
   const list = await state.client.channels();
-  markReachable();
+  markReachable("channels");
   state.channels = Array.isArray(list) ? list : [];
   state.channelsLoaded = true;
   const current = state.channels.find((c) => c.channelId === state.selectedId && !c.degraded);
@@ -240,7 +245,7 @@ const loadChannels = createCoalescer(async () => {
     applyStatus(current);
   }
   renderAll();
-}, backgroundError);
+}, backgroundError("channels"));
 
 const channelsThrottle = createThrottle(() => void loadChannels(), CHANNELS_MIN_INTERVAL_MS);
 
@@ -250,7 +255,7 @@ const refreshOffers = createCoalescer(async () => {
     const list = await state.client.offers();
     state.offers = Array.isArray(list) ? list : [];
     state.offersError = null;
-    markReachable();
+    markReachable("offers");
   } catch (err) {
     if (err instanceof ApiError && (err.status === 401 || err.status === 0)) throw err;
     state.offersError = errorText(err);
@@ -258,7 +263,7 @@ const refreshOffers = createCoalescer(async () => {
     state.offersLoaded = true;
     renderLobby();
   }
-}, backgroundError);
+}, backgroundError("offers"));
 
 function applyStatus(st) {
   const prev = state.status;
