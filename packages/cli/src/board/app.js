@@ -7,6 +7,7 @@
 
 import {
   actionState,
+  autoReturnText,
   baseUnitsToUsdc,
   boardView,
   canMove,
@@ -886,6 +887,10 @@ function renderBoardArea() {
   const st = state.status;
   $("board-empty").hidden = !!st || !state.channelsLoaded;
   $("must-move-banner").hidden = !st?.challenge?.mustMove;
+  // Final fix wave (I1): the seat goes back to the agent near the deadline; say when.
+  const autoReturn = autoReturnText(st, state.deadline);
+  $("auto-return-banner").hidden = !autoReturn;
+  setText($("auto-return-banner"), autoReturn ?? "");
   setText($("board-title"), st ? turnText(st) : state.channelsLoaded ? "No channel selected" : "Loading");
   const chan = $("board-channel");
   setText(chan, st ? shortHex(st.channelId) : "");

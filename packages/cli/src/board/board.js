@@ -349,6 +349,23 @@ export function channelBanners(status) {
   return out;
 }
 
+/**
+ * Final fix wave (I1): the warning a human holding a seat that must move under a challenge sees while the daemon's
+ * auto-return is on -- "Move before <time> or the seat returns to your agent" -- or null. `<time>` is when the daemon
+ * hands the seat back: the challenge's expected wall-clock end (`deadline.endsAt`, from syncDeadline) less the
+ * chain-time gap between `challenge.deadline` and `challenge.autoReturnAt`.
+ * @param {ChannelStatus | null | undefined} status
+ * @param {{ deadline: string, endsAt: number } | null | undefined} deadline
+ * @param {(ms: number) => string} [formatTime]
+ * @returns {string | null}
+ */
+export function autoReturnText(status, deadline, formatTime = (ms) => new Date(ms).toLocaleTimeString()) {
+  const ch = status?.challenge;
+  if (!status || status.controller !== "human" || !ch?.mustMove || ch.autoReturnAt == null || !deadline) return null;
+  const returnsAtMs = deadline.endsAt - (Number(ch.deadline) - Number(ch.autoReturnAt)) * 1000;
+  return `Move before ${formatTime(returnsAtMs)} or the seat returns to your agent`;
+}
+
 /** The channel to show first: a forced move, then our turn (human-controlled first), then any live channel.
  *  @param {ReadonlyArray<ChannelStatus | DegradedChannel> | null | undefined} list @returns {string | null} */
 export function pickDefaultChannel(list) {

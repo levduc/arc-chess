@@ -39,6 +39,10 @@ const STAKE = 100_000n;
 const START = 10_000_000n;
 const FEE = 5_000n;
 const TIMEOUT = 60; // the hub's MIN_TIMEOUT
+/** Final fix wave (I1): a human-held seat that must move goes back to the agent with max(60, timeout / 3) seconds
+ *  left -- at once for a 60 s window. The scenarios where the human answers a challenge use this longer one, so the
+ *  seat returns only with 200 s left. */
+const LONG_TIMEOUT = 600;
 
 // Per-scenario wall-clock times, printed at the end of the file.
 const times: Array<{ name: string; ms: number }> = [];
@@ -93,12 +97,13 @@ async function waitPhase(hub: HubClient, id: Hex, phase: string, ms = 20_000): P
   await waitFor(async () => (await hub.channelInfo(id)).phase === phase, ms, `on-chain phase ${phase}`);
 }
 
-/** Alice offers (challengeTimeout 60 s, the hub's minimum), Bob accepts, and both daemons see the channel Open. */
-async function matchAndOpen(alice: Player, bob: Player): Promise<Hex> {
+/** Alice offers (challengeTimeout 60 s, the hub's minimum, unless given), Bob accepts, and both daemons see the
+ *  channel Open. */
+async function matchAndOpen(alice: Player, bob: Player, timeout = TIMEOUT): Promise<Hex> {
   const { offerId } = await alice.api("POST", "/offers", {
     deposit: DEPOSIT.toString(),
     stakePerGame: STAKE.toString(),
-    challengeTimeout: String(TIMEOUT),
+    challengeTimeout: String(timeout),
   });
   await bob.api("POST", "/offers/accept", { offerId });
   const id = await waitFor(async () => {
@@ -291,13 +296,13 @@ suite(
 
     /** A fresh stack, Alice and Bob, and one Open channel between them (Alice is white in game 0). */
     type Fresh = { s: Stack; alice: Player; bob: Player; hub: HubClient; pub: PublicClient; id: Hex };
-    async function freshChannel(): Promise<Fresh> {
+    async function freshChannel(timeout = TIMEOUT): Promise<Fresh> {
       const s = await startStack();
       stack = s;
       const alice = await s.player("alice");
       const bob = await s.player("bob");
       const { hub, pub } = hubOf(s);
-      const id = await matchAndOpen(alice, bob);
+      const id = await matchAndOpen(alice, bob, timeout);
       return { s, alice, bob, hub, pub, id };
     }
 
@@ -464,9 +469,9 @@ suite(
     );
 
     timed(
-      "3. challenge while the human holds the seat: mustMove banner, a countdown that runs down, and the clicked move lands via respond",
+      "3. challenge while the human holds the seat: mustMove and auto-return banners, a countdown that runs down, and the clicked move lands via respond",
       async () => {
-        const { alice, bob, hub, pub, id } = await freshChannel();
+        const { alice, bob, hub, pub, id } = await freshChannel(LONG_TIMEOUT);
         await playLine(alice, bob, id, ["e2e4", "e7e5"]); // turn 2: Alice (white) to move
         const note = "Bob may challenge: answer on the board";
         await alice.api("POST", "/handoff", { channel: id, to: "human", note });
@@ -480,11 +485,15 @@ suite(
         await bob.api("POST", "/challenge", { channel: id });
         await waitPhase(hub, id, "Challenged");
         await page.getByTestId("must-move-banner").waitFor({ state: "visible", timeout: 15_000 });
+        // Final fix wave (I1): the human is told when the seat goes back to the agent (200 s before the deadline).
+        const autoReturn = page.getByTestId("auto-return-banner");
+        await autoReturn.waitFor({ state: "visible", timeout: 15_000 });
+        expect(await autoReturn.textContent()).toMatch(/^Move before .+ or the seat returns to your agent$/);
         const countdown = page.getByTestId("countdown");
         await countdown.waitFor({ state: "visible" });
         const first = countdownSeconds(await countdown.textContent());
         expect(first).toBeGreaterThan(0);
-        expect(first).toBeLessThanOrEqual(TIMEOUT);
+        expect(first).toBeLessThanOrEqual(LONG_TIMEOUT);
         // It runs down between chain blocks (Anvil mines none while nothing is sent).
         await page.waitForFunction(
           (limit) => {
@@ -506,6 +515,7 @@ suite(
         await waitStatus(alice, (s) => s.phase === "Open" && s.turnNum === "3" && s.challenge === null, 15_000, id);
         await waitStatus(bob, (s) => s.phase === "Open" && s.turnNum === "3" && s.myTurn, 15_000, id);
         await page.getByTestId("must-move-banner").waitFor({ state: "hidden", timeout: 15_000 });
+        await page.getByTestId("auto-return-banner").waitFor({ state: "hidden", timeout: 15_000 });
         await page.getByTestId("countdown").waitFor({ state: "hidden", timeout: 15_000 });
         // Informational: either daemon may land the respond (Bob's watchtower also holds turn 3 once it is relayed).
         const tx = await pub.getTransaction({ hash: responded[0].transactionHash });
@@ -721,6 +731,61 @@ suite(
         }
       },
       60_000,
+    );
+
+    timed(
+      "9. a challenge on a human-held seat after the human closed the board: the agent is woken, gets the seat back in time, and answers via respond (final fix wave I1)",
+      async () => {
+        // A 200 s window: the seat goes back to the agent with max(60, 200 / 3) = 66 s left.
+        const { s, alice, bob, hub, pub, id } = await freshChannel(200);
+        await playLine(alice, bob, id, ["e2e4", "e7e5"]); // turn 2: Alice (white) to move
+        await alice.api("POST", "/handoff", { channel: id, to: "human", note: "your call on move 2" });
+
+        // The human opens the board, then closes it and walks away.
+        browser = await launchChrome();
+        const board = await openBoard(browser, alice);
+        await waitText(board.page, "controller-badge", "Human");
+        await board.page.close();
+
+        // Bob challenges, and then his daemon goes away: only Alice's own respond can answer it.
+        await bob.api("POST", "/challenge", { channel: id });
+        await waitPhase(hub, id, "Challenged");
+        await bob.kill();
+
+        // The agent's wait wakes even though the human holds the seat.
+        expect(await alice.api("GET", `/wait?channel=${id}&timeout=30`)).toEqual({ channelId: id, reason: "human-must-move" });
+        const held = (await alice.api("GET", `/status?channel=${id}`)) as Status & {
+          challenge: { deadline: string; mustMove: boolean; autoReturnAt: string | null };
+        };
+        expect(held.controller).toBe("human");
+        expect(held.attention).toBe("human-must-move");
+        expect(held.challenge.mustMove).toBe(true);
+        expect(held.challenge.autoReturnAt).toBe((BigInt(held.challenge.deadline) - 66n).toString());
+
+        // No human step: chain time runs on to 60 s before the deadline, and the daemon hands the seat back.
+        await s.increaseTime(140);
+        const woke = (await alice.api("GET", `/wait?channel=${id}&timeout=30`)) as { channelId: Hex; reason: string };
+        expect(woke.channelId).toBe(id);
+        expect(["control-changed", "your-turn"]).toContain(woke.reason); // §12 item 44: either, depending on timing
+        const back = (await alice.api("GET", `/status?channel=${id}`)) as Status;
+        expect(back.controller).toBe("agent");
+        expect(back.note).toBe("auto-returned: challenge deadline approaching");
+        expect(back.myTurn).toBe(true);
+
+        // The agent answers in time; the move lands on chain through Alice's own respond.
+        await alice.api("POST", "/move", { channel: id, move: "g1f3" });
+        await waitPhase(hub, id, "Open", 30_000);
+        const responded = (await hub.disputeEvents(id)).filter((e) => e.kind === "Responded");
+        expect(responded).toHaveLength(1);
+        expect((await hub.registeredState(id)).turnNum).toBe(3n);
+        const tx = await pub.getTransaction({ hash: responded[0].transactionHash });
+        const params = await hub.channelParams(id);
+        expect(tx.from.toLowerCase()).toBe(params.signers[0].toLowerCase()); // Alice's session key
+        await expectNoErrors(alice);
+
+        expectTokenHygiene(board);
+      },
+      90_000,
     );
   },
 );

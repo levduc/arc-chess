@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   actionState,
+  autoReturnText,
   baseUnitsToUsdc,
   boardView,
   canMove,
@@ -332,6 +333,22 @@ describe("channel list chips and banners", () => {
     expect(channelBanners(humanSilent).map((b: any) => b.kind)).toEqual(["opponent-silent"]);
     const must = status({ phase: "Challenged", challenge: { deadline: "1", secondsLeft: 60, mustMove: true, challenger: "opponent" } });
     expect(channelBanners(must).map((b: any) => b.kind)).toEqual(["must-move"]);
+  });
+
+  it("final fix wave I1: warns a human who must move when the seat returns to the agent", () => {
+    const challenge = { deadline: "5000", secondsLeft: 600, mustMove: true, challenger: "opponent", autoReturnAt: "4800" };
+    const human = status({ phase: "Challenged", controller: "human", attention: "human-must-move", challenge });
+    // The deadline is expected at wall-clock 1_000_000 ms; the seat returns 200 s (5000 - 4800) before it.
+    const deadline = { deadline: "5000", endsAt: 1_000_000 };
+    const at = (ms: number) => `@${ms}`;
+    expect(autoReturnText(human, deadline, at)).toBe("Move before @800000 or the seat returns to your agent");
+    // No warning without a return time (auto-return off, or the agent holds the seat), without a forced move, or
+    // before the countdown is synced.
+    expect(autoReturnText(status({ ...human, challenge: { ...challenge, autoReturnAt: null } }), deadline, at)).toBeNull();
+    expect(autoReturnText(status({ ...human, controller: "agent" }), deadline, at)).toBeNull();
+    expect(autoReturnText(status({ ...human, challenge: { ...challenge, mustMove: false } }), deadline, at)).toBeNull();
+    expect(autoReturnText(human, null, at)).toBeNull();
+    expect(autoReturnText(status(), deadline, at)).toBeNull();
   });
 
   it("picks the most urgent channel to select first", () => {
