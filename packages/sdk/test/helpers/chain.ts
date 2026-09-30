@@ -88,6 +88,15 @@ export async function setEthBalance(who: Address, wei: bigint): Promise<void> {
   await testClient.setBalance({ address: who, value: wei });
 }
 
+/** Fix round 3, M-3: pins the chain's own base fee (not just a daemon's local `maxFeePerGas` estimate stub) --
+ *  mines a block right after, so the *next* read of the latest block (what `estimateFeesPerGas` projects
+ *  forward from) actually reflects it. Without this, a test computing a boundary from one fee read and a daemon
+ *  pass computing the same boundary from a later read can disagree if the real market fee moves in between. */
+export async function setBaseFeePerGas(wei: bigint): Promise<void> {
+  await testClient.setNextBlockBaseFeePerGas({ baseFeePerGas: wei });
+  await testClient.mine({ blocks: 1 });
+}
+
 export async function now(): Promise<bigint> {
   return (await publicClient().getBlock()).timestamp;
 }

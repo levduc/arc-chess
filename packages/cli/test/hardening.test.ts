@@ -24,7 +24,7 @@ import {
   type SignedAcceptance,
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
-import { CHAIN, RPC, increaseTime, now, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
+import { CHAIN, RPC, increaseTime, now, setBaseFeePerGas, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
 import {
   ArenaDaemon,
   DaemonError,
@@ -1708,6 +1708,12 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       const l = alice.daemon.handle(id);
       const session = l.sessionSender.address;
       await setEthBalance(session, boundary + 1n);
+      // Fix round 3, M-3: this scenario actually sends a transaction, whose own fee is chosen by the sender's
+      // *own*, unstubbed read of the real chain -- currentFeePerGas above only pins the daemon's own dust/reserve
+      // decision. If the real network fee happened to be above F, the value sent (reserved against F) could come
+      // up short and the send itself could fail on TxInsufficientFundsError, flaking this test independently of
+      // the boundary math it is actually about. Pinned well below F here so that can never happen.
+      await setBaseFeePerGas(F / 10n);
       d.sweepChannel = original;
       await waitFor(() => l.record.swept !== undefined, 20_000, "swept one wei above the boundary");
       expect(l.record.swept).toBe(true);
