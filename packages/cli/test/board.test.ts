@@ -10,6 +10,7 @@ import {
   clickSquare,
   DIALOG_GRACE_MS,
   dialogClickAllowed,
+  escapeIntent,
   formatCountdown,
   formatDuration,
   formatUsdc,
@@ -264,6 +265,15 @@ describe("click intents", () => {
 
   it("does nothing while the agent is in control", () => {
     expect(clickSquare({ ...s, controller: "agent" }, { selected: null }, "e2")).toEqual({ selected: null, intent: null });
+  });
+});
+
+describe("Escape on the board", () => {
+  it("closes an open promotion picker first, wherever focus is, else drops the selection", () => {
+    expect(escapeIntent({ promotionOpen: true, selected: "e7" })).toBe("close-promotion");
+    expect(escapeIntent({ promotionOpen: true, selected: null })).toBe("close-promotion");
+    expect(escapeIntent({ promotionOpen: false, selected: "e2" })).toBe("deselect");
+    expect(escapeIntent({ promotionOpen: false, selected: null })).toBeNull();
   });
 });
 

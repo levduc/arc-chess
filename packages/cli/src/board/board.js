@@ -203,6 +203,18 @@ export function clickSquare(status, ui, square) {
   return { selected: null, intent: null };
 }
 
+/**
+ * What Escape does on the board, wherever focus is on the page: an open promotion picker closes first (the
+ * selection it was opened from stays, so a different target can be picked), otherwise the selection is dropped.
+ * @param {{ promotionOpen: boolean, selected: string | null }} ui
+ * @returns {"close-promotion" | "deselect" | null}
+ */
+export function escapeIntent(ui) {
+  if (ui.promotionOpen) return "close-promotion";
+  if (ui.selected) return "deselect";
+  return null;
+}
+
 /** The 64 squares in display order, each with everything app.js needs to draw it. */
 export function boardView(status, ui) {
   const orientation = status?.orientation === "black" ? "black" : "white";

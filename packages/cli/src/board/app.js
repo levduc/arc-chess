@@ -14,6 +14,7 @@ import {
   channelChip,
   clickSquare,
   dialogClickAllowed,
+  escapeIntent,
   formatCountdown,
   formatDuration,
   formatUsdc,
@@ -654,7 +655,18 @@ function wireBoard() {
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       activateSquare(sq);
-    } else if (e.key === "Escape" && state.selected) {
+    }
+  });
+  // Escape is handled once, at the document, so it closes the promotion picker whether focus is in the picker,
+  // on the board, or anywhere else -- except while the confirm dialog is open, which handles its own Escape.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || /** @type {HTMLDialogElement} */ ($("confirm-dialog")).open) return;
+    const intent = escapeIntent({ promotionOpen: !!state.promotion, selected: state.selected });
+    if (intent === "close-promotion") {
+      e.preventDefault();
+      closePromotion();
+      squares.get(state.focus)?.cell.focus();
+    } else if (intent === "deselect") {
       state.selected = null;
       renderBoard();
     }
@@ -662,13 +674,6 @@ function wireBoard() {
   $("promotion-cancel").addEventListener("click", () => {
     closePromotion();
     squares.get(state.focus)?.cell.focus();
-  });
-  $("promotion").addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      closePromotion();
-      squares.get(state.focus)?.cell.focus();
-    }
   });
 }
 
