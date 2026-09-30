@@ -8,6 +8,8 @@ import {
   channelChip,
   checkSquare,
   clickSquare,
+  DIALOG_GRACE_MS,
+  dialogClickAllowed,
   formatCountdown,
   formatDuration,
   formatUsdc,
@@ -379,6 +381,16 @@ describe("formatting", () => {
     expect(formatDuration(3600)).toBe("1 h");
     expect(shortHex(`0x${"12".repeat(32)}`)).toBe("0x1212…1212");
     expect(shortHex("0xabc")).toBe("0xabc");
+  });
+});
+
+describe("confirm dialog grace period", () => {
+  it("ignores clicks for 300 ms after the dialog opens (the second click of a double-click)", () => {
+    expect(DIALOG_GRACE_MS).toBe(300);
+    expect(dialogClickAllowed(1_000, 1_000)).toBe(false);
+    expect(dialogClickAllowed(1_000, 1_299)).toBe(false);
+    expect(dialogClickAllowed(1_000, 1_300)).toBe(true);
+    expect(dialogClickAllowed(1_000, 5_000)).toBe(true);
   });
 });
 

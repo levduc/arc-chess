@@ -428,6 +428,18 @@ export function shortHex(hex) {
   return s.length > 14 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s;
 }
 
+// ---------------------------------------------------------------- confirm dialog
+
+/** How long after a confirm dialog opens its backdrop and Confirm button ignore clicks: the second click of a
+ *  double-click on the button that opened it would otherwise land on the backdrop (cancelling the dialog it
+ *  just opened) or, where the two overlap, on Confirm itself. */
+export const DIALOG_GRACE_MS = 300;
+
+/** @param {number} openedAtMs @param {number} nowMs */
+export function dialogClickAllowed(openedAtMs, nowMs) {
+  return nowMs - openedAtMs >= DIALOG_GRACE_MS;
+}
+
 // ---------------------------------------------------------------- handoff note
 
 /** Mirrors the daemon's own check (MAX_HANDOFF_NOTE_LENGTH and FORBIDDEN_NOTE_CHARS in daemon.ts), so the user

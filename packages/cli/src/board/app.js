@@ -13,6 +13,7 @@ import {
   channelBanners,
   channelChip,
   clickSquare,
+  dialogClickAllowed,
   formatCountdown,
   formatDuration,
   formatUsdc,
@@ -148,6 +149,7 @@ function errorText(err) {
 }
 
 let confirmResolve = null;
+let confirmOpenedAt = 0;
 
 function closeConfirm(result) {
   const dlg = /** @type {HTMLDialogElement} */ ($("confirm-dialog"));
@@ -172,21 +174,27 @@ function confirmDialog({ title, message, details = [], confirmLabel = "Confirm",
   return new Promise((resolve) => {
     confirmResolve = resolve;
     dlg.showModal();
+    confirmOpenedAt = performance.now();
     $("confirm-cancel").focus();
   });
 }
 
 function wireConfirm() {
   const dlg = $("confirm-dialog");
-  $("confirm-ok").addEventListener("click", () => closeConfirm(true));
+  $("confirm-ok").addEventListener("click", () => {
+    if (dialogClickAllowed(confirmOpenedAt, performance.now())) closeConfirm(true);
+  });
   $("confirm-cancel").addEventListener("click", () => closeConfirm(false));
   dlg.addEventListener("cancel", (e) => {
     e.preventDefault();
     closeConfirm(false);
   });
-  // A click on the backdrop lands on the dialog element itself.
+  // A click on the backdrop lands on the dialog element itself -- but so does one on the dialog's own padding,
+  // so only a point outside the dialog's box counts as the backdrop.
   dlg.addEventListener("click", (e) => {
-    if (e.target === dlg) closeConfirm(false);
+    if (e.target !== dlg || !dialogClickAllowed(confirmOpenedAt, performance.now())) return;
+    const r = dlg.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) closeConfirm(false);
   });
 }
 
