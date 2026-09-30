@@ -32,6 +32,17 @@ describe("arena CLI", () => {
     expect(loadConfig(home).maxFeePerPlayer).toBe(10_000n);
   });
 
+  it("final fix wave I1: init leaves auto-return on by default; --auto-return-on-challenge false turns it off", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    expect(await runCli(INIT, io(home).io)).toBe(0);
+    expect(loadConfig(home).autoReturnOnChallenge).toBeUndefined(); // the default: on
+    expect(await runCli([...INIT, "--auto-return-on-challenge", "false"], io(home).io)).toBe(0);
+    expect(loadConfig(home).autoReturnOnChallenge).toBe(false);
+    const bad = io(home);
+    expect(await runCli([...INIT, "--auto-return-on-challenge", "no"], bad.io)).toBe(2);
+    expect(bad.err.join("\n")).toMatch(/must be true or false/);
+  });
+
   it("maps commands to API calls with the token and agent actor", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     const t = io(home);

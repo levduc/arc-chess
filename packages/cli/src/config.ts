@@ -31,6 +31,10 @@ export type ArenaConfig = {
    *  `DEFAULT_MIN_CHALLENGE_TIMEOUT`. A missed challenge deadline can roll a channel back to an old state, so a
    *  window of a minute (the hub's own minimum) is too short for a daemon that may restart or lose its RPC. */
   minChallengeTimeout?: bigint;
+  /** Final fix wave (I1): while a human holds a seat that must move under a challenge, the daemon hands the seat
+   *  back to the agent once `autoReturnSecondsOf(challengeTimeout)` or less is left, so a forfeit never depends on
+   *  a human who walked away. Default true; `arena init --auto-return-on-challenge false` turns it off. */
+  autoReturnOnChallenge?: boolean;
 };
 
 /** A canonical arena deployment on one chain (final review I2). */
@@ -99,6 +103,18 @@ export function sessionGasFloorOf(cfg: ArenaConfig): bigint {
 /** The config's `minChallengeTimeout`, or its default (configs written before it existed lack it). */
 export function minChallengeTimeoutOf(cfg: ArenaConfig): bigint {
   return cfg.minChallengeTimeout ?? DEFAULT_MIN_CHALLENGE_TIMEOUT;
+}
+
+/** The config's `autoReturnOnChallenge`, or its default: on. */
+export function autoReturnOnChallengeOf(cfg: ArenaConfig): boolean {
+  return cfg.autoReturnOnChallenge ?? true;
+}
+
+/** Final fix wave (I1): how many seconds before a challenge's deadline the daemon hands a human-held seat that must
+ *  move back to the agent: `max(60, challengeTimeout / 3)` -- the whole window for the hub's 60 s minimum, 300 s
+ *  for the 900 s default. */
+export function autoReturnSecondsOf(challengeTimeout: bigint): number {
+  return Math.max(60, Math.floor(Number(challengeTimeout) / 3));
 }
 
 export function defaultHome(env: NodeJS.ProcessEnv): string {

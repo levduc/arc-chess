@@ -51,10 +51,19 @@ export type ChannelStatus = {
   newGame: "none" | "proposed_by_me" | "proposed_by_opponent";
   closing: boolean;
   opponentWantsToClose: boolean;
-  challenge: null | { deadline: string; secondsLeft: number; mustMove: boolean; challenger: "me" | "opponent" };
+  /** `autoReturnAt` (final fix wave I1): the chain time (unix seconds, like `deadline`) at which the daemon hands
+   *  this seat back to the agent -- set only while a human holds a seat that must move and auto-return is on. */
+  challenge: null | {
+    deadline: string;
+    secondsLeft: number;
+    mustMove: boolean;
+    challenger: "me" | "opponent";
+    autoReturnAt: string | null;
+  };
   attention:
     | null
     | "session-gas-low"
+    | "human-must-move"
     | "your-turn"
     | "new-game-proposed"
     | "game-over"
@@ -62,8 +71,8 @@ export type ChannelStatus = {
     | "opponent-silent"
     | "settled";
   /** Plan 5 Task 3 fix round: what a human holding the seat should see that `attention` deliberately leaves out.
-   *  `attention` stays agent-only apart from session-gas-low, because `wait()` wakes on any `attention` and must stay
-   *  quiet while a human controls the channel (spec §6.2). Today that is `opponent-silent` alone, with
+   *  `attention` stays agent-only apart from session-gas-low and human-must-move (final fix wave I1), because
+   *  `wait()` wakes on any `attention` and must stay quiet while a human controls the channel (spec §6.2). Today that is `opponent-silent` alone, with
    *  `arena challenge` first in `suggestedActions` exactly as for the agent. Null while the agent is in control. */
   humanAttention: null | "opponent-silent";
   suggestedActions: string[];
@@ -105,6 +114,11 @@ export type StatusInput = {
   sessionGasLow?: string | null;
   /** Final review m4: the channel settled while the daemon watched it and no `wait()` has woken for it yet. */
   settled?: boolean;
+  /** Final fix wave (I1): seconds before the deadline at which the daemon returns a human-held seat that must move
+   *  to the agent (`autoReturnSecondsOf`), or null/absent when auto-return is off. */
+  autoReturnSeconds?: number | null;
+  /** Final fix wave (I1): `wait()` has already woken for this challenge's `human-must-move`. */
+  ignoreHumanMustMove?: boolean;
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -157,15 +171,19 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   const closing = snapshot.closeState !== null;
   const opponentWantsToClose = snapshot.closeSigs[opponent] !== "0x";
   const phase = chain?.phase ?? "Unknown";
-  const challenge =
-    chain && phase === "Challenged"
-      ? {
-          deadline: chain.deadline.toString(),
-          secondsLeft: Math.max(0, Number(chain.deadline - chain.now)),
-          mustMove: myTurn && chain.registeredTurn !== null && chain.registeredTurn === s.turnNum,
-          challenger: (chain.challenger === me ? "me" : "opponent") as "me" | "opponent",
-        }
-      : null;
+  let challenge: ChannelStatus["challenge"] = null;
+  if (chain && phase === "Challenged") {
+    const mustMove = myTurn && chain.registeredTurn !== null && chain.registeredTurn === s.turnNum;
+    const autoReturn = input.autoReturnSeconds ?? null;
+    challenge = {
+      deadline: chain.deadline.toString(),
+      secondsLeft: Math.max(0, Number(chain.deadline - chain.now)),
+      mustMove,
+      challenger: chain.challenger === me ? "me" : "opponent",
+      autoReturnAt:
+        mustMove && record.controller === "human" && autoReturn !== null ? (chain.deadline - BigInt(autoReturn)).toString() : null,
+    };
+  }
   const cooldown = chain
     ? {
         meSeconds: Math.max(0, Number(chain.cooldownUntil[me] - chain.now)),
@@ -196,6 +214,10 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     else if (opponentWantsToClose && over && !closing && newGame === "none") attention = "close-requested";
     else if (over && !closing && newGame === "none") attention = "game-over";
     else if (silent) attention = "opponent-silent";
+  } else if (live && challenge?.mustMove && !input.ignoreHumanMustMove) {
+    // Final fix wave (I1): a human holds a seat that must move before the challenge deadline. Raised for the agent
+    // too (wait() wakes once per challenge): the human may have walked away, and a missed deadline forfeits.
+    attention = "human-must-move";
   } else if (input.settled && (phase === "Finalized" || phase === "Reclaimed")) {
     // Final review m4: one wake for the settlement (e.g. after this player's close), consumed by `wait()`. Final
     // fix wave (M2): whoever holds the seat -- a settled channel has no seat left to protect.
@@ -247,6 +269,14 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     );
   } else if (challengeHint) {
     suggestedActions.push(challengeHint);
+  }
+  if (challenge?.mustMove && record.controller === "human") {
+    suggestedActions.unshift(
+      `tell your human: a challenge needs their move on the board within ${challenge.secondsLeft}s` +
+        (challenge.autoReturnAt !== null
+          ? `; with ${input.autoReturnSeconds}s left the daemon hands the seat back to you, and then you must move (arena move)`
+          : "; if they cannot, take the seat back (arena handoff agent) and move"),
+    );
   }
   if (input.lobbyError) {
     suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);

@@ -3,7 +3,7 @@ import { erc20Abi, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, HubRevertError, LocalKeyTxSender, buildParams, offerId as computeOfferId, type MatchEvent } from "@arena/sdk";
-import { ArenaDaemon, DaemonError, SETTLED_GRACE_SECONDS, loadConfig } from "../src/index.js";
+import { ArenaDaemon, DaemonError, SETTLED_GRACE_SECONDS, loadConfig, type ArenaConfig } from "../src/index.js";
 import { CHAIN, RPC, increaseTime, now, setLimits, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
@@ -479,6 +479,49 @@ describe("ArenaDaemon core", () => {
 });
 
 describe("watchtower", () => {
+  it("final fix wave I1: a challenge on a human-held seat wakes the agent once, the seat returns at the threshold, and the agent answers", async () => {
+    const { alice, bob, id } = await matched(); // challengeTimeout 600: the seat returns with max(60, 600/3) = 200 s left
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob turn");
+    await bob.daemon.move(id, "e5", { actor: "agent" });
+    await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 5_000, "alice turn");
+    await alice.daemon.handoff(id, "human", "your call");
+    await bob.daemon.challenge(id, "agent"); // registers turn 2: Alice's seat, held by her human, must move
+    await bob.daemon.stop(); // from here on, only Alice's own respond can answer it
+    // Before: the agent's wait stayed silent (attention was agent-only) until its own timeout.
+    await expect(alice.daemon.wait({ timeoutMs: 10_000 })).resolves.toEqual({ channelId: id, reason: "human-must-move" });
+    const st = await alice.daemon.status(id);
+    expect(st.controller).toBe("human");
+    expect(st.attention).toBe("human-must-move");
+    expect(st.challenge).toMatchObject({ mustMove: true, autoReturnAt: (BigInt(st.challenge!.deadline) - 200n).toString() });
+    // One wake per challenge, like session-gas-low.
+    await expect(alice.daemon.wait({ timeoutMs: 300 })).resolves.toEqual({ channelId: null, reason: "timeout" });
+    await expect(alice.daemon.move(id, "Nf3", { actor: "agent" })).rejects.toThrow(/the human is in control/);
+    // More than 200 s left: the seat stays with the human.
+    await alice.daemon.idle();
+    await alice.daemon.tick();
+    expect(alice.daemon.handle(id).record.controller).toBe("human");
+    // Turned off (autoReturnOnChallenge: false): not even inside the window.
+    const config = (alice.daemon as unknown as { opts: { config: ArenaConfig } }).opts.config;
+    config.autoReturnOnChallenge = false;
+    await increaseTime(401); // under 200 s left now
+    await alice.daemon.idle();
+    await alice.daemon.tick();
+    expect(alice.daemon.handle(id).record.controller).toBe("human");
+    // On (the default): the next dispute pass hands the seat back, and a wait in flight sees it.
+    const waiting = alice.daemon.wait({ timeoutMs: 10_000 });
+    delete config.autoReturnOnChallenge;
+    await expect(waiting).resolves.toEqual({ channelId: id, reason: "control-changed" });
+    const back = await alice.daemon.status(id);
+    expect(back.controller).toBe("agent");
+    expect(back.note).toBe("auto-returned: challenge deadline approaching");
+    expect(back.attention).toBe("your-turn");
+    // The agent answers in time, through respond.
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "the challenge answered");
+    expect((await alice.daemon.hub.registeredState(id)).turnNum).toBe(3n);
+  });
+
   it("answers a stale challenge automatically", async () => {
     const { alice, bob, id } = await matched();
     await alice.daemon.move(undefined, "e4", { actor: "agent" });

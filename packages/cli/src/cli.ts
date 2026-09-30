@@ -22,8 +22,10 @@ export type CliIo = {
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
-       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS]
+       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false]
        (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
+       (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
+        agent once max(60 s, challengeTimeout / 3) is left)
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
@@ -226,6 +228,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (sessionGasFloor !== undefined && sessionGasFloor > sessionGasWei) {
         throw new UsageError(`--session-gas-floor (${sessionGasFloor}) must not exceed --session-gas-wei (${sessionGasWei})`);
       }
+      // Final fix wave (I1): on unless explicitly turned off.
+      const autoReturnRaw = flag("auto-return-on-challenge");
+      if (autoReturnRaw !== undefined && autoReturnRaw !== "true" && autoReturnRaw !== "false") {
+        throw new UsageError("--auto-return-on-challenge must be true or false");
+      }
+      const autoReturn = autoReturnRaw === undefined ? undefined : autoReturnRaw === "true";
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,
@@ -241,6 +249,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
         ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),
         ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
+        ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
       const { privateKeyToAccount } = await import("viem/accounts");

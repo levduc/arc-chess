@@ -42,6 +42,8 @@ import {
 } from "@arena/sdk";
 import {
   arenaPaths,
+  autoReturnOnChallengeOf,
+  autoReturnSecondsOf,
   isCanonicalId,
   minChallengeTimeoutOf,
   sessionGasFloorOf,
@@ -153,6 +155,9 @@ export type ChannelHandle = {
   /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
    *  woken for it yet: drives the one-shot `settled` attention. */
   settledWake: boolean;
+  /** Final fix wave (I1): the deadline of the challenge whose `human-must-move` a `wait()` has already woken for
+   *  (one wake per challenge), or null. Cleared when a human takes the seat again. */
+  humanMustMoveWoken: string | null;
   /** Final review I3: chain time at which the main pass first saw this channel settled; it is evicted from `live`
    *  `SETTLED_GRACE_SECONDS` later. */
   settledAt: bigint | null;
@@ -347,6 +352,10 @@ const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"])
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
  *  cosmetic. */
 export const MAX_HANDOFF_NOTE_LENGTH = 1024;
+
+/** Final fix wave (I1): the handoff note the daemon leaves when it hands a human-held seat back to the agent because
+ *  a challenge deadline is near. */
+export const AUTO_RETURN_NOTE = "auto-returned: challenge deadline approaching";
 
 /**
  * Plan 5 Task 2 fix round, minor 4: every character class a handoff note refuses, beyond the length cap above --
@@ -998,6 +1007,7 @@ export class ArenaDaemon {
       refillLastWalletBalance: null,
       sessionGasLowWoken: false,
       settledWake: false,
+      humanMustMoveWoken: null,
       settledAt: null,
       sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
     };
@@ -2171,13 +2181,35 @@ export class ArenaDaemon {
     // Plan 5 Task 2 fix round, minor 4: checked before touching the channel or the record, like every other
     // input validation in this class.
     checkHandoffNote(note);
-    const l = this.pick(ref);
-    // Plan 5 Task 2: handoffAt drives ChannelStatus.handoff.since -- set every time, even human -> human or
-    // agent -> agent, so the board can show "handed off just now" regardless of whether the controller actually
-    // changed.
+    this.setController(this.pick(ref), to, note);
+  }
+
+  /** Sets a channel's controller and note, persists them, and tells every waiter. Plan 5 Task 2: handoffAt drives
+   *  ChannelStatus.handoff.since -- set every time, even human -> human or agent -> agent, so the board can show
+   *  "handed off just now" regardless of whether the controller actually changed. */
+  private setController(l: ChannelHandle, to: Controller, note: string): void {
     l.record = { ...l.record, controller: to, note, handoffAt: Date.now() };
     this.records.saveChannel(l.record);
+    // Final fix wave (I1): a human taking the seat (again) under a challenge earns the agent a fresh wake.
+    if (to === "human") l.humanMustMoveWoken = null;
     this.notify();
+  }
+
+  /**
+   * Final fix wave (I1): hands a human-held seat back to the agent when a challenge needs this seat's move and at
+   * most `autoReturnSecondsOf(challengeTimeout)` of chain time is left before its deadline (and
+   * `autoReturnOnChallenge` is on) -- so a forfeit never depends on a human who closed the board or walked away
+   * (spec §3.1). Leaves `AUTO_RETURN_NOTE`; the agent's `wait` then sees `control-changed` or `your-turn`. Called by
+   * the dispute pass, on move in the registered state, after autoPlay (which may already have resigned or claimed).
+   */
+  private autoReturnIfDeadlineNear(l: ChannelHandle, deadline: bigint, now: bigint): void {
+    if (l.record.controller !== "human" || l.record.finalized || !autoReturnOnChallengeOf(this.opts.config)) return;
+    const latest = l.session.latest.state;
+    if (isGameOver(latest) || mover(latest) !== l.record.me) return; // resigned, claimed, or the human just moved
+    const left = deadline > now ? deadline - now : 0n;
+    if (left > BigInt(autoReturnSecondsOf(l.record.params.challengeTimeout))) return;
+    this.setController(l, "agent", AUTO_RETURN_NOTE);
+    this.log(`channel ${l.record.channelId}: a challenge needs this seat's move with ${left}s left: handed the seat back to the agent`);
   }
 
   // ------------------------------------------------------------------ watchtower (Task 6)
@@ -2537,8 +2569,10 @@ export class ArenaDaemon {
       await this.respondIfChallenged(l);
     } else if (latest.turnNum === registered.turnNum && !isGameOver(latest) && mover(latest) === me) {
       // We are on move in the registered state: auto-resign if checkmated, auto-claim if stalemated,
-      // otherwise leave it for the controller (status shows mustMove).
+      // otherwise leave it for the controller (status shows mustMove) -- or, final fix wave (I1), return a
+      // human-held seat to the agent once the deadline is near.
       await this.autoPlay(l, true);
+      this.autoReturnIfDeadlineNear(l, info.deadline, now);
     } else if (now >= info.deadline && (isGameOver(registered) || mover(registered) !== me)) {
       // R9/I2: past the deadline, a newer state we hold is no longer answerable (respond would revert
       // DeadlinePassed), so this is the fallback once the respond branch above is no longer available.
@@ -2697,6 +2731,7 @@ export class ArenaDaemon {
         if (prev === undefined) controllers.set(id, l.record.controller);
         else if (prev !== l.record.controller) return { channelId: id, reason: "control-changed" };
         let st = this.statusOf(l);
+        let ignoreSessionGasLow = false;
         if (st.attention === "session-gas-low") {
           // Final review C1: one wake per low-gas episode. While the wallet stays empty, later waits see the
           // channel's other attention instead of returning at once on every call (status keeps showing it).
@@ -2704,7 +2739,17 @@ export class ArenaDaemon {
             l.sessionGasLowWoken = true;
             return { channelId: id, reason: st.attention };
           }
-          st = this.statusOf(l, { ignoreSessionGasLow: true });
+          ignoreSessionGasLow = true;
+          st = this.statusOf(l, { ignoreSessionGasLow });
+        }
+        if (st.attention === "human-must-move") {
+          // Final fix wave (I1): whoever holds the seat, one wake per challenge (keyed by its deadline).
+          const deadline = st.challenge?.deadline ?? "";
+          if (l.humanMustMoveWoken !== deadline) {
+            l.humanMustMoveWoken = deadline;
+            return { channelId: id, reason: st.attention };
+          }
+          st = this.statusOf(l, { ignoreSessionGasLow, ignoreHumanMustMove: true });
         }
         // Final review m4: `settled` wakes one wait, then is gone.
         if (st.attention === "settled") l.settledWake = false;
@@ -2716,7 +2761,7 @@ export class ArenaDaemon {
     }
   }
 
-  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean } = {}): ChannelStatus {
+  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean } = {}): ChannelStatus {
     return buildStatus({
       record: l.record,
       snapshot: l.session.snapshot(),
@@ -2727,6 +2772,8 @@ export class ArenaDaemon {
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
       settled: l.settledWake,
+      autoReturnSeconds: autoReturnOnChallengeOf(this.opts.config) ? autoReturnSecondsOf(l.record.params.challengeTimeout) : null,
+      ignoreHumanMustMove: opts.ignoreHumanMustMove,
     });
   }
 
