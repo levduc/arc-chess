@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, http, type Chain, type Hex, type PublicClient } from "viem";
+import { createPublicClient, defineChain, erc20Abi, http, TransactionNotFoundError, type Chain, type Hex, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -1302,7 +1302,10 @@ export class ArenaDaemon {
           return { kind: "swept", record: updated, amount: recovered.amount, hash: recovered.hash };
         }
         // Fix round 3, I-2: confirmed gone (reverted, or the node no longer knows it at all) -- nothing to
-        // recover. Falls through to a fresh attempt below, same as any other failure, within this same try.
+        // recover. Charged as a failed attempt (this recovery slot found nothing, same as any other failure
+        // would) and falls through to a fresh attempt below, within this same try -- never an early abandon
+        // from this alone; the normal attempt just below decides that for itself if it also fails.
+        backoff.attempts++;
       }
       if (this.stopped || (record.swept !== undefined && !retryingAbandoned && !rechecking)) return { kind: "skipped", record };
       if (!opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) return { kind: "skipped", record };
@@ -1368,15 +1371,17 @@ export class ArenaDaemon {
   }
 
   /** Fix round 2, minor 2: looks up a transaction this daemon lost track of (its receipt went missing after
-   *  `waitOrReplace` treated it as mined). Returns `"pending"` if the receipt still cannot be read at all (try
-   *  again next attempt), `"failed"` if it can be read but did not succeed (nothing to recover), or the amount and
-   *  hash to record as swept if it did.
+   *  `waitOrReplace` treated it as mined). Returns `"pending"` if the receipt still cannot be read but the node
+   *  still knows the transaction at all (try again next attempt), `"failed"` if a receipt was read but it did not
+   *  succeed, *or* if no receipt exists and the node no longer knows the transaction either (fix round 3, I-2:
+   *  genuinely gone -- charge the attempt and fall through to a fresh one, rather than skip forever), or the
+   *  amount and hash to record as swept if it did succeed.
    *
-   *  Fix round 3, C-1: the whole body is now inside its own try/catch (in addition to `runSweepAttempt`'s own,
-   *  which now also wraps this call -- see its own note) -- probe F1 found `getTransaction` throwing on a plain
-   *  RPC blip (after a successful receipt read) escaping uncaught, all the way out of `runSweepAttempt`, which a
+   *  Fix round 3, C-1: the whole body is inside its own try/catch (in addition to `runSweepAttempt`'s own, which
+   *  now also wraps this call -- see its own note) -- probe F1 found `getTransaction` throwing on a plain RPC
+   *  blip (after a successful receipt read) escaping uncaught, all the way out of `runSweepAttempt`, which a
    *  timer-driven `void this.mainPass()` has no catch above; Node exits the whole process on that unhandled
-   *  rejection. Treated as "pending" (try again next attempt), like any other transient read failure here --
+   *  rejection. Any failure not otherwise classified below is treated as "pending" -- try again next attempt --
    *  never charged as a failed attempt for what may just be a slow node. */
   private async recoverPendingSweepTx(hash: Hex): Promise<"pending" | "failed" | { amount: bigint; hash: Hex }> {
     try {
@@ -1384,7 +1389,15 @@ export class ArenaDaemon {
       try {
         receipt = await this.client.getTransactionReceipt({ hash });
       } catch {
-        return "pending";
+        // Fix round 3, I-2: probe F2 -- a receipt that will never exist (the transaction was replaced, or the
+        // node's mempool simply forgot it) previously meant "pending" forever: every attempt from here on
+        // skipped, the channel's session gas never swept, with no way out short of a restart. `getTransaction`
+        // tells still-in-flight (worth trying again) apart from truly gone (nothing left to wait for).
+        const known = await this.client.getTransaction({ hash }).catch((err: unknown) => {
+          if (err instanceof TransactionNotFoundError) return null;
+          throw err;
+        });
+        return known ? "pending" : "failed";
       }
       if (receipt.status !== "success") return "failed";
       const tx = await this.client.getTransaction({ hash });

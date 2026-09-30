@@ -1762,6 +1762,30 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       d.client.getTransaction = realGetTransaction;
     }
   });
+
+  it("fix round 3, I-2: a pendingTx that will never have a receipt is charged as a failed attempt, not skipped forever", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    // A hash the node never knew at all -- exactly what a replaced or forgotten transaction looks like. Before
+    // I-2, `getTransactionReceipt` fails forever (never mined, never will be) and `recoverPendingSweepTx` had no
+    // way to tell that apart from "still pending" -- every attempt from here on skipped, permanently, with no
+    // way out short of a restart (probe F2).
+    const fakeHash = ("0x" + "77".repeat(32)) as Hex;
+    l.sweep.pendingTx = fakeHash;
+
+    // performSweep also fails (stubbed), so the fall-through attempt I-2 asks for is itself charged too -- one
+    // pass should show *two* failures (the recovery's own "confirmed gone" charge, plus the fall-through's own),
+    // not zero (the pre-fix "skipped forever" behaviour) and not one (recovery alone, no fall-through at all).
+    const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    internals.performSweep = () => Promise.reject(new Error("simulated: nothing else to do this pass"));
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+
+    await waitFor(() => l.sweep.pendingTx === undefined, 10_000, "the dead hash is given up on, not remembered forever");
+    await waitFor(() => l.sweep.attempts >= 2, 10_000, "both the recovery's own charge and the fall-through's own count");
+    expect(l.record.swept).toBeUndefined(); // performSweep is still stubbed to fail: nothing recorded yet, just charged
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {
