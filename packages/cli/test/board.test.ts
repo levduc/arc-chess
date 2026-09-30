@@ -32,7 +32,7 @@ import {
   targetsFrom,
   usdcToBaseUnits,
 } from "../src/board/board.js";
-import { backoffDelay, createCoalescer, createErrorGate, createThrottle, parseSse } from "../src/board/api.js";
+import { backoffDelay, createActionGate, createCoalescer, createErrorGate, createThrottle, parseSse } from "../src/board/api.js";
 
 // Plan 5 Task 3: the web board's pure helpers (no DOM, no fetch) -- see packages/cli/src/board/board.js.
 
@@ -499,6 +499,20 @@ describe("api.js helpers", () => {
     expect(gate.report("status", "worse")).toBe(true);
     gate.clear("status");
     expect(gate.report("status", "worse")).toBe(true);
+  });
+
+  it("tracks busy actions per key, so one channel's slow action never blocks another channel or the lobby", () => {
+    const gate = createActionGate();
+    expect(gate.tryStart("0xaaa")).toBe(true);
+    expect(gate.isBusy("0xaaa")).toBe(true);
+    expect(gate.tryStart("0xaaa")).toBe(false); // the same channel: one action at a time
+    expect(gate.isBusy("0xbbb")).toBe(false);
+    expect(gate.tryStart("0xbbb")).toBe(true); // another channel: free to act (e.g. a forced move)
+    expect(gate.tryStart("lobby")).toBe(true);
+    gate.finish("0xaaa");
+    expect(gate.isBusy("0xaaa")).toBe(false);
+    expect(gate.isBusy("0xbbb")).toBe(true);
+    expect(gate.isBusy(null)).toBe(false);
   });
 
   it("backs off exponentially up to a cap", () => {

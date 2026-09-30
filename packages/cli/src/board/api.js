@@ -229,6 +229,31 @@ export function createErrorGate() {
   };
 }
 
+/**
+ * Which user actions are in flight, per key: a channel id, or one key for the lobby. One action at a time per
+ * key, but a slow close or challenge on one channel never blocks a forced move on another (nor the lobby).
+ */
+export function createActionGate() {
+  /** @type {Set<string>} */
+  const running = new Set();
+  return {
+    /** @param {string} key @returns {boolean} false if an action with this key is already running */
+    tryStart(key) {
+      if (running.has(key)) return false;
+      running.add(key);
+      return true;
+    },
+    /** @param {string} key */
+    finish(key) {
+      running.delete(key);
+    },
+    /** @param {string | null | undefined} key */
+    isBusy(key) {
+      return key !== null && key !== undefined && running.has(key);
+    },
+  };
+}
+
 /** Reconnect delay for the event stream: 1 s, 2 s, 4 s, ... capped at 30 s. */
 export function backoffDelay(attempt) {
   return Math.min(30_000, 1_000 * 2 ** Math.max(0, attempt));

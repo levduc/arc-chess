@@ -36,7 +36,7 @@ import {
   turnText,
   usdcToBaseUnits,
 } from "./board.js";
-import { ApiError, backoffDelay, createClient, createCoalescer, createErrorGate, createThrottle } from "./api.js";
+import { ApiError, backoffDelay, createActionGate, createClient, createCoalescer, createErrorGate, createThrottle } from "./api.js";
 
 const STATUS_POLL_MS = 5_000; // fallback while the event stream is down
 const CHANNELS_MIN_INTERVAL_MS = 10_000;
@@ -57,13 +57,21 @@ const state = {
   selected: null, // the board's selected origin square
   focus: null, // the board's roving-tabindex square
   promotion: null,
-  busy: false,
   offers: [],
   offersLoaded: false,
   offersError: null,
   sseOpen: false,
   stopped: false,
 };
+
+/** In-flight user actions, keyed by channel id, or LOBBY for offers (see createActionGate). */
+const actions = createActionGate();
+const LOBBY = "lobby";
+
+/** True while an action on the selected channel is in flight. */
+function busyHere() {
+  return actions.isBusy(state.selectedId);
+}
 
 // ------------------------------------------------------------------ DOM helpers
 
@@ -375,12 +383,15 @@ async function runEvents() {
 
 // ------------------------------------------------------------------ actions
 
-/** Runs one user action: optional confirmation, one at a time, the returned status applied, errors toasted. */
-async function runAction(label, fn, { confirm, onSuccess } = {}) {
-  if (state.busy || state.stopped) return;
+/**
+ * Runs one user action under `key` (a channel id, or LOBBY): optional confirmation, one at a time per key, the
+ * returned status applied, errors toasted.
+ */
+async function runAction(label, key, fn, { confirm, onSuccess } = {}) {
+  if (!key || actions.isBusy(key) || state.stopped) return;
   if (confirm && !(await confirmDialog(confirm))) return;
-  state.busy = true;
-  state.selected = null;
+  if (!actions.tryStart(key)) return;
+  if (key === state.selectedId) state.selected = null;
   renderAll();
   try {
     const result = await fn();
@@ -391,7 +402,7 @@ async function runAction(label, fn, { confirm, onSuccess } = {}) {
     if (!(err instanceof ApiError && err.status === 401)) toast("error", `${label} failed`, errorText(err));
     void refreshStatus();
   } finally {
-    state.busy = false;
+    actions.finish(key);
     renderAll();
   }
 }
@@ -400,7 +411,7 @@ function sendMove(uci) {
   const id = state.selectedId;
   const toggle = /** @type {HTMLInputElement} */ ($("offer-draw-toggle"));
   const offerDraw = toggle.checked;
-  return runAction("Move", () => state.client.move(id, uci, offerDraw), {
+  return runAction("Move", id, () => state.client.move(id, uci, offerDraw), {
     onSuccess: () => {
       toggle.checked = false;
     },
@@ -410,7 +421,7 @@ function sendMove(uci) {
 function channelAction(label, call, confirm) {
   const id = state.selectedId;
   if (!id) return;
-  void runAction(label, () => call(id), confirm ? { confirm } : {});
+  void runAction(label, id, () => call(id), confirm ? { confirm } : {});
 }
 
 function wireActions() {
@@ -431,7 +442,7 @@ function wireActions() {
     }
     const id = state.selectedId;
     if (!id) return;
-    void runAction("Hand back", () => state.client.handoff(id, "agent", note), {
+    void runAction("Hand back", id, () => state.client.handoff(id, "agent", note), {
       onSuccess: () => {
         noteInput.value = "";
         $("note-count").textContent = `0 / ${MAX_NOTE_LENGTH}`;
@@ -499,7 +510,7 @@ async function createOffer() {
     return;
   }
   error.textContent = "";
-  await runAction("Post offer", () => state.client.createOffer(deposit, stake), {
+  await runAction("Post offer", LOBBY, () => state.client.createOffer(deposit, stake), {
     confirm: {
       title: "Post this offer?",
       message:
@@ -521,7 +532,7 @@ async function createOffer() {
 
 function acceptOffer(o) {
   const offer = o.offer ?? {};
-  void runAction("Accept offer", () => state.client.acceptOffer(o.offerId), {
+  void runAction("Accept offer", LOBBY, () => state.client.acceptOffer(o.offerId), {
     confirm: {
       title: "Accept this offer?",
       message: "Accepting commits your deposit to a new channel against this player. It stays locked until the channel settles.",
@@ -584,7 +595,7 @@ function renderBoard() {
   const view = boardView(st ?? { fen: START_FEN, orientation }, { selected: state.selected });
   if (state.selected && !view.some((v) => v.selected)) state.selected = null;
   if (!state.focus || !squares.has(state.focus)) state.focus = defaultFocus(st);
-  const enabled = canMove(st) && !state.busy;
+  const enabled = canMove(st) && !busyHere();
   for (const v of view) {
     const e = squares.get(v.square);
     setClass(e.cell, cls(
@@ -609,14 +620,14 @@ function renderBoard() {
   const board = $("board");
   board.classList.toggle("is-idle", !st);
   board.classList.toggle("is-playable", enabled);
-  board.classList.toggle("is-busy", state.busy);
+  board.classList.toggle("is-busy", busyHere());
   board.setAttribute("aria-disabled", String(!enabled));
   if (focusWasOnBoard && !board.contains(document.activeElement)) squares.get(state.focus)?.cell.focus();
 }
 
 function activateSquare(sq) {
   const st = state.status;
-  if (!st || state.busy || state.promotion) return;
+  if (!st || busyHere() || state.promotion) return;
   const r = clickSquare(st, { selected: state.selected }, sq);
   state.selected = r.selected;
   state.focus = sq;
@@ -890,11 +901,12 @@ function renderPanel() {
 
   const takeOver = /** @type {HTMLButtonElement} */ ($("take-over"));
   takeOver.hidden = !a?.takeOver;
-  takeOver.disabled = !a?.takeOver || state.busy;
+  const busy = busyHere();
+  takeOver.disabled = !a?.takeOver || busy;
   const handBackForm = $("hand-back-form");
   handBackForm.hidden = !a?.handBack;
-  /** @type {HTMLButtonElement} */ ($("hand-back")).disabled = !a?.handBack || state.busy;
-  /** @type {HTMLTextAreaElement} */ ($("hand-back-note")).disabled = !a?.handBack || state.busy;
+  /** @type {HTMLButtonElement} */ ($("hand-back")).disabled = !a?.handBack || busy;
+  /** @type {HTMLTextAreaElement} */ ($("hand-back-note")).disabled = !a?.handBack || busy;
 
   const note = st?.handoff?.note ?? st?.note ?? "";
   setText($("handoff-note"), note);
@@ -921,7 +933,7 @@ function renderPanel() {
   setText($("fact-phase"), st ? st.phase : "—");
 
   const setBtn = (id, enabled) => {
-    /** @type {HTMLButtonElement | HTMLInputElement} */ ($(id)).disabled = !enabled || state.busy;
+    /** @type {HTMLButtonElement | HTMLInputElement} */ ($(id)).disabled = !enabled || busy;
   };
   setBtn("offer-draw-toggle", a?.offerDraw);
   setBtn("btn-resign", a?.resign);
@@ -989,7 +1001,7 @@ function updateOfferRow(li, o) {
   setClass(r.btn, cls("btn btn-small", o.mine ? "btn-ghost" : "btn-primary"));
   setText(r.btn, o.mine ? "Yours" : "Accept");
   setAttr(r.btn, "aria-label", o.mine ? "Your own offer" : `Accept offer from ${String(offer.player ?? "unknown")}`);
-  r.btn.disabled = !!o.mine || state.busy;
+  r.btn.disabled = !!o.mine || actions.isBusy(LOBBY);
 }
 
 function renderLobby() {
@@ -1001,14 +1013,15 @@ function renderLobby() {
   setText(empty, state.offersError ? `Could not load offers: ${state.offersError}` : "No open offers right now.");
 }
 
-/** Keeps the lobby's buttons in step with `busy` between offer refreshes. */
+/** Keeps the lobby's buttons in step with its own busy flag between offer refreshes. */
 function renderLobbyBusy() {
+  const busy = actions.isBusy(LOBBY);
   for (const li of $("offer-list").children) {
     const r = refs.get(li);
-    if (r) r.btn.disabled = state.busy || !!r.offer?.mine;
+    if (r) r.btn.disabled = busy || !!r.offer?.mine;
   }
   const submit = $("create-offer-form").querySelector("button[type=submit]");
-  if (submit) /** @type {HTMLButtonElement} */ (submit).disabled = state.busy;
+  if (submit) /** @type {HTMLButtonElement} */ (submit).disabled = busy;
 }
 
 // ------------------------------------------------------------------ start
