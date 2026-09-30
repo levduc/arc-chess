@@ -1,7 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,18 +64,8 @@ type BoardAsset = { body: Buffer; contentType: string };
 const BOARD_DIR = join(dirname(fileURLToPath(import.meta.url)), "board");
 
 /**
- * Plan 5 Task 2: chess.js 1.4.0's ESM build, served at /board/vendor/chess.js so the board can `import` it with
- * no bundler and no CDN (Global Constraints: local only). `chess.js`'s own package.json points `main` at its CJS
- * build (`dist/cjs/chess.js`); the ESM build sits one directory over, at the same depth under `dist/`.
- */
-function resolveChessEsm(): string {
-  const cjsEntry = createRequire(import.meta.url).resolve("chess.js");
-  return join(dirname(dirname(cjsEntry)), "esm", "chess.js");
-}
-
-/**
  * Plan 5 Task 2: every static board file, read once here rather than per request. This map IS the allowlist --
- * `/board`, `/board/`, and the five URLs below, exactly -- so any other path under /board (a traversal attempt,
+ * `/board`, `/board/`, and the four URLs below, exactly -- so any other path under /board (a traversal attempt,
  * encoded or not, or simply an unknown file) can never resolve to a file: see the exact-match lookup below,
  * against `url.pathname`, which normalizes real `.`/`..` segments but never decodes `%2f` into a literal slash.
  */
@@ -92,7 +81,6 @@ function loadBoardAssets(): Map<string, BoardAsset> {
   add("/board/board.js", join(BOARD_DIR, "board.js"), "text/javascript; charset=utf-8");
   add("/board/api.js", join(BOARD_DIR, "api.js"), "text/javascript; charset=utf-8");
   add("/board/style.css", join(BOARD_DIR, "style.css"), "text/css; charset=utf-8");
-  add("/board/vendor/chess.js", resolveChessEsm(), "text/javascript; charset=utf-8");
   return assets;
 }
 

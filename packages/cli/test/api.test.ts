@@ -300,10 +300,9 @@ describe("local API", () => {
     expect(css.status).toBe(200);
     expect(css.headers.get("content-type")).toBe("text/css; charset=utf-8");
 
-    const vendor = await fetch(`${url}/board/vendor/chess.js`);
-    expect(vendor.status).toBe(200);
-    expect(vendor.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
-    expect(await vendor.text()).toMatch(/class Chess/);
+    // Final fix wave: the board never imported chess.js, so its vendored copy is no longer served (nor read at
+    // module load, where a moved file would have stopped the whole API loading).
+    expect((await fetch(`${url}/board/vendor/chess.js`)).status).toBe(404);
 
     // No token anywhere above -- static routes carry no data. Everything else under /board, including a
     // traversal attempt (plain or percent-encoded), gets 404, not the daemon's config/token files.
