@@ -273,9 +273,11 @@ export async function startApi(
           res.writeHead(405);
           return res.end();
         }
-        // Plan 5 Task 2 fix round, minor 2: a malformed request target (e.g. "http://[", an unterminated IPv6
-        // literal host) makes `new URL` throw -- caught here and turned into a 400 like any other bad request,
-        // instead of falling through to the generic catch's 500.
+        // Plan 5 Task 2 fix round, minor 2: a malformed request target that still starts with "/" (so minor 3's
+        // check above lets it through) can still make `new URL` throw -- e.g. "//[", a network-path reference
+        // whose own host is an unterminated IPv6 literal. Caught here and turned into a 400 like any other bad
+        // request, instead of falling through to the generic catch's 500. ("http://[" -- this item's original
+        // motivating example -- is now caught by minor 3's check above instead, since it doesn't start with "/".)
         let url: URL;
         try {
           url = new URL(req.url ?? "/", `http://${host}:${boundPort}`);

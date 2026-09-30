@@ -151,8 +151,12 @@ describe("local API", () => {
       await pair.cleanup();
     };
     const port = (server.address() as AddressInfo).port;
-    // "http://[" is not a valid URL (an unterminated IPv6 literal host) -- new URL(req.url, base) throws on it.
-    const res = await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "http://[" });
+    // "//[" starts with "/" (origin-form, so minor 3's absolute-form/asterisk-form check lets it through) but is
+    // still not a valid URL once parsed: WHATWG takes "//..." as network-path-reference, so this reads as an
+    // unterminated IPv6 literal host -- new URL(req.url, base) throws, exercising this item's own try/catch
+    // rather than minor 3's check (an earlier version of this test used "http://[", which minor 3 now rejects
+    // first for an unrelated reason, before ever reaching this guard).
+    const res = await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "//[" });
     expect(res.status).toBe(400);
   });
 
