@@ -287,6 +287,12 @@ export const SWEEP_HEADROOM_DEN = 10n;
  *  records before returning, reporting `remaining` for whatever is left rather than hanging the caller. */
 export const SWEEP_TIME_BUDGET_MS = 60_000;
 
+/** Fix round 3, M-2: the most one record's own receipt wait (`giveUpAt`, threaded down to `waitOrReplace`) may
+ *  claim out of `SWEEP_TIME_BUDGET_MS`, even when the budget has much more of it left -- so one record stuck
+ *  replacing a dead entry cannot eat the whole budget (or, for `--channel`, the whole of a much larger
+ *  `budgetMs`) and starve every other record a bulk sweep would otherwise have gotten through. */
+export const SWEEP_PER_RECORD_TIMEOUT_MS = 20_000;
+
 /** Plan 4.5 Task 10 re-review (M5): a recorded channel that fails to open this many times on a match retry is
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
@@ -1524,11 +1530,16 @@ export class ArenaDaemon {
     if (this.sweeping) throw new DaemonError(409, "a sweep is already in progress: retry shortly");
     this.sweeping = true;
     try {
-      // Minor 3: this budget now bounds every record's own wait too (via `giveUpAt`, threaded through
+      // Minor 3: this budget bounds every record's own wait too (via `giveUpAt`, threaded through
       // `sweepOneNow`/`runSweepAttempt`/`performSweep` down to `waitOrReplace`), not only how many records the
-      // `--channel`-less bulk loop below gets through -- so one record stuck replacing a dead entry can no longer
-      // eat the whole budget (or, for `--channel`, run unbounded) waiting on a receipt that will never come.
+      // `--channel`-less bulk loop below gets through. Fix round 3, M-2: `giveUpAt` for any one record is
+      // `min(deadline, its own start + SWEEP_PER_RECORD_TIMEOUT_MS)`, computed fresh per record below -- not
+      // `deadline` itself, which one record stuck replacing a dead entry could otherwise still claim in full
+      // (correcting an earlier version of this comment, which overclaimed exactly that: with a single shared
+      // `giveUpAt`, one such record *could* eat the whole remaining budget, starving every record after it in
+      // the same bulk sweep -- this bounds each one's own share instead).
       const deadline = Date.now() + (opts.budgetMs ?? SWEEP_TIME_BUDGET_MS);
+      const perRecordDeadline = () => Math.min(deadline, Date.now() + SWEEP_PER_RECORD_TIMEOUT_MS);
       const want = ref?.toLowerCase();
       const allFinalized = this.records.channels().filter((r) => r.finalized);
       if (want) {
@@ -1544,9 +1555,9 @@ export class ArenaDaemon {
           // decline it and record "dust" again).
           const balance = await this.client.getBalance({ address: this.senderFor(record.channelId, record).address });
           if (balance === 0n) return { results: [{ channelId: record.channelId, swept: "already" }], remaining: 0 };
-          return { results: [await this.sweepOneNow(record, deadline, true)], remaining: 0 };
+          return { results: [await this.sweepOneNow(record, perRecordDeadline(), true)], remaining: 0 };
         }
-        return { results: [await this.sweepOneNow(record, deadline)], remaining: 0 };
+        return { results: [await this.sweepOneNow(record, perRecordDeadline())], remaining: 0 };
       }
       const targets = allFinalized.filter((r) => r.swept !== true && r.swept !== "dust");
       const results: Array<{ channelId: Hex; swept: string; hash?: Hex }> = [];
@@ -1554,7 +1565,7 @@ export class ArenaDaemon {
       for (const record of targets) {
         if (Date.now() >= deadline) break;
         processed++;
-        results.push(await this.sweepOneNow(record, deadline));
+        results.push(await this.sweepOneNow(record, perRecordDeadline()));
       }
       return { results, remaining: targets.length - processed };
     } finally {

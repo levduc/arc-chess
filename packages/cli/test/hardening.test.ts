@@ -35,6 +35,7 @@ import {
   SWEEP_ABANDON_ATTEMPTS,
   SWEEP_HEADROOM_DEN,
   SWEEP_HEADROOM_NUM,
+  SWEEP_PER_RECORD_TIMEOUT_MS,
   arenaPaths,
   loadConfig,
   type ChannelRecord,
@@ -1961,6 +1962,43 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // for an evicted channel actually reads -- still served the stale "abandoned" forever.
     expect(d.settled.get(id)?.status.swept).toBe(true);
     expect((await alice.daemon.status(id)).swept).toBe(true);
+  });
+
+  it("fix round 3, M-2: no single record's own wait may claim more than SWEEP_PER_RECORD_TIMEOUT_MS out of a much larger overall budget", async () => {
+    const { alice, bob, id: id0 } = await matched();
+    await settleWithSweepDisabled(alice, bob, id0);
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id1 = await waitFor(() => alice.daemon.channelIds().find((c) => c !== id0), 20_000, "second match");
+    await waitFor(() => bob.daemon.channelIds().includes(id1), 20_000, "bob's second match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id1)).phase === "Open", 20_000, "second open");
+    await settleWithSweepDisabled(alice, bob, id1);
+    const d = alice.daemon;
+
+    // A real, successful sweep of each (automine stays on): performSweep is stubbed only to observe the giveUpAt
+    // it is actually called with, for both records, not to change what it does.
+    const internals = d as unknown as { performSweep(sender: unknown, giveUpAt?: number): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    const seen: Array<number | undefined> = [];
+    internals.performSweep = (sender: unknown, giveUpAt?: number) => {
+      seen.push(giveUpAt);
+      return realPerformSweep(sender, giveUpAt);
+    };
+    try {
+      const before = Date.now();
+      // Far more overall budget than any one record should be allowed to claim on its own -- before M-2, both
+      // records would have shared this exact same, much later giveUpAt.
+      const overallBudget = 10 * SWEEP_PER_RECORD_TIMEOUT_MS;
+      const { results } = await d.sweep(undefined, { budgetMs: overallBudget });
+      expect(results).toHaveLength(2);
+      expect(seen).toHaveLength(2);
+      for (const g of seen) {
+        expect(g).toBeDefined();
+        expect(g!).toBeLessThanOrEqual(before + SWEEP_PER_RECORD_TIMEOUT_MS + 5_000); // generous slack, real test overhead
+      }
+    } finally {
+      internals.performSweep = realPerformSweep;
+    }
   });
 });
 
