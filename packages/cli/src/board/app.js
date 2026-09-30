@@ -1,5 +1,5 @@
-// Plan 5 Task 3: the board's wiring. Reads the token from the URL fragment, drives board.js's pure view model into
-// the DOM, and talks to the daemon through api.js.
+// Plan 5 Task 3: the board's wiring. Trades the link's one-time code for the token (final fix wave M1), drives
+// board.js's pure view model into the DOM, and talks to the daemon through api.js.
 //
 // CSP (api.ts): no inline script or style, no style="" attributes, no inline handlers -- so every node is built
 // with DOM APIs and styled by class. Untrusted text (notes, errors, addresses, offer fields) only ever goes into
@@ -37,7 +37,16 @@ import {
   turnText,
   usdcToBaseUnits,
 } from "./board.js";
-import { ApiError, backoffDelay, createActionGate, createClient, createCoalescer, createErrorGate, createThrottle } from "./api.js";
+import {
+  ApiError,
+  backoffDelay,
+  createActionGate,
+  createClient,
+  createCoalescer,
+  createErrorGate,
+  createThrottle,
+  exchangeCode,
+} from "./api.js";
 
 const STATUS_POLL_MS = 5_000; // fallback while the event stream is down
 const CHANNELS_MIN_INTERVAL_MS = 10_000;
@@ -98,22 +107,35 @@ const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : "");
 
 // ------------------------------------------------------------------ token and boot
 
-/** The token from `#token=…`, then removed from the address bar (and so from history). Memory only. */
-function readToken() {
-  const hash = location.hash.replace(/^#/, "");
-  const token = new URLSearchParams(hash).get("token");
+/**
+ * Final fix wave (M1): the one-time code from `#code=…` (`arena board` prints it). The fragment is cleared from the
+ * address bar at once, but that does not remove it from the browser's history -- which is why the link carries a
+ * code, not the token: the code is single-use, expires 120 s after it is minted, and is traded (POST
+ * /board/session) for the token, which is kept in memory only. History ends up holding a dead code. An old
+ * `#token=…` link is no longer accepted (`legacy`).
+ */
+function readLink() {
+  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const code = params.get("code");
+  const legacy = params.has("token");
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
-  return token && token.trim() ? token.trim() : null;
+  return { code: code && code.trim() ? code.trim() : null, legacy };
 }
 
+const GATE_REASONS = {
+  missing: "This page needs the one-time link that `arena board` prints.",
+  expired: "This link has expired — run `arena board` again",
+  rejected: "The daemon no longer accepts this session (it may have restarted with a new token) — run `arena board` again",
+  limited: "Too many sign-in attempts — wait a minute, then run `arena board` again",
+  unreachable: "Cannot reach the daemon. Is `arena daemon` running? Then run `arena board` again",
+};
+
+/** @param {keyof typeof GATE_REASONS} reason */
 function showGate(reason) {
   $("boot").hidden = true;
   $("app").hidden = true;
   $("missing-token").hidden = false;
-  $("gate-reason").textContent =
-    reason === "rejected"
-      ? "The daemon did not accept this link's token. It may have restarted with a new one."
-      : "This page needs the private link that carries its access token.";
+  $("gate-reason").textContent = GATE_REASONS[reason];
 }
 
 /** Any 401: stop every timer and stream, and show the missing-token view. */
@@ -128,7 +150,7 @@ function lockOut() {
 
 // A new link pasted into this same tab only changes the fragment (no navigation): reload to pick it up.
 window.addEventListener("hashchange", () => {
-  if (/(^#|&)token=/.test(location.hash)) location.reload();
+  if (/(^#|&)(code|token)=/.test(location.hash)) location.reload();
 });
 
 // ------------------------------------------------------------------ toasts and confirmation
@@ -1051,6 +1073,15 @@ function start(token) {
   void runEvents();
 }
 
-const token = readToken();
-if (token) start(token);
-else showGate("missing");
+async function boot() {
+  const { code, legacy } = readLink();
+  if (!code) return showGate(legacy ? "expired" : "missing");
+  try {
+    start(await exchangeCode(code));
+  } catch (err) {
+    const status = err instanceof ApiError ? err.status : 0;
+    showGate(status === 401 ? "expired" : status === 429 ? "limited" : "unreachable");
+  }
+}
+
+void boot();

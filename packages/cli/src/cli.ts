@@ -27,7 +27,7 @@ const USAGE = `usage: arena <command> [options]
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
   daemon [start]
-  board   (prints the board's URL, token in the fragment: open it in a browser while the daemon is running)
+  board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
@@ -285,12 +285,27 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     }
 
     if (cmd === "board") {
-      // Plan 5 Task 2: read straight from the config/token files, not through the API -- a running daemon isn't
-      // required just to print the URL. Printed on stdout only (io.out), never io.err (the log stream): the
-      // token must never land in a log file.
+      // Final fix wave (M1): the link carries a one-time code, never the token -- a browser keeps every URL it
+      // opens in its history (and omnibox autocomplete, and maybe cloud sync), which replaceState cannot undo.
+      // The running daemon mints the code (POST /board/code, with the token read from disk); the board trades it
+      // once for the token, which it keeps in memory only. The code expires 120 s after it is minted.
       const cfg = loadConfig(home);
       const token = loadToken(home);
-      io.out(`http://127.0.0.1:${cfg.port}/board#token=${token}`);
+      let res: Response;
+      try {
+        res = await io.fetch(`http://127.0.0.1:${cfg.port}/board/code`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}` },
+        });
+      } catch {
+        throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "arena daemon", then run "arena board" again`);
+      }
+      const payload = (await res.json().catch(() => ({}))) as { code?: unknown; error?: string };
+      if (!res.ok || typeof payload.code !== "string") {
+        io.err(`error: ${payload.error ?? res.statusText}`);
+        return 1;
+      }
+      io.out(`http://127.0.0.1:${cfg.port}/board#code=${payload.code}`);
       return 0;
     }
 

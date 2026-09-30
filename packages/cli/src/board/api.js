@@ -129,6 +129,36 @@ export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (in
 }
 
 /**
+ * Final fix wave (M1): trades a board link's one-time code for the bearer token (`POST /board/session`). The code
+ * is the only credential this request carries; the token comes back in the JSON body and goes nowhere but the
+ * caller's memory. Rejects with ApiError: 401 for a used, expired or unknown code, 429 when rate-limited, 0 when
+ * the daemon cannot be reached.
+ * @param {string} code
+ * @param {(input: string, init: RequestInit) => Promise<Response>} [fetchImpl]
+ * @returns {Promise<string>}
+ */
+export async function exchangeCode(code, fetchImpl = (input, init) => fetch(input, init)) {
+  let res;
+  try {
+    res = await fetchImpl("/board/session", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code }),
+      cache: "no-store",
+      redirect: "error",
+    });
+  } catch {
+    throw new ApiError(0, "Cannot reach the daemon. Is `arena daemon` still running?");
+  }
+  const payload = /** @type {{ token?: unknown, error?: unknown } | null} */ (await res.json().catch(() => null));
+  if (!res.ok || !payload || typeof payload.token !== "string" || payload.token === "") {
+    const message = payload && typeof payload.error === "string" ? payload.error : `request failed (HTTP ${res.status})`;
+    throw new ApiError(res.ok ? 0 : res.status, message);
+  }
+  return payload.token;
+}
+
+/**
  * Splits a text/event-stream buffer into complete events plus the unfinished tail. Comment lines (": ping") and
  * data-less blocks ("retry: 3000") dispatch nothing, as in the EventSource spec.
  * @param {string} buffer

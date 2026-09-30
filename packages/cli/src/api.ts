@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -136,6 +136,13 @@ function authorized(req: IncomingMessage, token: string): boolean {
   return given.length === want.length && timingSafeEqual(given, want);
 }
 
+/** Final fix wave (M1): a board link's one-time code is good for this long after `POST /board/code` mints it. */
+export const BOARD_CODE_TTL_MS = 120_000;
+/** Final fix wave (M1): `POST /board/session` answers at most this many attempts per minute, per daemon. */
+export const BOARD_SESSION_ATTEMPTS_PER_MINUTE = 10;
+/** Final fix wave (M1): at most this many unused codes are kept; minting another drops the oldest. */
+const MAX_BOARD_CODES = 32;
+
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
 function amount(v: unknown, name: string): bigint {
   if (typeof v !== "string" || !/^[0-9]+$/.test(v)) throw new DaemonError(400, `${name} must be a decimal string of base units`);
@@ -150,6 +157,8 @@ export async function startApi(
     host?: string;
     /** Test-only overrides for the SSE feed's own timing; production never sets either (the defaults below). */
     sse?: { pingIntervalMs?: number; changeDebounceMs?: number };
+    /** Test-only: the clock the board's one-time codes and their rate limit read (default `Date.now`). */
+    board?: { now?: () => number };
   },
 ): Promise<{ server: Server; url: string }> {
   const host = opts.host ?? "127.0.0.1";
@@ -166,6 +175,45 @@ export async function startApi(
   // Plan 5 Task 2 fix round, minor 5: `notify()` fires on every watchtower tick (as often as `pollMs`), not only
   // on a change a human would care about -- an unthrottled feed would push far more than the board ever needs.
   const CHANGE_DEBOUNCE_MS = opts.sse?.changeDebounceMs ?? 1_000;
+
+  /**
+   * Final fix wave (M1): the board's one-time sign-in codes. `arena board` mints one with the token it reads from
+   * disk (`POST /board/code`) and prints it in the link's fragment instead of the token itself; the board trades
+   * it once for the token (`POST /board/session`) and keeps the token in memory only. The browser's history then
+   * holds a dead code, never the token. Per API server (one per daemon), in memory: a restart voids every code.
+   */
+  const boardNow = opts.board?.now ?? Date.now;
+  const boardCodes = new Map<string, number>(); // code -> expiry (ms)
+  const sessionAttempts: number[] = []; // when each recent POST /board/session arrived (ms), oldest first
+
+  function mintBoardCode(): string {
+    const now = boardNow();
+    for (const [code, expiresAt] of boardCodes) if (expiresAt <= now) boardCodes.delete(code);
+    while (boardCodes.size >= MAX_BOARD_CODES) boardCodes.delete(boardCodes.keys().next().value as string);
+    const code = randomBytes(16).toString("base64url"); // 128 bits
+    boardCodes.set(code, now + BOARD_CODE_TTL_MS);
+    return code;
+  }
+
+  /** `POST /board/session {code}`: no bearer token -- the code is the credential. Host-guarded like every route,
+   *  rate-limited before the code is even read, and single-use: a used, expired or unknown code gets 401. */
+  async function handleBoardSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const now = boardNow();
+    while (sessionAttempts.length > 0 && sessionAttempts[0] <= now - 60_000) sessionAttempts.shift();
+    if (sessionAttempts.length >= BOARD_SESSION_ATTEMPTS_PER_MINUTE) {
+      return send(res, 429, { error: "too many board sign-in attempts: wait a minute, then run `arena board` again" });
+    }
+    sessionAttempts.push(now);
+    const b = await body(req);
+    const code = typeof b.code === "string" ? b.code : "";
+    const expiresAt = boardCodes.get(code);
+    if (expiresAt === undefined || expiresAt <= now) {
+      if (expiresAt !== undefined) boardCodes.delete(code);
+      return send(res, 401, { error: "this board link has expired: run `arena board` again" });
+    }
+    boardCodes.delete(code);
+    return send(res, 200, { token: opts.token });
+  }
 
   /**
    * GET /events (spec: Plan 5 Task 2 requirement 4). Browsers cannot set an `Authorization` header on
@@ -272,6 +320,14 @@ export async function startApi(
         } catch {
           throw new DaemonError(400, "malformed request target");
         }
+        // Final fix wave (M1): the board's sign-in routes, matched on the exact raw path before the static files
+        // (which 404 every other method and path under /board).
+        const rawPath = (req.url ?? "/").split("?")[0];
+        if (req.method === "POST" && rawPath === "/board/code") {
+          if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
+          return send(res, 200, { code: mintBoardCode() });
+        }
+        if (req.method === "POST" && rawPath === "/board/session") return await handleBoardSession(req, res);
         // Static board files, before anything token-gated: they need no token (Task 2 requirement 3), and any
         // path under /board that isn't one of them must 404, never 401.
         if (isBoardRequest(req.url ?? "/")) return serveBoard(req, res, url.pathname);

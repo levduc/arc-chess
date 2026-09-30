@@ -5,7 +5,7 @@
  * with a message instead of failing.
  */
 import { existsSync } from "node:fs";
-import { chromium, type Browser } from "playwright-core";
+import { chromium, type Browser, type BrowserContext } from "playwright-core";
 
 export const CHROME_PATH = process.env.ARENA_CHROME ?? "/usr/bin/google-chrome-stable";
 
@@ -24,4 +24,12 @@ export async function launchChrome(opts: { args?: string[] } = {}): Promise<Brow
     headless: true,
     ...(opts.args && opts.args.length > 0 ? { args: opts.args } : {}),
   });
+}
+
+/**
+ * Final fix wave (M1): headless Chrome on a real, on-disk profile (`userDataDir`), so a test can read what the browser
+ * persisted -- its `Default/History` SQLite database -- once the context is closed.
+ */
+export async function launchChromeWithProfile(userDataDir: string): Promise<BrowserContext> {
+  return chromium.launchPersistentContext(userDataDir, { executablePath: CHROME_PATH, headless: true });
 }

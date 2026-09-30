@@ -11,20 +11,26 @@
  *   that same channel (scenario 7);
  * - scenarios 2 to 5 share a second channel, in order: controller boundary (agent in control), a challenge the
  *   human answers, an XSS note, then the hostile-origin and DNS-rebinding checks.
- * Token hygiene (scenario 6) is asserted on every board session the file opens (`expectTokenHygiene`).
+ * Token hygiene (scenario 6) is asserted on every board session the file opens (`expectTokenHygiene`). Final fix wave
+ * (M1): `arena board` prints a one-time code, never the token; the board trades it for the token (POST
+ * /board/session) and keeps the token in memory. Scenario 8 reads Chrome's own History database to prove the token
+ * never lands there.
  */
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { createPublicClient, http, type Hex, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
-import type { Browser, Page } from "playwright-core";
+import type { Browser, BrowserContext, Page } from "playwright-core";
 import { HubClient, type SessionSnapshot } from "@arena/sdk";
 import { readJson, type ChannelRecord } from "@arena/cli";
 import { runCli, startStack, usdcBalanceOf, type Player, type Stack } from "./harness.js";
 import { playLine, waitStatus, type Status } from "./bot.js";
-import { launchChrome, NO_CHROME_MESSAGE, skipIfNoChrome } from "./browser.js";
+import { launchChrome, launchChromeWithProfile, NO_CHROME_MESSAGE, skipIfNoChrome } from "./browser.js";
 
 const SCHOLARS_MATE = ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"];
 
@@ -141,20 +147,31 @@ function sessionSnapshot(p: Player, id: Hex): SessionSnapshot {
 type BoardSession = {
   page: Page;
   token: string;
+  /** The link `arena board` printed, and the one-time code in its fragment. */
+  link: string;
+  code: string;
   /** Every request the page made: its URL, its Referer, and whether it carried the token as a bearer header. */
   requests: Array<{ url: string; referer: string | undefined; bearer: boolean }>;
   pageErrors: string[];
   cspViolations: string[];
 };
 
-/** Opens `p`'s board from the URL `arena board` prints (token in the fragment), recording every request. */
-async function openBoard(b: Browser, p: Player): Promise<BoardSession> {
+/** The link `arena board` prints for `p`: `<api>/board#code=<one-time code>` (final fix wave M1), never the token. */
+async function boardLink(p: Player): Promise<{ link: string; code: string }> {
   const printed = await runCli(["board"], p.home);
   expect(printed.status).toBe(0);
-  const url = printed.stdout.trim();
-  expect(url).toBe(`${p.apiUrl}/board#token=${p.token}`);
+  const link = printed.stdout.trim();
+  expect(link).not.toContain(p.token);
+  const code = link.startsWith(`${p.apiUrl}/board#code=`) ? link.slice(`${p.apiUrl}/board#code=`.length) : "";
+  expect(code, `the printed link ${link}`).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  return { link, code };
+}
+
+/** Opens `p`'s board from the link `arena board` prints, recording every request. */
+async function openBoard(b: Browser | BrowserContext, p: Player): Promise<BoardSession> {
+  const { link, code } = await boardLink(p);
   const page = await b.newPage();
-  const session: BoardSession = { page, token: p.token, requests: [], pageErrors: [], cspViolations: [] };
+  const session: BoardSession = { page, token: p.token, link, code, requests: [], pageErrors: [], cspViolations: [] };
   page.on("request", (r) => {
     const headers = r.headers();
     const bearer = headers["authorization"] === `Bearer ${p.token}`;
@@ -164,11 +181,12 @@ async function openBoard(b: Browser, p: Player): Promise<BoardSession> {
   page.on("console", (m) => {
     if (/content security policy/i.test(m.text())) session.cspViolations.push(m.text());
   });
-  await page.goto(url);
-  // The app booted with the token: the app shell is shown, the missing-token gate is not.
+  await page.goto(link);
+  // The app traded the code for the token and booted: the app shell is shown, the gate is not.
   await page.locator("#app").waitFor({ state: "visible" });
   expect(await page.getByTestId("missing-token").isHidden()).toBe(true);
-  // Scenario 6: the board removed the fragment from the address bar (and so from history).
+  // Scenario 6: the board removed the code from the address bar (the browser's history still keeps the link it
+  // opened -- which is why that link carries a single-use code, not the token; scenario 8 reads that history).
   expect(await page.evaluate(() => (globalThis as any).location.hash)).toBe("");
   expect(page.url()).toBe(`${p.apiUrl}/board`);
   return session;
@@ -180,6 +198,8 @@ async function openBoard(b: Browser, p: Player): Promise<BoardSession> {
  * header -- so the check is not vacuous. Also: no uncaught page error and no CSP violation during the whole session.
  */
 function expectTokenHygiene(s: BoardSession): void {
+  // The token came from the one-time code exchange, not from the link.
+  expect(s.requests.some((r) => new URL(r.url).pathname === "/board/session" && !r.bearer)).toBe(true);
   expect(s.requests.filter((r) => r.bearer).length).toBeGreaterThan(1);
   expect(s.requests.some((r) => r.bearer && new URL(r.url).pathname === "/events")).toBe(true);
   for (const r of s.requests) {
@@ -602,11 +622,24 @@ suite(
           await rebindPage.goto(`http://rebind.example:${port}/board`).catch(() => undefined);
           expect((await rebound).status()).toBe(421);
 
-          // The exact host still serves the static board (with no token in this link: the gate).
+          // The exact host still serves the static board (with no code in this link: the gate).
           const exactPage = await browser.newPage();
           const ok = await exactPage.goto(`http://127.0.0.1:${port}/board`);
           expect(ok?.status()).toBe(200);
           await exactPage.getByTestId("missing-token").waitFor({ state: "visible" });
+
+          // Final fix wave (M1): an old `#token=` link is no longer accepted, even with the right token -- the board
+          // shows the expired-link gate and never uses it.
+          const legacyPage = await browser.newPage();
+          const legacyBearer: string[] = [];
+          legacyPage.on("request", (r) => {
+            if (r.headers()["authorization"]) legacyBearer.push(r.url());
+          });
+          await legacyPage.goto(`http://127.0.0.1:${port}/board#token=${alice.token}`);
+          await legacyPage.getByTestId("missing-token").waitFor({ state: "visible" });
+          await waitText(legacyPage, "gate-reason", "This link has expired — run `arena board` again");
+          expect(legacyPage.url()).toBe(`http://127.0.0.1:${port}/board`);
+          expect(legacyBearer).toEqual([]);
         } finally {
           await new Promise<void>((r) => hostile.close(() => r()));
         }
@@ -636,6 +669,55 @@ suite(
         expect(preflight.status).toBe(405);
         for (const r of [noToken, preflight]) {
           expect(Object.keys(r.headers).filter((k) => k.startsWith("access-control-"))).toEqual([]);
+        }
+      },
+      60_000,
+    );
+
+    timed(
+      "8. browser history (final fix wave M1): Chrome's own History database never holds the token, only the dead one-time code",
+      async () => {
+        const s = await startStack();
+        stack = s;
+        const alice = await s.player("alice");
+        const profile = mkdtempSync(join(tmpdir(), "arena-board-profile-"));
+        try {
+          const printed = await runCli(["board"], alice.home);
+          expect(printed.status).toBe(0);
+          const link = printed.stdout.trim();
+          const fragment = new URL(link).hash.replace(/^#/, "");
+          const secret = new URLSearchParams(fragment).values().next().value ?? "";
+          expect(secret).not.toBe("");
+          const context = await launchChromeWithProfile(profile);
+          try {
+            const page = await context.newPage();
+            await page.goto(link);
+            await page.locator("#app").waitFor({ state: "visible" });
+            await page.locator("#conn", { hasText: /^Live$/ }).waitFor(); // the /events stream is up: the token works
+            expect(page.url()).toBe(`${alice.apiUrl}/board`);
+          } finally {
+            await context.close();
+          }
+          // Chrome writes its History database under the profile; read it once the browser has closed it.
+          const db = new DatabaseSync(join(profile, "Default", "History"), { readOnly: true });
+          let urls: string[];
+          try {
+            urls = (db.prepare("SELECT url FROM urls").all() as Array<{ url: string }>).map((r) => String(r.url));
+          } finally {
+            db.close();
+          }
+          console.log(`[board] history: ${urls.length} URL(s) recorded: ${urls.join(" | ")}`);
+          // Not vacuous: the history did record the link it opened, fragment and all.
+          expect(urls.some((u) => u.includes(secret))).toBe(true);
+          for (const u of urls) expect(u, "a History URL").not.toContain(alice.token);
+
+          // And what it holds is dead: the code is single-use, so the very same link opened again is refused.
+          browser = await launchChrome();
+          const again = await browser.newPage();
+          await again.goto(link);
+          await waitText(again, "gate-reason", "This link has expired — run `arena board` again");
+        } finally {
+          rmSync(profile, { recursive: true, force: true });
         }
       },
       60_000,

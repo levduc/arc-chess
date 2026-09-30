@@ -311,6 +311,72 @@ describe("local API", () => {
     expect((await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "/board/..%2fconfig.json" })).status).toBe(404);
   });
 
+  it("final fix wave M1: POST /board/code mints a single-use code that expires after 120 s; POST /board/session trades it for the token", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    let now = 1_000_000;
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token, board: { now: () => now } });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const mint = () => fetch(`${url}/board/code`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
+    const exchange = (code: unknown) =>
+      fetch(`${url}/board/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
+
+    // Minting needs the token (a data route, not a static one).
+    expect((await fetch(`${url}/board/code`, { method: "POST" })).status).toBe(401);
+    expect((await fetch(`${url}/board/code`, { method: "POST", headers: { authorization: "Bearer wrong" } })).status).toBe(401);
+    const minted = await mint();
+    expect(minted.status).toBe(200);
+    const { code } = (await minted.json()) as { code: string };
+    expect(code).toMatch(/^[A-Za-z0-9_-]{22}$/); // 128 bits, base64url
+
+    // The exchange needs no bearer token: the code is the credential. The token comes back in the body only.
+    const session = await exchange(code);
+    expect(session.status).toBe(200);
+    expect(session.headers.get("cache-control")).toBe("no-store");
+    expect(await session.json()).toEqual({ token });
+    expect((await exchange(code)).status).toBe(401); // single-use
+    expect((await exchange("not-a-code")).status).toBe(401);
+    expect((await exchange(undefined)).status).toBe(401);
+
+    // Expiry: 120 s after it is minted.
+    const { code: late } = (await (await mint()).json()) as { code: string };
+    now += 120_000;
+    expect((await exchange(late)).status).toBe(401);
+    const { code: inTime } = (await (await mint()).json()) as { code: string };
+    now += 119_000;
+    expect((await exchange(inTime)).status).toBe(200);
+
+    // Neither route answers any other method (the static board's 404).
+    expect((await fetch(`${url}/board/session`)).status).toBe(404);
+    expect((await fetch(`${url}/board/code`)).status).toBe(404);
+  });
+
+  it("final fix wave M1: POST /board/session is rate-limited to 10 attempts per minute", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    let now = 5_000_000;
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token, board: { now: () => now } });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const mint = async () =>
+      ((await (await fetch(`${url}/board/code`, { method: "POST", headers: { authorization: `Bearer ${token}` } })).json()) as { code: string }).code;
+    const exchange = (code: unknown) =>
+      fetch(`${url}/board/session`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
+    for (let i = 0; i < 10; i++) expect((await exchange(`guess-${i}`)).status).toBe(401);
+    const valid = await mint();
+    // The 11th attempt inside the minute is refused before the code is even looked at -- a valid one included.
+    const limited = await exchange(valid);
+    expect(limited.status).toBe(429);
+    expect(JSON.stringify(await limited.json())).not.toContain(token);
+    now += 60_001; // the window slides
+    expect((await exchange(valid)).status).toBe(200); // not consumed by the refused attempt
+  });
+
   it("Plan 5 Task 2: GET /events requires the token, streams a retry line and change events, and caps at 8 clients", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);

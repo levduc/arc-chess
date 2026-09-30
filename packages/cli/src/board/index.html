@@ -26,11 +26,12 @@
       <div class="gate-card">
         <div class="brand-mark brand-mark-lg" aria-hidden="true">♞</div>
         <h1>Arena board</h1>
-        <p id="gate-reason" class="muted">This page needs the private link that carries its access token.</p>
+        <p id="gate-reason" class="muted" data-testid="gate-reason">This page needs the one-time link that `arena board` prints.</p>
         <p class="gate-cta">Open the link printed by <code>arena board</code></p>
         <p class="muted small">
-          The token travels only in the link's <code>#fragment</code>. The board keeps it in memory and removes it
-          from the address bar, so reloading the page asks for the link again.
+          The link carries a one-time code, good for two minutes. The board trades it for its access token, keeps
+          the token in memory only, and removes the code from the address bar, so reloading the page asks for a
+          new link.
         </p>
       </div>
     </section>

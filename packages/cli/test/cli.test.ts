@@ -64,14 +64,27 @@ describe("arena CLI", () => {
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({ to: "human", note: "look" });
   });
 
-  it("Plan 5 Task 2: arena board prints the board URL (token in the fragment), with no API call", async () => {
+  it("final fix wave M1: arena board mints a one-time code from the daemon and prints it in the fragment, never the token", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     await runCli(INIT, io(home).io);
-    const t = io(home);
+    const t = io(home, [{ status: 200, body: { code: "Zm9vYmFyYmF6cXV4MTIzNA" } }]);
     expect(await runCli(["board"], t.io)).toBe(0);
-    expect(t.calls).toHaveLength(0); // no running daemon required
-    expect(t.out).toHaveLength(1);
-    expect(t.out[0]).toMatch(/^http:\/\/127\.0\.0\.1:7010\/board#token=[0-9a-f]{64}$/);
+    expect(t.calls).toHaveLength(1);
+    expect(t.calls[0].url).toBe("http://127.0.0.1:7010/board/code");
+    expect(t.calls[0].init.method).toBe("POST");
+    const token = new Headers(t.calls[0].init.headers).get("authorization")?.replace(/^Bearer /, "");
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(t.out).toEqual(["http://127.0.0.1:7010/board#code=Zm9vYmFyYmF6cXV4MTIzNA"]);
+    expect(t.out.join("\n")).not.toContain(token);
+
+    // With no daemon to mint a code, it fails with a hint instead of printing a link.
+    const down = io(home);
+    (down.io as { fetch: typeof fetch }).fetch = (async () => {
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+    expect(await runCli(["board"], down.io)).toBe(1);
+    expect(down.out).toEqual([]);
+    expect(down.err.join("\n")).toMatch(/arena daemon/);
   });
 
   it("Plan 5 Task 2 fix round, CRITICAL 1: the daemon start line never carries the token fragment", () => {

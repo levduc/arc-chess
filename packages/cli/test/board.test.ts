@@ -40,6 +40,7 @@ import {
   createCoalescer,
   createErrorGate,
   createThrottle,
+  exchangeCode,
   parseSse,
 } from "../src/board/api.js";
 
@@ -551,6 +552,27 @@ describe("api.js helpers", () => {
       expect(init.headers.authorization).toBe("Bearer tok");
       expect(init.headers["x-arena-actor"]).toBe("human");
     }
+  });
+
+  it("final fix wave M1: exchangeCode trades the code (no bearer header) for the token, and reports a dead code as 401", async () => {
+    const calls: Array<{ url: string; init: any }> = [];
+    const ok = async (url: string, init: any) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ token: "tok" }), { status: 200 });
+    };
+    await expect(exchangeCode("c0de", ok)).resolves.toBe("tok");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("/board/session");
+    expect(calls[0].init.method).toBe("POST");
+    expect(JSON.parse(calls[0].init.body)).toEqual({ code: "c0de" });
+    expect(calls[0].init.headers.authorization).toBeUndefined();
+    expect(calls[0].init.redirect).toBe("error");
+    const dead = async () => new Response(JSON.stringify({ error: "this board link has expired" }), { status: 401 });
+    await expect(exchangeCode("used", dead)).rejects.toMatchObject({ status: 401, message: "this board link has expired" });
+    const down = async () => {
+      throw new TypeError("fetch failed");
+    };
+    await expect(exchangeCode("any", down)).rejects.toMatchObject({ status: 0 });
   });
 
   it("backs off exponentially up to a cap", () => {
