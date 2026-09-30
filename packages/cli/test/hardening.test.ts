@@ -1012,6 +1012,13 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     return original;
   }
 
+  /** Stops the daemon's periodic passes (the `285c4c1` pattern) so a test drives every pass itself: a test that
+   *  calls sweepChannel directly holds none of the flags (`mainBusy`) the periodic main pass takes around it. */
+  async function stopPeriodicPasses(d: ArenaDaemon): Promise<void> {
+    clearInterval((d as unknown as { timer?: NodeJS.Timeout }).timer);
+    await d.idle();
+  }
+
   it("sweeps the session key's balance back to the wallet after settle: exact accounting (rule 4/I9)", async () => {
     const { alice, bob, id } = await matched();
     const d = alice.daemon;
@@ -1240,6 +1247,9 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const { alice, bob, id } = await matched();
     const original = await settleWithSweepDisabled(alice, bob, id);
     const d = alice.daemon;
+    // Final fix wave (M11): the periodic main pass would otherwise sweep this channel between the guarded calls
+    // below (the moment `refilling` is cleared), making the "skipped" assertions race it.
+    await stopPeriodicPasses(d);
     const l = d.handle(id);
     const callSweepChannel = (h: unknown) => (d as unknown as { sweepChannel(x: unknown): Promise<void> }).sweepChannel(h);
     (d as unknown as SweepableDaemon).sweepChannel = original;
@@ -1255,7 +1265,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     l.disputeBusy = false;
 
     await callSweepChannel(l);
-    await waitFor(() => l.record.swept !== undefined, 20_000, "swept once both guards clear");
+    expect(l.record.swept).toBe(true); // swept by this call itself, once both guards clear
   });
 
   it("fix round 2, important 2: sweep() (API path) also honours rule 1 -- never sweeps while a refill or the dispute pass is busy", async () => {
@@ -1283,6 +1293,10 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const { alice, bob, id } = await matched();
     const original = await settleWithSweepDisabled(alice, bob, id);
     const d = alice.daemon;
+    // Final fix wave (M11): without this, a periodic attempt that read isSweepable before the loop below abandons
+    // the channel could reach the real performSweep after the finally restores it, sweep for real, and leave the
+    // "evicted despite never actually sweeping" check vacuous (the 285c4c1 shape).
+    await stopPeriodicPasses(d);
     const l = d.handle(id);
     (d as unknown as SweepableDaemon).sweepChannel = original;
     const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
@@ -1299,11 +1313,13 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     } finally {
       internals.performSweep = realPerformSweep;
     }
-    // Eviction can now proceed (swept is no longer unset) once the grace period passes.
-    await d.idle();
+    // Eviction can now proceed (swept is no longer unset) once the grace period passes. With the timer stopped,
+    // the two passes eviction needs (one records settledAt, one is past the grace period) are explicit.
     await d.tick();
     await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
-    await waitFor(() => d.channelIds().length === 0, 10_000, "evicted despite never actually sweeping");
+    await d.tick();
+    expect(d.channelIds()).toEqual([]);
+    expect(l.record.swept).toBe("abandoned"); // evicted without ever actually sweeping
   });
 
   it("fix round I9: eviction never proceeds while swept stays unset, even well past the grace period", async () => {
@@ -2054,12 +2070,6 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     }
     expect(sweptAtSaveTime).toBe(true);
   });
-
-  /** Stops the daemon's periodic passes (the `285c4c1` pattern) so a test drives every pass itself. */
-  async function stopPeriodicPasses(d: ArenaDaemon): Promise<void> {
-    clearInterval((d as unknown as { timer?: NodeJS.Timeout }).timer);
-    await d.idle();
-  }
 
   it(
     "final fix wave, I2: a stuck automatic sweep holds the main pass for at most SWEEP_PER_RECORD_TIMEOUT_MS",
