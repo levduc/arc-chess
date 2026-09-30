@@ -4,8 +4,33 @@ import type { AddressInfo } from "node:net";
 import type { Hex } from "viem";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
 
+/**
+ * Plan 5 Task 2 (Global Constraints): the board's own CSP, verbatim -- served on every response, JSON or static,
+ * alongside the legacy sniffing/framing/referrer defenses. This API never sends any `Access-Control-*` header:
+ * there is no CORS support at all, by design (a hostile origin gets no read access even with the right guesses).
+ */
+const CONTENT_SECURITY_POLICY =
+  "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
+  "frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+function securityHeaders(res: ServerResponse): void {
+  res.setHeader("content-security-policy", CONTENT_SECURITY_POLICY);
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("x-frame-options", "DENY");
+}
+
+/**
+ * Plan 5 Task 2 (Global Constraints: DNS-rebinding defense): true only for the two exact Host values a legitimate
+ * local client can send. `boundPort` is read from `server.address()` after `listen()` (not `opts.port`), so this
+ * also works when the caller asked for port 0. A missing Host header, `[::1]`, or any other host/port -- fails.
+ */
+function hostAllowed(header: string | undefined, boundPort: number): boolean {
+  return header === `127.0.0.1:${boundPort}` || header === `localhost:${boundPort}`;
+}
+
 function send(res: ServerResponse, code: number, value: unknown): void {
-  res.writeHead(code, { "content-type": "application/json" });
+  res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
 }
 
@@ -45,10 +70,30 @@ export async function startApi(
   opts: { port: number; token: string; host?: string },
 ): Promise<{ server: Server; url: string }> {
   const host = opts.host ?? "127.0.0.1";
-  const server = createServer((req, res) => {
+  // Set once listen() resolves, below -- read from server.address() so a caller-requested port 0 still guards the
+  // real bound port. No request can reach the handler before that assignment (nothing can connect before listen
+  // returns), so the closure below always sees the real value once traffic starts flowing.
+  let boundPort = opts.port;
+  // requireHostHeader: false -- Node's own HTTP/1.1 parser otherwise answers a request with no Host header with
+  // a bare 400 before this handler ever runs (RFC 7230 section 5.4), which would make the DNS-rebinding guard
+  // below (hostAllowed) unreachable for exactly the "no Host header" case the ruling calls out for 421.
+  const server = createServer({ requireHostHeader: false }, (req, res) => {
     void (async () => {
+      securityHeaders(res);
       try {
-        const url = new URL(req.url ?? "/", `http://${host}`);
+        // Plan 5 Task 2 (Global Constraints): the Host guard applies to every route, including /health and /board,
+        // before anything else -- a hostile page that got a victim's browser to hit this port by name (DNS
+        // rebinding) must never reach a single byte of this API.
+        if (!hostAllowed(req.headers.host, boundPort)) {
+          res.writeHead(421);
+          return res.end();
+        }
+        // No CORS is supported: a preflight can never succeed here.
+        if (req.method === "OPTIONS") {
+          res.writeHead(405);
+          return res.end();
+        }
+        const url = new URL(req.url ?? "/", `http://${host}:${boundPort}`);
         const route = `${req.method} ${url.pathname}`;
         if (route === "GET /health") return send(res, 200, { ok: true });
         if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
@@ -122,12 +167,15 @@ export async function startApi(
             return send(res, 404, { error: `no route ${route}` });
         }
       } catch (err) {
+        // A throw after headers already went out (e.g. mid-SSE) must never re-writeHead -- that throws its own
+        // ERR_HTTP_HEADERS_SENT and crashes this handler instead of just ending the one response.
+        if (res.headersSent) return void res.end();
         if (err instanceof DaemonError) return send(res, err.code, { error: err.message });
         return send(res, 500, { error: err instanceof Error ? err.message.split("\n")[0] : String(err) });
       }
     })();
   });
   await new Promise<void>((resolve) => server.listen(opts.port, host, resolve));
-  const port = (server.address() as AddressInfo).port;
-  return { server, url: `http://${host}:${port}` };
+  boundPort = (server.address() as AddressInfo).port;
+  return { server, url: `http://${host}:${boundPort}` };
 }
