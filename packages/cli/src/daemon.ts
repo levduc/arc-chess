@@ -1660,6 +1660,13 @@ export class ArenaDaemon {
     });
     const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0 };
     const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt, recheck });
+    // Fix round 3, M-1: this record may already be in the settled-index cache (evicted from `live` some time
+    // ago, or loaded straight into it at start() -- either way, never through `live`/`sweepQueue`, so neither of
+    // those two paths' own `refreshSettledCache` calls above ever reach it). Without this, `status()`/`channels()`
+    // for an evicted channel kept serving the pre-sweep (or pre-retry) cached status forever, even once the sweep
+    // above genuinely landed -- e.g. an "abandoned" channel `arena sweep` retries successfully (important 1) still
+    // read back as "abandoned" from the cache.
+    if (result.record.swept !== undefined) this.refreshSettledCache(id, result.record);
     return this.sweepResultWithHash(id, result, wasAbandoned, recheck);
   }
 

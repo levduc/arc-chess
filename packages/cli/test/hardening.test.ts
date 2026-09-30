@@ -1924,6 +1924,44 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       await testClient.mine({ blocks: 1 }); // lands the never-mined stand-in so the shared anvil's mempool is clean
     }
   });
+
+  it("fix round 3, M-1: an abandoned channel retried (and swept) via arena sweep shows swept: true in status(), not the stale cache", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon as unknown as SweepableDaemon & {
+      settled: Map<Hex, { status: { swept: unknown }; settledAt: number }>;
+    };
+    const l = alice.daemon.handle(id);
+    d.sweepChannel = original;
+    const internals = alice.daemon as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(alice.daemon);
+    internals.performSweep = () => Promise.reject(new Error("simulated sweep failure"));
+    const callSweepChannel = () => (d as unknown as { sweepChannel(x: unknown): Promise<void> }).sweepChannel(l);
+    try {
+      for (let i = 0; i < SWEEP_ABANDON_ATTEMPTS; i++) {
+        l.sweep.blockedUntil = 0; // bypass the real back-off wait between attempts
+        await callSweepChannel();
+      }
+      expect(l.record.swept).toBe("abandoned");
+    } finally {
+      internals.performSweep = realPerformSweep;
+    }
+    // Evicted from `live` -- the settled-index cache now holds this abandoned status, as `start()`/evictSettled
+    // would for any other settled channel; this is the orphan/disk path sweepOneNow takes from here on.
+    await alice.daemon.idle();
+    await alice.daemon.tick();
+    await increaseTime(Number(SETTLED_GRACE_SECONDS) + 1);
+    await waitFor(() => alice.daemon.channelIds().length === 0, 10_000, "evicted while abandoned");
+    expect(d.settled.get(id)?.status.swept).toBe("abandoned");
+
+    // `arena sweep` retries it (important 1) -- via the orphan/disk path, real money this time.
+    const result = await alice.daemon.sweep(id);
+    expect(result.results[0].swept).toMatch(/^retried: 0x[0-9a-f]+$/);
+    // Before M-1: the disk record showed swept: true, but the settled-index cache -- what status()/channels()
+    // for an evicted channel actually reads -- still served the stale "abandoned" forever.
+    expect(d.settled.get(id)?.status.swept).toBe(true);
+    expect((await alice.daemon.status(id)).swept).toBe(true);
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {
