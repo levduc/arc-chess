@@ -357,9 +357,25 @@ export function formatCountdown(seconds) {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
-/** The countdown ticked down locally: `secondsLeft` as of `syncedAtMs`, read at `nowMs`. */
-export function remainingSeconds(secondsLeft, syncedAtMs, nowMs) {
-  return Math.max(0, secondsLeft - Math.floor((nowMs - syncedAtMs) / 1000));
+/**
+ * The wall-clock time a challenge deadline is expected at, re-synced from each status. For the same deadline a
+ * fresh `secondsLeft` can only pull the estimate earlier, never push it back: `secondsLeft` is measured on chain
+ * time, which lags between blocks (and stands still on a local chain with no new blocks), so taking it at face
+ * value on every refresh would freeze or bounce the countdown. Erring early is the safe side of a deadline.
+ * A different deadline (a new challenge) starts over; no challenge gives null.
+ * @returns {{ deadline: string, endsAt: number } | null}
+ */
+export function syncDeadline(prev, challenge, nowMs) {
+  if (!challenge) return null;
+  const endsAt = nowMs + Math.max(0, Number(challenge.secondsLeft) || 0) * 1000;
+  const deadline = String(challenge.deadline);
+  if (prev && prev.deadline === deadline) return { deadline, endsAt: Math.min(prev.endsAt, endsAt) };
+  return { deadline, endsAt };
+}
+
+/** Whole seconds from `nowMs` until `endsAt`, rounded up, never negative. */
+export function secondsUntil(endsAt, nowMs) {
+  return Math.max(0, Math.ceil((endsAt - nowMs) / 1000));
 }
 
 export function formatDuration(seconds) {

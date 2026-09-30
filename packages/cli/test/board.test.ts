@@ -19,11 +19,12 @@ import {
   noteError,
   pickDefaultChannel,
   piecesFromFen,
-  remainingSeconds,
+  secondsUntil,
   shortHex,
   sideToMove,
   squareAt,
   squareLabel,
+  syncDeadline,
   stepSquare,
   targetsFrom,
   usdcToBaseUnits,
@@ -348,9 +349,26 @@ describe("formatting", () => {
     expect(formatCountdown(65)).toBe("1:05");
     expect(formatCountdown(3725)).toBe("1:02:05");
     expect(formatCountdown(-5)).toBe("0:00");
-    expect(remainingSeconds(100, 1_000, 1_000)).toBe(100);
-    expect(remainingSeconds(100, 1_000, 3_500)).toBe(98);
-    expect(remainingSeconds(1, 0, 60_000)).toBe(0);
+    const d = syncDeadline(null, { deadline: "5000", secondsLeft: 100 }, 1_000);
+    expect(d).toEqual({ deadline: "5000", endsAt: 101_000 });
+    expect(secondsUntil(d!.endsAt, 1_000)).toBe(100);
+    expect(secondsUntil(d!.endsAt, 1_500)).toBe(100);
+    expect(secondsUntil(d!.endsAt, 3_000)).toBe(98);
+    expect(secondsUntil(d!.endsAt, 500_000)).toBe(0);
+    expect(syncDeadline(d, null, 2_000)).toBeNull();
+  });
+
+  it("re-syncs the countdown on each status without ever jumping back up for the same deadline", () => {
+    const d0 = syncDeadline(null, { deadline: "5000", secondsLeft: 900 }, 0);
+    // A chain clock that stands still (a local chain with no new blocks) keeps reporting 900 s: the local tick wins.
+    const d1 = syncDeadline(d0, { deadline: "5000", secondsLeft: 900 }, 10_000);
+    expect(secondsUntil(d1!.endsAt, 10_000)).toBe(890);
+    // A status that says less time is left than the local estimate pulls the countdown down.
+    const d2 = syncDeadline(d1, { deadline: "5000", secondsLeft: 850 }, 20_000);
+    expect(secondsUntil(d2!.endsAt, 20_000)).toBe(850);
+    // A new challenge (another deadline) starts over.
+    const d3 = syncDeadline(d2, { deadline: "9000", secondsLeft: 600 }, 30_000);
+    expect(secondsUntil(d3!.endsAt, 30_000)).toBe(600);
   });
 
   it("formats durations and ids", () => {
