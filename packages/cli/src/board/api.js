@@ -1,9 +1,10 @@
+// @ts-check
 // Plan 5 Task 3: the board's network half -- the JSON API and the /events feed -- plus the small scheduling
 // helpers app.js uses to keep request volume bounded. Nothing here touches the DOM, and nothing runs at import
 // time, so the pure helpers are unit-tested under vitest (packages/cli/test/board.test.ts).
 
 export class ApiError extends Error {
-  /** @param {number} status HTTP status, or 0 when the daemon could not be reached at all */
+  /** @param {number} status HTTP status, or 0 when the daemon could not be reached at all @param {string} message */
   constructor(status, message) {
     super(message);
     this.name = "ApiError";
@@ -15,14 +16,18 @@ export class ApiError extends Error {
  * A client for the daemon's local API (packages/cli/src/api.ts). Every request carries the bearer token and
  * `x-arena-actor: human`, so the daemon applies the controller rule for a human (spec §6.2). The token lives only
  * in this closure; it never goes into a URL. `onUnauthorized` runs on any 401 (a stale or wrong link).
+ * @param {string} token
+ * @param {{ onUnauthorized?: () => void, fetchImpl?: (input: string, init: RequestInit) => Promise<Response> }} [opts]
  */
-export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (...a) => fetch(...a) } = {}) {
+export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (input, init) => fetch(input, init) } = {}) {
+  /** @param {boolean} json @returns {Record<string, string>} */
   const headers = (json) => ({
     authorization: `Bearer ${token}`,
     "x-arena-actor": "human",
     ...(json ? { "content-type": "application/json" } : {}),
   });
 
+  /** @param {string} method @param {string} path @param {unknown} [body] @returns {Promise<any>} */
   async function request(method, path, body) {
     let res;
     try {
@@ -51,22 +56,29 @@ export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (..
     return payload;
   }
 
+  /** @param {string} path @param {unknown} body */
   const post = (path, body) => request("POST", path, body);
+  /** @param {string} path @returns {(channel: string) => Promise<any>} */
   const onChannel = (path) => (channel) => post(path, { channel });
 
   return {
     channels: () => request("GET", "/channels"),
+    /** @param {string} channel */
     status: (channel) => request("GET", `/status?channel=${encodeURIComponent(channel)}`),
     offers: () => request("GET", "/offers"),
-    /** Amounts are base-unit decimal strings. No challengeTimeout: the daemon picks its own default. */
+    /** Amounts are base-unit decimal strings. No challengeTimeout: the daemon picks its own default.
+     *  @param {string} deposit @param {string} stakePerGame */
     createOffer: (deposit, stakePerGame) => post("/offers", { deposit, stakePerGame }),
+    /** @param {string} offerId */
     acceptOffer: (offerId) => post("/offers/accept", { offerId }),
+    /** @param {string} channel @param {string} move @param {boolean} offerDraw */
     move: (channel, move, offerDraw) => post("/move", { channel, move, offerDraw: offerDraw === true }),
     resign: onChannel("/resign"),
     acceptDraw: onChannel("/accept-draw"),
     nextGame: onChannel("/next-game"),
     close: onChannel("/close"),
     challenge: onChannel("/challenge"),
+    /** @param {string} channel @param {"agent" | "human"} to @param {string} note */
     handoff: (channel, to, note) => post("/handoff", { channel, to, note }),
 
     /**
@@ -74,6 +86,12 @@ export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (..
      * fetch() plus a ReadableStream reader instead. `onEvent` gets each dispatched event; `onActivity` runs on
      * every chunk (pings included) so the caller can spot a stalled stream. Resolves when the server ends the
      * stream; rejects with ApiError on a refused connection or a network error.
+     * @param {{
+     *   onOpen?: () => void,
+     *   onEvent?: (ev: { event: string, data: string }) => void,
+     *   onActivity?: () => void,
+     *   signal?: AbortSignal,
+     * }} [opts]
      */
     async events({ onOpen = () => {}, onEvent = () => {}, onActivity = () => {}, signal } = {}) {
       let res;
@@ -113,8 +131,11 @@ export function createClient(token, { onUnauthorized = () => {}, fetchImpl = (..
 /**
  * Splits a text/event-stream buffer into complete events plus the unfinished tail. Comment lines (": ping") and
  * data-less blocks ("retry: 3000") dispatch nothing, as in the EventSource spec.
+ * @param {string} buffer
+ * @returns {{ events: Array<{ event: string, data: string }>, rest: string }}
  */
 export function parseSse(buffer) {
+  /** @type {Array<{ event: string, data: string }>} */
   const events = [];
   let rest = buffer;
   for (;;) {
@@ -123,6 +144,7 @@ export function parseSse(buffer) {
     const block = rest.slice(0, m.index);
     rest = rest.slice(m.index + m[0].length);
     let event = "message";
+    /** @type {string[]} */
     const data = [];
     for (const raw of block.split(/\r?\n/)) {
       if (raw === "" || raw.startsWith(":")) continue;
@@ -146,6 +168,7 @@ export function parseSse(buffer) {
  * @returns {() => Promise<void>}
  */
 export function createCoalescer(fn, onError = () => {}) {
+  /** @type {Promise<void> | null} */
   let chain = null;
   let dirty = false;
   return function trigger() {
@@ -178,6 +201,7 @@ export function createCoalescer(fn, onError = () => {}) {
  */
 export function createThrottle(fn, intervalMs, clock = globalThis) {
   let last = -Infinity;
+  /** @type {unknown} */
   let timer = null;
   const fire = () => {
     if (timer !== null) {
@@ -254,7 +278,8 @@ export function createActionGate() {
   };
 }
 
-/** Reconnect delay for the event stream: 1 s, 2 s, 4 s, ... capped at 30 s. */
+/** Reconnect delay for the event stream: 1 s, 2 s, 4 s, ... capped at 30 s.
+ *  @param {number} attempt */
 export function backoffDelay(attempt) {
   return Math.min(30_000, 1_000 * 2 ** Math.max(0, attempt));
 }

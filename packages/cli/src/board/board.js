@@ -1,7 +1,34 @@
+// @ts-check
 // Plan 5 Task 3: the board's pure half. Everything here maps a ChannelStatus (packages/cli/src/status.ts) plus a
 // little UI state to plain data -- a view model, an intent, a label -- and never touches the DOM or the network,
 // so it runs unchanged in the browser and under vitest (packages/cli/test/board.test.ts). app.js turns the view
 // model into DOM nodes and sends the intents through api.js.
+//
+// Type-checked (// @ts-check) against the daemon's own ChannelStatus, imported for types only -- nothing from the
+// daemon is ever loaded in the browser.
+
+/** @typedef {import("../status.js").ChannelStatus} ChannelStatus */
+/** @typedef {import("../daemon.js").DegradedChannel} DegradedChannel */
+/** @typedef {"white" | "black"} Side */
+/** @typedef {{ selected: string | null }} BoardUi */
+/** @typedef {{ type: "move", uci: string } | { type: "promote", from: string, to: string, choices: string[] }} Intent */
+/**
+ * @typedef {object} SquareView
+ * @property {string} square
+ * @property {string} piece FEN letter, or "" for an empty square
+ * @property {boolean} dark
+ * @property {boolean} movable
+ * @property {boolean} lastMove
+ * @property {boolean} selected
+ * @property {boolean} target
+ * @property {boolean} capture
+ * @property {boolean} check
+ * @property {string} fileLabel
+ * @property {string} rankLabel
+ * @property {string} label
+ */
+/** @typedef {{ kind: string, label: string }} Chip */
+/** @typedef {{ kind: string, text: string }} Banner */
 
 export const FILES = "abcdefgh";
 
@@ -10,21 +37,25 @@ const LIVE_PHASES = new Set(["Open", "Challenged"]);
 const SETTLED_PHASES = new Set(["Finalized", "Reclaimed"]);
 const OVER_STATUSES = new Set(["white_won", "black_won", "draw"]);
 
+/** @type {Record<string, string>} */
 const PIECE_NAMES = { k: "king", q: "queen", r: "rook", b: "bishop", n: "knight", p: "pawn" };
 // The filled glyph set for both colours (coloured by CSS): the outline set renders inconsistently across system
 // fonts. U+FE0E asks for text presentation, so the pawn never turns into an emoji.
+/** @type {Record<string, string>} */
 const GLYPHS = { k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟" };
 
 // ---------------------------------------------------------------- squares and orientation
 
-/** The square at grid `index` (0-63, row-major from the top-left corner as the viewer sees it). */
+/** The square at grid `index` (0-63, row-major from the top-left corner as the viewer sees it).
+ *  @param {number} index @param {string} orientation @returns {string} */
 export function squareAt(index, orientation) {
   const row = Math.floor(index / 8);
   const col = index % 8;
   return orientation === "black" ? `${FILES[7 - col]}${row + 1}` : `${FILES[col]}${8 - row}`;
 }
 
-/** The grid index of `square` for this orientation; the inverse of `squareAt`. */
+/** The grid index of `square` for this orientation; the inverse of `squareAt`.
+ *  @param {string} square @param {string} orientation @returns {number} */
 export function indexOfSquare(square, orientation) {
   const file = FILES.indexOf(square[0]);
   const rank = Number(square[1]);
@@ -33,7 +64,8 @@ export function indexOfSquare(square, orientation) {
 }
 
 /** Keyboard navigation in screen space: ArrowUp always moves up the screen, whichever side is at the bottom.
- *  Clamped at the board's edges; any other key leaves the square unchanged. */
+ *  Clamped at the board's edges; any other key leaves the square unchanged.
+ *  @param {string} square @param {string} key @param {string} orientation @returns {string} */
 export function stepSquare(square, key, orientation) {
   const i = indexOfSquare(square, orientation);
   let row = Math.floor(i / 8);
@@ -52,7 +84,7 @@ export function stepSquare(square, key, orientation) {
 // ---------------------------------------------------------------- FEN
 
 /** `{ e1: "K", d8: "q", ... }` from a FEN's piece-placement field; `{}` for anything malformed.
- *  @returns {Record<string, string>} */
+ *  @param {unknown} fen @returns {Record<string, string>} */
 export function piecesFromFen(fen) {
   /** @type {Record<string, string>} */
   const out = {};
@@ -70,23 +102,28 @@ export function piecesFromFen(fen) {
   return out;
 }
 
+/** @param {unknown} fen @returns {Side} */
 export function sideToMove(fen) {
   return typeof fen === "string" && fen.split(" ")[1] === "b" ? "black" : "white";
 }
 
+/** @param {string} letter @returns {Side} */
 export function pieceColor(letter) {
   return letter === letter.toUpperCase() ? "white" : "black";
 }
 
+/** @param {string} letter */
 export function pieceName(letter) {
   return `${pieceColor(letter)} ${PIECE_NAMES[letter.toLowerCase()]}`;
 }
 
+/** @param {string} letter */
 export function pieceGlyph(letter) {
-  return `${GLYPHS[letter.toLowerCase()]}︎`;
+  return `${GLYPHS[letter.toLowerCase()]}\uFE0E`;
 }
 
-/** "e4 white pawn", "d5 empty", or with state suffixes: "e1 white king, in check". */
+/** "e4 white pawn", "d5 empty", or with state suffixes: "e1 white king, in check".
+ *  @param {string} square @param {string} letter @param {string[]} [extras] */
 export function squareLabel(square, letter, extras = []) {
   const base = `${square} ${letter ? pieceName(letter) : "empty"}`;
   return extras.length > 0 ? `${base}, ${extras.join(", ")}` : base;
@@ -94,8 +131,10 @@ export function squareLabel(square, letter, extras = []) {
 
 // ---------------------------------------------------------------- moves
 
-/** The distinct target squares of the legal UCI moves starting on `from` (a promotion's four moves are one). */
+/** The distinct target squares of the legal UCI moves starting on `from` (a promotion's four moves are one).
+ *  @param {readonly string[] | null | undefined} legalMovesUci @param {string} from @returns {string[]} */
 export function targetsFrom(legalMovesUci, from) {
+  /** @type {string[]} */
   const out = [];
   for (const uci of legalMovesUci ?? []) {
     if (uci.slice(0, 2) !== from) continue;
@@ -105,23 +144,27 @@ export function targetsFrom(legalMovesUci, from) {
   return out;
 }
 
-/** Every legal UCI move from `from` to `to`: one, or four for a promotion. */
+/** Every legal UCI move from `from` to `to`: one, or four for a promotion.
+ *  @param {readonly string[] | null | undefined} legalMovesUci @param {string} from @param {string} to @returns {string[]} */
 export function movesBetween(legalMovesUci, from, to) {
   return (legalMovesUci ?? []).filter((uci) => uci.slice(0, 2) === from && uci.slice(2, 4) === to);
 }
 
+/** @param {readonly string[] | null | undefined} legalMovesUci @param {string} from @param {string} to */
 export function isPromotion(legalMovesUci, from, to) {
   return movesBetween(legalMovesUci, from, to).some((uci) => uci.length === 5);
 }
 
+/** @param {{ from: string, to: string, san?: string } | null | undefined} lastMove @returns {string[]} */
 export function lastMoveSquares(lastMove) {
   return lastMove ? [lastMove.from, lastMove.to] : [];
 }
 
-/** The side-to-move king's square when the last move gave check (its SAN ends in "+" or "#"), else null. */
+/** The side-to-move king's square when the last move gave check (its SAN ends in "+" or "#"), else null.
+ *  @param {ChannelStatus | null | undefined} status @returns {string | null} */
 export function checkSquare(status) {
   const san = status?.lastMove?.san;
-  if (typeof san !== "string" || !/[+#]$/.test(san)) return null;
+  if (!status || typeof san !== "string" || !/[+#]$/.test(san)) return null;
   const king = sideToMove(status.fen) === "white" ? "K" : "k";
   const pieces = piecesFromFen(status.fen);
   return Object.keys(pieces).find((sq) => pieces[sq] === king) ?? null;
@@ -129,20 +172,24 @@ export function checkSquare(status) {
 
 // ---------------------------------------------------------------- what the human may do
 
+/** @param {ChannelStatus | null | undefined} status */
 export function isLive(status) {
   return !!status && LIVE_PHASES.has(status.phase);
 }
 
+/** @param {ChannelStatus | null | undefined} status */
 export function isSettled(status) {
   return !!status && SETTLED_PHASES.has(status.phase);
 }
 
+/** @param {ChannelStatus | null | undefined} status */
 export function isGameOver(status) {
   return !!status && OVER_STATUSES.has(status.gameStatus);
 }
 
 /** Moves are clickable only when the human controls the seat, it is our turn, and the game is live. The daemon
- *  fills `legalMovesUci` on our turn whoever controls the seat, so the controller check has to happen here too. */
+ *  fills `legalMovesUci` on our turn whoever controls the seat, so the controller check has to happen here too.
+ *  @param {ChannelStatus | null | undefined} status @returns {boolean} */
 export function canMove(status) {
   return (
     !!status &&
@@ -154,17 +201,20 @@ export function canMove(status) {
   );
 }
 
-/** True when `suggestedActions` lists `command`, exactly or followed by a space (its usage hint). */
+/** True when `suggestedActions` lists `command`, exactly or followed by a space (its usage hint).
+ *  @param {ChannelStatus} status @param {string} command */
 function suggests(status, command) {
   return (status.suggestedActions ?? []).some((a) => a === command || a.startsWith(`${command} `));
 }
 
 /** Which controls are enabled. Everything that signs needs the human in control; the daemon enforces the same
- *  thing (409), this just avoids offering a button that can only fail. */
+ *  thing (409), this just avoids offering a button that can only fail.
+ *  @param {ChannelStatus | null | undefined} status */
 export function actionState(status) {
   const human = status?.controller === "human";
   const live = isLive(status);
-  const act = (command) => human && live && suggests(status, command);
+  /** @param {string} command */
+  const act = (command) => !!status && human && live && suggests(status, command);
   const move = canMove(status);
   return {
     move,
@@ -173,7 +223,8 @@ export function actionState(status) {
     acceptDraw: act("arena accept-draw"),
     nextGame: act("arena next-game"),
     close: act("arena close"),
-    challenge: human && status?.phase === "Open" && suggests(status, "arena challenge") && (status.cooldown?.meSeconds ?? 0) === 0,
+    challenge:
+      !!status && human && status.phase === "Open" && suggests(status, "arena challenge") && (status.cooldown?.meSeconds ?? 0) === 0,
     takeOver: !!status && !human && !isSettled(status),
     handBack: human && !isSettled(status),
   };
@@ -184,9 +235,13 @@ export function actionState(status) {
 /**
  * One click on `square`, given the current selection. Returns the next selection and at most one intent:
  * `{type: "move", uci}` or `{type: "promote", from, to, choices}` (app.js then asks which piece).
+ * @param {ChannelStatus | null | undefined} status
+ * @param {BoardUi | null | undefined} ui
+ * @param {string} square
+ * @returns {{ selected: string | null, intent: Intent | null }}
  */
 export function clickSquare(status, ui, square) {
-  if (!canMove(status)) return { selected: null, intent: null };
+  if (!status || !canMove(status)) return { selected: null, intent: null };
   const moves = status.legalMovesUci;
   const selected = ui?.selected ?? null;
   if (selected) {
@@ -215,16 +270,18 @@ export function escapeIntent(ui) {
   return null;
 }
 
-/** The 64 squares in display order, each with everything app.js needs to draw it. */
+/** The 64 squares in display order, each with everything app.js needs to draw it.
+ *  @param {ChannelStatus | null | undefined} status @param {BoardUi | null | undefined} ui @returns {SquareView[]} */
 export function boardView(status, ui) {
   const orientation = status?.orientation === "black" ? "black" : "white";
   const pieces = piecesFromFen(status?.fen);
   const last = lastMoveSquares(status?.lastMove);
-  const check = status ? checkSquare(status) : null;
-  const moves = canMove(status) ? status.legalMovesUci : [];
+  const check = checkSquare(status);
+  const moves = status && canMove(status) ? status.legalMovesUci : [];
   const movable = new Set(moves.map((u) => u.slice(0, 2)));
   const selected = ui?.selected && movable.has(ui.selected) ? ui.selected : null;
   const targets = selected ? targetsFrom(moves, selected) : [];
+  /** @type {SquareView[]} */
   const out = [];
   for (let i = 0; i < 64; i++) {
     const square = squareAt(i, orientation);
@@ -238,6 +295,7 @@ export function boardView(status, ui) {
       capture: targets.includes(square) && piece !== "",
       check: square === check,
     };
+    /** @type {string[]} */
     const extras = [];
     if (flags.check) extras.push("in check");
     if (flags.selected) extras.push("selected");
@@ -259,9 +317,10 @@ export function boardView(status, ui) {
 
 // ---------------------------------------------------------------- channel list
 
-/** One chip per channel: your turn, waiting, challenged, settled, and a few in-between states. */
+/** One chip per channel: your turn, waiting, challenged, settled, and a few in-between states.
+ *  @param {ChannelStatus | DegradedChannel} status @returns {Chip} */
 export function channelChip(status) {
-  if (status?.degraded) return { kind: "degraded", label: "Unavailable" };
+  if ("degraded" in status) return { kind: "degraded", label: "Unavailable" };
   if (isSettled(status)) return { kind: "settled", label: "Settled" };
   if (status.phase === "Challenged") return { kind: "challenged", label: status.challenge?.mustMove ? "Must move" : "Challenged" };
   if (status.phase === "None" || status.phase === "Funding") return { kind: "funding", label: "Funding" };
@@ -275,9 +334,11 @@ export function channelChip(status) {
   return { kind: "waiting", label: "Waiting" };
 }
 
-/** Per-channel warnings for the list. The lobby error is daemon-wide, so app.js shows it once, not per channel. */
+/** Per-channel warnings for the list. The lobby error is daemon-wide, so app.js shows it once, not per channel.
+ *  @param {ChannelStatus | DegradedChannel | null | undefined} status @returns {Banner[]} */
 export function channelBanners(status) {
-  if (!status || status.degraded) return [];
+  if (!status || "degraded" in status) return [];
+  /** @type {Banner[]} */
   const out = [];
   if (status.attention === "session-gas-low") out.push({ kind: "session-gas-low", text: "Session gas low: fund your wallet" });
   if (status.challenge?.mustMove) out.push({ kind: "must-move", text: "You must move before the deadline" });
@@ -288,9 +349,10 @@ export function channelBanners(status) {
   return out;
 }
 
-/** The channel to show first: a forced move, then our turn (human-controlled first), then any live channel. */
+/** The channel to show first: a forced move, then our turn (human-controlled first), then any live channel.
+ *  @param {ReadonlyArray<ChannelStatus | DegradedChannel> | null | undefined} list @returns {string | null} */
 export function pickDefaultChannel(list) {
-  const ok = (list ?? []).filter((s) => s && !s.degraded);
+  const ok = /** @type {ChannelStatus[]} */ ((list ?? []).filter((s) => s && !("degraded" in s)));
   const pick =
     ok.find((s) => s.challenge?.mustMove) ??
     ok.find((s) => s.myTurn && s.controller === "human") ??
@@ -320,6 +382,7 @@ export function planKeyedList(currentKeys, nextKeys) {
   const remove = currentKeys.filter((k) => !wanted.has(k));
   const create = target.filter((k) => !had.has(k));
   const dom = currentKeys.filter((k) => wanted.has(k));
+  /** @type {Array<{ key: string, before: string | null }>} */
   const moves = [];
   let i = 0;
   for (const key of target) {
@@ -339,6 +402,7 @@ export function planKeyedList(currentKeys, nextKeys) {
 
 // ---------------------------------------------------------------- text
 
+/** @param {ChannelStatus | null | undefined} status */
 export function gameStatusText(status) {
   switch (status?.gameStatus) {
     case "playing":
@@ -346,9 +410,9 @@ export function gameStatusText(status) {
     case "draw_offered":
       return "Draw offered";
     case "white_won":
-      return status.color === "white" ? "White won (you)" : "White won";
+      return status?.color === "white" ? "White won (you)" : "White won";
     case "black_won":
-      return status.color === "black" ? "Black won (you)" : "Black won";
+      return status?.color === "black" ? "Black won (you)" : "Black won";
     case "draw":
       return "Draw";
     default:
@@ -356,7 +420,8 @@ export function gameStatusText(status) {
   }
 }
 
-/** The one-line headline above the board. */
+/** The one-line headline above the board.
+ *  @param {ChannelStatus | null | undefined} status */
 export function turnText(status) {
   if (!status) return "";
   if (status.phase === "Finalized") return "Channel settled";
@@ -372,7 +437,8 @@ export function turnText(status) {
   return "Waiting for the opponent";
 }
 
-/** "0.900000" -> "0.90": at least two decimals, trailing zeros past them dropped. Anything else passes through. */
+/** "0.900000" -> "0.90": at least two decimals, trailing zeros past them dropped. Anything else passes through.
+ *  @param {unknown} amount */
 export function formatUsdc(amount) {
   const m = /^(\d+)\.(\d+)$/.exec(String(amount));
   if (!m) return String(amount);
@@ -380,15 +446,17 @@ export function formatUsdc(amount) {
   return `${m[1]}.${frac}`;
 }
 
-/** A base-unit string ("1500000", as the offers list sends it) as a USDC amount ("1.50"). */
+/** A base-unit string ("1500000", as the offers list sends it) as a USDC amount ("1.50").
+ *  @param {unknown} base */
 export function baseUnitsToUsdc(base) {
   if (!/^\d+$/.test(String(base))) return "?";
-  const v = BigInt(base);
+  const v = BigInt(String(base));
   return formatUsdc(`${v / 1_000_000n}.${(v % 1_000_000n).toString().padStart(6, "0")}`);
 }
 
 /** A USDC amount typed by the user ("1.5") as the base-unit string the API takes ("1500000"). Throws on anything
- *  that is not a plain non-negative decimal with at most 6 fractional digits. */
+ *  that is not a plain non-negative decimal with at most 6 fractional digits.
+ *  @param {unknown} input @returns {string} */
 export function usdcToBaseUnits(input) {
   const s = String(input).trim();
   const m = /^(\d*)(?:\.(\d{0,6}))?$/.exec(s);
@@ -400,6 +468,7 @@ export function usdcToBaseUnits(input) {
   return (whole * 1_000_000n + frac).toString();
 }
 
+/** @param {unknown} seconds */
 export function formatCountdown(seconds) {
   const s = Math.max(0, Math.floor(Number(seconds) || 0));
   const h = Math.floor(s / 3600);
@@ -414,6 +483,9 @@ export function formatCountdown(seconds) {
  * time, which lags between blocks (and stands still on a local chain with no new blocks), so taking it at face
  * value on every refresh would freeze or bounce the countdown. Erring early is the safe side of a deadline.
  * A different deadline (a new challenge) starts over; no challenge gives null.
+ * @param {{ deadline: string, endsAt: number } | null | undefined} prev
+ * @param {{ deadline: unknown, secondsLeft: unknown } | null | undefined} challenge
+ * @param {number} nowMs
  * @returns {{ deadline: string, endsAt: number } | null}
  */
 export function syncDeadline(prev, challenge, nowMs) {
@@ -424,11 +496,13 @@ export function syncDeadline(prev, challenge, nowMs) {
   return { deadline, endsAt };
 }
 
-/** Whole seconds from `nowMs` until `endsAt`, rounded up, never negative. */
+/** Whole seconds from `nowMs` until `endsAt`, rounded up, never negative.
+ *  @param {number} endsAt @param {number} nowMs */
 export function secondsUntil(endsAt, nowMs) {
   return Math.max(0, Math.ceil((endsAt - nowMs) / 1000));
 }
 
+/** @param {unknown} seconds */
 export function formatDuration(seconds) {
   const s = Math.max(0, Math.floor(Number(seconds) || 0));
   if (s < 60) return `${s} s`;
@@ -438,6 +512,7 @@ export function formatDuration(seconds) {
   return m === 0 ? `${h} h` : `${h} h ${m} min`;
 }
 
+/** @param {unknown} hex */
 export function shortHex(hex) {
   const s = String(hex ?? "");
   return s.length > 14 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s;
@@ -460,12 +535,14 @@ export function dialogClickAllowed(openedAtMs, nowMs) {
 /** Mirrors the daemon's own check (MAX_HANDOFF_NOTE_LENGTH and FORBIDDEN_NOTE_CHARS in daemon.ts), so the user
  *  sees the problem before sending; the daemon remains the authority. */
 export const MAX_NOTE_LENGTH = 1024;
-const FORBIDDEN_NOTE_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F‪-‮⁦-⁩]/;
+const FORBIDDEN_NOTE_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/;
 
+/** @param {unknown} note */
 export function normalizeNote(note) {
   return String(note ?? "").replace(/\r\n/g, "\n");
 }
 
+/** @param {string} note @returns {string | null} */
 export function noteError(note) {
   if (note.length > MAX_NOTE_LENGTH) return `The note must be at most ${MAX_NOTE_LENGTH} characters (it has ${note.length})`;
   if (FORBIDDEN_NOTE_CHARS.test(note)) return "The note contains a control or bidi-override character";
