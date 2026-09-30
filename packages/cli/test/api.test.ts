@@ -1,5 +1,5 @@
 import { request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect as netConnect, type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadToken, startApi } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
@@ -39,6 +39,24 @@ function rawRequest(
     );
     req.on("error", reject);
     req.end();
+  });
+}
+
+/**
+ * Plan 5 Task 2 fix round, minor 3: a fully raw request over a plain socket -- used only for a duplicate `Host`
+ * header, which `node:http`'s own client refuses to construct (`options.headers.host` must be a single string).
+ */
+function rawSocketRequest(port: number, requestText: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const sock = netConnect(port, "127.0.0.1", () => sock.write(requestText));
+    let buf = "";
+    sock.on("data", (d: Buffer) => (buf += d.toString("utf8")));
+    sock.on("end", () => {
+      const [head, ...rest] = buf.split("\r\n\r\n");
+      const status = Number((head ?? "").split("\r\n")[0]?.split(" ")[1] ?? "0");
+      resolve({ status, body: rest.join("\r\n\r\n") });
+    });
+    sock.on("error", reject);
   });
 }
 
@@ -133,6 +151,39 @@ describe("local API", () => {
     // "http://[" is not a valid URL (an unterminated IPv6 literal host) -- new URL(req.url, base) throws on it.
     const res = await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "http://[" });
     expect(res.status).toBe(400);
+  });
+
+  it("Plan 5 Task 2 fix round, minor 3: rejects a request with more than one Host header (421)", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const port = (server.address() as AddressInfo).port;
+    const res = await rawSocketRequest(
+      port,
+      `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nHost: evil.example\r\nConnection: close\r\n\r\n`,
+    );
+    expect(res.status).toBe(421);
+  });
+
+  it("Plan 5 Task 2 fix round, minor 3: rejects an absolute-form or asterisk-form request target (400)", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const port = (server.address() as AddressInfo).port;
+    // A well-formed *absolute* URL (unlike minor 2's "http://["), so this exercises the dedicated origin-form
+    // check, not the malformed-target catch.
+    const absolute = await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "http://evil.example/channels" });
+    expect(absolute.status).toBe(400);
+    const asterisk = await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "*", method: "OPTIONS" });
+    expect([400, 405]).toContain(asterisk.status);
   });
 
   it("Plan 5 Task 2: rejects a Host header that is not exactly 127.0.0.1:<port> or localhost:<port> (421)", async () => {

@@ -33,6 +33,28 @@ function hostAllowed(header: string | undefined, boundPort: number): boolean {
   return header === `127.0.0.1:${boundPort}` || header === `localhost:${boundPort}`;
 }
 
+/** Plan 5 Task 2 fix round, minor 3: true if `rawHeaders` (Node's flat, un-folded, original-casing list) names
+ *  `Host` more than once. `req.headers.host` silently keeps only the first and drops the rest, so a duplicate
+ *  Host header is invisible to `hostAllowed` above -- checked separately here, against the one place Node still
+ *  exposes it, since which Host a request "really" means is now ambiguous rather than merely wrong. */
+function hasDuplicateHostHeader(rawHeaders: readonly string[]): boolean {
+  let count = 0;
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (rawHeaders[i]?.toLowerCase() === "host") count++;
+  }
+  return count > 1;
+}
+
+/** Plan 5 Task 2 fix round, minor 3: true only for an origin-form request-target (what every legitimate request
+ *  here uses: a path starting with "/", e.g. "/channels"). False for absolute-form ("http://evil.example/x" --
+ *  a well-formed URL in its own right, with its own host, that `new URL(req.url, base)` would parse without ever
+ *  raising minor 2's malformed-target check) and asterisk-form ("*", normally valid only for `OPTIONS *`). Both
+ *  of those forms exist for a request through a proxy, never a request straight to this origin server, and
+ *  neither is bound by this server's own Host guard the way an origin-form target's path is. */
+function isOriginFormTarget(rawUrl: string): boolean {
+  return rawUrl.startsWith("/");
+}
+
 function send(res: ServerResponse, code: number, value: unknown): void {
   res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
@@ -201,9 +223,18 @@ export async function startApi(
       try {
         // Plan 5 Task 2 (Global Constraints): the Host guard applies to every route, including /health and /board,
         // before anything else -- a hostile page that got a victim's browser to hit this port by name (DNS
-        // rebinding) must never reach a single byte of this API.
-        if (!hostAllowed(req.headers.host, boundPort)) {
+        // rebinding) must never reach a single byte of this API. Fix round, minor 3: a duplicate Host header is
+        // folded into the same 421 -- see hasDuplicateHostHeader's docstring for why it belongs here, not with
+        // minor 3's other (400) check below.
+        if (!hostAllowed(req.headers.host, boundPort) || hasDuplicateHostHeader(req.rawHeaders)) {
           res.writeHead(421);
+          return res.end();
+        }
+        // Plan 5 Task 2 fix round, minor 3: an absolute-form or asterisk-form request-target is refused outright,
+        // before anything else parses it -- see isOriginFormTarget's docstring. Checked ahead of the OPTIONS
+        // check too, so "OPTIONS *" lands here (400), which the ruling allows equally with 405.
+        if (!isOriginFormTarget(req.url ?? "/")) {
+          res.writeHead(400);
           return res.end();
         }
         // No CORS is supported: a preflight can never succeed here.
