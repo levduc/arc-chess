@@ -118,6 +118,9 @@ describe("local API", () => {
     expect(handoff.body.handoff.note).toBe("n");
     expect(typeof handoff.body.handoff.since).toBe("string");
     expect((await call(url, token, "POST", "/handoff", { to: "robot" })).status).toBe(400);
+    // Plan 5 Task 2 fix round, minor 4: an over-long or control/bidi-carrying note is refused end to end too.
+    expect((await call(url, token, "POST", "/handoff", { to: "agent", note: "x".repeat(1025) })).status).toBe(400);
+    expect((await call(url, token, "POST", "/handoff", { to: "agent", note: "bidi‮override" })).status).toBe(400);
   });
 
   it("Plan 5 Task 1: POST /offers without challengeTimeout defaults to minChallengeTimeoutOf(config)", async () => {

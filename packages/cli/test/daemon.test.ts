@@ -271,6 +271,25 @@ describe("ArenaDaemon core", () => {
     await expect(alice.daemon.move(undefined, "d4", { actor: "human" })).rejects.toThrow(/agent is in control|not your turn/);
   });
 
+  it("Plan 5 Task 2 fix round, minor 4: refuses a handoff note that is too long or carries a control/bidi character", async () => {
+    const { alice } = await matched();
+    await expect(alice.daemon.handoff(undefined, "human", "x".repeat(1025))).rejects.toThrow(/1024/);
+    await alice.daemon.handoff(undefined, "human", "x".repeat(1024)); // exactly the cap: allowed
+    for (const bad of [
+      "back\u0000stab", // NUL
+      "line\u0001break", // a C0 control other than \t/\n
+      "del\u007Fete", // DEL
+      "c1\u0085control", // a C1 control (NEL)
+      "bidi‮override", // RLO
+      "isolate⁦start", // LRI
+    ]) {
+      await expect(alice.daemon.handoff(undefined, "agent", bad)).rejects.toThrow(/control|bidi/);
+    }
+    // Newline and tab are exactly the two control characters this note allows through.
+    await alice.daemon.handoff(undefined, "human", "line one\nline two\tindented");
+    expect((await alice.daemon.status()).note).toBe("line one\nline two\tindented");
+  });
+
   it("rejects a mismatched match without funding", async () => {
     // Bob's daemon expects a different rules contract, so the host's match must be ignored by Bob.
     const pair = await startPair({ bobConfig: { rules: "0x00000000000000000000000000000000000000e5" } });

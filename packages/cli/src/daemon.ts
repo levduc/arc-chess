@@ -316,6 +316,31 @@ export const MAX_OPEN_ATTEMPTS = 5;
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
 
+/** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
+ *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
+ *  cosmetic. */
+export const MAX_HANDOFF_NOTE_LENGTH = 1024;
+
+/**
+ * Plan 5 Task 2 fix round, minor 4: every character class a handoff note refuses, beyond the length cap above --
+ * C0 controls other than tab (U+0009) and newline (U+000A), DEL (U+007F), C1 controls (U+0080-U+009F), and the
+ * bidi-override/isolate formatting characters (U+202A-U+202E, U+2066-U+2069) that can make rendered text read in
+ * an order different from its bytes. The board shows this note as plain text (never innerHTML, per Global
+ * Constraints), so this is not an XSS defense -- it's aimed at a note that would otherwise corrupt the terminal
+ * or the board's own layout (a bidi override flips visual order; C0/C1 controls include things like backspace,
+ * form feed, or an ANSI escape's own controls) rather than at markup, which plain-text rendering already defeats.
+ */
+const FORBIDDEN_NOTE_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F‪-‮⁦-⁩]/;
+
+function checkHandoffNote(note: string): void {
+  if (note.length > MAX_HANDOFF_NOTE_LENGTH) {
+    throw new DaemonError(400, `note must be at most ${MAX_HANDOFF_NOTE_LENGTH} characters (got ${note.length})`);
+  }
+  if (FORBIDDEN_NOTE_CHARS.test(note)) {
+    throw new DaemonError(400, "note contains a disallowed control or bidi-override character");
+  }
+}
+
 export class ArenaDaemon {
   readonly client: PublicClient;
   readonly hub: HubClient;
@@ -2003,6 +2028,9 @@ export class ArenaDaemon {
   }
 
   async handoff(ref: string | undefined, to: Controller, note: string): Promise<void> {
+    // Plan 5 Task 2 fix round, minor 4: checked before touching the channel or the record, like every other
+    // input validation in this class.
+    checkHandoffNote(note);
     const l = this.pick(ref);
     // Plan 5 Task 2: handoffAt drives ChannelStatus.handoff.since -- set every time, even human -> human or
     // agent -> agent, so the board can show "handed off just now" regardless of whether the controller actually
