@@ -267,6 +267,22 @@ export class SerialTxSender implements TxSender, TxTracker {
     return run;
   }
 
+  /** Fix round 3, I-1(a): re-checks every tracked entry against the chain -- via the same `prune()` `send()`
+   *  itself runs before picking a nonce -- without sending anything, serialized through the same queue `send()`
+   *  uses so it never runs concurrently with (or ahead of) an in-flight send. A caller (e.g. a sweep deciding how
+   *  much reserve a dead entry needs) that reads `tracked()` right after this sees a `released` entry that has
+   *  since mined as gone, not stale: `tracked()` alone never notices this on its own, since nothing but `send()`
+   *  (which this lets a caller invoke without actually sending) or `waitOrReplace`'s own `settle()`/`release()`
+   *  calls ever touches an entry after it is created. A no-op if this sender is not tracking at all (no reader,
+   *  or the underlying sender does not support replacement). */
+  async refresh(): Promise<void> {
+    const reader = this.reader;
+    if (!reader || !this.tracking) return;
+    const run = this.tail.then(() => this.prune(reader).then(() => undefined));
+    this.tail = run.catch(() => undefined);
+    return run;
+  }
+
   // --- TxTracker (driven by waitOrReplace)
 
   entryOf(hash: Hex): TrackedTx | undefined {
