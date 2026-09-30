@@ -1,6 +1,10 @@
 import { timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
 
@@ -32,6 +36,69 @@ function hostAllowed(header: string | undefined, boundPort: number): boolean {
 function send(res: ServerResponse, code: number, value: unknown): void {
   res.writeHead(code, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v)));
+}
+
+type BoardAsset = { body: Buffer; contentType: string };
+
+const BOARD_DIR = join(dirname(fileURLToPath(import.meta.url)), "board");
+
+/**
+ * Plan 5 Task 2: chess.js 1.4.0's ESM build, served at /board/vendor/chess.js so the board can `import` it with
+ * no bundler and no CDN (Global Constraints: local only). `chess.js`'s own package.json points `main` at its CJS
+ * build (`dist/cjs/chess.js`); the ESM build sits one directory over, at the same depth under `dist/`.
+ */
+function resolveChessEsm(): string {
+  const cjsEntry = createRequire(import.meta.url).resolve("chess.js");
+  return join(dirname(dirname(cjsEntry)), "esm", "chess.js");
+}
+
+/**
+ * Plan 5 Task 2: every static board file, read once here rather than per request. This map IS the allowlist --
+ * `/board`, `/board/`, and the five URLs below, exactly -- so any other path under /board (a traversal attempt,
+ * encoded or not, or simply an unknown file) can never resolve to a file: see the exact-match lookup below,
+ * against `url.pathname`, which normalizes real `.`/`..` segments but never decodes `%2f` into a literal slash.
+ */
+function loadBoardAssets(): Map<string, BoardAsset> {
+  const assets = new Map<string, BoardAsset>();
+  const add = (urlPath: string, filePath: string, contentType: string) => {
+    assets.set(urlPath, { body: readFileSync(filePath), contentType });
+  };
+  const indexHtml = join(BOARD_DIR, "index.html");
+  add("/board", indexHtml, "text/html; charset=utf-8");
+  add("/board/", indexHtml, "text/html; charset=utf-8");
+  add("/board/app.js", join(BOARD_DIR, "app.js"), "text/javascript; charset=utf-8");
+  add("/board/board.js", join(BOARD_DIR, "board.js"), "text/javascript; charset=utf-8");
+  add("/board/api.js", join(BOARD_DIR, "api.js"), "text/javascript; charset=utf-8");
+  add("/board/style.css", join(BOARD_DIR, "style.css"), "text/css; charset=utf-8");
+  add("/board/vendor/chess.js", resolveChessEsm(), "text/javascript; charset=utf-8");
+  return assets;
+}
+
+const BOARD_ASSETS = loadBoardAssets();
+
+/** True for `/board`, `/board/`, or anything under it, checked against the *raw* request-target (before `new
+ *  URL` normalizes `.`/`..` segments away) -- so a plain traversal attempt (`/board/../config.json`, which
+ *  normalizes to `/config.json`) is still recognized as a board request and 404s below, rather than falling
+ *  through to the token-gated switch and answering 401 instead of the 404 a static path must always get. */
+function isBoardRequest(rawUrl: string): boolean {
+  const path = rawUrl.split("?")[0];
+  return path === "/board" || path.startsWith("/board/");
+}
+
+/** GET on an allowlisted path serves the file; anything else under /board -- another method, an unknown file, a
+ *  traversal attempt whether plain or percent-encoded -- gets a bare 404. No token is required: these routes
+ *  serve no data, only the static app shell (Global Constraints, Task 2 requirement 3). */
+function serveBoard(req: IncomingMessage, res: ServerResponse, pathname: string): void {
+  if (req.method === "GET") {
+    const asset = BOARD_ASSETS.get(pathname);
+    if (asset) {
+      res.writeHead(200, { "content-type": asset.contentType });
+      res.end(asset.body);
+      return;
+    }
+  }
+  res.writeHead(404);
+  res.end();
 }
 
 async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -94,6 +161,9 @@ export async function startApi(
           return res.end();
         }
         const url = new URL(req.url ?? "/", `http://${host}:${boundPort}`);
+        // Static board files, before anything token-gated: they need no token (Task 2 requirement 3), and any
+        // path under /board that isn't one of them must 404, never 401.
+        if (isBoardRequest(req.url ?? "/")) return serveBoard(req, res, url.pathname);
         const route = `${req.method} ${url.pathname}`;
         if (route === "GET /health") return send(res, 200, { ok: true });
         if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });

@@ -167,6 +167,44 @@ describe("local API", () => {
     expect(opt.status).toBe(405);
   });
 
+  it("Plan 5 Task 2: serves the static board with no token, and 404s anything else under /board", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const port = (server.address() as AddressInfo).port;
+
+    const index = await fetch(`${url}/board`);
+    expect(index.status).toBe(200);
+    expect(index.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await index.text()).toContain("<html");
+    expect((await fetch(`${url}/board/`)).status).toBe(200);
+
+    const appJs = await fetch(`${url}/board/app.js`);
+    expect(appJs.status).toBe(200);
+    expect(appJs.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+    expect((await fetch(`${url}/board/board.js`)).status).toBe(200);
+    expect((await fetch(`${url}/board/api.js`)).status).toBe(200);
+
+    const css = await fetch(`${url}/board/style.css`);
+    expect(css.status).toBe(200);
+    expect(css.headers.get("content-type")).toBe("text/css; charset=utf-8");
+
+    const vendor = await fetch(`${url}/board/vendor/chess.js`);
+    expect(vendor.status).toBe(200);
+    expect(vendor.headers.get("content-type")).toBe("text/javascript; charset=utf-8");
+    expect(await vendor.text()).toMatch(/class Chess/);
+
+    // No token anywhere above -- static routes carry no data. Everything else under /board, including a
+    // traversal attempt (plain or percent-encoded), gets 404, not the daemon's config/token files.
+    expect((await fetch(`${url}/board/nope.js`)).status).toBe(404);
+    expect((await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "/board/../config.json" })).status).toBe(404);
+    expect((await rawRequest(port, { hostHeader: `127.0.0.1:${port}`, path: "/board/..%2fconfig.json" })).status).toBe(404);
+  });
+
   it("fix round I5: POST /sweep returns {results, remaining}", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);
