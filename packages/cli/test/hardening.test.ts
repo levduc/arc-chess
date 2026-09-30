@@ -1601,7 +1601,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const realPerformSweep = internals.performSweep.bind(d);
     internals.performSweep = () => Promise.reject(new TxReceiptMissingError(hash, 0n));
     (d as unknown as SweepableDaemon).sweepChannel = original;
-    await waitFor(() => l.sweep.pendingTx === hash, 10_000, "the hash is remembered for the next attempt");
+    await waitFor(() => l.sweep.pendingTx?.[0] === hash, 10_000, "the hash is remembered for the next attempt");
     expect(l.record.swept).toBeUndefined(); // not yet recorded: this attempt only remembered the hash
     internals.performSweep = realPerformSweep; // the recovery path below must not need it at all
 
@@ -1731,7 +1731,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const hash = await sender.send(req);
     await d.client.waitForTransactionReceipt({ hash });
     sender.tracker?.settle(hash);
-    l.sweep.pendingTx = hash;
+    l.sweep.pendingTx = [hash];
 
     // getTransaction (called by recoverPendingSweepTx only after a successful receipt read) throws a few times
     // in a row -- not a single manual call, but left for the daemon's own real periodic timer (a fire-and-forget
@@ -1773,7 +1773,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // way to tell that apart from "still pending" -- every attempt from here on skipped, permanently, with no
     // way out short of a restart (probe F2).
     const fakeHash = ("0x" + "77".repeat(32)) as Hex;
-    l.sweep.pendingTx = fakeHash;
+    l.sweep.pendingTx = [fakeHash];
 
     // performSweep also fails (stubbed), so the fall-through attempt I-2 asks for is itself charged too -- one
     // pass should show *two* failures (the recovery's own "confirmed gone" charge, plus the fall-through's own),
@@ -1785,6 +1785,144 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     await waitFor(() => l.sweep.pendingTx === undefined, 10_000, "the dead hash is given up on, not remembered forever");
     await waitFor(() => l.sweep.attempts >= 2, 10_000, "both the recovery's own charge and the fall-through's own count");
     expect(l.record.swept).toBeUndefined(); // performSweep is still stubbed to fail: nothing recorded yet, just charged
+  });
+
+  it("fix round 3, I-1, scenario E1: a released entry that has since mined does not block a genuinely dust balance", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
+    const l = alice.daemon.handle(id);
+    const sender = l.sessionSender;
+    const F = 1_500_000_000n; // pinned (M-3's own lesson): the real market fee can drift between reads
+    d.currentFeePerGas = () => Promise.resolve(F);
+    const gas = 21_000n;
+    const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    try {
+      // A stand-in respond, abandoned by an aborted wait (released, never mined) -- then it mines anyway, despite
+      // nothing of ours ever waiting on it again. tracked() alone never notices: it is still "released" here.
+      const standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      const ac = new AbortController();
+      ac.abort();
+      await waitOrReplace(alice.daemon.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, { signal: ac.signal }).catch(
+        () => undefined,
+      );
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]);
+      await testClient.mine({ blocks: 1 });
+      expect((await alice.daemon.client.getTransactionReceipt({ hash: standInHash })).status).toBe("success");
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]); // still stale here
+    } finally {
+      await testClient.setAutomine(true);
+    }
+    const boundary = gas * (reserve + F) - 1n; // strictly plain dust
+    await setEthBalance(sender.address, boundary);
+    d.sweepChannel = original;
+    // Before I-1(a)/(b): this abandoned after 12 attempts, throwing "needs more reserve" over a dead entry that
+    // had, in fact, already mined -- for a balance that was independently already dust either way.
+    await waitFor(() => l.record.swept !== undefined, 20_000, "declined as dust, not abandoned over a stale entry");
+    expect(l.record.swept).toBe("dust");
+    expect(await alice.daemon.client.getBalance({ address: sender.address })).toBe(boundary); // untouched
+  });
+
+  it("fix round 3, I-1, scenario E2: an elevated released entry that has since mined does not force an unneeded reserve", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
+    const l = alice.daemon.handle(id);
+    const sender = l.sessionSender;
+    const F = 1_500_000_000n;
+    d.currentFeePerGas = () => Promise.resolve(F);
+    const gas = 21_000n;
+    const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    let bumpedFee: bigint;
+    try {
+      const standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      await waitOrReplace(alice.daemon.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, {
+        timeoutMs: 100,
+        maxReplacements: 5,
+      }).catch(() => undefined);
+      const stuckBefore = sender.tracked()[0];
+      expect(stuckBefore.state).toBe("released");
+      const lastFee = stuckBefore.lastFees.maxFeePerGas!;
+      bumpedFee = (lastFee * 1125n + 999n) / 1000n;
+      expect(bumpedFee).toBeGreaterThan(reserve); // genuinely elevated over the plain reserve, same as probe E2
+      await testClient.mine({ blocks: 1 }); // it lands anyway
+      // The last of its own replacements, not the original standInHash -- each replacement evicts the one before
+      // it from the mempool (same nonce, higher fee), so only the last one can still be the one that mines.
+      const latestHash = stuckBefore.hashes.at(-1)!;
+      expect((await alice.daemon.client.getTransactionReceipt({ hash: latestHash })).status).toBe("success");
+    } finally {
+      await testClient.setAutomine(true);
+    }
+    expect(sender.tracked().map((t) => t.state)).toEqual(["released"]); // still stale here
+    // Chosen so the ELEVATED reserve would look dust-level (value == gas*F), but the PLAIN reserve leaves it
+    // clearly, plainly sweepable -- exactly probe E2's own numbers.
+    const B = gas * (bumpedFee + F);
+    await setEthBalance(sender.address, B);
+    d.sweepChannel = original;
+    await waitFor(() => l.record.swept !== undefined, 20_000, "swept for real, not abandoned over a stale bumped entry");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptAmount).toBe(B - gas * reserve); // the plain reserve: refresh() found no live stuck entry
+  });
+
+  it("fix round 3, I-1(c), scenario E3: a sweep whose wait gave up (giveUpAt) but that lands anyway is recorded as swept, not lost", async () => {
+    const { alice, bob, id } = await matched();
+    await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    const walletBefore = await d.client.getBalance({ address: alice.address });
+    try {
+      const first = await d.sweep(id, { budgetMs: 300 });
+      expect(first.results[0].swept).toMatch(/^error:/); // gave up waiting -- but it was already sent
+      expect(l.sweep.pendingTx?.length).toBeGreaterThan(0);
+    } finally {
+      await testClient.setAutomine(true);
+      await testClient.mine({ blocks: 1 }); // the abandoned-on wait's own send lands anyway, late
+    }
+    const second = await d.sweep(id);
+    expect(second.results[0].swept).toMatch(/^0x[0-9a-f]+$/); // recognized as the real sweep, not "dust"
+    expect(l.record.swept).toBe(true);
+    expect(l.sweep.pendingTx).toBeUndefined();
+    expect(await d.client.getBalance({ address: alice.address })).toBeGreaterThan(walletBefore);
+  });
+
+  it("fix round 3, I-1(b), a genuinely still-stuck (not stale) entry does not block a plainly dust balance either", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
+    const l = alice.daemon.handle(id);
+    const sender = l.sessionSender;
+    const F = 1_500_000_000n;
+    d.currentFeePerGas = () => Promise.resolve(F);
+    const gas = 21_000n;
+    const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+
+    const testClient = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
+    await testClient.setAutomine(false);
+    try {
+      const standInHash = await sender.send({ to: sender.address, data: "0x", value: 0n, gas: 100_000n });
+      const ac = new AbortController();
+      ac.abort();
+      await waitOrReplace(alice.daemon.client, sender, { to: sender.address, data: "0x", value: 0n }, standInHash, { signal: ac.signal }).catch(
+        () => undefined,
+      );
+      expect(sender.tracked().map((t) => t.state)).toEqual(["released"]); // genuinely still stuck: never mined below
+      const boundary = gas * (reserve + F) - 1n; // plain dust
+      await setEthBalance(sender.address, boundary);
+      d.sweepChannel = original;
+      await waitFor(() => l.record.swept !== undefined, 20_000, "declined as dust despite a genuinely live stuck entry");
+      expect(l.record.swept).toBe("dust");
+    } finally {
+      await testClient.setAutomine(true);
+      await testClient.mine({ blocks: 1 }); // lands the never-mined stand-in so the shared anvil's mempool is clean
+    }
   });
 });
 

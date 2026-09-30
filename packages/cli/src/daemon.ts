@@ -17,6 +17,8 @@ import {
   TxInsufficientFundsError,
   TxNonceUsedError,
   TxReceiptMissingError,
+  TxStuckError,
+  TxWaitAbortedError,
   ZERO_HASH,
   channelId as computeChannelId,
   chunkRanges,
@@ -167,12 +169,17 @@ type SweepQueueEntry = {
   busy: boolean;
 };
 
-/** Shared shape of a channel's (or sweep-queue entry's) sweep back-off state. `pendingTx` (fix round 2, minor 2)
- *  is set when a sweep attempt's own `waitOrReplace` threw `TxReceiptMissingError`: the node stopped serving that
- *  transaction's receipt after treating it as mined, so the *next* attempt reads that hash's receipt first --
- *  before doing anything else -- and recovers a swept amount/tx from it rather than losing track of money that
- *  already arrived (and, worse, sending again or recording a spurious "dust"). */
-type SweepBackoff = { blockedUntil: number; backoffMs: number; attempts: number; pendingTx?: Hex };
+/** Shared shape of a channel's (or sweep-queue entry's) sweep back-off state. `pendingTx` (fix round 2, minor 2;
+ *  fix round 3, I-1(c): a list, not one hash) is set when a sweep attempt's own `waitOrReplace` gave up on a
+ *  transaction it cannot fully rule out having landed anyway -- `TxReceiptMissingError` (the node stopped serving
+ *  a receipt after treating it as mined), `TxStuckError` or `TxWaitAbortedError` (the wait gave up -- on
+ *  `giveUpAt`, or `stop()` -- while the transaction, or one of its fee-bumped replacements, could still land
+ *  later). Every hash `waitOrReplace` ever sent for that one intent (the original plus every replacement) is
+ *  kept, since any one of them, not just the last, could be the one that mines. The *next* attempt reads all of
+ *  their receipts first -- before doing anything else -- and recovers a swept amount/tx from whichever one
+ *  succeeded, rather than losing track of money that already arrived (and, worse, sending again or recording a
+ *  spurious "dust"). */
+type SweepBackoff = { blockedUntil: number; backoffMs: number; attempts: number; pendingTx?: Hex[] };
 
 /** Plan 5 fix round: what one sweep attempt on a session key resolved to. `"skipped"` covers every reason the
  *  attempt never actually ran (not yet confirmed settled on-chain, a concurrent send in flight, back-off still in
@@ -1219,11 +1226,24 @@ export class ArenaDaemon {
   ): Promise<{ status: "dust" } | { status: "swept"; amount: bigint; hash: Hex }> {
     for (let attempt = 0; ; attempt++) {
       if (this.stopped) throw new Error("stopped");
+      // Fix round 3, I-1(a): tracked() alone never notices a released entry has since mined -- refresh() re-runs
+      // the same prune() send() itself would, so a stale entry (probe E1/E2: released, then explicitly mined,
+      // with nothing of ours ever reading it in between) is gone from tracked() below, not mistaken for a still-
+      // live dead transaction that needs answering for.
+      await sender.refresh();
       const balance = await this.client.getBalance({ address: sender.address });
       const gasLimit = await this.gasForSweep(sender);
       const feePerGas = await this.currentFeePerGas();
       if (feePerGas === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
       const baseReserve = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
+      // Fix round 3, I-1(b): dust is decided against the plain reserve first, regardless of any tracked entry --
+      // a balance this low has nothing worth sending whether or not there is a dead transaction to answer for
+      // (this is the regression Important 5 introduced: it threw/backed off forever here instead, even for a
+      // balance that was independently already dust). Only once the plain reserve leaves it genuinely sweepable
+      // does a stuck entry's own, possibly higher, reserve requirement get a say -- and only then, if *that*
+      // alone pushes the value back down to the dust line, does this throw (back off, retry) rather than send.
+      const plainValue = balance - gasLimit * baseReserve;
+      if (plainValue <= gasLimit * feePerGas) return { status: "dust" };
       const stuck = sender
         .tracked()
         .filter((t) => t.state === "released")
@@ -1234,13 +1254,10 @@ export class ArenaDaemon {
       const stuckReserve = !stuck ? 0n : hasKnownFee(stuck.lastFees) ? bumpFeePerGas(feePerGasOf(stuck.lastFees)) : 2n * feePerGas;
       const reservePerGas = stuck && stuckReserve > baseReserve ? stuckReserve : baseReserve;
       const value = balance - gasLimit * reservePerGas;
-      if (value <= gasLimit * feePerGas) {
-        if (stuck) {
-          throw new Error(
-            `a dead transaction on this key (nonce ${stuck.nonce}, last fee ${feePerGasOf(stuck.lastFees)}) needs more reserve than this balance affords to replace`,
-          );
-        }
-        return { status: "dust" };
+      if (stuck && stuckReserve > baseReserve && value <= gasLimit * feePerGas) {
+        throw new Error(
+          `a dead transaction on this key (nonce ${stuck.nonce}, last fee ${feePerGasOf(stuck.lastFees)}) needs more reserve than this balance affords to replace`,
+        );
       }
       const req = { to: this.wallet.address, data: "0x" as Hex, value, gas: gasLimit };
       let hash: Hex;
@@ -1339,7 +1356,14 @@ export class ArenaDaemon {
       if (err instanceof TxReceiptMissingError) {
         // Minor 2: remember this hash so the very next attempt (see the top of this method) checks it before
         // trying anything else -- the transaction is most likely already mined; only the receipt went missing.
-        backoff.pendingTx = err.hash;
+        backoff.pendingTx = [err.hash];
+      } else if (err instanceof TxStuckError || err instanceof TxWaitAbortedError) {
+        // Fix round 3, I-1(c): probe E3 -- a sweep this wait gave up on (a tight giveUpAt, or stop()) can still
+        // land later: any one of the original send or its fee-bumped replacements might mine after this daemon
+        // stopped watching for it. Remembering all of them (not just the last) is what lets the next attempt
+        // recognise whichever one actually wins, instead of reading a fresh, near-zero balance and recording a
+        // spurious "dust" over what really was a successful, if late, sweep.
+        backoff.pendingTx = err.hashes;
       }
       this.log(`channel ${record.channelId}: sweep failed (retried with back-off): ${errorText(err)}`);
       backoff.attempts++;
@@ -1383,12 +1407,27 @@ export class ArenaDaemon {
    *  timer-driven `void this.mainPass()` has no catch above; Node exits the whole process on that unhandled
    *  rejection. Any failure not otherwise classified below is treated as "pending" -- try again next attempt --
    *  never charged as a failed attempt for what may just be a slow node. */
-  private async recoverPendingSweepTx(hash: Hex): Promise<"pending" | "failed" | { amount: bigint; hash: Hex }> {
+  /** Fix round 3, I-1(c): `hashes` is the original send plus every fee-bumped replacement `waitOrReplace` sent
+   *  for the one intent this backoff gave up on -- at most one of them can ever mine (they share a nonce), but
+   *  it is never necessarily the last one this daemon happened to be watching when it gave up, so every one of
+   *  them is checked. */
+  private async recoverPendingSweepTx(hashes: Hex[]): Promise<"pending" | "failed" | { amount: bigint; hash: Hex }> {
     try {
-      let receipt: { status: "success" | "reverted" };
-      try {
-        receipt = await this.client.getTransactionReceipt({ hash });
-      } catch {
+      let anyKnown = false;
+      for (const hash of hashes) {
+        let receipt: { status: "success" | "reverted" } | null;
+        try {
+          receipt = await this.client.getTransactionReceipt({ hash });
+        } catch {
+          receipt = null;
+        }
+        if (receipt) {
+          if (receipt.status === "success") {
+            const tx = await this.client.getTransaction({ hash });
+            return { amount: tx.value, hash };
+          }
+          continue; // this one reverted (or never existed) -- another hash in the list may still have landed
+        }
         // Fix round 3, I-2: probe F2 -- a receipt that will never exist (the transaction was replaced, or the
         // node's mempool simply forgot it) previously meant "pending" forever: every attempt from here on
         // skipped, the channel's session gas never swept, with no way out short of a restart. `getTransaction`
@@ -1397,13 +1436,11 @@ export class ArenaDaemon {
           if (err instanceof TransactionNotFoundError) return null;
           throw err;
         });
-        return known ? "pending" : "failed";
+        if (known) anyKnown = true;
       }
-      if (receipt.status !== "success") return "failed";
-      const tx = await this.client.getTransaction({ hash });
-      return { amount: tx.value, hash };
+      return anyKnown ? "pending" : "failed";
     } catch (err) {
-      this.log(`sweep recovery: ${errorText(err)} looking up ${hash} (retried next attempt)`);
+      this.log(`sweep recovery: ${errorText(err)} looking up ${hashes.length} pending hash(es) (retried next attempt)`);
       return "pending";
     }
   }
