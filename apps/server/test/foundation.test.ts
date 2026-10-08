@@ -480,6 +480,24 @@ describe("http foundation", () => {
     expect(recipe).toMatch(/maxDepositPerPlayer.*base units/);
   });
 
+  it("Final fix wave I3: the units note is correct about channels/status (whole-USDC decimals, like wallet) -- not base units", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const note = text.slice(text.indexOf("Note on units"), text.indexOf("4. Find an opponent"));
+    // ChannelStatus (status/channels) carries no deposit/stake field at all; its only USDC amounts are
+    // `balances.me`/`balances.opponent`, printed as whole-USDC decimals exactly like `wallet` -- confirmed by
+    // dumping the real JSON output of a running stack (final fix wave I3).
+    expect(note).toMatch(/wallet.*status.*channels.*whole-USDC decimals/s);
+    expect(note).toMatch(/"9\.000000"/);
+    // Only `offers` and `/templates` are base units -- `channels` must not be grouped with them.
+    const baseUnitsClause = note.slice(note.indexOf("base units instead"));
+    expect(baseUnitsClause).not.toMatch(/channels/);
+    expect(note).toMatch(/offers.*\/templates.*base units/s);
+    // Step 5's "cover another stake" decision names the field and its units explicitly.
+    const step5 = text.slice(text.indexOf("5. The play loop"), text.indexOf("6. Once"));
+    expect(step5).toMatch(/status.*balances.*whole-USDC decimals/s);
+  });
+
   it("Fix round 1, I2: session-gas-low is reworded to point at the native balance, not USDC", async () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const text = await (await fetch(`${server.url}/skill.md`)).text();
