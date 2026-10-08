@@ -436,6 +436,78 @@ describe("http foundation", () => {
     expect(text).toMatch(/never.*(pasted|shared)|(pasted|shared).*never/i);
   });
 
+  it("Plan 5.5 Task 3: skill.md's first section is the play-N-games recipe, with every step's command", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const recipeAt = text.indexOf("## Recipe: play N games at $X per game");
+    expect(recipeAt).toBeGreaterThan(-1);
+    // It's the *first* `##` section -- nothing else at that heading level comes before it.
+    expect(text.slice(0, recipeAt)).not.toMatch(/^## /m);
+    const recipe = text.slice(recipeAt, text.indexOf("## Setup (once)"));
+    for (const fragment of [
+      "arena init --server",
+      "arena daemon",
+      "arena channels",
+      "arena wallet",
+      "arena offers",
+      "arena accept <offerId>",
+      "arena offer --deposit",
+      "arena wait",
+      "arena status",
+      "arena move <SAN>",
+      "arena next-game",
+      "arena close",
+      "status.controller",
+      "Finalized",
+      "arena challenge",
+      "human-must-move",
+      "session-gas-low",
+    ]) {
+      expect(recipe).toContain(fragment);
+    }
+  });
+
+  it("Plan 5.5 Task 3 (ruling 2): the recipe's daemon-log path is quoted and ARENA_HOME-aware", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toContain('"${ARENA_HOME:-$HOME/.arena}/daemon.log"');
+  });
+
+  it("Plan 5.5 Task 3 (ruling 3): the recipe sizes the deposit from /templates' limits.maxDepositPerPlayer", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toMatch(/limits\.maxDepositPerPlayer/);
+    expect(text).toMatch(/min\(N.{1,3}X, cap\)/);
+    expect(text).toMatch(/second channel/i);
+  });
+
+  it("Plan 5.5 Task 3 (ruling 4): the recipe's commands always use cfg.cliCommand, never a hardcoded \"arena\"", async () => {
+    server = await startServer(testConfig({ cliCommand: "/tmp/agent-onboarding-test/bin/my-arena" }), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toContain("/tmp/agent-onboarding-test/bin/my-arena init --server");
+    expect(text).toContain("/tmp/agent-onboarding-test/bin/my-arena wallet");
+    // The only mention of the bare word "arena" left anywhere is the product name in the title.
+    const strayArena = text
+      .split("\n")
+      .filter((line) => /\barena\b/i.test(line) && !line.includes("/tmp/agent-onboarding-test/bin/my-arena"));
+    expect(strayArena).toEqual(["# Agent Chess Arena"]);
+  });
+
+  it("Plan 5.5 Task 3 (ruling 1): the index page addresses an agent above the table, and llms.txt does on its first line", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const html = await (await fetch(`${server.url}/`)).text();
+    const agentLineAt = html.indexOf("AI agent?");
+    const tableAt = html.indexOf("<table>");
+    expect(agentLineAt).toBeGreaterThan(-1);
+    expect(tableAt).toBeGreaterThan(-1);
+    expect(agentLineAt).toBeLessThan(tableAt);
+    expect(html).toMatch(/href="\/skill\.md"/);
+
+    const llms = await (await fetch(`${server.url}/llms.txt`)).text();
+    const firstLine = llms.split("\n")[1]; // line 0 is the "# Agent Chess Arena" title
+    expect(firstLine).toMatch(/^> AI agent\?.*skill\.md/);
+  });
+
   it("Task 2 (spec §13): /templates publishes the hub's current launch limits", async () => {
     const chain = new FakeChain();
     chain.hubLimits = { maxDepositPerPlayer: 10_000_000n, maxCommittedEscrow: 1_000_000_000n, committedEscrow: 500_000n, paused: true };
