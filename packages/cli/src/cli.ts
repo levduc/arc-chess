@@ -1,5 +1,6 @@
 import { formatUnits, parseUnits, type Address, type Hex } from "viem";
 import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
+import { runBot } from "./bot.js";
 import {
   defaultHome,
   initHome,
@@ -35,6 +36,10 @@ const USAGE = `usage: arena <command> [options]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
   faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
+  bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
+      (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
+       agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
+       sometimes a check or a capture, else a random move. Refuses any chain but 31337 unless --allow-real-chain.)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
@@ -167,6 +172,7 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
     const a = argv[i];
     if (a === "--offer-draw") flags.set("offer-draw", true);
     else if (a === "--no-faucet") flags.set("no-faucet", true);
+    else if (a === "--allow-real-chain") flags.set("allow-real-chain", true);
     else if (a.startsWith("--")) {
       const v = argv[i + 1];
       if (v === undefined || v.startsWith("--")) throw new UsageError(`missing value for ${a}`);
@@ -448,6 +454,68 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       io.out(JSON.stringify(payload, null, 2));
       return 0;
+    }
+
+    if (cmd === "bot") {
+      // Plan 5.5 Task 2: house bots are dev tooling -- refuse any chain but 31337 up front, before the home lock
+      // or any RPC call, unless the caller explicitly overrides it.
+      const cfg = loadConfig(home);
+      if (cfg.chainId !== 31337 && !flags.has("allow-real-chain")) {
+        throw new UsageError(
+          `refusing to run "arena bot" against chain ${cfg.chainId}: house bots are dev tooling for chain 31337 ` +
+            `only. Pass --allow-real-chain to run one on a real chain anyway.`,
+        );
+      }
+      const amountOrDefault = (name: string, def: string): bigint => {
+        const v = flag(name) ?? def;
+        if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(v)) {
+          throw new UsageError(`--${name} must be a non-negative USDC amount with at most 6 decimal places`);
+        }
+        return parseUnits(v, 6);
+      };
+      const offers = Number(flag("offers") ?? "1");
+      if (!Number.isInteger(offers) || offers < 0) throw new UsageError("--offers must be a non-negative integer");
+      const idleCloseSeconds = Number(flag("idle-close-seconds") ?? "120");
+      if (!Number.isFinite(idleCloseSeconds) || idleCloseSeconds < 0) {
+        throw new UsageError("--idle-close-seconds must be a non-negative number");
+      }
+      const offerTimeout = flag("timeout") !== undefined ? BigInt(flag("timeout")!) : undefined;
+
+      const proc = await startDaemonProcess(home, { log: io.err });
+      io.out(
+        JSON.stringify({
+          ...daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address }),
+          bot: true,
+        }),
+      );
+
+      const controller = new AbortController();
+      const stop = () => {
+        process.removeListener("SIGINT", stop);
+        process.removeListener("SIGTERM", stop);
+        controller.abort();
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+
+      await runBot(proc.daemon, {
+        usdc: cfg.usdc,
+        deposit: amountOrDefault("deposit", "10"),
+        stake: amountOrDefault("stake", "1"),
+        offers,
+        offerTimeout,
+        idleCloseMs: idleCloseSeconds * 1000,
+        log: io.err,
+        signal: controller.signal,
+      }).catch((err) => io.err(`bot: ${err instanceof Error ? err.message : String(err)}`));
+
+      await proc.stop();
+      // Plan 5.5 Task 2: `daemon.wait()` polls in up-to-1s steps against its own `timeoutMs` (default 15s); an
+      // abandoned call from the moment `controller.abort()` fired keeps a harmless timer alive until it elapses
+      // on its own. `arena.mjs` never calls process.exit() itself (it just sets `process.exitCode`), so without
+      // this the process would otherwise linger for that long after a clean shutdown -- this command is the only
+      // one with such a loop, so forcing the exit here (after every bit of cleanup above has already run) is safe.
+      process.exit(0);
     }
 
     const channel = flag("channel");

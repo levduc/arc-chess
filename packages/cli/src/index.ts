@@ -4,6 +4,7 @@ export * from "./fileStore.js";
 export * from "./records.js";
 export * from "./daemon.js";
 export * from "./status.js";
+export * from "./bot.js";
 export * from "./api.js";
 export * from "./host.js";
 export * from "./lock.js";

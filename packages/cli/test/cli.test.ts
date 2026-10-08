@@ -196,4 +196,20 @@ describe("arena CLI", () => {
     expect(await runCli(["faucet"], down.io)).toBe(1);
     expect(down.err.join("\n")).toMatch(/cannot reach/);
   });
+
+  it("Plan 5.5 Task 2: arena bot refuses a non-31337 chain without --allow-real-chain, before touching the daemon", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    const mainnetInit = INIT.map((v) => (v === "31337" ? "1" : v));
+    await runCli(mainnetInit, io(home).io);
+    expect(loadConfig(home).chainId).toBe(1);
+
+    const refused = io(home);
+    // No responses queued: if this reached startDaemonProcess (an RPC call) or io.fetch at all, the stub below
+    // would throw on an empty queue instead of this returning the clear usage error.
+    (refused.io as { fetch: typeof fetch }).fetch = (async () => {
+      throw new Error("must not reach the network");
+    }) as unknown as typeof fetch;
+    expect(await runCli(["bot"], refused.io)).toBe(2);
+    expect(refused.err.join("\n")).toMatch(/refusing to run "arena bot".*chain 1.*--allow-real-chain/s);
+  });
 });
