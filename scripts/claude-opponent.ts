@@ -14,9 +14,10 @@
  *
  * Reuses the same sandbox builders as `tests/system/llm-games.ts` (`tests/system/claude-sandbox.ts`): a narrow
  * `--allowedTools` list (the `arena` CLI, plus `curl` pinned to `--server`'s origin) and a minimal environment.
- * The allowed tools must include running the `cliCommand` wrapper the server advertises; Task 3 provides
- * `<dir>/bin/arena` (written by `dev:up`). Until then, `--cli` accepts an explicit path, defaulting to
- * `<repo>/.arena-dev/bin/arena`.
+ * The allowed tools must include running the `cliCommand` wrapper the server advertises -- `<dir>/bin/arena`,
+ * written by `dev:up` (Plan 5.5 Task 3, `writeArenaWrapper` in `scripts/dev-up.ts`) and set as the server's
+ * `cliCommand`, so `skill.md` shows this exact path. `--cli` accepts an explicit path too, defaulting to
+ * `<repo>/.arena-dev/bin/arena` (the default `--dir`'s wrapper).
  *
  * This spends real Claude usage -- never run it as part of a test or CI. Tests that touch this file must verify
  * only `--help`/argument parsing (see the Plan 5.5 Task 2 report); `main()` only runs when this file is executed

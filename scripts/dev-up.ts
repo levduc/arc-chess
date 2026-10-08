@@ -22,7 +22,7 @@
  * pass a fresh `--dir`, and later runs will carry their own marker from then on.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
@@ -34,6 +34,22 @@ const CONTRACTS_DIR = join(REPO_ROOT, "contracts");
 const CLI_BIN = join(REPO_ROOT, "packages/cli/bin/arena.mjs");
 const SERVER_BIN = join(REPO_ROOT, "apps/server/bin/arena-server.mjs");
 const DEFAULT_DEV_DIR = join(REPO_ROOT, ".arena-dev");
+
+/**
+ * Plan 5.5 Task 3: writes `<dir>/bin/arena`, an executable shell wrapper around `node packages/cli/bin/arena.mjs`,
+ * and returns its absolute path. This is the command `skill.md` shows a fresh agent (via the server's
+ * `cliCommand`): a bare absolute path it can run from any directory, with no PATH setup and no assumption that the
+ * agent's shell has `node` on PATH at all -- `process.execPath` is spliced in instead of a bare `node`, since a
+ * fresh non-interactive shell (no nvm, no rc file sourced) is exactly the case this exists for.
+ */
+function writeArenaWrapper(dir: string): string {
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const wrapperPath = join(binDir, "arena");
+  writeFileSync(wrapperPath, `#!/bin/sh\nexec "${process.execPath}" "${CLI_BIN}" "$@"\n`);
+  chmodSync(wrapperPath, 0o755);
+  return wrapperPath;
+}
 
 // Anvil's well-known default account 0, derived from its built-in test mnemonic ("test test test test test test
 // test test test test test junk"). Anvil pre-funds it with ETH at startup. Local-dev only: never use this key
@@ -234,6 +250,7 @@ async function main(): Promise<void> {
   writeFileSync(join(DEV_DIR, DEV_DIR_MARKER), `${new Date().toISOString()}\n`);
   const playersDir = join(DEV_DIR, "players");
   mkdirSync(playersDir, { recursive: true });
+  const wrapperPath = writeArenaWrapper(DEV_DIR);
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
@@ -285,7 +302,9 @@ async function main(): Promise<void> {
     fundingWindow: "3600",
     offerMaxLifetime: "86400",
     defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" },
-    cliCommand: "arena",
+    // Plan 5.5 Task 3: the wrapper's absolute path, not the bare string "arena" -- skill.md then shows a command
+    // a fresh agent can run from any directory with no PATH setup (see writeArenaWrapper).
+    cliCommand: wrapperPath,
     audit: "unaudited (development build)",
     indexer: { pollMs: 1_000, chunkBlocks: 1000, startBlock: 0 },
     limits: {},
@@ -396,6 +415,8 @@ async function main(): Promise<void> {
   process.stderr.write(`  owner/deployer private key (LOCAL DEV ONLY, never use for real funds): ${OWNER_KEY}\n`);
   process.stderr.write(`  anvil:  ${rpcUrl}\n`);
   process.stderr.write(`  server: ${serverUrl}\n\n`);
+  process.stderr.write(`  arena CLI wrapper: ${wrapperPath}\n`);
+  process.stderr.write(`  optional: export PATH=${join(DEV_DIR, "bin")}:$PATH\n\n`);
   if (numHouseBots > 0) {
     process.stderr.write(`  ${numHouseBots} house bot(s) are up and have standing offers open (logs under ${logsDir}).\n\n`);
     process.stderr.write(
