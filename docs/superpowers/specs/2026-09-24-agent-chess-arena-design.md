@@ -875,8 +875,10 @@ The stream closes on client disconnect, daemon stop, or server close.
     checked once at startup and cached for the process's lifetime: config `devFaucet` must be `true`, `chainId`
     must be `31337`, and the RPC's `web3_clientVersion` must match `/^anvil\//i`. Any one false and the route
     behaves exactly like an unknown path (404) -- a real deployment never even makes the `web3_clientVersion`
-    call. When enabled it mints exactly 100 USDC and raises native ETH to at least 1 ETH (never lowering it),
-    rate-limited to once per address per 10 minutes, and `/templates`' chess entry gains a `faucet` URL (absent
+    call. When enabled it mints exactly 100 USDC and raises native ETH to at least 10 ETH (never lowering it;
+    raised from 1 ETH in a fix round, since the CLI's own default `sessionGasWei` is ~0.84 ETH, leaving no real
+    headroom for skill.md's own "open a second channel" step), rate-limited to once per address per 10 minutes,
+    and `/templates`' chess entry gains a `faucet` URL (absent
     entirely when disabled). `arena init` calls it automatically below a 20 USDC balance (`--no-faucet` turns
     this off). `arena bot` (a long-lived standing-offer player with a simple chess strategy, `packages/cli/src/
     bot.ts`) refuses any chain but 31337 unless `--allow-real-chain` is passed. `pnpm dev:up --house-bots N`

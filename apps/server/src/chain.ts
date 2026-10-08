@@ -144,8 +144,12 @@ export class RpcChainReader implements ChainReader {
 
 /** Plan 5.5 Task 1: 100 USDC (6 decimals), the fixed amount every `/faucet` request mints. */
 export const FAUCET_USDC_AMOUNT = 100_000_000n;
-/** The native balance `/faucet` guarantees at least: 1 ETH (never lowered if already higher). */
-export const FAUCET_MIN_NATIVE_WEI = 10n ** 18n;
+/** The native balance `/faucet` guarantees at least: 10 ETH (never lowered if already higher). Raised from 1
+ *  ETH (Plan 5.5 Task 3 fix round 1, controller add): the default `sessionGasWei` a fresh `arena init` derives
+ *  is itself ~0.84 ETH (4 x 2.1M gas x the CLI's 100 gwei default fee ceiling), which left a 1 ETH top-up with
+ *  no real headroom for the recipe's "close, then open a second channel" step once transaction gas and a
+ *  second channel's own session key are accounted for. */
+export const FAUCET_MIN_NATIVE_WEI = 10n ** 19n;
 
 /**
  * Plan 5.5 Task 1: funds `to` on a local Anvil chain -- 100 USDC minted via MockUSDC's `mint`, sent with

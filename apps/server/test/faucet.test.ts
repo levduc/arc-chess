@@ -87,7 +87,7 @@ describe("dev faucet guard (stub chain)", () => {
 });
 
 describe("dev faucet funding (real Anvil)", () => {
-  it("mints 100 USDC and raises native to at least 1 ETH, waits for the receipt, and rejects a repeat within 10 minutes", async () => {
+  it("mints 100 USDC and raises native to at least 10 ETH, waits for the receipt, and rejects a repeat within 10 minutes", async () => {
     const env = await deployArena();
     server = await startServer(testConfig({ rpcUrl: RPC, chainId: 31337, hub: env.hub, usdc: env.usdc, rules: env.rules, devFaucet: true }));
     const to = freshAddress();
@@ -114,13 +114,14 @@ describe("dev faucet funding (real Anvil)", () => {
     const env = await deployArena();
     server = await startServer(testConfig({ rpcUrl: RPC, chainId: 31337, hub: env.hub, usdc: env.usdc, rules: env.rules, devFaucet: true }));
     const to = freshAddress();
-    const twoEth = 2n * 10n ** 18n;
-    await setEthBalance(to, twoEth);
+    // Above FAUCET_MIN_NATIVE_WEI (10 ETH): the faucet must leave this exactly as-is, not raise or lower it.
+    const twentyEth = 20n * 10n ** 18n;
+    await setEthBalance(to, twentyEth);
 
     const res = await postFaucet(server.url, to);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { native: string };
-    expect(BigInt(body.native)).toBe(twoEth);
+    expect(BigInt(body.native)).toBe(twentyEth);
   });
 
   it("a request from a different address is funded independently (no cross-address rate limiting)", async () => {

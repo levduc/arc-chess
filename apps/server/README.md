@@ -45,8 +45,10 @@ false and the route behaves exactly like an unknown path (404) — a real deploy
 non-31337 chain) never even makes the `web3_clientVersion` RPC call. When enabled, `/templates`' chess entry
 gains a `faucet` URL; a real deployment's `/templates` never has that key at all.
 
-`POST {address}` mints exactly 100 USDC to `address` and raises its native balance to at least 1 ETH (never
-lowering an already-higher balance), rate-limited to once per address per 10 minutes (`429` with
+`POST {address}` mints exactly 100 USDC to `address` and raises its native balance to at least 10 ETH (never
+lowering an already-higher balance; raised from 1 ETH so a fresh wallet still has headroom for a second
+channel's session gas after the first channel's own, default ~0.84 ETH, `sessionGasWei`), rate-limited to once
+per address per 10 minutes (`429` with
 `retryAfterSeconds` otherwise). `arena init` calls it automatically when the wallet's USDC balance is below 20
 (`--no-faucet` turns this off); `arena faucet` calls it explicitly. `pnpm dev:up` always sets `devFaucet: true`
 (its Anvil is always chain 31337).
