@@ -24,6 +24,19 @@ const INIT = [
 ];
 
 describe("arena CLI", () => {
+  it("M1: a generic command names the daemon port and the recipe step to fix it, instead of a bare fetch error", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const t = io(home);
+    (t.io as { fetch: typeof fetch }).fetch = (async () => {
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+    expect(await runCli(["offers"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toMatch(/127\.0\.0\.1:7010/);
+    expect(t.err.join("\n")).toMatch(/arena daemon/);
+    expect(t.err.join("\n")).toMatch(/recipe step 2/);
+  });
+
   it("init writes the home", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     const t = io(home);

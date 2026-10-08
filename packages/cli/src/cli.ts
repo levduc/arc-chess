@@ -688,11 +688,21 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     const cfg = loadConfig(home);
     const token = loadToken(home);
-    const res = await io.fetch(`http://127.0.0.1:${cfg.port}${request.path}`, {
-      method: request.method,
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
-      body: request.body === undefined ? undefined : JSON.stringify(request.body),
-    });
+    let res: Response;
+    try {
+      res = await io.fetch(`http://127.0.0.1:${cfg.port}${request.path}`, {
+        method: request.method,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: request.body === undefined ? undefined : JSON.stringify(request.body),
+      });
+    } catch (err) {
+      // M1: a bare "fetch failed" named neither the port nor what to do about it. Mirrors the board command's
+      // own wording (skill.md's recipe step 2 starts the daemon).
+      throw new Error(
+        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "arena daemon" (skill.md's recipe step 2), ` +
+          `then retry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     const payload = (await res.json()) as unknown;
     if (!res.ok) {
       io.err(`error: ${(payload as { error?: string }).error ?? res.statusText}`);
