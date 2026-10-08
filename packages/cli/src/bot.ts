@@ -101,7 +101,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 async function maintainOffers(
   daemon: ArenaDaemon,
   opts: Pick<BotOptions, "usdc" | "deposit" | "stake" | "offers" | "offerTimeout">,
-  rng: Rng,
   log: (line: string) => void,
   state: { fundsShort: boolean },
 ): Promise<void> {
@@ -141,7 +140,6 @@ async function maintainOffers(
     log("bot: USDC balance recovered; posting standing offers again");
   }
   if (posted > 0) state.fundsShort = false;
-  void rng; // reserved: a future tie-break between otherwise-identical offer terms
 }
 
 type GameOverMark = { gameIndex: number; since: number };
@@ -230,7 +228,7 @@ export async function runBot(daemon: ArenaDaemon, opts: BotOptions): Promise<voi
   while (!signal?.aborted) {
     if (Date.now() - lastOfferCheck >= offerRecheckMs) {
       lastOfferCheck = Date.now();
-      await maintainOffers(daemon, opts, rng, log, offerState).catch((err) => log(`bot: standing-offer check failed: ${errorText(err)}`));
+      await maintainOffers(daemon, opts, log, offerState).catch((err) => log(`bot: standing-offer check failed: ${errorText(err)}`));
       if (signal?.aborted) break;
     }
 

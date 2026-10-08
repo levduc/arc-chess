@@ -490,13 +490,19 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       );
 
       const controller = new AbortController();
+      // Plan 5.5 Task 2: `process.on` (not `once`), and idempotent -- a process group signal (a terminal Ctrl-C,
+      // or dev-up's own teardown sending SIGTERM moments after its SIGINT reaches this process too) can deliver
+      // more than one. A `once` handler that removes itself leaves the *second* signal with no listener at all,
+      // so Node's default action terminates the process immediately -- mid `proc.stop()` (the daemon, the API
+      // server, the home lock) rather than after it finishes cleanly.
+      let stopping = false;
       const stop = () => {
-        process.removeListener("SIGINT", stop);
-        process.removeListener("SIGTERM", stop);
+        if (stopping) return;
+        stopping = true;
         controller.abort();
       };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
 
       await runBot(proc.daemon, {
         usdc: cfg.usdc,
