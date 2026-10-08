@@ -452,11 +452,11 @@ describe("http foundation", () => {
       "arena offers",
       "arena accept <offerId>",
       "arena offer --deposit",
-      "arena wait",
-      "arena status",
-      "arena move <SAN>",
-      "arena next-game",
-      "arena close",
+      "arena wait --channel <channelId>",
+      "arena status --channel <channelId>",
+      "arena move <SAN> --channel <channelId>",
+      "arena next-game --channel <channelId>",
+      "arena close --channel <channelId>",
       "status.controller",
       "Finalized",
       "arena challenge",
@@ -465,6 +465,29 @@ describe("http foundation", () => {
     ]) {
       expect(recipe).toContain(fragment);
     }
+  });
+
+  it("Fix round 1, I1: the recipe states which commands report USDC in base units vs whole-USDC decimals", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const recipe = text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("## Setup (once)"));
+    expect(recipe).toMatch(/base units/);
+    expect(recipe).toMatch(/whole-USDC decimals/);
+    expect(recipe).toMatch(/"1000000"/); // the worked example: $1 in base units
+    // The three comparisons the review called out each say which units they use.
+    expect(recipe).toMatch(/stakePerGame.*equals.*1000000.*base/);
+    expect(recipe).toMatch(/deposit.*at least.*1000000.*base/);
+    expect(recipe).toMatch(/maxDepositPerPlayer.*base units/);
+  });
+
+  it("Fix round 1, I2: session-gas-low is reworded to point at the native balance, not USDC", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const line = text.slice(text.indexOf("`session-gas-low`: the channel's"));
+    expect(line).toMatch(/native/);
+    expect(line).toMatch(/arena wallet.*`native`/);
+    expect(line).toMatch(/arena faucet/);
+    expect(line).toMatch(/Arc, gas is paid in USDC/);
   });
 
   it("Plan 5.5 Task 3 (ruling 2): the recipe's daemon-log path is quoted and ARENA_HOME-aware", async () => {

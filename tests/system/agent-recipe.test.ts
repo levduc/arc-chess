@@ -51,11 +51,11 @@ function recipeCommands(wrapper: string): string[] {
     `${wrapper} offers`,
     `${wrapper} accept <offerId>`,
     `${wrapper} offer --deposit`,
-    `${wrapper} wait`,
-    `${wrapper} status`,
-    `${wrapper} move <SAN>`,
-    `${wrapper} next-game`,
-    `${wrapper} close`,
+    `${wrapper} wait --channel <channelId>`,
+    `${wrapper} status --channel <channelId>`,
+    `${wrapper} move <SAN> --channel <channelId>`,
+    `${wrapper} next-game --channel <channelId>`,
+    `${wrapper} close --channel <channelId>`,
     `${wrapper} challenge`,
   ];
 }
