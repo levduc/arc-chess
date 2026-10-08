@@ -19,6 +19,27 @@ const REPO_DEV_DIR = join(REPO_ROOT, ".arena-dev");
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Races `promise` against a deadline, clearing the timer the instant `promise` settles -- unlike a bare
+ *  `Promise.race([promise, sleep(ms).then(() => { throw ... })])` (M11), this never leaves the losing branch's
+ *  timer running: left uncleared, it fires `ms` after the race was already won and throws into a `.then()`
+ *  with nothing left listening, an unhandled rejection `ms` later. Harmless only while each test file runs in
+ *  its own vitest fork. */
+function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 let child: ChildProcess | undefined;
 let deploymentSnapshot: string | null | undefined;
 let devDir: string | undefined;
@@ -188,12 +209,7 @@ describe("pnpm dev:up", () => {
       expect(pid).toBeDefined();
       const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
       process.kill(-pid!, "SIGINT"); // simulates a terminal Ctrl-C: signals dev-up's whole process group
-      await Promise.race([
-        exited,
-        sleep(20_000).then(() => {
-          throw new Error("dev-up did not exit within 20s of SIGINT");
-        }),
-      ]);
+      await withDeadline(exited, 20_000, "dev-up did not exit within 20s of SIGINT");
 
       // Ports free up promptly after teardown; poll briefly for the OS to release them.
       const end = Date.now() + 10_000;
@@ -267,12 +283,7 @@ describe("pnpm dev:up", () => {
       expect(pid).toBeDefined();
       const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
       process.kill(-pid!, "SIGINT"); // simulates a terminal Ctrl-C: signals dev-up's whole process group
-      await Promise.race([
-        exited,
-        sleep(20_000).then(() => {
-          throw new Error("dev-up did not exit within 20s of SIGINT");
-        }),
-      ]);
+      await withDeadline(exited, 20_000, "dev-up did not exit within 20s of SIGINT");
 
       // The house bot's own process (not just dev-up itself) is gone, and both ports free up -- teardown stops
       // everything it started, not just anvil/server. Poll briefly for the OS to catch up.
