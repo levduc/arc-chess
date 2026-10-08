@@ -381,7 +381,15 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
                 const detail = typeof payload.error === "string" ? `: ${payload.error}` : "";
                 throw new Error(`faucet ${template.faucet} answered with status ${res.status}${detail}`);
               }
-              summary.faucet = { usdc: payload.usdc, native: payload.native };
+              // Plan 5.5 Task 3 carry-forward: the server reports raw base-unit decimal strings (matching every
+              // other /templates amount); format them the same way `arena wallet` does rather than passing them
+              // through unchanged, so a human (or agent) reading init's own summary sees "100.000000"/"1.0", not
+              // "100000000"/"1000000000000000000".
+              const decStr = /^[0-9]+$/;
+              if (typeof payload.usdc !== "string" || !decStr.test(payload.usdc) || typeof payload.native !== "string" || !decStr.test(payload.native)) {
+                throw new Error(`faucet ${template.faucet} answered with a malformed amount: ${JSON.stringify(payload)}`);
+              }
+              summary.faucet = { usdc: formatUsdc6(BigInt(payload.usdc)), native: formatNativeBalance(BigInt(payload.native)) };
             } else {
               summary.faucet = "skipped: balance already at or above 20 USDC";
             }

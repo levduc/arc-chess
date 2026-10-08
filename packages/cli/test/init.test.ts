@@ -429,7 +429,9 @@ describe("arena init --server", () => {
     });
     expect(code).toBe(0);
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
-    expect(printed.faucet).toEqual({ usdc: "100000000", native: "1000000000000000000" });
+    // Plan 5.5 Task 3 carry-forward: formatted like `arena wallet` (6-decimal USDC, native in ether), not the
+    // server's raw base-unit strings.
+    expect(printed.faucet).toEqual({ usdc: "100.000000", native: "1.0" });
     expect(calls.some((c) => c.url === "http://host.test/faucet" && c.method === "POST")).toBe(true);
     expect(calls.some((c) => c.method === "eth_call")).toBe(true);
   });
@@ -487,5 +489,25 @@ describe("arena init --server", () => {
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
     expect(printed.faucet).toMatch(/^skipped:/);
     expect(printed.faucet).toMatch(/faucet exploded|500/);
+  });
+
+  it("Plan 5.5 Task 3 carry-forward: a malformed (non-decimal-string) faucet amount is reported as skipped, not thrown", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub } = stubFetch({
+      templates: templatesResponse({ faucet: "http://host.test/faucet" }),
+      faucetBalance: 0n,
+      faucetResponse: { status: 200, body: { address: `0x${"ab".repeat(20)}`, usdc: "not-a-number", native: "1000000000000000000" } },
+    });
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toMatch(/^skipped:/);
+    expect(printed.faucet).toMatch(/malformed amount/);
   });
 });
