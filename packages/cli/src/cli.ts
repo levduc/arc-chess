@@ -378,12 +378,23 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           try {
             const balance = await usdcBalanceOf(io, rpcUrl, usdc, walletAddress);
             if (balance < FAUCET_MIN_USDC_BALANCE) {
+              // M3: the faucet URL comes from the same /templates response as the hub/RPC addresses, but costs
+              // nothing extra to pin -- refuse a faucet whose origin differs from --server's, rather than ever
+              // POSTing the wallet address somewhere else a compromised or careless server named.
+              if (new URL(template.faucet).origin !== new URL(server).origin) {
+                throw new Error(`faucet ${template.faucet} is not on ${server}'s origin; refusing to call it`);
+              }
               let res: Response;
               try {
                 res = await io.fetch(template.faucet, {
                   method: "POST",
                   headers: { "content-type": "application/json" },
                   body: JSON.stringify({ address: walletAddress }),
+                  // M3: a faucet that accepts and then stalls must not hang init forever ("never fails init"
+                  // does not cover a hang), and a redirect is refused outright rather than followed somewhere
+                  // off the pinned origin.
+                  signal: AbortSignal.timeout(30_000),
+                  redirect: "error",
                 });
               } catch (err) {
                 throw new Error(`faucet ${template.faucet} is unreachable: ${err instanceof Error ? err.message : String(err)}`);
@@ -493,13 +504,36 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         io.err(`error: cannot reach ${faucetUrl}: ${err instanceof Error ? err.message : String(err)}`);
         return 1;
       }
-      const payload = (await res.json().catch(() => ({}))) as { error?: string };
+      const payload = (await res.json().catch(() => ({}))) as { error?: string; retryAfterSeconds?: unknown };
       if (!res.ok) {
+        // M2: a 429 carries retryAfterSeconds (the server's own cooldown) -- this is exactly the command
+        // skill.md's session-gas-low troubleshooting sends an agent to, so drop it on the floor here and the
+        // agent has nothing to tell a human but "try again sometime".
+        const retry = res.status === 429 && typeof payload.retryAfterSeconds === "number" ? ` (retry in ${payload.retryAfterSeconds}s)` : "";
         const message = res.status === 404 ? "server advertises no faucet (not a dev server)" : payload.error ?? res.statusText;
-        io.err(`error: ${message}`);
+        io.err(`error: ${message}${retry}`);
         return 1;
       }
-      io.out(JSON.stringify(payload, null, 2));
+      // M2: formatted like `arena wallet`, not the server's raw base-unit strings -- consistent with every
+      // other amount this CLI prints to a human (or agent) rather than to another program.
+      const faucetPayload = payload as unknown as { address?: unknown; usdc?: unknown; native?: unknown };
+      const decStr = /^[0-9]+$/;
+      if (
+        typeof faucetPayload.usdc !== "string" ||
+        !decStr.test(faucetPayload.usdc) ||
+        typeof faucetPayload.native !== "string" ||
+        !decStr.test(faucetPayload.native)
+      ) {
+        io.err(`error: faucet ${faucetUrl} answered with a malformed amount: ${JSON.stringify(payload)}`);
+        return 1;
+      }
+      io.out(
+        JSON.stringify(
+          { address: faucetPayload.address, usdc: formatUsdc6(BigInt(faucetPayload.usdc)), native: formatNativeBalance(BigInt(faucetPayload.native)) },
+          null,
+          2,
+        ),
+      );
       return 0;
     }
 

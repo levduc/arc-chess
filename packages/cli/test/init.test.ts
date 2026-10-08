@@ -466,6 +466,46 @@ describe("arena init --server", () => {
     expect(calls.some((c) => c.method === "eth_call")).toBe(true);
   });
 
+  it("M3: refuses a faucet URL whose origin differs from --server's, without ever calling it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub, calls } = stubFetch({
+      templates: templatesResponse({ faucet: "http://evil.test/faucet" }),
+      faucetBalance: 0n,
+    });
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0); // M3: never fails init, same as any other faucet-skip reason
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toMatch(/^skipped:/);
+    expect(printed.faucet).toMatch(/not on .* origin/);
+    expect(calls.some((c) => c.url.includes("evil.test"))).toBe(false);
+  });
+
+  it("M3: the faucet POST carries a 30s abort signal and refuses to follow a redirect", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    let faucetInit: RequestInit | undefined;
+    const base = stubFetch({ templates: templatesResponse({ faucet: "http://host.test/faucet" }), faucetBalance: 0n });
+    const fetchStub = (async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/faucet")) faucetInit = init;
+      return base.fetchStub(url, init);
+    }) as typeof fetch;
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    expect(faucetInit?.redirect).toBe("error");
+    expect(faucetInit?.signal).toBeInstanceOf(AbortSignal);
+  });
+
   it("Plan 5.5 Task 1: --no-faucet skips auto-funding entirely, with no balance read and no faucet call", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-init-"));
     const { fetchStub, calls } = stubFetch({ templates: templatesResponse({ faucet: "http://host.test/faucet" }) });

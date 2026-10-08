@@ -181,12 +181,19 @@ describe("arena CLI", () => {
     expect(t.calls[0].url).toBe("http://127.0.0.1:3000/faucet"); // cfg.serverUrl from INIT
     expect(t.calls[0].init.method).toBe("POST");
     expect(JSON.parse(String(t.calls[0].init.body))).toMatchObject({ address: expect.stringMatching(/^0x[0-9a-fA-F]{40}$/) });
-    expect(JSON.parse(t.out.join("\n"))).toEqual({ address: "0xabc", usdc: "100000000", native: "1000000000000000000" });
+    // M2: formatted like `arena wallet`, not the server's raw base-unit strings.
+    expect(JSON.parse(t.out.join("\n"))).toEqual({ address: "0xabc", usdc: "100.000000", native: "1.0" });
 
     // A server with no faucet (404): a clear, specific message, not a raw status.
     const notDev = io(home, [{ status: 404, body: { error: "not found" } }]);
     expect(await runCli(["faucet"], notDev.io)).toBe(1);
     expect(notDev.err.join("\n")).toMatch(/server advertises no faucet/);
+
+    // M2: a 429 reports the server's own retryAfterSeconds, not just a bare error.
+    const limited = io(home, [{ status: 429, body: { error: "rate limited", retryAfterSeconds: 345 } }]);
+    expect(await runCli(["faucet"], limited.io)).toBe(1);
+    expect(limited.err.join("\n")).toMatch(/rate limited/);
+    expect(limited.err.join("\n")).toMatch(/retry in 345s/);
 
     // Unreachable server: fails clearly, doesn't throw.
     const down = io(home);
@@ -195,6 +202,14 @@ describe("arena CLI", () => {
     }) as unknown as typeof fetch;
     expect(await runCli(["faucet"], down.io)).toBe(1);
     expect(down.err.join("\n")).toMatch(/cannot reach/);
+  });
+
+  it("M2: arena faucet reports a malformed success amount instead of crashing", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const t = io(home, [{ status: 200, body: { address: "0xabc", usdc: "not-a-number", native: "1000000000000000000" } }]);
+    expect(await runCli(["faucet"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toMatch(/malformed amount/);
   });
 
   it("Plan 5.5 Task 2: arena bot refuses a non-31337 chain without --allow-real-chain, before touching the daemon", async () => {
