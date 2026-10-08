@@ -32,6 +32,10 @@ export class FakeChain implements ChainReader {
   /** Canonical block hashes by height, for the indexer's reorg-vs-lag check; unset heights read as null. */
   hashes = new Map<bigint, Hex>();
   async blockHash(block: bigint) { return this.hashes.get(block) ?? null; }
+  /** Plan 5.5 Task 1: the faucet guard's `web3_clientVersion` check. Defaults to a real Anvil's reported string;
+   *  tests of the guard's "not Anvil" branch override it (e.g. to a geth version string). */
+  version = "anvil/v1.0.0";
+  async clientVersion() { return this.version; }
 }
 
 export function testConfig(over: Partial<ServerConfig> = {}): ServerConfig {

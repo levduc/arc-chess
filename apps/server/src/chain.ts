@@ -27,6 +27,10 @@ export interface ChainReader {
    *  event that vanished from `getLogs`, to tell a reorg from a lagging log index. Optional: without it, a
    *  vanished event is always treated as reorged out. */
   blockHash?(block: bigint): Promise<Hex | null>;
+  /** Plan 5.5 Task 1: the RPC's `web3_clientVersion`, read once at server start to help gate the dev faucet (one
+   *  of its three required checks: Global Constraints). Never used for anything else -- this never informs chain
+   *  logic. */
+  clientVersion(): Promise<string>;
 }
 
 const NOW_CACHE_MS = 1000;
@@ -105,6 +109,10 @@ export class RpcChainReader implements ChainReader {
       throw err;
     });
     return b?.hash ?? null;
+  }
+
+  clientVersion(): Promise<string> {
+    return this.client.request({ method: "web3_clientVersion" });
   }
 
   /** Immutable once the chain exists, so memoized forever like `timeoutBounds` -- with the same un-stick-on-
