@@ -26,9 +26,16 @@ import { join } from "node:path";
  */
 const CURL_FLAG_PREFIXES = ["", "-s", "-sS", "-sL", "-sSL", "-fsSL", "-L"];
 
-/** The exact `--allowedTools` patterns for one session, as a pure function of the server's URL so it can be unit
- *  tested without spawning anything. Deliberately minimal:
+/** The exact `--allowedTools` patterns for one session, as a pure function of the server's URL (and, optionally,
+ *  the absolute path of the CLI wrapper the served `skill.md` actually names) so it can be unit tested without
+ *  spawning anything. Deliberately minimal:
  *  - `Bash(arena *)` -- the CLI, via a wrapper on PATH (`buildClaudeEnv`'s `binDir`).
+ *  - `Bash(${cliPath} *)` too, when given -- final review I5: `cliCommand` (and so every command skill.md's
+ *    recipe shows) is the wrapper's *absolute path* on a dev-up stack, never the bare word "arena". Allowing
+ *    only `Bash(arena *)` denies the agent's very first literal command (`init`) under `--permission-prompts
+ *    none`, since Claude Code's allow rules are plain command-prefix matches, not PATH-aware. Both rules are
+ *    kept together when `cliPath` is given, since skill.md's own optional `export PATH=...` tip means the
+ *    agent may legitimately type either form.
  *  - `Bash(curl <flags> <origin>/*)` for each of `CURL_FLAG_PREFIXES`, pinned to this stack's own server origin --
  *    never a bare `Bash(curl *)`. Confirmed by hand that this pin actually restricts the origin, not just the
  *    flags: the same rule denies `curl -s http://example.com/`.
@@ -36,9 +43,10 @@ const CURL_FLAG_PREFIXES = ["", "-s", "-sS", "-sL", "-sSL", "-fsSL", "-L"];
  *  `--permission-prompts none` means anything outside this list is denied automatically rather than hanging on a
  *  prompt nobody can answer.
  */
-export function buildAllowedTools(serverUrl: string): string[] {
+export function buildAllowedTools(serverUrl: string, cliPath?: string): string[] {
   const origin = new URL(serverUrl).origin;
-  return ["Bash(arena *)", ...CURL_FLAG_PREFIXES.map((flags) => `Bash(curl ${flags ? `${flags} ` : ""}${origin}/*)`)];
+  const arenaRules = cliPath ? ["Bash(arena *)", `Bash(${cliPath} *)`] : ["Bash(arena *)"];
+  return [...arenaRules, ...CURL_FLAG_PREFIXES.map((flags) => `Bash(curl ${flags ? `${flags} ` : ""}${origin}/*)`)];
 }
 
 // --------------------------------------------------------------------------------------------------------- env

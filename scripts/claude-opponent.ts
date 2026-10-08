@@ -15,16 +15,16 @@
  * Reuses the same sandbox builders as `tests/system/llm-games.ts` (`tests/system/claude-sandbox.ts`): a narrow
  * `--allowedTools` list (the `arena` CLI, plus `curl` pinned to `--server`'s origin) and a minimal environment.
  * The allowed tools must include running the `cliCommand` wrapper the server advertises -- `<dir>/bin/arena`,
- * written by `dev:up` (Plan 5.5 Task 3, `writeArenaWrapper` in `scripts/dev-up.ts`) and set as the server's
- * `cliCommand`, so `skill.md` shows this exact path. `--cli` accepts an explicit path too, defaulting to
- * `<repo>/.arena-dev/bin/arena` (the default `--dir`'s wrapper).
+ * written by `dev:up` (Plan 5.5 Task 3, `writeArenaWrapper` in `tests/system/claude-sandbox.ts`, shared with
+ * `dev-up.ts`) and set as the server's `cliCommand`, so `skill.md` shows this exact path. `--cli` accepts an
+ * explicit path too, defaulting to `<repo>/.arena-dev/bin/arena` (the default `--dir`'s wrapper).
  *
  * This spends real Claude usage -- never run it as part of a test or CI. Tests that touch this file must verify
  * only `--help`/argument parsing (see the Plan 5.5 Task 2 report); `main()` only runs when this file is executed
  * directly, exactly like `llm-games.ts`'s own guard.
  */
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentHomeAndWorkDir, buildAllowedTools, buildClaudeEnv, extractCost } from "../tests/system/claude-sandbox.js";
@@ -32,6 +32,24 @@ import { agentHomeAndWorkDir, buildAllowedTools, buildClaudeEnv, extractCost } f
 const REPO_ROOT = join(import.meta.dirname, "..");
 const DEV_DIR = join(REPO_ROOT, ".arena-dev");
 const CLAUDE_BIN = join(process.env.HOME ?? "", ".local/bin/claude");
+
+/** True if `pid` is alive and its command line looks like an `arena` daemon (packages/cli/bin/arena.mjs, run
+ *  directly or through the wrapper) -- a cheap, best-effort /proc check (Linux only) before M7's cleanup
+ *  SIGTERMs a pid `daemon.lock` once named. Any error (no /proc, pid gone, unreadable cmdline) reads as "not
+ *  it": the only consequence of a false negative here is leaving a daemon running, no worse than before this
+ *  existed, which is strictly better than SIGTERMing an unrelated process that happens to reuse an old pid. */
+function looksLikeArenaDaemon(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("arena");
+  } catch {
+    return false;
+  }
+}
 
 const USAGE = `usage: pnpm dev:claude-opponent [--server http://127.0.0.1:8080] [--games 3] [--stake 1] [--model ID] [--minutes 30] [--cli PATH]
 
@@ -106,7 +124,9 @@ async function main(): Promise<void> {
     "-p",
     prompt,
     "--allowedTools",
-    ...buildAllowedTools(args.server),
+    // Final review I5: args.cli is the absolute wrapper path a dev-up stack's served skill.md actually names
+    // (cliCommand) -- without it, every command the agent's own recipe tells it to run is denied outright.
+    ...buildAllowedTools(args.server, args.cli),
     "--permission-mode",
     "manual",
     "--permission-prompts",
@@ -179,6 +199,19 @@ async function main(): Promise<void> {
       } catch {
         // already gone
       }
+    }
+    // M7: the agent's own daemon (nohup'd per skill.md's recipe step 2) otherwise outlives this script --
+    // holding funds in any open channel, and the next dev-up run wipes its home out from underneath it. Read
+    // the pid this specific ARENA_HOME's lock names, and stop only that, only if it is still alive and still
+    // looks like an arena daemon (not some unrelated process that has since reused the same pid).
+    try {
+      const { pid } = JSON.parse(readFileSync(join(home, "daemon.lock"), "utf8")) as { pid?: unknown };
+      if (typeof pid === "number" && looksLikeArenaDaemon(pid)) {
+        console.log(`[claude-opponent] stopping this agent's own daemon (pid ${pid})`);
+        process.kill(pid, "SIGTERM");
+      }
+    } catch {
+      // no lock file, malformed, or already gone -- nothing to stop
     }
   }
 
