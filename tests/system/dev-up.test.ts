@@ -162,6 +162,13 @@ describe("pnpm dev:up", () => {
       expect(existsSync(join(devDir, "players", "alice", "config.json"))).toBe(true);
       expect(existsSync(REPO_DEV_DIR) ? statSync(REPO_DEV_DIR).ctimeMs : null).toBe(repoDevDirBefore);
 
+      // Plan 5.5 Task 3: dev-up writes the "<dir>/bin/arena" CLI wrapper itself (not just this test's own copy of
+      // one, as agent-recipe.test.ts uses) -- executable, and set as the server's cliCommand so skill.md actually
+      // shows this exact path in its recipe. This is the file the user's one-sentence prompt depends on.
+      const wrapperPath = join(devDir, "bin", "arena");
+      expect(existsSync(wrapperPath)).toBe(true);
+      expect(statSync(wrapperPath).mode & 0o111).not.toBe(0); // executable by someone
+
       // Both services are actually reachable, not just "the script said so".
       const rpcRes = await fetch(`http://127.0.0.1:${anvilPort}`, {
         method: "POST",
@@ -171,6 +178,8 @@ describe("pnpm dev:up", () => {
       expect(rpcRes.ok).toBe(true);
       const healthRes = await fetch(`http://127.0.0.1:${serverPort}/healthz`);
       expect(healthRes.ok).toBe(true);
+      const skillText = await (await fetch(`http://127.0.0.1:${serverPort}/skill.md`)).text();
+      expect(skillText).toContain(`${wrapperPath} init --server`);
 
       expect(await isPortFree(anvilPort)).toBe(false);
       expect(await isPortFree(serverPort)).toBe(false);

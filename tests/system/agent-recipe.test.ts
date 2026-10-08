@@ -23,7 +23,7 @@ import { createPublicClient, http, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
 import { channelHubAbi } from "@arena/sdk";
-import { loadConfig, loadWalletKey, pickMove } from "@arena/cli";
+import { loadWalletKey, pickMove } from "@arena/cli";
 import { CLI_BIN, freeTcpPort, runCli, usdcBalanceOf, type Stack, startStack } from "./harness.js";
 
 const REPO_ROOT = join(import.meta.dirname, "../..");
