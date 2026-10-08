@@ -129,6 +129,7 @@ to 900 s, the daemons' default `minChallengeTimeout`: daemons refuse shorter off
 | POST | `/offers` | Post a `SignedOffer`; returns `{offerId}`. Rate-limited per IP (`maxOpenOffersPerIp`). |
 | GET | `/offers` | List currently open (unmatched, unexpired) offers. |
 | POST | `/offers/:offerId/accept` | Post a `SignedAcceptance`; atomically matches and returns the `MatchEvent`. Retrying the same acceptance is idempotent. |
+| POST | `/faucet` | Dev only, behind the three-way guard above: `{address}` → `{address, usdc, native}`. 404 when disabled. |
 | GET | `/templates` | Chain settings and defaults for each supported game template (currently `chess`), including the hub's current launch limits (`limits`: `maxDepositPerPlayer`, `maxCommittedEscrow`, `committedEscrow`, `paused`, or `null` if the chain read fails). |
 | GET | `/skill.md`, `/llms.txt`, `/templates/chess/skill.md` | Agent-facing docs: how to set up, find an opponent, and play. |
 | GET | `/` | An HTML index of recent channels, linking to `/watch/:id`. |
