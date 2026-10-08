@@ -24,7 +24,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
 import { channelHubAbi } from "@arena/sdk";
 import { loadWalletKey, pickMove } from "@arena/cli";
-import { CLI_BIN, freeTcpPort, runCli, usdcBalanceOf, type Stack, startStack } from "./harness.js";
+import { CLI_BIN, freeTcpPort, isPortFree, runCli, usdcBalanceOf, type Stack, startStack } from "./harness.js";
 
 const REPO_ROOT = join(import.meta.dirname, "../..");
 
@@ -357,12 +357,34 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       expect(botStatusJson.lastError).toBeNull();
       expect(botStatusJson.phase).toBe("Finalized");
 
-      // --- nothing was left running: stop the agent daemon and confirm ---
-      const agentPid = agentDaemon.pid;
+      // --- nothing left running (I3): stop the agent daemon, every house bot and the whole stack right here (not
+      // just in afterEach), then assert every pid this test started is actually gone, and both ports free up.
+      // afterEach stays as the safety net for a failure earlier in the test, not the thing this asserts. ---
+      const pidsToConfirmDead: number[] = [];
+      if (agentDaemon.pid !== undefined) pidsToConfirmDead.push(agentDaemon.pid);
+      for (const b of houseBots) if (b.child.pid !== undefined) pidsToConfirmDead.push(b.child.pid);
+      const serverPid = stack.server.pid;
+      const anvilPid = stack.anvil.pid;
+      if (serverPid !== undefined) pidsToConfirmDead.push(serverPid);
+      if (anvilPid !== undefined) pidsToConfirmDead.push(anvilPid);
+      const anvilPort = Number(new URL(stack.rpcUrl).port);
+      const serverPort = Number(new URL(stack.serverUrl).port);
+
       agentDaemon.kill("SIGTERM");
-      await waitFor("agent daemon to exit", 10_000, async () => (isAlive(agentPid) ? undefined : true));
-      expect(isAlive(agentPid)).toBe(false);
+      await Promise.all(houseBots.map((b) => stopHouseBot(b)));
+      await stack.stop();
+
+      await waitFor("every process this test started to exit", 15_000, async () =>
+        pidsToConfirmDead.every((pid) => !isAlive(pid)) ? true : undefined,
+      );
+      for (const pid of pidsToConfirmDead) expect(isAlive(pid)).toBe(false);
+      expect(await isPortFree(anvilPort)).toBe(true);
+      expect(await isPortFree(serverPort)).toBe(true);
+
+      // Clear the outer variables so afterEach's own (idempotent) teardown is a no-op on the success path.
       agentDaemon = undefined;
+      houseBots.length = 0;
+      stack = undefined;
     },
     10 * 60_000,
   );
