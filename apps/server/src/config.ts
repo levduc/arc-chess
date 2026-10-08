@@ -38,6 +38,10 @@ export type ServerConfig = {
   /** Behind a reverse proxy: key per-IP limits on the right-most `X-Forwarded-For` entry, not the socket peer
    *  (which is then the proxy itself). Never enable it on a directly exposed server: clients could spoof it. */
   trustProxy: boolean;
+  /** Plan 5.5 Task 1: opts into the dev-only `/faucet` route. This alone never enables it -- `startServer` also
+   *  requires `chainId === 31337` and the RPC's `web3_clientVersion` to start with `anvil/`, checked once at
+   *  startup, so a config carrying this by mistake on a real chain still serves 404 (Global Constraints). */
+  devFaucet: boolean;
 };
 
 /** Anvil's chain id: the only chain where the development `audit` default is allowed. */
@@ -185,9 +189,10 @@ export function parseServerConfig(raw: unknown): ServerConfig {
 
   const limits = parseLimits(obj);
   const trustProxy = bool(obj, "trustProxy", false);
+  const devFaucet = bool(obj, "devFaucet", false);
 
   return {
     host, port, publicUrl, rpcUrl, publicRpcUrl, chainId, hub, usdc, rules, dbPath,
-    fundingWindow, offerMaxLifetime, defaults, cliCommand, audit, indexer, limits, trustProxy,
+    fundingWindow, offerMaxLifetime, defaults, cliCommand, audit, indexer, limits, trustProxy, devFaucet,
   };
 }

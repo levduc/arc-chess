@@ -41,6 +41,7 @@ export function testConfig(over: Partial<ServerConfig> = {}): ServerConfig {
     rules: "0x00000000000000000000000000000000000000a3", dbPath: ":memory:", fundingWindow: 3600n, offerMaxLifetime: 86_400n,
     defaults: { deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n }, cliCommand: "arena",
     audit: "unaudited (development build)", indexer: { pollMs: 0, chunkBlocks: 1000, startBlock: 0n }, limits: DEFAULT_LIMITS, trustProxy: false,
+    devFaucet: false,
     ...over,
   };
 }

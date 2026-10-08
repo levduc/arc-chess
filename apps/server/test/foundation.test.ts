@@ -53,6 +53,16 @@ describe("config", () => {
     expect(() => parseServerConfig({ ...base, port: 70_000 })).toThrow(/port/);
     expect(() => parseServerConfig({ ...base, port: 1.5 })).toThrow(/port/);
   });
+  it("Plan 5.5 Task 1: devFaucet defaults to false and is settable; parsing never checks chain or RPC", () => {
+    const base = validBase();
+    expect(parseServerConfig(base).devFaucet).toBe(false);
+    expect(parseServerConfig({ ...base, devFaucet: true }).devFaucet).toBe(true);
+    // Review Focus 1: a non-31337 chain with devFaucet: true must still parse -- the three-way guard is enforced
+    // at server start (server.ts), not here, so a real-chain config with the flag mistakenly set still starts.
+    const real = { ...base, chainId: 5042002, audit: "unaudited; guarded launch", devFaucet: true };
+    expect(parseServerConfig(real).devFaucet).toBe(true);
+    expect(() => parseServerConfig({ ...base, devFaucet: "yes" })).toThrow(/devFaucet/);
+  });
 });
 
 function validBase() {
