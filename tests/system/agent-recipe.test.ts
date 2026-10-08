@@ -231,6 +231,11 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
 
       // --- Step 3: wallet check ---
       const walletBefore = await runWrapperJson(wrapperPath, ["wallet"], agentHome);
+      // Final review I3: wallet reports whole-USDC decimals (e.g. "100.000000"), not base units -- assert the
+      // shape, not just this one value, so the units claim in skill.md's recipe is actually tested.
+      const WHOLE_USDC = /^[0-9]+\.[0-9]{6}$/;
+      const BASE_UNITS = /^[0-9]+$/;
+      expect(walletBefore.usdc).toMatch(WHOLE_USDC);
       expect(walletBefore.usdc).toBe("100.000000");
 
       // --- Step 4: find an opponent -- accept a house bot's standing offer ---
@@ -239,6 +244,11 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
         offer: { player: Address; deposit: string; stakePerGame: string };
       }>;
       expect(offers.length).toBeGreaterThanOrEqual(2);
+      // Final review I3: offers reports USDC in base units (6 decimals), not whole-USDC decimals.
+      for (const o of offers) {
+        expect(o.offer.stakePerGame).toMatch(BASE_UNITS);
+        expect(o.offer.deposit).toMatch(BASE_UNITS);
+      }
       const chosen = offers.find((o) => o.offer.stakePerGame === "1000000");
       expect(chosen).toBeDefined();
       const houseBot = houseBots.find((b) => b.address.toLowerCase() === chosen!.offer.player.toLowerCase());
@@ -250,10 +260,13 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
         const c = list.find((c) => !("degraded" in c));
         return c?.channelId;
       });
-      await waitFor("channel funded (phase Open)", 30_000, async () => {
+      const openedStatus = await waitFor<{ balances: { me: string; opponent: string } }>("channel funded (phase Open)", 30_000, async () => {
         const s = await runWrapperJson(wrapperPath, ["status", "--channel", channelId], agentHome);
-        return s.phase === "Open" ? true : undefined;
+        return s.phase === "Open" ? s : undefined;
       });
+      // Final review I3: channels/status balances are whole-USDC decimals too, like wallet -- never base units.
+      expect(openedStatus.balances.me).toMatch(WHOLE_USDC);
+      expect(openedStatus.balances.opponent).toMatch(WHOLE_USDC);
       console.log(`[agent-recipe] channel ${channelId} open with house bot ${houseBot!.address}`);
 
       // --- Step 5: the play loop -- 3 games at $1, always resigning game index 1 ("game 2") ---
