@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { acquireHomeLock } from "../src/lock.js";
+import { acquireHomeLock, livePidHoldingLock } from "../src/lock.js";
 
 /** Neither a successful acquire nor a failed/stale one leaves any of its private temp files behind. */
 function tempLockFiles(home: string): string[] {
@@ -64,5 +64,32 @@ describe("acquireHomeLock", () => {
     writeFileSync(lockPath, JSON.stringify({ pid: otherPid }), { mode: 0o600 });
     l.release();
     expect(JSON.parse(readFileSync(lockPath, "utf8"))).toEqual({ pid: otherPid });
+  });
+});
+
+describe("livePidHoldingLock", () => {
+  it("returns null when there is no lock file at all", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
+  it("returns the pid when the lock names a genuinely live process", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+    expect(livePidHoldingLock(home)).toBe(process.pid);
+  });
+
+  it("returns null for a stale lock (dead pid) -- never a take-over, just not a block", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: 2 ** 22 + 12345 }), { mode: 0o600 });
+    expect(livePidHoldingLock(home)).toBeNull();
+    // Confirms it really left the lock alone, unlike acquireHomeLock.
+    expect(JSON.parse(readFileSync(join(home, "daemon.lock"), "utf8"))).toEqual({ pid: 2 ** 22 + 12345 });
+  });
+
+  it("returns null for an unreadable lock file", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    writeFileSync(join(home, "daemon.lock"), "not valid json {{{", { mode: 0o600 });
+    expect(livePidHoldingLock(home)).toBeNull();
   });
 });

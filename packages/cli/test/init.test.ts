@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -81,6 +81,36 @@ describe("arena init --server", () => {
       chainId: 31337,
       hub: `0x${"11".repeat(20)}`,
     });
+  });
+
+  it("Final review I4: refuses to init while a live daemon holds this home's lock, naming the pid and how to stop it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+    const { fetchStub, calls } = stubFetch();
+    const err: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    expect(code).toBe(1);
+    expect(err.join("\n")).toContain(`pid ${process.pid}`);
+    expect(err.join("\n")).toContain(`kill ${process.pid}`);
+    expect(calls).toHaveLength(0); // refused before ever reaching the network
+  });
+
+  it("Final review I4: a stale lock (dead pid) never blocks init -- only a genuinely live one does", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: 2 ** 22 + 12345 }), { mode: 0o600 });
+    const { fetchStub } = stubFetch();
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: () => undefined,
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
   });
 
   it("verifies the adopted chain over its RPC and prints every adopted value with a trust line (I8)", async () => {

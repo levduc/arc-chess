@@ -1,6 +1,7 @@
 import { formatUnits, parseUnits, type Address, type Hex } from "viem";
 import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
 import { runBot } from "./bot.js";
+import { livePidHoldingLock } from "./lock.js";
 import {
   defaultHome,
   initHome,
@@ -236,6 +237,17 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     if (cmd === "init") {
       const server = need("server");
+      // Final review I4: a live daemon already holds this home's lock. Re-pointing config.json underneath it
+      // would leave that daemon running against the old settings (serverUrl, chain, hub) while every later
+      // `arena <cmd>` talks to it over its still-open local API, silently split-brained. A stale lock (dead
+      // pid) never blocks: acquireHomeLock already takes those over the moment a daemon actually starts.
+      const livePid = livePidHoldingLock(home);
+      if (livePid !== null) {
+        throw new Error(
+          `a live arena daemon (pid ${livePid}) already holds ${home}. Stop it first (kill ${livePid}), or ` +
+            "run init against a different ARENA_HOME.",
+        );
+      }
       const explicitFields = ["rpc", "chain-id", "hub", "usdc", "rules"];
       const haveAllExplicit = explicitFields.every((name) => flag(name) !== undefined);
       let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; faucet?: string } = {};
