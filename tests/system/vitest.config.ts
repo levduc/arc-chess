@@ -15,6 +15,6 @@ export default defineConfig({
     // Pinned: outside a TTY (CI, agents) vitest otherwise picks its "minimal" reporter, which hides passing tests'
     // output regardless of `silent`.
     reporters: ["default"],
-    onConsoleLog: (log) => /^\[(chaos|faulty-rpc|dispute|adversarial|load|board)/.test(log),
+    onConsoleLog: (log) => /^\[(chaos|faulty-rpc|dispute|adversarial|load|board|agent-recipe)/.test(log),
   },
 });
