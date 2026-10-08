@@ -73,6 +73,11 @@ export type BotOptions = {
   waitTimeoutMs?: number;
   /** Wall-clock ms the bot pauses before playing a move it owes ("after a 500 ms beat"). Default 500. */
   moveDelayMs?: number;
+  /** Fix round (critical 1): the challenge-retry back-off's first wait, doubling up to `challengeBackoffMaxMs`.
+   *  Default `CHALLENGE_BACKOFF_START_MS` (30 s); overridable so tests don't wait out the real schedule. */
+  challengeBackoffStartMs?: number;
+  /** Fix round (critical 1): the challenge-retry back-off's cap. Default `CHALLENGE_BACKOFF_MAX_MS` (5 min). */
+  challengeBackoffMaxMs?: number;
   rng?: Rng;
   log?: (line: string) => void;
   /** Aborting stops the loop (and any in-flight `sleep`/`wait`) promptly; see `runBot`'s own docstring. */
@@ -155,21 +160,74 @@ function gameOverElapsedMs(marks: Map<Hex, GameOverMark>, channelId: Hex, gameIn
   return Date.now() - prev.since;
 }
 
+/** Fix round (critical 1): a per-channel retry schedule -- `attempts` so far, and the wall-clock ms before which
+ *  the next attempt is skipped entirely (0 = try now). Shared shape for every per-channel back-off in this file. */
+type Backoff = { attempts: number; nextAttemptAt: number };
+
+/** Fix round (critical 1): first failure waits `startMs`, doubling on each further failure, capped at `maxMs`. */
+function backoffDelayMs(attempts: number, startMs: number, maxMs: number): number {
+  return Math.min(maxMs, startMs * 2 ** (attempts - 1));
+}
+
+/** Fix round (critical 1): default challenge-retry schedule (spec: "30 s, doubling, up to 5 min") -- exported so
+ *  a test can assert against the real production numbers, not just whatever it happens to override them to. */
+export const CHALLENGE_BACKOFF_START_MS = 30_000;
+export const CHALLENGE_BACKOFF_MAX_MS = 300_000;
+
 type ActCtx = {
   rng: Rng;
   log: (line: string) => void;
   idleCloseMs: number;
   moveDelayMs: number;
+  challengeBackoffStartMs: number;
+  challengeBackoffMaxMs: number;
   gameOverSince: Map<Hex, GameOverMark>;
-  challenged: Set<Hex>;
+  /** Fix round (critical 1): replaces the old one-shot `Set<Hex>` -- a failed challenge (an RPC blip, a
+   *  transient revert, an `InCooldown` refusal) must not permanently stop this channel from ever being
+   *  challenged again, and a *second* silence episode (after an earlier dispute cycle resolved) must be
+   *  challenged again too. Cleared whenever a status for this channel is no longer `opponent-silent` (see
+   *  `actOnChannel`), so a fresh episode always starts a fresh schedule. */
+  challengeAttempts: Map<Hex, Backoff>;
   signal?: AbortSignal;
 };
 
-/** Acts on one agent-controlled channel's current status. Returns true if it took an action (so the loop's own
- *  idle back-off, see `runBot`, is skipped for this pass). Every daemon call is caught and logged: a transient
- *  409 (a turn race, a close already submitted by the relay path, ...) must never kill the bot. */
+/** Fix round (critical 1): decides and, if it's time, makes one challenge attempt for a channel whose attention
+ *  is `opponent-silent`. Returns false without calling `daemon.challenge` at all when: a prior failure's
+ *  back-off (`CHALLENGE_BACKOFF_START_MS`, doubling to `CHALLENGE_BACKOFF_MAX_MS`) hasn't elapsed yet, or this
+ *  bot is still in the hub's post-`respond` cooldown for this channel (`status.cooldown.meSeconds`, read fresh
+ *  from `st` -- not guessed from an `InCooldown` error message) -- in which case the next attempt is scheduled
+ *  for exactly when that cooldown clears, rather than hammering `challenge()` into a revert on every pass.
+ */
+async function attemptChallenge(daemon: ArenaDaemon, st: ChannelStatus, ctx: ActCtx): Promise<boolean> {
+  const id = st.channelId;
+  const now = Date.now();
+  const prev = ctx.challengeAttempts.get(id);
+  if (prev && now < prev.nextAttemptAt) return false;
+  if (st.cooldown.meSeconds > 0) {
+    ctx.challengeAttempts.set(id, { attempts: prev?.attempts ?? 0, nextAttemptAt: now + st.cooldown.meSeconds * 1000 });
+    return false;
+  }
+  try {
+    await daemon.challenge(id, "agent");
+    ctx.challengeAttempts.delete(id);
+    return true;
+  } catch (err) {
+    const attempts = (prev?.attempts ?? 0) + 1;
+    const wait = backoffDelayMs(attempts, ctx.challengeBackoffStartMs, ctx.challengeBackoffMaxMs);
+    ctx.challengeAttempts.set(id, { attempts, nextAttemptAt: now + wait });
+    ctx.log(`bot: challenge on ${id} failed (attempt ${attempts}, retrying in ${Math.round(wait / 1000)}s): ${errorText(err)}`);
+    return false;
+  }
+}
+
+/** Acts on one agent-controlled channel's current status. Returns true if it took an action that actually
+ *  succeeded (so the loop's own idle back-off, see `runBot`, is skipped for this pass only on real progress --
+ *  a caught failure returns false, same as "nothing to do"). Every daemon call is caught and logged: a
+ *  transient 409 (a turn race, a close already submitted by the relay path, ...) must never kill the bot. */
 async function actOnChannel(daemon: ArenaDaemon, st: ChannelStatus, ctx: ActCtx): Promise<boolean> {
   const id = st.channelId;
+  // Fix round (critical 1): a fresh episode always starts a fresh challenge-retry schedule.
+  if (st.attention !== "opponent-silent") ctx.challengeAttempts.delete(id);
   switch (st.attention) {
     case "your-turn": {
       await sleep(ctx.moveDelayMs, ctx.signal);
@@ -190,13 +248,8 @@ async function actOnChannel(daemon: ArenaDaemon, st: ChannelStatus, ctx: ActCtx)
       await daemon.close(id, "agent").catch((err) => ctx.log(`bot: idle-close on ${id} failed: ${errorText(err)}`));
       return true;
     }
-    case "opponent-silent": {
-      if (ctx.challenged.has(id)) return false;
-      if (!st.suggestedActions.some((a) => a.startsWith("arena challenge"))) return false;
-      ctx.challenged.add(id);
-      await daemon.challenge(id, "agent").catch((err) => ctx.log(`bot: challenge on ${id} failed: ${errorText(err)}`));
-      return true;
-    }
+    case "opponent-silent":
+      return attemptChallenge(daemon, st, ctx);
     default:
       return false; // session-gas-low (the daemon refills on its own), settled, human-must-move, or nothing to do
   }
@@ -219,9 +272,21 @@ export async function runBot(daemon: ArenaDaemon, opts: BotOptions): Promise<voi
   const offerRecheckMs = opts.offerRecheckMs ?? 15_000;
   const waitTimeoutMs = opts.waitTimeoutMs ?? 15_000;
   const moveDelayMs = opts.moveDelayMs ?? 500;
+  const challengeBackoffStartMs = opts.challengeBackoffStartMs ?? CHALLENGE_BACKOFF_START_MS;
+  const challengeBackoffMaxMs = opts.challengeBackoffMaxMs ?? CHALLENGE_BACKOFF_MAX_MS;
   const signal = opts.signal;
 
-  const ctx: ActCtx = { rng, log, idleCloseMs, moveDelayMs, gameOverSince: new Map(), challenged: new Set(), signal };
+  const ctx: ActCtx = {
+    rng,
+    log,
+    idleCloseMs,
+    moveDelayMs,
+    challengeBackoffStartMs,
+    challengeBackoffMaxMs,
+    gameOverSince: new Map(),
+    challengeAttempts: new Map(),
+    signal,
+  };
   const offerState = { fundsShort: false };
   let lastOfferCheck = 0;
 

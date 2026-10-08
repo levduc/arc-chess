@@ -1,8 +1,46 @@
-import { afterEach, describe, expect, it } from "vitest";
+import type { Address, Hex } from "viem";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { increaseTime, mintUsdc, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { mulberry32 } from "../../sdk/test/helpers/fixtures.js";
 import { pickMove, runBot } from "../src/bot.js";
+import type { ArenaDaemon } from "../src/daemon.js";
+import type { ChannelStatus } from "../src/status.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
+
+const FAKE_CHANNEL_ID = `0x${"1".repeat(64)}` as Hex;
+
+/** A minimal `ChannelStatus` with just the fields `actOnChannel` actually reads, for fake-daemon unit tests of
+ *  the challenge back-off/cooldown logic below that need no chain, no Anvil and no real game at all. */
+function fakeStatus(overrides: Partial<ChannelStatus> = {}): ChannelStatus {
+  return {
+    channelId: FAKE_CHANNEL_ID,
+    controller: "agent",
+    attention: "opponent-silent",
+    gameIndex: 0,
+    cooldown: { meSeconds: 0, opponentSeconds: 0 },
+    suggestedActions: [],
+    ...overrides,
+  } as unknown as ChannelStatus;
+}
+
+/** A fake `ArenaDaemon` exposing only the surface `runBot` touches -- `channels` and `challenge` are given by
+ *  the caller; everything else is a harmless no-op/empty stub (the standing-offer check still runs every pass
+ *  with `offers: 0`, so `listOffers`/`hub.feeConfig` must resolve to something, even though `maintainOffers`
+ *  returns before ever reading them when `need <= 0`). */
+function fakeDaemon(channels: () => Promise<ChannelStatus[]>, challenge: (id: Hex, actor: string) => Promise<void>): ArenaDaemon {
+  return {
+    wait: async () => ({ channelId: null, reason: "timeout" }),
+    channels,
+    listOffers: async () => [],
+    hub: { feeConfig: async () => ({ feePerPlayer: 0n, feeRecipient: "0x0000000000000000000000000000000000000000" as Address }) },
+    client: { readContract: async () => 0n },
+    wallet: { address: "0x0000000000000000000000000000000000000000" as Address },
+    challenge,
+    move: async () => {},
+    nextGame: async () => {},
+    close: async () => {},
+  } as unknown as ArenaDaemon;
+}
 
 let cleanup: (() => Promise<void>) | undefined;
 afterEach(async () => {
@@ -41,6 +79,148 @@ describe("pickMove", () => {
     const move = pickMove(fen, rng);
     expect(move).toMatch(/^[a-h][1-8][a-h][1-8]$/);
   });
+});
+
+// ------------------------------------------------------------------------- runBot's challenge retry (fake daemon)
+
+describe("runBot: the opponent-silent challenge retries instead of giving up after one failure", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("fix round (critical 1): a challenge that fails once is retried with back-off, and succeeds on a later pass", async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    let challenged = false;
+    const challenge = vi.fn(async () => {
+      calls++;
+      if (calls === 1) throw new Error("boom: a transient RPC blip");
+      challenged = true;
+    });
+    // Once the real `challenge()` succeeds, attention goes quiet (see the cooldown test below for why) -- without
+    // this, the fake would keep reporting `opponent-silent` forever and the bot would (correctly, for a *real*
+    // silent opponent) keep challenging again on every pass, which isn't what this test is about.
+    const daemon = fakeDaemon(async () => [fakeStatus({ attention: challenged ? null : "opponent-silent" })], challenge);
+    const controller = new AbortController();
+    const logs: string[] = [];
+    const done = runBot(daemon, {
+      usdc: "0x0000000000000000000000000000000000000000" as Address,
+      deposit: 0n,
+      stake: 0n,
+      offers: 0,
+      offerRecheckMs: 1_000_000,
+      waitTimeoutMs: 50,
+      moveDelayMs: 0,
+      challengeBackoffStartMs: 3_000,
+      challengeBackoffMaxMs: 10_000,
+      log: (l) => logs.push(l),
+      signal: controller.signal,
+    });
+
+    await vi.advanceTimersByTimeAsync(10); // the first pass runs essentially immediately
+    expect(calls).toBe(1); // the first attempt failed
+
+    // Several outer passes (the loop's own 1s idle sleep) go by, but the 3s challenge back-off is not up yet.
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(calls).toBe(1);
+
+    // Now past the 3s back-off: the next pass retries, and this time it succeeds.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(calls).toBe(2);
+    expect(logs.some((l) => /challenge on .* failed \(attempt 1, retrying in 3s\)/.test(l))).toBe(true);
+
+    // Settled (attention quiet): no further attempts, ever.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(calls).toBe(2);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(100);
+    await done;
+  }, 5_000);
+
+  it("fix round (critical 1): waits out status.cooldown.meSeconds (an InCooldown-style refusal) before retrying", async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const cooldownSecondsAt0 = 5;
+    // Once the real `challenge()` succeeds, the channel goes Challenged and (per daemon.ts's own buildStatus,
+    // confirmed in hardening.test.ts) attention goes quiet -- modeled here so a successful call doesn't keep
+    // reporting `opponent-silent` forever and sending this fake straight into an unthrottled retry loop.
+    let challenged = false;
+    const challenge = vi.fn(async () => {
+      challenged = true;
+    });
+    const channels = async () => {
+      if (challenged) return [fakeStatus({ attention: null })];
+      const elapsedS = (Date.now() - startedAt) / 1000;
+      const remaining = Math.max(0, cooldownSecondsAt0 - elapsedS);
+      return [fakeStatus({ cooldown: { meSeconds: Math.ceil(remaining), opponentSeconds: 0 } })];
+    };
+    const daemon = fakeDaemon(channels, challenge);
+    const controller = new AbortController();
+    const done = runBot(daemon, {
+      usdc: "0x0000000000000000000000000000000000000000" as Address,
+      deposit: 0n,
+      stake: 0n,
+      offers: 0,
+      offerRecheckMs: 1_000_000,
+      waitTimeoutMs: 50,
+      moveDelayMs: 0,
+      signal: controller.signal,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(challenge).not.toHaveBeenCalled(); // still in cooldown
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(challenge).not.toHaveBeenCalled(); // still in cooldown (5s total)
+
+    await vi.advanceTimersByTimeAsync(3_000); // now past the 5s cooldown
+    expect(challenge).toHaveBeenCalledTimes(1);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(100);
+    await done;
+  }, 5_000);
+
+  it("fix round (item 6 follow-on): a second silence episode after the challenge record is cleared challenges again", async () => {
+    // attention !== "opponent-silent" clears the record (see actOnChannel); a later opponent-silent episode on
+    // the same channel must not be treated as already-attempted.
+    vi.useFakeTimers();
+    let attention: ChannelStatus["attention"] = "opponent-silent";
+    const challenge = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const daemon = fakeDaemon(async () => [fakeStatus({ attention })], challenge);
+    const controller = new AbortController();
+    const done = runBot(daemon, {
+      usdc: "0x0000000000000000000000000000000000000000" as Address,
+      deposit: 0n,
+      stake: 0n,
+      offers: 0,
+      offerRecheckMs: 1_000_000,
+      waitTimeoutMs: 50,
+      moveDelayMs: 0,
+      challengeBackoffStartMs: 60_000,
+      challengeBackoffMaxMs: 300_000,
+      signal: controller.signal,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(challenge).toHaveBeenCalledTimes(1); // episode 1: the one and only attempt (then a long back-off)
+
+    // The episode ends (e.g. the opponent finally moved) before the 60s back-off would have allowed a retry.
+    attention = null;
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    // Episode 2 starts: despite the still-running 60s back-off from episode 1, a fresh episode retries at once.
+    attention = "opponent-silent";
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(challenge).toHaveBeenCalledTimes(2);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(100);
+    await done;
+  }, 5_000);
 });
 
 // -------------------------------------------------------------------------------------------- runBot (Anvil, :8546)
