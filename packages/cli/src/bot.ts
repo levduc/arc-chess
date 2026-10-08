@@ -78,6 +78,9 @@ export type BotOptions = {
   challengeBackoffStartMs?: number;
   /** Fix round (critical 1): the challenge-retry back-off's cap. Default `CHALLENGE_BACKOFF_MAX_MS` (5 min). */
   challengeBackoffMaxMs?: number;
+  /** Fix round (important 3): how long `maintainOffers` backs off entirely after the hub itself refuses a
+   *  `createOffer` (paused, or its escrow cap). Default `OFFER_BLOCK_BACKOFF_MS` (60 s). */
+  offerBlockBackoffMs?: number;
   rng?: Rng;
   log?: (line: string) => void;
   /** Aborting stops the loop (and any in-flight `sleep`/`wait`) promptly; see `runBot`'s own docstring. */
@@ -96,19 +99,45 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return Promise.race([new Promise<void>((resolve) => setTimeout(resolve, ms)), abortSignal(signal)]);
 }
 
+/** Fix round (important 3): how long `maintainOffers` backs off reposting entirely once the hub itself refuses
+ *  `createOffer` (paused, or its escrow cap) -- a condition the next `offerRecheckMs` pass alone can't fix, so
+ *  there's no point retrying that often. */
+export const OFFER_BLOCK_BACKOFF_MS = 60_000;
+
+/** Fix round (important 3): matched against `createOffer`'s own `DaemonError` messages (`checkDepositAllowed`
+ *  in daemon.ts) to tell a known, recoverable hub-level refusal from anything else (which still propagates, so
+ *  it isn't silently swallowed). */
+const HUB_PAUSED_RE = /hub is paused/;
+const ESCROW_CAP_RE = /escrow cap/;
+
+type OfferState = {
+  fundsShort: boolean;
+  /** Fix round (important 3): the hub's own reason the last `createOffer` attempt failed for (paused, or the
+   *  escrow cap), while it keeps failing for that same reason; `null` once it's posting again. Dedupes the log
+   *  exactly like `fundsShort` (one line when it starts, one when it clears) instead of logging every pass. */
+  blockedReason: string | null;
+  /** Fix round (important 3): wall-clock ms before which `maintainOffers` doesn't even try `createOffer` again
+   *  while `blockedReason` is set. */
+  blockedUntil: number;
+};
+
 /** Plan 5.5 Task 2 (Standing offers): tops up this bot's open offers to `opts.offers`, refusing to post one it
  *  cannot afford. "Afford" means the wallet's current USDC balance covers `deposit + fee` for every offer this
  *  bot already has open, every channel of its own still unfunded (phase `None`/`Funding` -- a conservative,
  *  over-counting proxy: once a channel funds, the committed amount has left the wallet for real, but it is never
  *  under-counted this way), *and* the new offer about to be posted. Logs once on a shortfall (not on every pass)
- *  and resumes silently once the balance recovers.
+ *  and resumes silently once the balance recovers. Fix round (important 3): a hub-level refusal (paused, or its
+ *  escrow cap) gets the same one-line-each-way treatment, plus its own `OFFER_BLOCK_BACKOFF_MS` back-off.
  */
 async function maintainOffers(
   daemon: ArenaDaemon,
   opts: Pick<BotOptions, "usdc" | "deposit" | "stake" | "offers" | "offerTimeout">,
   log: (line: string) => void,
-  state: { fundsShort: boolean },
+  state: OfferState,
+  offerBlockBackoffMs: number,
 ): Promise<void> {
+  const now = Date.now();
+  if (state.blockedReason && now < state.blockedUntil) return;
   const [offers, channels, fee] = await Promise.all([daemon.listOffers(), daemon.channels(), daemon.hub.feeConfig()]);
   const mine = offers.filter((o) => o.mine).length;
   const need = opts.offers - mine;
@@ -117,6 +146,7 @@ async function maintainOffers(
   const committed = BigInt(mine + unfundedMatches) * perOffer;
   if (need <= 0) {
     state.fundsShort = false;
+    state.blockedReason = null;
     return;
   }
   const balance = await daemon.client.readContract({
@@ -138,13 +168,31 @@ async function maintainOffers(
       }
       return;
     }
-    await daemon.createOffer({ deposit: opts.deposit, stakePerGame: opts.stake, challengeTimeout: opts.offerTimeout });
-    posted++;
+    try {
+      await daemon.createOffer({ deposit: opts.deposit, stakePerGame: opts.stake, challengeTimeout: opts.offerTimeout });
+      posted++;
+    } catch (err) {
+      const message = errorText(err);
+      const reason = HUB_PAUSED_RE.test(message)
+        ? "the hub is paused"
+        : ESCROW_CAP_RE.test(message)
+          ? "the hub's escrow cap is reached"
+          : null;
+      if (!reason) throw err; // not a known, recoverable hub-level refusal -- let it surface normally
+      if (state.blockedReason !== reason) {
+        log(`bot: cannot post a standing offer: ${reason}; backing off for ${Math.round(offerBlockBackoffMs / 1000)}s`);
+      }
+      state.blockedReason = reason;
+      state.blockedUntil = now + offerBlockBackoffMs;
+      return;
+    }
   }
-  if (posted > 0 && state.fundsShort) {
-    log("bot: USDC balance recovered; posting standing offers again");
+  if (posted > 0) {
+    if (state.fundsShort) log("bot: USDC balance recovered; posting standing offers again");
+    if (state.blockedReason) log(`bot: standing offers resumed (${state.blockedReason} cleared)`);
+    state.fundsShort = false;
+    state.blockedReason = null;
   }
-  if (posted > 0) state.fundsShort = false;
 }
 
 type GameOverMark = { gameIndex: number; since: number };
@@ -309,6 +357,7 @@ export async function runBot(daemon: ArenaDaemon, opts: BotOptions): Promise<voi
   const moveDelayMs = opts.moveDelayMs ?? 500;
   const challengeBackoffStartMs = opts.challengeBackoffStartMs ?? CHALLENGE_BACKOFF_START_MS;
   const challengeBackoffMaxMs = opts.challengeBackoffMaxMs ?? CHALLENGE_BACKOFF_MAX_MS;
+  const offerBlockBackoffMs = opts.offerBlockBackoffMs ?? OFFER_BLOCK_BACKOFF_MS;
   const signal = opts.signal;
 
   const ctx: ActCtx = {
@@ -323,13 +372,15 @@ export async function runBot(daemon: ArenaDaemon, opts: BotOptions): Promise<voi
     actionBackoff: new Map(),
     signal,
   };
-  const offerState = { fundsShort: false };
+  const offerState: OfferState = { fundsShort: false, blockedReason: null, blockedUntil: 0 };
   let lastOfferCheck = 0;
 
   while (!signal?.aborted) {
     if (Date.now() - lastOfferCheck >= offerRecheckMs) {
       lastOfferCheck = Date.now();
-      await maintainOffers(daemon, opts, log, offerState).catch((err) => log(`bot: standing-offer check failed: ${errorText(err)}`));
+      await maintainOffers(daemon, opts, log, offerState, offerBlockBackoffMs).catch((err) =>
+        log(`bot: standing-offer check failed: ${errorText(err)}`),
+      );
       if (signal?.aborted) break;
     }
 

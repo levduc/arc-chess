@@ -1,6 +1,6 @@
 import type { Address, Hex } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { increaseTime, mintUsdc, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { increaseTime, mintUsdc, setPaused, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { mulberry32 } from "../../sdk/test/helpers/fixtures.js";
 import { pickMove, runBot } from "../src/bot.js";
 import type { ArenaDaemon } from "../src/daemon.js";
@@ -408,6 +408,43 @@ describe("runBot", () => {
       await mintUsdc(env.usdc, alice.address, 10_000_000n);
       await waitFor(async () => (await alice.daemon.listOffers()).filter((o) => o.mine).length === 2, 10_000, "resumed posting");
       expect(logs.some((l) => l.includes("recovered"))).toBe(true);
+
+      controller.abort();
+      await botDone;
+    },
+    30_000,
+  );
+
+  it(
+    "fix round (important 3): a paused hub produces one log line over several passes, and resumes once unpaused",
+    async () => {
+      const pair = await startPair();
+      cleanup = pair.cleanup;
+      const { alice, env } = pair;
+      await setPaused(env.hub, true);
+
+      const controller = new AbortController();
+      const logs: string[] = [];
+      const botDone = runBot(alice.daemon, {
+        usdc: env.usdc,
+        deposit: 1_000_000n,
+        stake: 100_000n,
+        offers: 1,
+        offerRecheckMs: 100,
+        waitTimeoutMs: 100,
+        offerBlockBackoffMs: 300,
+        signal: controller.signal,
+        log: (l) => logs.push(l),
+      });
+
+      // Several recheck passes, and several 300ms back-off cycles, all while still paused.
+      await new Promise((r) => setTimeout(r, 1_000));
+      expect((await alice.daemon.listOffers()).filter((o) => o.mine).length).toBe(0);
+      expect(logs.filter((l) => l.includes("the hub is paused")).length).toBe(1);
+
+      await setPaused(env.hub, false);
+      await waitFor(async () => (await alice.daemon.listOffers()).filter((o) => o.mine).length === 1, 10_000, "resumed posting once unpaused");
+      expect(logs.some((l) => l.includes("standing offers resumed"))).toBe(true);
 
       controller.abort();
       await botDone;
