@@ -200,4 +200,85 @@ describe("pnpm dev:up", () => {
     },
     120_000,
   );
+
+  it(
+    "Plan 5.5 Task 2: --house-bots 1 posts a standing offer, and teardown leaves no process behind",
+    async () => {
+      deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+
+      child = spawn(
+        TSX_BIN,
+        [
+          DEV_UP_SCRIPT,
+          "--anvil-port",
+          String(anvilPort),
+          "--port",
+          String(serverPort),
+          "--players",
+          "0",
+          "--house-bots",
+          "1",
+          "--dir",
+          devDir,
+        ],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
+      );
+
+      // dev-up itself only prints the ready line once the bot's offer is already visible in the lobby (it waits
+      // for that before calling itself ready) -- so this doubles as the "offer appears" assertion.
+      const ready = await waitForJsonLine(child, (o) => o.ready === true, 60_000);
+      expect(ready.houseBots).toBe(1);
+      const homeDir = join(devDir, "house-bots", "house-1");
+      expect(existsSync(join(homeDir, "config.json"))).toBe(true);
+      expect(existsSync(join(devDir, "logs", "house-1.log"))).toBe(true);
+
+      const serverUrl = `http://127.0.0.1:${serverPort}`;
+      const offersRes = await fetch(`${serverUrl}/offers`);
+      expect(offersRes.ok).toBe(true);
+      const offers = (await offersRes.json()) as Array<{ offer?: { player?: string } }>;
+      expect(offers.length).toBeGreaterThan(0);
+
+      // The bot's own daemon process, found the same way llm-games.ts's killDaemon does (ARENA_HOME/daemon.lock).
+      const lock = JSON.parse(readFileSync(join(homeDir, "daemon.lock"), "utf8")) as { pid: number };
+      const botAlive = () => {
+        try {
+          process.kill(lock.pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      expect(botAlive()).toBe(true);
+
+      const pid = child.pid;
+      expect(pid).toBeDefined();
+      const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      process.kill(-pid!, "SIGINT"); // simulates a terminal Ctrl-C: signals dev-up's whole process group
+      await Promise.race([
+        exited,
+        sleep(20_000).then(() => {
+          throw new Error("dev-up did not exit within 20s of SIGINT");
+        }),
+      ]);
+
+      // The house bot's own process (not just dev-up itself) is gone, and both ports free up -- teardown stops
+      // everything it started, not just anvil/server. Poll briefly for the OS to catch up.
+      const end = Date.now() + 10_000;
+      let anvilFree = false;
+      let serverFree = false;
+      while (Date.now() < end && !(anvilFree && serverFree && !botAlive())) {
+        anvilFree = await isPortFree(anvilPort);
+        serverFree = await isPortFree(serverPort);
+        if (!(anvilFree && serverFree) || botAlive()) await sleep(200);
+      }
+      expect(botAlive()).toBe(false);
+      expect(anvilFree).toBe(true);
+      expect(serverFree).toBe(true);
+    },
+    120_000,
+  );
 });
