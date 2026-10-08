@@ -8,16 +8,28 @@ daemons that receive it (spec §3, row 4; §12 item 17).
 
 ## Local dev stack (`pnpm dev:up`)
 
-From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 2]` brings up a whole local stack
-for manual play: Anvil, a fresh contract deployment (`forge script contracts/script/Deploy.s.sol`), this server
-pointed at it, and one funded `ARENA_HOME` per player (`arena init --server ...`, minted 100 USDC each) under
-`.arena-dev/` at the repo root (gitignored). It refuses cleanly — without starting or killing anything — if the
-requested Anvil or server port is already in use (e.g. by another dev stack, or a running demo); pass `--port`/
-`--anvil-port` to pick free ones. It does not start the players' daemons itself: it prints the exact
-`ARENA_HOME=... node .../arena.mjs daemon` command for each one, to run in its own terminal. The deployer stays
-the `ChannelHub` owner; its private key is printed too, labelled as a local-dev-only key (it is Anvil's
-well-known default account 0 — never use it where real funds could reach it). Ctrl-C tears down the server and
-Anvil.
+From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2]` brings up a
+whole local stack for manual (or agent) play: Anvil, a fresh contract deployment (`forge script
+contracts/script/Deploy.s.sol`), this server pointed at it, `--house-bots` always-available opponents, and one
+funded `ARENA_HOME` per `--players` (`arena init --server ...`, minted 100 USDC each) — all under `.arena-dev/`
+at the repo root (gitignored). It refuses cleanly — without starting or killing anything — if the requested
+Anvil or server port is already in use (e.g. by another dev stack, or a running demo); pass `--port`/
+`--anvil-port` to pick free ones.
+
+Each house bot is `arena bot` (`packages/cli/src/bot.ts`): a long-lived process with its own funded `ARENA_HOME`
+(`house-1`, `house-2`, …) that runs a daemon in-process, keeps a standing offer open in the lobby, and plays its
+own seats with a simple chess strategy, logging to `.arena-dev/logs/house-i.log`. dev:up waits until each one's
+offer is actually visible in the lobby before printing its ready line, then prints the one-sentence prompt a
+fresh agent session can be given to play end to end:
+
+> Go to http://127.0.0.1:8080 and use your money to play 10 $1 games with whoever is available.
+
+`--players` defaults to 0 now that agents self-onboard (`skill.md`) and fund themselves from the dev faucet; pass
+it explicitly for unfunded-by-bot human homes too. It does not start those players' daemons itself: it prints the
+exact `ARENA_HOME=... node .../arena.mjs daemon` command for each one, to run in its own terminal. The deployer
+stays the `ChannelHub` owner; its private key is printed too, labelled as a local-dev-only key (it is Anvil's
+well-known default account 0 — never use it where real funds could reach it). Ctrl-C tears down every house bot,
+then the server, then Anvil.
 
 ## System tests (`pnpm test:system`)
 
