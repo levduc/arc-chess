@@ -186,6 +186,10 @@ describe("buildStatus", () => {
     const oppClosed = { ...a.snapshot(), closeSigs: ["0x", close.sig] as [Hex, Hex] };
     const req = buildStatus({ record: rec(0), snapshot: oppClosed, myTurn: false, chain: OPEN, lastError: null });
     expect(req.attention).toBe("close-requested");
+    // Final fix wave I2(b): next-game would now be refused by the daemon (daemon.ts's nextGame), so it must
+    // not be suggested here either -- the only way forward is close.
+    expect(req.suggestedActions).toEqual(["arena close"]);
+    expect(req.suggestedActions).not.toContain("arena next-game");
     // A Close signature recorded against a non-terminal latest (as a snapshot written before the SDK refused them
     // could hold) must not raise close-requested: `arena close` would always fail there.
     const fresh = await sessions();

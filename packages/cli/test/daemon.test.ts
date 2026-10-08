@@ -47,6 +47,24 @@ describe("ArenaDaemon core", () => {
     expect(bob.daemon.handle(id).record.me).toBe(1);
   });
 
+  it("final fix wave I2: nextGame refuses once the opponent has signed Close, pointing the agent at close instead", async () => {
+    const { alice, bob, id } = await matched();
+    // Alice (me 0) is white in game 0 and resigns on her own turn, ending the game decisively -- no need to
+    // play a real line out.
+    await alice.daemon.resign(id, "agent");
+    await waitFor(async () => (await bob.daemon.status(id)).gameStatus !== "playing", 20_000, "bob sees game over");
+    // Bob signs Close; Alice's own session picks up his signature once the relay delivers it.
+    await bob.daemon.close(id, "agent");
+    await waitFor(() => alice.daemon.handle(id).session.snapshot().closeSigs[1] !== "0x", 20_000, "alice sees bob's close signature");
+
+    const err = await alice.daemon.nextGame(id, "agent").catch((e: unknown) => e as DaemonError);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).code).toBe(409);
+    expect((err as DaemonError).message).toMatch(/run close, not next-game/);
+    // Refused, not silently accepted and later wedged: no new-game proposal went out.
+    expect(alice.daemon.handle(id).session.snapshot().pendingCheckpoint).toBeNull();
+  });
+
   it("final review I2: approves exactly deposit + fee per funding, never an unlimited allowance", async () => {
     const pair = await startPair();
     cleanup = pair.cleanup;
