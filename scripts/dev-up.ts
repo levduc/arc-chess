@@ -255,6 +255,9 @@ async function main(): Promise<void> {
     indexer: { pollMs: 1_000, chunkBlocks: 1000, startBlock: 0 },
     limits: {},
     trustProxy: false,
+    // Plan 5.5 Task 1: dev-up always runs a local Anvil at chainId 31337, so the three-way faucet guard's other
+    // two checks (chainId, Anvil's web3_clientVersion) are satisfied too -- /faucet comes up enabled.
+    devFaucet: true,
   };
   writeFileSync(serverConfigPath, JSON.stringify(serverConfig, null, 2));
 
