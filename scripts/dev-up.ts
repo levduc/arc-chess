@@ -22,34 +22,19 @@
  * pass a fresh `--dir`, and later runs will carry their own marker from then on.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
+import { writeArenaWrapper } from "../tests/system/claude-sandbox.js";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const CONTRACTS_DIR = join(REPO_ROOT, "contracts");
 const CLI_BIN = join(REPO_ROOT, "packages/cli/bin/arena.mjs");
 const SERVER_BIN = join(REPO_ROOT, "apps/server/bin/arena-server.mjs");
 const DEFAULT_DEV_DIR = join(REPO_ROOT, ".arena-dev");
-
-/**
- * Plan 5.5 Task 3: writes `<dir>/bin/arena`, an executable shell wrapper around `node packages/cli/bin/arena.mjs`,
- * and returns its absolute path. This is the command `skill.md` shows a fresh agent (via the server's
- * `cliCommand`): a bare absolute path it can run from any directory, with no PATH setup and no assumption that the
- * agent's shell has `node` on PATH at all -- `process.execPath` is spliced in instead of a bare `node`, since a
- * fresh non-interactive shell (no nvm, no rc file sourced) is exactly the case this exists for.
- */
-function writeArenaWrapper(dir: string): string {
-  const binDir = join(dir, "bin");
-  mkdirSync(binDir, { recursive: true });
-  const wrapperPath = join(binDir, "arena");
-  writeFileSync(wrapperPath, `#!/bin/sh\nexec "${process.execPath}" "${CLI_BIN}" "$@"\n`);
-  chmodSync(wrapperPath, 0o755);
-  return wrapperPath;
-}
 
 // Anvil's well-known default account 0, derived from its built-in test mnemonic ("test test test test test test
 // test test test test test junk"). Anvil pre-funds it with ETH at startup. Local-dev only: never use this key
@@ -250,13 +235,18 @@ async function main(): Promise<void> {
   writeFileSync(join(DEV_DIR, DEV_DIR_MARKER), `${new Date().toISOString()}\n`);
   const playersDir = join(DEV_DIR, "players");
   mkdirSync(playersDir, { recursive: true });
-  const wrapperPath = writeArenaWrapper(DEV_DIR);
+  const wrapperPath = writeArenaWrapper(DEV_DIR, CLI_BIN);
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   process.stderr.write(`dev-up: starting anvil on :${anvilPort}\n`);
-  anvil = spawn("anvil", ["--port", String(anvilPort)], {
+  // Final review I1: without --block-time, Anvil only mines on an incoming transaction, so chain time freezes
+  // between them. Silence detection (opponent-silent), challenge/funding deadlines and offer expiry are all
+  // driven by that same frozen clock -- on a stack where only the agent and house bots run, nothing mines, so
+  // none of them ever fire even when they should. --block-time 1 makes chain time track wall-clock time, the
+  // same as it does on Arc.
+  anvil = spawn("anvil", ["--port", String(anvilPort), "--block-time", "1"], {
     cwd: REPO_ROOT,
     env: { ...process.env, PATH: `${process.env.HOME}/.foundry/bin:${process.env.PATH ?? ""}` },
     stdio: ["ignore", "ignore", "inherit"],
@@ -383,6 +373,11 @@ async function main(): Promise<void> {
   const logsDir = join(DEV_DIR, "logs");
   mkdirSync(logsDir, { recursive: true });
   for (let i = 1; i <= numHouseBots; i++) {
+    // M4: a Ctrl-C that lands mid-startup runs shutdown()/teardown() against whatever `bots` holds *right now*;
+    // main() itself just keeps looping through this for-loop regardless, since nothing here was awaiting the
+    // signal. Without this check, the next bot spawned after that snapshot was taken would never receive the
+    // terminal's SIGINT and would survive against an already-dead stack.
+    if (shuttingDown) break;
     const name = `house-${i}`;
     const key = generatePrivateKey();
     const address = privateKeyToAccount(key).address;
@@ -402,10 +397,19 @@ async function main(): Promise<void> {
 
     process.stderr.write(`dev-up: starting house bot ${name} (logging to ${join(logsDir, `${name}.log`)})\n`);
     const logFd = openSync(join(logsDir, `${name}.log`), "a");
-    const bot = spawn("node", [CLI_BIN, "bot"], {
+    // Final review I2(d): an LLM opponent is much slower than the scripted test agent, so the default 120s
+    // idle-close would end a game -- and start the "both of you must agree to close" standoff I2 fixes -- while
+    // a real agent is still mid-turn. 600s gives it real headroom.
+    const bot = spawn("node", [CLI_BIN, "bot", "--idle-close-seconds", "600"], {
       cwd: REPO_ROOT,
       env: { ...process.env, ARENA_HOME: home },
       stdio: ["ignore", logFd, logFd],
+    });
+    // M4: a house bot's own exit (e.g. a sticky lobbyError -- M8, parked) was otherwise silent; at least log it
+    // so dev-up's own output tells a human watching that the lobby has one fewer opponent in it. Never logged
+    // during an ordinary teardown, which this process itself initiates.
+    bot.on("exit", (code, signal) => {
+      if (!shuttingDown) process.stderr.write(`dev-up: house bot ${name} exited unexpectedly (code=${code} signal=${signal})\n`);
     });
     bots.push({ label: name, child: bot });
     await waitForOffer(serverUrl, address);

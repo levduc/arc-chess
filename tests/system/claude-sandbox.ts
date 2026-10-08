@@ -9,7 +9,7 @@
  * plain root-level script, outside every workspace package's own `tsconfig`/`node_modules` layout, and imports
  * this file directly across that boundary.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -56,6 +56,27 @@ export function buildClaudeEnv(arenaHome: string, binDir: string): NodeJS.Proces
   const home = process.env.HOME;
   if (!home) throw new Error("HOME is not set in this process's environment -- required for the claude CLI's auth/config");
   return { PATH: `${binDir}:${process.env.PATH ?? ""}`, HOME: home, ARENA_HOME: arenaHome };
+}
+
+// -------------------------------------------------------------------------------------------------------- wrapper
+
+/**
+ * Plan 5.5 final fix wave, M9: writes `<dir>/bin/arena`, an executable shell wrapper around `node cliBin`, and
+ * returns its absolute path. Single-quoted (POSIX `'\''` escaping), not double-quoted: inside a double-quoted
+ * shell string `$`, a backtick, `\` and `"` all stay special, where a single-quoted one has no special
+ * characters at all except the quote itself. `process.execPath`/`cliBin` are fixed, developer-controlled
+ * absolute paths today, so this costs nothing and removes the (currently theoretical) class of break entirely.
+ * Exported here, once, so `scripts/dev-up.ts` and `tests/system/agent-recipe.test.ts` can't drift out of
+ * lockstep the way their two separate copies already had (fix round 1 review, M9).
+ */
+export function writeArenaWrapper(dir: string, cliBin: string): string {
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const wrapperPath = join(binDir, "arena");
+  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  writeFileSync(wrapperPath, `#!/bin/sh\nexec ${sq(process.execPath)} ${sq(cliBin)} "$@"\n`);
+  chmodSync(wrapperPath, 0o755);
+  return wrapperPath;
 }
 
 // ------------------------------------------------------------------------------------------------------- tmp root

@@ -15,7 +15,7 @@
  * loop runs the same command shapes -- with real arguments -- through the wrapper binary.
  */
 import { type ChildProcess, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,21 +24,10 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
 import { channelHubAbi } from "@arena/sdk";
 import { loadWalletKey, pickMove } from "@arena/cli";
+import { writeArenaWrapper } from "./claude-sandbox.js";
 import { CLI_BIN, freeTcpPort, isPortFree, runCli, usdcBalanceOf, type Stack, startStack } from "./harness.js";
 
 const REPO_ROOT = join(import.meta.dirname, "../..");
-
-/** Mirrors `writeArenaWrapper` in `scripts/dev-up.ts` -- deliberately duplicated rather than imported (that file
- *  is a standalone script, not a module meant to export helpers), but must stay the same shape: an executable
- *  shell wrapper around `node packages/cli/bin/arena.mjs`, using `process.execPath` rather than a bare "node". */
-function writeArenaWrapper(dir: string): string {
-  const binDir = join(dir, "bin");
-  mkdirSync(binDir, { recursive: true });
-  const wrapperPath = join(binDir, "arena");
-  writeFileSync(wrapperPath, `#!/bin/sh\nexec "${process.execPath}" "${CLI_BIN}" "$@"\n`);
-  chmodSync(wrapperPath, 0o755);
-  return wrapperPath;
-}
 
 /** A pinned copy of the commands skill.md's recipe documents, `<wrapper>` standing in for `cfg.cliCommand`.
  *  Checked against the actually-served doc below, so this list can never silently drift from the real one. */
@@ -189,9 +178,13 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
     "inits with auto-fund, accepts a house bot's offer, plays 3 games (resigning game 2), closes, and settles with exact accounting",
     async () => {
       dir = mkdtempSync(join(tmpdir(), "agent-recipe-"));
-      const wrapperPath = writeArenaWrapper(dir);
+      const wrapperPath = writeArenaWrapper(dir, CLI_BIN);
+      // Final review I1: automine freezes chain time between transactions (startStack's own default, and never
+      // changed -- about 70 other system tests depend on it). This test's whole point is the recipe a real dev
+      // stack serves, so it opts into the same --block-time 1 dev-up itself now runs with: silence detection,
+      // challenge/funding deadlines and offer expiry all need chain time to actually track wall-clock time.
       // The dev faucet must be on for `arena init` to auto-fund a brand-new wallet, exactly like a real dev stack.
-      stack = await startStack({ serverOverrides: { cliCommand: wrapperPath, devFaucet: true } });
+      stack = await startStack({ blockTime: 1, serverOverrides: { cliCommand: wrapperPath, devFaucet: true } });
 
       console.log(`[agent-recipe] stack up: server=${stack.serverUrl} rpc=${stack.rpcUrl}`);
       houseBots.push(await startHouseBot(stack, dir, "1"));
