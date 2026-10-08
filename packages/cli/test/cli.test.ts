@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { daemonStartLine, loadConfig, runCli } from "../src/index.js";
+import { daemonStartLine, invalidOfferTimeoutReason, loadConfig, runCli } from "../src/index.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = []) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -211,5 +211,34 @@ describe("arena CLI", () => {
     }) as unknown as typeof fetch;
     expect(await runCli(["bot"], refused.io)).toBe(2);
     expect(refused.err.join("\n")).toMatch(/refusing to run "arena bot".*chain 1.*--allow-real-chain/s);
+  });
+
+  it("fix round (minor 5): arena bot validates --timeout like the other flags, before touching the daemon", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io); // chain 31337: passes the chain check, so --timeout's own validation is reached
+    for (const bad of ["abc", "-1", "1.5", "", "60s"]) {
+      const t = io(home);
+      (t.io as { fetch: typeof fetch }).fetch = (async () => {
+        throw new Error("must not reach the network");
+      }) as unknown as typeof fetch;
+      expect(await runCli(["bot", "--timeout", bad], t.io)).toBe(2);
+      expect(t.err.join("\n")).toMatch(/--timeout must be a non-negative integer/);
+    }
+  });
+
+  it("fix round (minor 5): invalidOfferTimeoutReason checks --timeout against the larger of the hub's MIN_TIMEOUT and minChallengeTimeout, and the hub's MAX_TIMEOUT", () => {
+    const bounds = { min: 60n, max: 604_800n };
+    // Below the hub's own minimum.
+    expect(invalidOfferTimeoutReason(30n, bounds, 60n)).toMatch(/below the minimum of 60s/);
+    // At the hub's minimum, but below this daemon's own (larger) floor.
+    expect(invalidOfferTimeoutReason(100n, bounds, 900n)).toMatch(/below the minimum of 900s/);
+    // Exactly at the floor: fine.
+    expect(invalidOfferTimeoutReason(900n, bounds, 900n)).toBeNull();
+    // Comfortably within bounds: fine.
+    expect(invalidOfferTimeoutReason(3_600n, bounds, 900n)).toBeNull();
+    // Exactly at the hub's maximum: fine.
+    expect(invalidOfferTimeoutReason(604_800n, bounds, 60n)).toBeNull();
+    // Above the hub's maximum.
+    expect(invalidOfferTimeoutReason(604_801n, bounds, 60n)).toMatch(/above the hub's maximum of 604800s/);
   });
 });

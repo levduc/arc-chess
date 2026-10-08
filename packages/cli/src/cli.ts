@@ -7,6 +7,7 @@ import {
   loadConfig,
   loadToken,
   loadWalletKey,
+  minChallengeTimeoutOf,
   DEFAULT_LOG_CHUNK_BLOCKS,
   defaultSessionGasWei,
   knownDeploymentWarnings,
@@ -109,6 +110,32 @@ export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: str
     board: `${proc.apiUrl}/board`,
     boardHint: "run: arena board",
   };
+}
+
+/**
+ * Plan 5.5 Task 2 fix round (minor 5): the reason `arena bot --timeout <timeout>` would never actually work on
+ * this chain/daemon, or `null` if it's fine. The floor is the larger of the hub's own `MIN_TIMEOUT` and this
+ * daemon's own `minChallengeTimeout` (`createOffer`'s own check order, mirrored here so the error surfaces at
+ * startup instead of as a repeating, generic createOffer failure on every standing-offer recheck pass). A pure
+ * function of the three bounds, so it's unit-testable without a chain -- `arena bot` reads `hubBounds` from
+ * `daemon.hub.timeoutBounds()` once, after the daemon (and so the hub connection) is up.
+ */
+export function invalidOfferTimeoutReason(
+  timeout: bigint,
+  hubBounds: { min: bigint; max: bigint },
+  minChallengeTimeout: bigint,
+): string | null {
+  const floor = hubBounds.min > minChallengeTimeout ? hubBounds.min : minChallengeTimeout;
+  if (timeout < floor) {
+    return (
+      `--timeout ${timeout}s is below the minimum of ${floor}s (the hub's own minimum is ${hubBounds.min}s; ` +
+      `this daemon's minChallengeTimeout is ${minChallengeTimeout}s)`
+    );
+  }
+  if (timeout > hubBounds.max) {
+    return `--timeout ${timeout}s is above the hub's maximum of ${hubBounds.max}s`;
+  }
+  return null;
 }
 
 /** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors. */
@@ -466,6 +493,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             `only. Pass --allow-real-chain to run one on a real chain anyway.`,
         );
       }
+      // Fix round: every flag is parsed and format-checked here, before startDaemonProcess takes the home lock
+      // and starts the API -- a usage error must never leave a daemon running (or a lock held) behind it.
       const amountOrDefault = (name: string, def: string): bigint => {
         const v = flag(name) ?? def;
         if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(v)) {
@@ -479,9 +508,27 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (!Number.isFinite(idleCloseSeconds) || idleCloseSeconds < 0) {
         throw new UsageError("--idle-close-seconds must be a non-negative number");
       }
-      const offerTimeout = flag("timeout") !== undefined ? BigInt(flag("timeout")!) : undefined;
+      const timeoutRaw = flag("timeout");
+      if (timeoutRaw !== undefined && !/^[0-9]+$/.test(timeoutRaw)) {
+        throw new UsageError("--timeout must be a non-negative integer number of seconds");
+      }
+      const offerTimeout = timeoutRaw !== undefined ? BigInt(timeoutRaw) : undefined;
+      const deposit = amountOrDefault("deposit", "10");
+      const stake = amountOrDefault("stake", "1");
 
       const proc = await startDaemonProcess(home, { log: io.err });
+      // Fix round (minor 5): an explicit --timeout this daemon would never actually be able to use (below the
+      // hub's own minimum or this daemon's minChallengeTimeout, or above the hub's maximum) is caught here,
+      // clearly, at startup -- rather than only surfacing later as a repeating, generic createOffer failure on
+      // every standing-offer recheck pass.
+      if (offerTimeout !== undefined) {
+        const bounds = await proc.daemon.hub.timeoutBounds();
+        const reason = invalidOfferTimeoutReason(offerTimeout, bounds, minChallengeTimeoutOf(cfg));
+        if (reason) {
+          await proc.stop();
+          throw new UsageError(reason);
+        }
+      }
       io.out(
         JSON.stringify({
           ...daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address }),
@@ -506,8 +553,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
       await runBot(proc.daemon, {
         usdc: cfg.usdc,
-        deposit: amountOrDefault("deposit", "10"),
-        stake: amountOrDefault("stake", "1"),
+        deposit,
+        stake,
         offers,
         offerTimeout,
         idleCloseMs: idleCloseSeconds * 1000,
