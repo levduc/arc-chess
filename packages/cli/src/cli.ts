@@ -1,10 +1,11 @@
-import { parseUnits, type Address, type Hex } from "viem";
+import { formatUnits, parseUnits, type Address, type Hex } from "viem";
 import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
 import {
   defaultHome,
   initHome,
   loadConfig,
   loadToken,
+  loadWalletKey,
   DEFAULT_LOG_CHUNK_BLOCKS,
   defaultSessionGasWei,
   knownDeploymentWarnings,
@@ -22,14 +23,18 @@ export type CliIo = {
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
-       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false]
+       [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false] [--no-faucet]
        (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
         agent once max(60 s, challengeTimeout / 3) is left)
        (missing chain settings are filled from the server's /templates and checked over the RPC;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
+       (when the server advertises a dev faucet and the wallet's USDC balance is below 20, init calls it;
+        --no-faucet turns this off)
   daemon [start]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
+  wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
+  faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
@@ -37,6 +42,48 @@ const USAGE = `usage: arena <command> [options]
   handoff human|agent [--note TEXT] [--channel ID]`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/** Plan 5.5 Task 1: `init` auto-funds from the server's faucet only below this USDC balance (6 decimals). */
+const FAUCET_MIN_USDC_BALANCE = 20_000_000n;
+
+/** ERC20 `balanceOf(address)` calldata: the well-known 4-byte selector `0x70a08231`, plus the address
+ *  left-padded to a 32-byte word. */
+function balanceOfCalldata(address: Address): Hex {
+  return `0x70a08231${address.slice(2).toLowerCase().padStart(64, "0")}` as Hex;
+}
+
+function hexToBigIntOrThrow(raw: unknown, what: string): bigint {
+  if (typeof raw !== "string" || !/^0x[0-9a-fA-F]*$/.test(raw)) throw new Error(`${what}: malformed RPC result ${JSON.stringify(raw)?.slice(0, 80)}`);
+  return raw === "0x" ? 0n : BigInt(raw);
+}
+
+/** USDC's `balanceOf`, read with a raw `eth_call` through `io.fetch` -- stubbable, no viem client needed. */
+async function usdcBalanceOf(io: CliIo, rpcUrl: string, usdc: Address, address: Address): Promise<bigint> {
+  const raw = await rpcCall(io, rpcUrl, "eth_call", [{ to: usdc, data: balanceOfCalldata(address) }, "latest"]);
+  return hexToBigIntOrThrow(raw, `RPC ${rpcUrl} eth_call (USDC balanceOf)`);
+}
+
+/** The chain's native balance (wei), read with `eth_getBalance` through `io.fetch`. */
+async function nativeBalanceOf(io: CliIo, rpcUrl: string, address: Address): Promise<bigint> {
+  const raw = await rpcCall(io, rpcUrl, "eth_getBalance", [address, "latest"]);
+  return hexToBigIntOrThrow(raw, `RPC ${rpcUrl} eth_getBalance`);
+}
+
+/** USDC amounts always print with exactly 6 decimal places (e.g. `100.000000`), unlike `formatUnits`, which
+ *  trims trailing zeros -- a fixed width makes balances easy to compare at a glance. */
+function formatUsdc6(amount: bigint): string {
+  const negative = amount < 0n;
+  const digits = (negative ? -amount : amount).toString().padStart(7, "0");
+  return `${negative ? "-" : ""}${digits.slice(0, -6) || "0"}.${digits.slice(-6)}`;
+}
+
+/** The native balance, formatted with `formatUnits` (which trims trailing zeros and, for a whole amount, the
+ *  decimal point too) but always showing at least one decimal place -- `formatUnits(10n ** 18n, 18)` is `"1"`;
+ *  this returns `"1.0"`. */
+function formatNativeBalance(wei: bigint): string {
+  const s = formatUnits(wei, 18);
+  return s.includes(".") ? s : `${s}.0`;
+}
 
 class UsageError extends Error {}
 
@@ -119,6 +166,7 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--offer-draw") flags.set("offer-draw", true);
+    else if (a === "--no-faucet") flags.set("no-faucet", true);
     else if (a.startsWith("--")) {
       const v = argv[i + 1];
       if (v === undefined || v.startsWith("--")) throw new UsageError(`missing value for ${a}`);
@@ -157,7 +205,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const server = need("server");
       const explicitFields = ["rpc", "chain-id", "hub", "usdc", "rules"];
       const haveAllExplicit = explicitFields.every((name) => flag(name) !== undefined);
-      let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string } = {};
+      let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; faucet?: string } = {};
       if (!haveAllExplicit) {
         const templatesUrl = `${server.replace(/\/$/, "")}/templates`;
         const res = await io.fetch(templatesUrl);
@@ -176,6 +224,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           hub: typeof chess.hub === "string" ? chess.hub : undefined,
           usdc: typeof chess.usdc === "string" ? chess.usdc : undefined,
           rules: typeof chess.rules === "string" ? chess.rules : undefined,
+          // Plan 5.5 Task 1 (Global Constraints): only ever set by a dev server whose faucet guard is fully
+          // satisfied -- a real deployment's /templates never carries this key at all.
+          faucet: typeof chess.faucet === "string" ? chess.faucet : undefined,
         };
       }
       const rpcUrl = flag("rpc") ?? template.rpcUrl;
@@ -254,9 +305,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       };
       const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
       const { privateKeyToAccount } = await import("viem/accounts");
+      const walletAddress = privateKeyToAccount(walletKey).address;
       const summary: Record<string, unknown> = {
         home,
-        wallet: privateKeyToAccount(walletKey).address,
+        wallet: walletAddress,
         port: cfg.port,
         rpcUrl,
         chainId,
@@ -269,6 +321,41 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         summary.trust =
           `these contract addresses and the RPC come from ${server}; verify them against a source you trust, ` +
           "or pass --rpc/--hub/--usdc/--rules explicitly";
+      }
+      // Plan 5.5 Task 1: only when the template actually advertised a faucet (a real deployment's /templates
+      // never does) -- a server without one leaves `summary` with no `faucet` key at all. `--no-faucet` turns
+      // this off without reading the balance or reaching the faucet. A faucet failure is reported here, never
+      // thrown: auto-funding is a convenience, not a reason to fail `init`.
+      if (template.faucet !== undefined) {
+        if (flags.has("no-faucet")) {
+          summary.faucet = "skipped: --no-faucet";
+        } else {
+          try {
+            const balance = await usdcBalanceOf(io, rpcUrl, usdc, walletAddress);
+            if (balance < FAUCET_MIN_USDC_BALANCE) {
+              let res: Response;
+              try {
+                res = await io.fetch(template.faucet, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ address: walletAddress }),
+                });
+              } catch (err) {
+                throw new Error(`faucet ${template.faucet} is unreachable: ${err instanceof Error ? err.message : String(err)}`);
+              }
+              const payload = (await res.json().catch(() => ({}))) as { usdc?: unknown; native?: unknown; error?: unknown };
+              if (!res.ok) {
+                const detail = typeof payload.error === "string" ? `: ${payload.error}` : "";
+                throw new Error(`faucet ${template.faucet} answered with status ${res.status}${detail}`);
+              }
+              summary.faucet = { usdc: payload.usdc, native: payload.native };
+            } else {
+              summary.faucet = "skipped: balance already at or above 20 USDC";
+            }
+          } catch (err) {
+            summary.faucet = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
+          }
+        }
       }
       io.out(JSON.stringify(summary, null, 2));
       return 0;
@@ -316,6 +403,50 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return 1;
       }
       io.out(`http://127.0.0.1:${cfg.port}/board#code=${payload.code}`);
+      return 0;
+    }
+
+    if (cmd === "wallet") {
+      // Plan 5.5 Task 1: reads the chain directly (no daemon, no token) -- useful whether or not one is running.
+      const cfg = loadConfig(home);
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const address = privateKeyToAccount(loadWalletKey(home)).address;
+      const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+      const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
+      io.out(
+        JSON.stringify(
+          { address, chainId: cfg.chainId, usdc: formatUsdc6(usdcBalance), native: formatNativeBalance(nativeBalance) },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+
+    if (cmd === "faucet") {
+      // Plan 5.5 Task 1: calls the host server's dev faucet for this wallet explicitly (no daemon needed).
+      const cfg = loadConfig(home);
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const address = privateKeyToAccount(loadWalletKey(home)).address;
+      const faucetUrl = `${cfg.serverUrl.replace(/\/$/, "")}/faucet`;
+      let res: Response;
+      try {
+        res = await io.fetch(faucetUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ address }),
+        });
+      } catch (err) {
+        io.err(`error: cannot reach ${faucetUrl}: ${err instanceof Error ? err.message : String(err)}`);
+        return 1;
+      }
+      const payload = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        const message = res.status === 404 ? "server advertises no faucet (not a dev server)" : payload.error ?? res.statusText;
+        io.err(`error: ${message}`);
+        return 1;
+      }
+      io.out(JSON.stringify(payload, null, 2));
       return 0;
     }
 

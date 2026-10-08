@@ -20,14 +20,30 @@ function templatesResponse(overrides: Record<string, unknown> = {}) {
 }
 
 /** Serves `GET <server>/templates` and answers JSON-RPC POSTs to any other URL as a chain with `chainId` whose
- *  contracts are the addresses in `withCode`. Every request URL is recorded in `calls`. */
-function stubFetch(opts: { templates?: unknown; chainId?: number; withCode?: string[]; gasPrice?: bigint } = {}) {
+ *  contracts are the addresses in `withCode`. Every request URL is recorded in `calls`.
+ *  `faucetBalance` answers `eth_call` (the USDC `balanceOf` read); `faucetResponse` answers a POST to a
+ *  `/faucet` URL -- both only matter for tests whose `templates` advertise a `faucet`. */
+function stubFetch(
+  opts: {
+    templates?: unknown;
+    chainId?: number;
+    withCode?: string[];
+    gasPrice?: bigint;
+    faucetBalance?: bigint;
+    faucetResponse?: { status: number; body: unknown };
+  } = {},
+) {
   const calls: Array<{ url: string; method?: string }> = [];
   const withCode = new Set((opts.withCode ?? [`0x${"11".repeat(20)}`, `0x${"33".repeat(20)}`]).map((a) => a.toLowerCase()));
   const fetchStub = (async (url: string, init?: RequestInit) => {
     if (url.endsWith("/templates")) {
       calls.push({ url });
       return new Response(JSON.stringify(opts.templates ?? templatesResponse()));
+    }
+    if (url.endsWith("/faucet")) {
+      calls.push({ url, method: "POST" });
+      const r = opts.faucetResponse ?? { status: 200, body: { address: `0x${"ab".repeat(20)}`, usdc: "100000000", native: "1000000000000000000" } };
+      return new Response(JSON.stringify(r.body), { status: r.status });
     }
     const req = JSON.parse(String(init?.body)) as { id: number; method: string; params: unknown[] };
     calls.push({ url, method: req.method });
@@ -36,7 +52,9 @@ function stubFetch(opts: { templates?: unknown; chainId?: number; withCode?: str
         ? `0x${(opts.chainId ?? 31337).toString(16)}`
         : req.method === "eth_gasPrice"
           ? `0x${(opts.gasPrice ?? 1_000_000_000n).toString(16)}`
-          : withCode.has(String(req.params[0]).toLowerCase())
+          : req.method === "eth_call"
+            ? `0x${(opts.faucetBalance ?? 0n).toString(16).padStart(64, "0")}`
+            : withCode.has(String(req.params[0]).toLowerCase())
           ? "0x6080"
           : "0x";
     return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }));
@@ -378,5 +396,96 @@ describe("arena init --server", () => {
     );
     expect(code).not.toBe(0);
     expect(err.join("\n")).toMatch(/rpc/);
+  });
+
+  it("Plan 5.5 Task 1: no faucet key in the output when the template advertises none", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub } = stubFetch(); // default templatesResponse(): no faucet field
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toBeUndefined();
+  });
+
+  it("Plan 5.5 Task 1: auto-funds when the template advertises a faucet and the balance is below 20 USDC", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub, calls } = stubFetch({
+      templates: templatesResponse({ faucet: "http://host.test/faucet" }),
+      faucetBalance: 0n,
+      faucetResponse: { status: 200, body: { address: `0x${"ab".repeat(20)}`, usdc: "100000000", native: "1000000000000000000" } },
+    });
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toEqual({ usdc: "100000000", native: "1000000000000000000" });
+    expect(calls.some((c) => c.url === "http://host.test/faucet" && c.method === "POST")).toBe(true);
+    expect(calls.some((c) => c.method === "eth_call")).toBe(true);
+  });
+
+  it("Plan 5.5 Task 1: --no-faucet skips auto-funding entirely, with no balance read and no faucet call", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub, calls } = stubFetch({ templates: templatesResponse({ faucet: "http://host.test/faucet" }) });
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test", "--no-faucet"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toBe("skipped: --no-faucet");
+    expect(calls.some((c) => c.method === "eth_call" || c.url.endsWith("/faucet"))).toBe(false);
+  });
+
+  it("Plan 5.5 Task 1: skips auto-funding (without calling the faucet) when the balance is already at or above 20 USDC", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub, calls } = stubFetch({
+      templates: templatesResponse({ faucet: "http://host.test/faucet" }),
+      faucetBalance: 20_000_000n,
+    });
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toMatch(/^skipped:/);
+    expect(calls.some((c) => c.url.endsWith("/faucet"))).toBe(false);
+  });
+
+  it("Plan 5.5 Task 1: a faucet failure is reported under faucet but never fails init", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const { fetchStub } = stubFetch({
+      templates: templatesResponse({ faucet: "http://host.test/faucet" }),
+      faucetBalance: 0n,
+      faucetResponse: { status: 500, body: { error: "faucet exploded" } },
+    });
+    const out: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: (s) => out.push(s),
+      err: () => undefined,
+    });
+    expect(code).toBe(0);
+    const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+    expect(printed.faucet).toMatch(/^skipped:/);
+    expect(printed.faucet).toMatch(/faucet exploded|500/);
   });
 });

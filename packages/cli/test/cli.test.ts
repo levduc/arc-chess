@@ -152,4 +152,48 @@ describe("arena CLI", () => {
     expect(await runCli(["offer", "--deposit", "1.123456", "--stake", "0"], t.io)).toBe(0);
     expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toMatchObject({ deposit: "1123456", stakePerGame: "0" });
   });
+
+  it("Plan 5.5 Task 1: arena wallet reads USDC and native balances directly over RPC, with no daemon call", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const usdcHex = `0x${(100_000_000n).toString(16).padStart(64, "0")}`; // 100 USDC, 6 decimals
+    const nativeHex = `0x${(10n ** 18n).toString(16)}`; // exactly 1 ETH
+    const t = io(home, [
+      { status: 200, body: { jsonrpc: "2.0", id: 1, result: usdcHex } }, // eth_call (balanceOf)
+      { status: 200, body: { jsonrpc: "2.0", id: 1, result: nativeHex } }, // eth_getBalance
+    ]);
+    expect(await runCli(["wallet"], t.io)).toBe(0);
+    expect(t.calls).toHaveLength(2);
+    expect(JSON.parse(String(t.calls[0].init.body)).method).toBe("eth_call");
+    expect(t.calls[0].url).toBe("http://127.0.0.1:8546"); // cfg.rpcUrl from INIT, not the daemon
+    expect(JSON.parse(String(t.calls[1].init.body)).method).toBe("eth_getBalance");
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(printed).toMatchObject({ chainId: 31337, usdc: "100.000000", native: "1.0" });
+    expect(printed.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
+  });
+
+  it("Plan 5.5 Task 1: arena faucet POSTs to the server and prints its result, or fails clearly", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const t = io(home, [{ status: 200, body: { address: "0xabc", usdc: "100000000", native: "1000000000000000000" } }]);
+    expect(await runCli(["faucet"], t.io)).toBe(0);
+    expect(t.calls).toHaveLength(1);
+    expect(t.calls[0].url).toBe("http://127.0.0.1:3000/faucet"); // cfg.serverUrl from INIT
+    expect(t.calls[0].init.method).toBe("POST");
+    expect(JSON.parse(String(t.calls[0].init.body))).toMatchObject({ address: expect.stringMatching(/^0x[0-9a-fA-F]{40}$/) });
+    expect(JSON.parse(t.out.join("\n"))).toEqual({ address: "0xabc", usdc: "100000000", native: "1000000000000000000" });
+
+    // A server with no faucet (404): a clear, specific message, not a raw status.
+    const notDev = io(home, [{ status: 404, body: { error: "not found" } }]);
+    expect(await runCli(["faucet"], notDev.io)).toBe(1);
+    expect(notDev.err.join("\n")).toMatch(/server advertises no faucet/);
+
+    // Unreachable server: fails clearly, doesn't throw.
+    const down = io(home);
+    (down.io as { fetch: typeof fetch }).fetch = (async () => {
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+    expect(await runCli(["faucet"], down.io)).toBe(1);
+    expect(down.err.join("\n")).toMatch(/cannot reach/);
+  });
 });
