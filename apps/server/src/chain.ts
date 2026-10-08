@@ -1,5 +1,16 @@
-import { createPublicClient, defineChain, http, type Address, type Hex, type PublicClient } from "viem";
-import { HubClient, type HubEvent } from "@arena/sdk";
+import {
+  createPublicClient,
+  createTestClient,
+  createWalletClient,
+  defineChain,
+  encodeFunctionData,
+  http,
+  type Address,
+  type Hex,
+  type PublicClient,
+} from "viem";
+import { foundry } from "viem/chains";
+import { HubClient, mockUsdcAbi, type HubEvent } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 
 export type Limits = {
@@ -129,4 +140,46 @@ export class RpcChainReader implements ChainReader {
     }
     return this.genesisHashPromise;
   }
+}
+
+/** Plan 5.5 Task 1: 100 USDC (6 decimals), the fixed amount every `/faucet` request mints. */
+export const FAUCET_USDC_AMOUNT = 100_000_000n;
+/** The native balance `/faucet` guarantees at least: 1 ETH (never lowered if already higher). */
+export const FAUCET_MIN_NATIVE_WEI = 10n ** 18n;
+
+/**
+ * Plan 5.5 Task 1: funds `to` on a local Anvil chain -- 100 USDC minted via MockUSDC's `mint`, sent with
+ * `eth_sendTransaction` from Anvil's unlocked `eth_accounts[0]` (never a private key held by this process), and
+ * the native balance raised to at least `FAUCET_MIN_NATIVE_WEI` via `anvil_setBalance` (read first; never
+ * lowered). Waits for the mint's receipt before reading balances back.
+ *
+ * Deliberately a free function, not a `ChainReader` method: only ever called after `startServer`'s three-way
+ * guard has confirmed this chain *is* Anvil's 31337, so `FakeChain`-backed tests (every other route) never need
+ * to stub it, and the guard's own disabled-path tests never reach a real RPC.
+ */
+export async function fundFromFaucet(rpcUrl: string, usdc: Address, to: Address): Promise<{ usdc: bigint; native: bigint }> {
+  const transport = http(rpcUrl);
+  const pub = createPublicClient({ chain: foundry, transport });
+  const wallet = createWalletClient({ chain: foundry, transport });
+  const test = createTestClient({ mode: "anvil", chain: foundry, transport });
+
+  const [from] = await wallet.getAddresses();
+  const hash = await wallet.sendTransaction({
+    account: from,
+    chain: foundry,
+    to: usdc,
+    data: encodeFunctionData({ abi: mockUsdcAbi, functionName: "mint", args: [to, FAUCET_USDC_AMOUNT] }),
+  });
+  await pub.waitForTransactionReceipt({ hash });
+
+  const currentNative = await pub.getBalance({ address: to });
+  if (currentNative < FAUCET_MIN_NATIVE_WEI) {
+    await test.setBalance({ address: to, value: FAUCET_MIN_NATIVE_WEI });
+  }
+
+  const [usdcBalance, native] = await Promise.all([
+    pub.readContract({ address: usdc, abi: mockUsdcAbi, functionName: "balanceOf", args: [to] }),
+    pub.getBalance({ address: to }),
+  ]);
+  return { usdc: usdcBalance, native };
 }

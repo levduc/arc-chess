@@ -1,9 +1,9 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import type { Address, Hex } from "viem";
+import { getAddress, type Address, type Hex } from "viem";
 import { channelId, decodeWire, fenOf, statusOf, toWire, WireFormatError } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
-import { RpcChainReader, type ChainReader } from "./chain.js";
+import { fundFromFaucet, RpcChainReader, type ChainReader } from "./chain.js";
 import { chessSkillMd, indexHtml, llmsTxt, skillMd, watchHtml } from "./docs.js";
 import { Indexer, playerStats } from "./indexer.js";
 import { clientKey, RateLimiter } from "./limits.js";
@@ -143,7 +143,7 @@ async function templateLimits(chain: ChainReader): Promise<{
   }
 }
 
-async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader) {
+async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader, faucetEnabled: boolean) {
   return {
     id: "chess",
     version: "1",
@@ -161,6 +161,10 @@ async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader)
     skillUrl: `${url}/templates/chess/skill.md`,
     audit: cfg.audit,
     limits: await templateLimits(chain),
+    // Plan 5.5 Task 1 (Global Constraints): advertised only once the three-way guard has confirmed the faucet is
+    // actually enabled -- `undefined` here is dropped by `toWire`'s JSON.stringify, so a disabled faucet leaves
+    // no `faucet` key at all, not a null or false one a careless client might still act on.
+    ...(faucetEnabled ? { faucet: `${url}/faucet` } : {}),
   };
 }
 
@@ -243,6 +247,45 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
       }),
     );
   }
+
+  // Plan 5.5 Task 1 (Global Constraints): the dev faucet needs all three at once -- config opt-in, chain id
+  // 31337, and the RPC itself answering as Anvil. Checked once, here, and cached for the server's lifetime: every
+  // `/faucet` request and every `/templates` response just reads this boolean, never re-derives it. The chain-id
+  // and config checks are synchronous and come first, so a real deployment (devFaucet never set, or chainId never
+  // 31337) never even makes the `clientVersion()` RPC call.
+  let faucetEnabled = false;
+  if (cfg.devFaucet === true && cfg.chainId === 31337) {
+    try {
+      const version = await chain.clientVersion();
+      faucetEnabled = /^anvil\//i.test(version);
+      if (!faucetEnabled) {
+        log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "warn",
+            msg: "devFaucet is set and chainId is 31337, but the RPC's web3_clientVersion is not Anvil's -- /faucet stays disabled",
+            clientVersion: version,
+          }),
+        );
+      }
+    } catch (err) {
+      log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "warn",
+          msg: "devFaucet is set, but web3_clientVersion could not be read -- /faucet stays disabled",
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+  if (faucetEnabled) {
+    log(JSON.stringify({ ts: new Date().toISOString(), level: "info", msg: "dev faucet enabled (chainId 31337, Anvil)" }));
+  }
+  // Plan 5.5 Task 1: one request per address per 10 minutes, in memory only -- the faucet is dev-only and this
+  // process's lifetime is the whole relevant window. Keyed by the lower-cased address so case never splits a key.
+  const FAUCET_COOLDOWN_MS = 10 * 60 * 1000;
+  const faucetLastRequest = new Map<string, number>();
 
   const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
 
@@ -355,7 +398,47 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     },
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/templates") return false;
-      sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, chain)]);
+      sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, chain, faucetEnabled)]);
+      return true;
+    },
+    async (ctx) => {
+      if (ctx.method !== "POST" || ctx.url.pathname !== "/faucet") return false;
+      // Global Constraints: disabled is indistinguishable from "route doesn't exist" -- falling through to the
+      // 404 catch-all at the bottom of `handle`, exactly like any other unknown path.
+      if (!faucetEnabled) return false;
+      const contentType = ctx.req.headers["content-type"] ?? "";
+      if (!/^application\/json\b/i.test(contentType)) {
+        sendJson(ctx.res, 415, { error: "content-type must be application/json" });
+        return true;
+      }
+      await withLobbyErrors(ctx.res, async () => {
+        const raw = decodeWire(await readBody(ctx.req, MAX_BODY_BYTES));
+        const body = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+        const addrRaw = typeof body.address === "string" ? body.address : "";
+        if (!ADDR_ROUTE_RE.test(addrRaw)) {
+          sendJson(ctx.res, 400, { error: "address must be a 0x-prefixed 40-hex-character address" });
+          return;
+        }
+        const address = getAddress(addrRaw);
+        const key = address.toLowerCase();
+        const now = Date.now();
+        const last = faucetLastRequest.get(key);
+        if (last !== undefined && now - last < FAUCET_COOLDOWN_MS) {
+          const retryAfterSeconds = Math.ceil((last + FAUCET_COOLDOWN_MS - now) / 1000);
+          sendJson(ctx.res, 429, { error: "this address was funded recently; try again later", retryAfterSeconds });
+          return;
+        }
+        // Reserve the slot before minting: two concurrent requests for the same address must not both mint, and
+        // a failed mint below must not lock the address out for a full cooldown it never actually received.
+        faucetLastRequest.set(key, now);
+        try {
+          const funded = await fundFromFaucet(cfg.rpcUrl, cfg.usdc, address);
+          sendJson(ctx.res, 200, { address, usdc: decStr(funded.usdc), native: decStr(funded.native) });
+        } catch (err) {
+          faucetLastRequest.delete(key);
+          throw err;
+        }
+      });
       return true;
     },
     async (ctx) => {
