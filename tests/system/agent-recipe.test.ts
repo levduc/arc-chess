@@ -214,7 +214,8 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       const agentHome = mkdtempSync(join(dir, "agent-"));
       const agentPort = await freeTcpPort();
       const initSummary = await runWrapperJson(wrapperPath, ["init", "--server", stack.serverUrl, "--port", String(agentPort)], agentHome);
-      expect(initSummary.faucet).toEqual({ usdc: "100.000000", native: "1.0" });
+      // native: "10.0" since FAUCET_MIN_NATIVE_WEI is 10 ETH (raised from 1 ETH, fix round 1 controller add).
+      expect(initSummary.faucet).toEqual({ usdc: "100.000000", native: "10.0" });
       const agentAddress = privateKeyToAccount(loadWalletKey(agentHome)).address;
       const balanceAfterInit = await usdcBalanceOf(stack, agentAddress);
       expect(balanceAfterInit).toBe(100_000_000n); // exactly the faucet's 100 USDC; the wallet started at 0
