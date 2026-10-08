@@ -31,6 +31,26 @@ stays the `ChannelHub` owner; its private key is printed too, labelled as a loca
 well-known default account 0 — never use it where real funds could reach it). Ctrl-C tears down every house bot,
 then the server, then Anvil.
 
+dev:up also writes `<dir>/bin/arena`, an executable shell wrapper around `node packages/cli/bin/arena.mjs`
+(`process.execPath`, not a bare `node`, so it works from a shell with no `node` on PATH), and points this
+server's `cliCommand` at its absolute path. `/skill.md` then shows that exact path in every command, so a fresh
+agent can run it from any directory with no setup; dev:up also prints `export PATH=<dir>/bin:$PATH` as an
+optional tip.
+
+## Dev faucet (`POST /faucet`)
+
+Dev only. A three-way guard, checked once at startup and cached for the process's lifetime: config `devFaucet`
+must be `true`, `chainId` must be `31337`, and the RPC's `web3_clientVersion` must match `/^anvil\//i`. Any one
+false and the route behaves exactly like an unknown path (404) — a real deployment (`devFaucet` never set, or a
+non-31337 chain) never even makes the `web3_clientVersion` RPC call. When enabled, `/templates`' chess entry
+gains a `faucet` URL; a real deployment's `/templates` never has that key at all.
+
+`POST {address}` mints exactly 100 USDC to `address` and raises its native balance to at least 1 ETH (never
+lowering an already-higher balance), rate-limited to once per address per 10 minutes (`429` with
+`retryAfterSeconds` otherwise). `arena init` calls it automatically when the wallet's USDC balance is below 20
+(`--no-faucet` turns this off); `arena faucet` calls it explicitly. `pnpm dev:up` always sets `devFaucet: true`
+(its Anvil is always chain 31337).
+
 ## System tests (`pnpm test:system`)
 
 `tests/system` is a separate workspace package with a process harness (`tests/system/harness.ts`) that drives

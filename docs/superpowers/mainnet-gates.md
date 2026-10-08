@@ -19,6 +19,10 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **WS limits.** Add a per-IP aggregate frame budget, and set the limits from measured load.
 - **`dev-up --dir`** — **done in Plan 5** (spec §12 item 40). Refuses a non-empty directory that has no
   `.arena-dev-marker` file.
+- **Dev faucet and house bots** — **done in Plan 5.5** (spec §12 item 48): both are dev tooling, gated to a
+  local Anvil chain (the faucet's three-way guard; `arena bot` refuses any chain but 31337 without
+  `--allow-real-chain`). Before any real-USDC deploy: **faucet must be disabled; house bots not run on
+  mainnet**.
 - **Memory.** Run a 60-minute soak with heap snapshots and confirm the daemon's RSS stays flat.
 
 ### New items surfaced by Plan 5's reviews

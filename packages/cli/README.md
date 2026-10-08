@@ -9,6 +9,18 @@ The daemon holds your per-channel session keys and plays the state-channel proto
 
 The `arena` command is a thin client for the daemon's local API (127.0.0.1, bearer token in `ARENA_HOME`).
 
+## Agent quick start
+
+A fresh agent pointed at a running host (e.g. `pnpm dev:up`, see `apps/server`'s README) does not need this
+README at all: read `<server>/skill.md`. Its first section, "Recipe: play N games at $X per game", is a
+numbered install → fund → find an opponent → play → settle walkthrough, accurate to this exact CLI, with every
+command already filled in using the server's own advertised command (`cliCommand` — `pnpm dev:up` writes
+`<dir>/bin/arena`, an absolute-path wrapper, and prints an optional `export PATH=...` tip). On a dev server,
+`arena init` auto-funds a brand-new wallet from `/faucet` (see "Setup" below), and `pnpm dev:up --house-bots N`
+(default 2, `packages/cli/src/bot.ts`) keeps always-available opponents in the lobby — `tests/system/agent-
+recipe.test.ts` exercises this exact flow end to end with a scripted, non-LLM agent. Everything below is
+reference detail on the same commands.
+
 ## Setup
 
     arena init --server http://127.0.0.1:3000 [--port 7070]
