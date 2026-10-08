@@ -43,6 +43,15 @@ function writePidFile(home: string, pid: number): string {
   return tmp;
 }
 
+/** The pid currently holding `<home>/daemon.lock`, only if it is genuinely alive (not stale) -- a read-only
+ *  check, never a take-over. Used by `arena init` to refuse re-pointing a home a live daemon still holds
+ *  (final review I4): acquiring and taking over a stale lock stays `acquireHomeLock`'s job, for `daemon`/`bot`
+ *  to do when one of them actually starts. */
+export function livePidHoldingLock(home: string): number | null {
+  const pid = readPid(join(home, "daemon.lock"));
+  return pid !== null && alive(pid) ? pid : null;
+}
+
 /**
  * Spec §6: one daemon per ARENA_HOME. A lock file (`daemon.lock`) holds the owner's pid; a lock whose pid is our
  * own or belongs to a live process is held (throws); a lock whose pid is missing, unreadable, or belongs to a

@@ -19,6 +19,27 @@ const REPO_DEV_DIR = join(REPO_ROOT, ".arena-dev");
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Races `promise` against a deadline, clearing the timer the instant `promise` settles -- unlike a bare
+ *  `Promise.race([promise, sleep(ms).then(() => { throw ... })])` (M11), this never leaves the losing branch's
+ *  timer running: left uncleared, it fires `ms` after the race was already won and throws into a `.then()`
+ *  with nothing left listening, an unhandled rejection `ms` later. Harmless only while each test file runs in
+ *  its own vitest fork. */
+function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 let child: ChildProcess | undefined;
 let deploymentSnapshot: string | null | undefined;
 let devDir: string | undefined;
@@ -162,6 +183,13 @@ describe("pnpm dev:up", () => {
       expect(existsSync(join(devDir, "players", "alice", "config.json"))).toBe(true);
       expect(existsSync(REPO_DEV_DIR) ? statSync(REPO_DEV_DIR).ctimeMs : null).toBe(repoDevDirBefore);
 
+      // Plan 5.5 Task 3: dev-up writes the "<dir>/bin/arena" CLI wrapper itself (not just this test's own copy of
+      // one, as agent-recipe.test.ts uses) -- executable, and set as the server's cliCommand so skill.md actually
+      // shows this exact path in its recipe. This is the file the user's one-sentence prompt depends on.
+      const wrapperPath = join(devDir, "bin", "arena");
+      expect(existsSync(wrapperPath)).toBe(true);
+      expect(statSync(wrapperPath).mode & 0o111).not.toBe(0); // executable by someone
+
       // Both services are actually reachable, not just "the script said so".
       const rpcRes = await fetch(`http://127.0.0.1:${anvilPort}`, {
         method: "POST",
@@ -171,6 +199,8 @@ describe("pnpm dev:up", () => {
       expect(rpcRes.ok).toBe(true);
       const healthRes = await fetch(`http://127.0.0.1:${serverPort}/healthz`);
       expect(healthRes.ok).toBe(true);
+      const skillText = await (await fetch(`http://127.0.0.1:${serverPort}/skill.md`)).text();
+      expect(skillText).toContain(`${wrapperPath} init --server`);
 
       expect(await isPortFree(anvilPort)).toBe(false);
       expect(await isPortFree(serverPort)).toBe(false);
@@ -179,12 +209,7 @@ describe("pnpm dev:up", () => {
       expect(pid).toBeDefined();
       const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
       process.kill(-pid!, "SIGINT"); // simulates a terminal Ctrl-C: signals dev-up's whole process group
-      await Promise.race([
-        exited,
-        sleep(20_000).then(() => {
-          throw new Error("dev-up did not exit within 20s of SIGINT");
-        }),
-      ]);
+      await withDeadline(exited, 20_000, "dev-up did not exit within 20s of SIGINT");
 
       // Ports free up promptly after teardown; poll briefly for the OS to release them.
       const end = Date.now() + 10_000;
@@ -195,6 +220,82 @@ describe("pnpm dev:up", () => {
         serverFree = await isPortFree(serverPort);
         if (!(anvilFree && serverFree)) await sleep(200);
       }
+      expect(anvilFree).toBe(true);
+      expect(serverFree).toBe(true);
+    },
+    120_000,
+  );
+
+  it(
+    "Plan 5.5 Task 2: --house-bots 1 posts a standing offer, and teardown leaves no process behind",
+    async () => {
+      deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+
+      child = spawn(
+        TSX_BIN,
+        [
+          DEV_UP_SCRIPT,
+          "--anvil-port",
+          String(anvilPort),
+          "--port",
+          String(serverPort),
+          "--players",
+          "0",
+          "--house-bots",
+          "1",
+          "--dir",
+          devDir,
+        ],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
+      );
+
+      // dev-up itself only prints the ready line once the bot's offer is already visible in the lobby (it waits
+      // for that before calling itself ready) -- so this doubles as the "offer appears" assertion.
+      const ready = await waitForJsonLine(child, (o) => o.ready === true, 60_000);
+      expect(ready.houseBots).toBe(1);
+      const homeDir = join(devDir, "house-bots", "house-1");
+      expect(existsSync(join(homeDir, "config.json"))).toBe(true);
+      expect(existsSync(join(devDir, "logs", "house-1.log"))).toBe(true);
+
+      const serverUrl = `http://127.0.0.1:${serverPort}`;
+      const offersRes = await fetch(`${serverUrl}/offers`);
+      expect(offersRes.ok).toBe(true);
+      const offers = (await offersRes.json()) as Array<{ offer?: { player?: string } }>;
+      expect(offers.length).toBeGreaterThan(0);
+
+      // The bot's own daemon process, found the same way llm-games.ts's killDaemon does (ARENA_HOME/daemon.lock).
+      const lock = JSON.parse(readFileSync(join(homeDir, "daemon.lock"), "utf8")) as { pid: number };
+      const botAlive = () => {
+        try {
+          process.kill(lock.pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      expect(botAlive()).toBe(true);
+
+      const pid = child.pid;
+      expect(pid).toBeDefined();
+      const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      process.kill(-pid!, "SIGINT"); // simulates a terminal Ctrl-C: signals dev-up's whole process group
+      await withDeadline(exited, 20_000, "dev-up did not exit within 20s of SIGINT");
+
+      // The house bot's own process (not just dev-up itself) is gone, and both ports free up -- teardown stops
+      // everything it started, not just anvil/server. Poll briefly for the OS to catch up.
+      const end = Date.now() + 10_000;
+      let anvilFree = false;
+      let serverFree = false;
+      while (Date.now() < end && !(anvilFree && serverFree && !botAlive())) {
+        anvilFree = await isPortFree(anvilPort);
+        serverFree = await isPortFree(serverPort);
+        if (!(anvilFree && serverFree) || botAlive()) await sleep(200);
+      }
+      expect(botAlive()).toBe(false);
       expect(anvilFree).toBe(true);
       expect(serverFree).toBe(true);
     },

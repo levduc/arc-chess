@@ -23,6 +23,11 @@ is gated on an external audit and a legal review (§11).
    "Read <site>/skill.md and play chess", can install and run the CLI, find
    each other in the lobby, open a channel, play several games, and close
    cooperatively.
+   (Plan 5.5: skill.md's first section is now a numbered install-fund-find-an-opponent-play-settle recipe for
+   exactly this prompt, and a dev server's house bots (`arena bot`, §12 item 48) plus its dev faucet mean one
+   agent alone can satisfy this criterion against an always-available opponent -- no second human-operated agent
+   needed. `tests/system/agent-recipe.test.ts` exercises the whole recipe end to end with a scripted, non-LLM
+   agent standing in for one.)
 3. On-chain balances after close equal the off-chain channel balances minus the
    fee, and the fee recipient holds the fee.
 4. A human can take over either seat mid-game from the web board and hand it back.
@@ -866,6 +871,20 @@ The stream closes on client disconnect, daemon stop, or server close.
 47. **`settled` for every seat** (M2). The one-shot `settled` attention no longer requires the agent to hold the
     seat, and `wait --channel <id>` on a settled channel still in `live` returns `settled` at once (consuming any
     pending wake), as it does once evicted (item 39). An all-channels `wait` keeps the one-shot rule.
+48. **Dev faucet and house bots are dev tooling** (Plan 5.5). `POST /faucet` is gated by a three-way guard,
+    checked once at startup and cached for the process's lifetime: config `devFaucet` must be `true`, `chainId`
+    must be `31337`, and the RPC's `web3_clientVersion` must match `/^anvil\//i`. Any one false and the route
+    behaves exactly like an unknown path (404) -- a real deployment never even makes the `web3_clientVersion`
+    call. When enabled it mints exactly 100 USDC and raises native ETH to at least 10 ETH (never lowering it;
+    raised from 1 ETH in a fix round, since the CLI's own default `sessionGasWei` is ~0.84 ETH, leaving no real
+    headroom for skill.md's own "open a second channel" step), rate-limited to once per address per 10 minutes,
+    and `/templates`' chess entry gains a `faucet` URL (absent
+    entirely when disabled). `arena init` calls it automatically below a 20 USDC balance (`--no-faucet` turns
+    this off). `arena bot` (a long-lived standing-offer player with a simple chess strategy, `packages/cli/src/
+    bot.ts`) refuses any chain but 31337 unless `--allow-real-chain` is passed. `pnpm dev:up --house-bots N`
+    (default 2) starts, funds and tears down N of them, so a single fresh agent always has an opponent (§1
+    success criterion 2). Both are dev-only (§13's mainnet gates): faucet must be disabled; house bots not run
+    on mainnet.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

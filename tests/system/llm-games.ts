@@ -21,7 +21,13 @@ import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { HubClient } from "@arena/sdk";
 import { loadToken } from "@arena/cli";
+import { buildAllowedTools, buildClaudeEnv, extractCost, makeTmpAgentRoot } from "./claude-sandbox.js";
 import { CLI_BIN, freeTcpPort, runCli, startStack, usdcBalanceOf, type Stack } from "./harness.js";
+
+// Plan 5.5 Task 2: re-exported so llm-games.test.ts's existing `import { buildAllowedTools, buildClaudeEnv } from
+// "./llm-games.js"` keeps working unchanged -- the builders themselves now live in claude-sandbox.ts, shared with
+// scripts/claude-opponent.ts.
+export { buildAllowedTools, buildClaudeEnv };
 
 const REPO_ROOT = join(import.meta.dirname, "../..");
 const LOG_DIR = join(REPO_ROOT, ".arena-dev", "llm");
@@ -91,11 +97,7 @@ async function initAgentHome(stack: Stack, name: string): Promise<AgentHome> {
   const key = generatePrivateKey();
   const address = privateKeyToAccount(key).address;
   await stack.fund(address, START_USDC);
-  const root = mkdtempSync(join(tmpdir(), "arena-llm-"));
-  const home = join(root, "home");
-  const workDir = join(root, "work");
-  mkdirSync(home, { recursive: true });
-  mkdirSync(workDir, { recursive: true });
+  const { root, home, workDir } = makeTmpAgentRoot("arena-llm-");
   const apiPort = await freeTcpPort();
   const init = await runCli(
     ["init", "--server", stack.serverUrl, "--wallet-key", key, "--port", String(apiPort), "--poll-ms", "200"],
@@ -138,44 +140,8 @@ type Session = {
   exitSignal: NodeJS.Signals | null;
 };
 
-/** The handful of flag prefixes real curl invocations are likely to use before the URL -- not because the flags
- *  themselves matter (they don't: every variant below is still hard-pinned to the same origin, so none of them
- *  widens what host can be reached), but because Claude Code's Bash allow rules are plain command-*prefix* matches
- *  (confirmed by hand: a rule's text before its wildcard must be a literal prefix of the real command, so
- *  `Bash(curl <origin>/*)` does NOT match `curl -s <origin>/...` -- the `-s` breaks the prefix). `""` and `"-s"`
- *  were the only two shapes either agent actually typed across Runs 1-2 (`grep`ped from their logs); the rest are
- *  defensive headroom against a third run's session picking a different common combination, since a rule-syntax
- *  miss here can only be diagnosed by spending one of the three budgeted runs. */
-const CURL_FLAG_PREFIXES = ["", "-s", "-sS", "-sL", "-sSL", "-fsSL", "-L"];
-
-/** The exact `--allowedTools` patterns for one session, as a pure function of the server's URL so it can be unit
- *  tested without spawning anything. Deliberately minimal:
- *  - `Bash(arena *)` -- the CLI, via the wrapper on PATH.
- *  - `Bash(curl <flags> <origin>/*)` for each of `CURL_FLAG_PREFIXES`, pinned to this stack's own server origin --
- *    never a bare `Bash(curl *)`. Confirmed by hand that this pin actually restricts the origin, not just the
- *    flags: the same rule denies `curl -s http://example.com/`.
- *  - No `Bash(cat *)` (Task 12 review: too wide -- nothing in the play loop needs it) and no Write/Edit/Read at all.
- *  `--permission-prompts none` means anything outside this list is denied automatically rather than hanging on a
- *  prompt nobody can answer. */
-export function buildAllowedTools(serverUrl: string): string[] {
-  const origin = new URL(serverUrl).origin;
-  return ["Bash(arena *)", ...CURL_FLAG_PREFIXES.map((flags) => `Bash(curl ${flags ? `${flags} ` : ""}${origin}/*)`)];
-}
-
-/** The exact environment for one session, as a pure function so it can be unit tested without spawning anything.
- *  Task 12 review: the orchestrator's *entire* environment must not be forwarded into the agent's sandbox. Empirically
- *  confirmed by hand (`env -i HOME=... PATH=... claude -p ...`, every other variable cleared) that `claude -p` needs
- *  nothing beyond `PATH` (to resolve `node`/`sh`/`curl`/the `arena` wrapper) and `HOME` (its on-disk auth/config
- *  live under `~/.claude`; `apiKeySource` was `"none"` in every smoke test here, so no `ANTHROPIC_API_KEY` or
- *  similar is required) to run and authenticate -- `ARENA_HOME` is the one variable the `arena` CLI itself needs,
- *  not `claude`. This is the complete env; nothing else from the orchestrator's process leaks into the agent's
- *  sandbox. Throws rather than silently omitting `HOME` if it's unset in this process, since a session that can't
- *  authenticate is a much worse failure mode than a fast, clear error here. */
-export function buildClaudeEnv(arenaHome: string, binDir: string): NodeJS.ProcessEnv {
-  const home = process.env.HOME;
-  if (!home) throw new Error("HOME is not set in this process's environment -- required for the claude CLI's auth/config");
-  return { PATH: `${binDir}:${process.env.PATH ?? ""}`, HOME: home, ARENA_HOME: arenaHome };
-}
+// buildAllowedTools and buildClaudeEnv now live in ./claude-sandbox.ts (shared with scripts/claude-opponent.ts);
+// see the re-export near the top of this file.
 
 /** Launches one headless agent. `--setting-sources ""`, `--strict-mcp-config` and `--disable-slash-commands` strip
  *  this machine's own CLAUDE.md/plugins/MCP servers out of the session, so it behaves like the clean agent the
@@ -377,25 +343,8 @@ async function pollForResult(
 
 // ------------------------------------------------------------------------------------------------------- reporting
 
-/** The session's total cost, from the last `total_cost_usd` seen in its stream-json log. Each `result` event's
- *  `total_cost_usd` is already cumulative for the whole session (confirmed against a two-turn smoke test: the
- *  second result's usage was the sum of both turns) -- so this takes the *last* value, never sums across events,
- *  which would double- (or N-)count. */
-function extractCost(logPath: string): number | undefined {
-  if (!existsSync(logPath)) return undefined;
-  let last: number | undefined;
-  for (const line of readFileSync(logPath, "utf8").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) continue;
-    try {
-      const obj = JSON.parse(trimmed) as { total_cost_usd?: number };
-      if (typeof obj.total_cost_usd === "number") last = obj.total_cost_usd;
-    } catch {
-      // not a complete JSON line -- skip
-    }
-  }
-  return last;
-}
+// extractCost now lives in ./claude-sandbox.ts (shared with scripts/claude-opponent.ts); see the import at the
+// top of this file.
 
 /** Pulls a handful of short, human-readable quotes out of a stream-json log that look like the agent got confused
  *  or blocked -- for the report's "notable confusions" section. Best-effort text mining, not a parser: stream-json

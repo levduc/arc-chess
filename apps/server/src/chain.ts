@@ -1,5 +1,16 @@
-import { createPublicClient, defineChain, http, type Address, type Hex, type PublicClient } from "viem";
-import { HubClient, type HubEvent } from "@arena/sdk";
+import {
+  createPublicClient,
+  createTestClient,
+  createWalletClient,
+  defineChain,
+  encodeFunctionData,
+  http,
+  type Address,
+  type Hex,
+  type PublicClient,
+} from "viem";
+import { foundry } from "viem/chains";
+import { HubClient, mockUsdcAbi, type HubEvent } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 
 export type Limits = {
@@ -27,6 +38,10 @@ export interface ChainReader {
    *  event that vanished from `getLogs`, to tell a reorg from a lagging log index. Optional: without it, a
    *  vanished event is always treated as reorged out. */
   blockHash?(block: bigint): Promise<Hex | null>;
+  /** Plan 5.5 Task 1: the RPC's `web3_clientVersion`, read once at server start to help gate the dev faucet (one
+   *  of its three required checks: Global Constraints). Never used for anything else -- this never informs chain
+   *  logic. */
+  clientVersion(): Promise<string>;
 }
 
 const NOW_CACHE_MS = 1000;
@@ -107,6 +122,10 @@ export class RpcChainReader implements ChainReader {
     return b?.hash ?? null;
   }
 
+  clientVersion(): Promise<string> {
+    return this.client.request({ method: "web3_clientVersion" });
+  }
+
   /** Immutable once the chain exists, so memoized forever like `timeoutBounds` -- with the same un-stick-on-
    *  rejection behavior for a transient RPC failure. */
   genesisHash(): Promise<Hex> {
@@ -121,4 +140,50 @@ export class RpcChainReader implements ChainReader {
     }
     return this.genesisHashPromise;
   }
+}
+
+/** Plan 5.5 Task 1: 100 USDC (6 decimals), the fixed amount every `/faucet` request mints. */
+export const FAUCET_USDC_AMOUNT = 100_000_000n;
+/** The native balance `/faucet` guarantees at least: 10 ETH (never lowered if already higher). Raised from 1
+ *  ETH (Plan 5.5 Task 3 fix round 1, controller add): the default `sessionGasWei` a fresh `arena init` derives
+ *  is itself ~0.84 ETH (4 x 2.1M gas x the CLI's 100 gwei default fee ceiling), which left a 1 ETH top-up with
+ *  no real headroom for the recipe's "close, then open a second channel" step once transaction gas and a
+ *  second channel's own session key are accounted for. */
+export const FAUCET_MIN_NATIVE_WEI = 10n ** 19n;
+
+/**
+ * Plan 5.5 Task 1: funds `to` on a local Anvil chain -- 100 USDC minted via MockUSDC's `mint`, sent with
+ * `eth_sendTransaction` from Anvil's unlocked `eth_accounts[0]` (never a private key held by this process), and
+ * the native balance raised to at least `FAUCET_MIN_NATIVE_WEI` via `anvil_setBalance` (read first; never
+ * lowered). Waits for the mint's receipt before reading balances back.
+ *
+ * Deliberately a free function, not a `ChainReader` method: only ever called after `startServer`'s three-way
+ * guard has confirmed this chain *is* Anvil's 31337, so `FakeChain`-backed tests (every other route) never need
+ * to stub it, and the guard's own disabled-path tests never reach a real RPC.
+ */
+export async function fundFromFaucet(rpcUrl: string, usdc: Address, to: Address): Promise<{ usdc: bigint; native: bigint }> {
+  const transport = http(rpcUrl);
+  const pub = createPublicClient({ chain: foundry, transport });
+  const wallet = createWalletClient({ chain: foundry, transport });
+  const test = createTestClient({ mode: "anvil", chain: foundry, transport });
+
+  const [from] = await wallet.getAddresses();
+  const hash = await wallet.sendTransaction({
+    account: from,
+    chain: foundry,
+    to: usdc,
+    data: encodeFunctionData({ abi: mockUsdcAbi, functionName: "mint", args: [to, FAUCET_USDC_AMOUNT] }),
+  });
+  await pub.waitForTransactionReceipt({ hash });
+
+  const currentNative = await pub.getBalance({ address: to });
+  if (currentNative < FAUCET_MIN_NATIVE_WEI) {
+    await test.setBalance({ address: to, value: FAUCET_MIN_NATIVE_WEI });
+  }
+
+  const [usdcBalance, native] = await Promise.all([
+    pub.readContract({ address: usdc, abi: mockUsdcAbi, functionName: "balanceOf", args: [to] }),
+    pub.getBalance({ address: to }),
+  ]);
+  return { usdc: usdcBalance, native };
 }

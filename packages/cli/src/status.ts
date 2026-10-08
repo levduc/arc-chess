@@ -256,6 +256,10 @@ export function buildStatus(input: StatusInput): ChannelStatus {
       // `arena close` always fails while our own proposal is pending, so it is not offered here.
       suggestedActions.push("wait: new game proposed");
       if (open) challengeHint = "arena challenge   (settles the finished game on-chain if the opponent never answers)";
+    } else if (opponentWantsToClose) {
+      // Final review I2: `arena next-game` now refuses once the opponent has signed Close (daemon.ts's
+      // nextGame), so it must not be suggested here either -- the only way forward is `close`.
+      suggestedActions.push("arena close");
     } else {
       suggestedActions.push("arena next-game", "arena close");
     }

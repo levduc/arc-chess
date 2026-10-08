@@ -2137,6 +2137,16 @@ export class ArenaDaemon {
   async nextGame(ref: string | undefined, actor: Actor): Promise<void> {
     const l = this.pick(ref);
     this.requireController(l, actor);
+    // Final review I2: a session signs Close only for its own latest signed state and then stops signing new
+    // states (sdk/session.ts's signClose/receive) -- so a NEW_GAME proposed after the opponent's Close has
+    // already arrived would wedge the channel: `proposeNewGame` itself only checks this player's own
+    // `closeState` and would still succeed locally, but the opponent's `receive()` rejects the proposal
+    // (CLOSING_MESSAGE) and this side's own later `signClose` then refuses too ("a new-game proposal is
+    // pending"). Same check as status.ts's `opponentWantsToClose`, so this refusal and that attention agree.
+    const opponent = l.record.me === 0 ? 1 : 0;
+    if (l.session.snapshot().closeSigs[opponent] !== "0x") {
+      throw new DaemonError(409, "the opponent has requested a close: run close, not next-game -- then find a new opponent for the remaining games");
+    }
     await this.sendState(l, await this.guard(() => l.session.proposeNewGame()));
     this.notify();
   }

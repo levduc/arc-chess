@@ -16,7 +16,8 @@
     "test:system": "pnpm --filter @arena/system-tests test",
     "soak": "tsx tests/system/soak.ts",
     "llm-games": "tsx tests/system/llm-games.ts",
-    "dev:up": "tsx scripts/dev-up.ts"
+    "dev:up": "tsx scripts/dev-up.ts",
+    "dev:claude-opponent": "tsx scripts/claude-opponent.ts"
   },
   "devDependencies": {
     "tsx": "4.23.15",

@@ -45,6 +45,21 @@ describe("buildAllowedTools", () => {
     expect(other.some((r) => r.includes(":9999/"))).toBe(true);
     expect(other.some((r) => r.includes(":45431/"))).toBe(false);
   });
+
+  it("final review I5: with a cliPath, allows both the bare 'arena' rule and the absolute wrapper path", () => {
+    const cliPath = "/home/x/.arena-dev/bin/arena";
+    const withCli = buildAllowedTools("http://127.0.0.1:45431", cliPath);
+    expect(withCli).toContain("Bash(arena *)");
+    expect(withCli).toContain(`Bash(${cliPath} *)`);
+    for (const r of withCli) {
+      expect(r.startsWith("Bash(arena ") || r.startsWith(`Bash(${cliPath} `) || r.startsWith("Bash(curl ")).toBe(true);
+    }
+  });
+
+  it("final review I5: omitting cliPath keeps only the bare 'arena' rule (llm-games' own stack uses it literally)", () => {
+    expect(rules).toEqual(buildAllowedTools("http://127.0.0.1:45431", undefined));
+    expect(rules.some((r) => r.includes("/bin/arena"))).toBe(false);
+  });
 });
 
 describe("buildClaudeEnv", () => {

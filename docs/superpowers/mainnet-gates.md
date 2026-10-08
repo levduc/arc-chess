@@ -19,6 +19,10 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **WS limits.** Add a per-IP aggregate frame budget, and set the limits from measured load.
 - **`dev-up --dir`** — **done in Plan 5** (spec §12 item 40). Refuses a non-empty directory that has no
   `.arena-dev-marker` file.
+- **Dev faucet and house bots** — **done in Plan 5.5** (spec §12 item 48): both are dev tooling, gated to a
+  local Anvil chain (the faucet's three-way guard; `arena bot` refuses any chain but 31337 without
+  `--allow-real-chain`). Before any real-USDC deploy: **faucet must be disabled; house bots not run on
+  mainnet**.
 - **Memory.** Run a 60-minute soak with heap snapshots and confirm the daemon's RSS stays flat.
 
 ### New items surfaced by Plan 5's reviews
@@ -67,6 +71,10 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   - **Other:**
     - When the late re-probe of a pending sweep returns "unknown" (an RPC blip), it records `swept: "dust"` and drops the pending hashes, so attribution is lost. The funds are safe. It should instead skip the pass and keep the hashes.
     - After the auto-return time has passed, the board still offers Take over and shows a deadline that is already past. Disable the button and show "the seat stays with your agent" instead.
+
+### Plan 5.5 final review
+- init: require `--force` to switch an existing home's chain/server/hub, and record the chain's genesis hash so
+  records from a previous chain are never acted on (ghost channels after a dev-up restart).
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 

@@ -53,6 +53,16 @@ describe("config", () => {
     expect(() => parseServerConfig({ ...base, port: 70_000 })).toThrow(/port/);
     expect(() => parseServerConfig({ ...base, port: 1.5 })).toThrow(/port/);
   });
+  it("Plan 5.5 Task 1: devFaucet defaults to false and is settable; parsing never checks chain or RPC", () => {
+    const base = validBase();
+    expect(parseServerConfig(base).devFaucet).toBe(false);
+    expect(parseServerConfig({ ...base, devFaucet: true }).devFaucet).toBe(true);
+    // Review Focus 1: a non-31337 chain with devFaucet: true must still parse -- the three-way guard is enforced
+    // at server start (server.ts), not here, so a real-chain config with the flag mistakenly set still starts.
+    const real = { ...base, chainId: 5042002, audit: "unaudited; guarded launch", devFaucet: true };
+    expect(parseServerConfig(real).devFaucet).toBe(true);
+    expect(() => parseServerConfig({ ...base, devFaucet: "yes" })).toThrow(/devFaucet/);
+  });
 });
 
 function validBase() {
@@ -424,6 +434,119 @@ describe("http foundation", () => {
     expect(text).toMatch(/arena board/);
     expect(text).toMatch(/one-time code/);
     expect(text).toMatch(/never.*(pasted|shared)|(pasted|shared).*never/i);
+  });
+
+  it("Plan 5.5 Task 3: skill.md's first section is the play-N-games recipe, with every step's command", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const recipeAt = text.indexOf("## Recipe: play N games at $X per game");
+    expect(recipeAt).toBeGreaterThan(-1);
+    // It's the *first* `##` section -- nothing else at that heading level comes before it.
+    expect(text.slice(0, recipeAt)).not.toMatch(/^## /m);
+    const recipe = text.slice(recipeAt, text.indexOf("## Setup (once)"));
+    for (const fragment of [
+      "arena init --server",
+      "arena daemon",
+      "arena channels",
+      "arena wallet",
+      "arena offers",
+      "arena accept <offerId>",
+      "arena offer --deposit",
+      "arena wait --channel <channelId>",
+      "arena status --channel <channelId>",
+      "arena move <SAN> --channel <channelId>",
+      "arena next-game --channel <channelId>",
+      "arena close --channel <channelId>",
+      "status.controller",
+      "Finalized",
+      "arena challenge",
+      "human-must-move",
+      "session-gas-low",
+    ]) {
+      expect(recipe).toContain(fragment);
+    }
+  });
+
+  it("Fix round 1, I1: the recipe states which commands report USDC in base units vs whole-USDC decimals", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const recipe = text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("## Setup (once)"));
+    expect(recipe).toMatch(/base units/);
+    expect(recipe).toMatch(/whole-USDC decimals/);
+    expect(recipe).toMatch(/"1000000"/); // the worked example: $1 in base units
+    // The three comparisons the review called out each say which units they use.
+    expect(recipe).toMatch(/stakePerGame.*equals.*1000000.*base/);
+    expect(recipe).toMatch(/deposit.*at least.*1000000.*base/);
+    expect(recipe).toMatch(/maxDepositPerPlayer.*base units/);
+  });
+
+  it("Final fix wave I3: the units note is correct about channels/status (whole-USDC decimals, like wallet) -- not base units", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const note = text.slice(text.indexOf("Note on units"), text.indexOf("4. Find an opponent"));
+    // ChannelStatus (status/channels) carries no deposit/stake field at all; its only USDC amounts are
+    // `balances.me`/`balances.opponent`, printed as whole-USDC decimals exactly like `wallet` -- confirmed by
+    // dumping the real JSON output of a running stack (final fix wave I3).
+    expect(note).toMatch(/wallet.*status.*channels.*whole-USDC decimals/s);
+    expect(note).toMatch(/"9\.000000"/);
+    // Only `offers` and `/templates` are base units -- `channels` must not be grouped with them.
+    const baseUnitsClause = note.slice(note.indexOf("base units instead"));
+    expect(baseUnitsClause).not.toMatch(/channels/);
+    expect(note).toMatch(/offers.*\/templates.*base units/s);
+    // Step 5's "cover another stake" decision names the field and its units explicitly.
+    const step5 = text.slice(text.indexOf("5. The play loop"), text.indexOf("6. Once"));
+    expect(step5).toMatch(/status.*balances.*whole-USDC decimals/s);
+  });
+
+  it("Fix round 1, I2: session-gas-low is reworded to point at the native balance, not USDC", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    const line = text.slice(text.indexOf("`session-gas-low`: the channel's"));
+    expect(line).toMatch(/native/);
+    expect(line).toMatch(/arena wallet.*`native`/);
+    expect(line).toMatch(/arena faucet/);
+    expect(line).toMatch(/Arc, gas is paid in USDC/);
+  });
+
+  it("Plan 5.5 Task 3 (ruling 2): the recipe's daemon-log path is quoted and ARENA_HOME-aware", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toContain('"${ARENA_HOME:-$HOME/.arena}/daemon.log"');
+  });
+
+  it("Plan 5.5 Task 3 (ruling 3): the recipe sizes the deposit from /templates' limits.maxDepositPerPlayer", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toMatch(/limits\.maxDepositPerPlayer/);
+    expect(text).toMatch(/min\(N.{1,3}X, cap\)/);
+    expect(text).toMatch(/second channel/i);
+  });
+
+  it("Plan 5.5 Task 3 (ruling 4): the recipe's commands always use cfg.cliCommand, never a hardcoded \"arena\"", async () => {
+    server = await startServer(testConfig({ cliCommand: "/tmp/agent-onboarding-test/bin/my-arena" }), { chain: new FakeChain() });
+    const text = await (await fetch(`${server.url}/skill.md`)).text();
+    expect(text).toContain("/tmp/agent-onboarding-test/bin/my-arena init --server");
+    expect(text).toContain("/tmp/agent-onboarding-test/bin/my-arena wallet");
+    // The only mention of the bare word "arena" left anywhere is the product name in the title.
+    const strayArena = text
+      .split("\n")
+      .filter((line) => /\barena\b/i.test(line) && !line.includes("/tmp/agent-onboarding-test/bin/my-arena"));
+    expect(strayArena).toEqual(["# Agent Chess Arena"]);
+  });
+
+  it("Plan 5.5 Task 3 (ruling 1): the index page addresses an agent above the table, and llms.txt does on its first line", async () => {
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const html = await (await fetch(`${server.url}/`)).text();
+    const agentLineAt = html.indexOf("AI agent?");
+    const tableAt = html.indexOf("<table>");
+    expect(agentLineAt).toBeGreaterThan(-1);
+    expect(tableAt).toBeGreaterThan(-1);
+    expect(agentLineAt).toBeLessThan(tableAt);
+    expect(html).toMatch(/href="\/skill\.md"/);
+
+    const llms = await (await fetch(`${server.url}/llms.txt`)).text();
+    const firstLine = llms.split("\n")[1]; // line 0 is the "# Agent Chess Arena" title
+    expect(firstLine).toMatch(/^> AI agent\?.*skill\.md/);
   });
 
   it("Task 2 (spec §13): /templates publishes the hub's current launch limits", async () => {
