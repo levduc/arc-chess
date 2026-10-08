@@ -174,6 +174,43 @@ function backoffDelayMs(attempts: number, startMs: number, maxMs: number): numbe
 export const CHALLENGE_BACKOFF_START_MS = 30_000;
 export const CHALLENGE_BACKOFF_MAX_MS = 300_000;
 
+/** Fix round (important 2): the routine-action retry schedule (move/next-game/close/idle-close) -- much faster
+ *  than the challenge one above, since these are ordinary turn-taking actions, not disputes. */
+export const ACTION_BACKOFF_START_MS = 1_000;
+export const ACTION_BACKOFF_MAX_MS = 30_000;
+
+/** Fix round (important 2): runs `fn` (one daemon call for channel `id`) unless an earlier failure's back-off
+ *  (`ACTION_BACKOFF_START_MS`, doubling to `ACTION_BACKOFF_MAX_MS`) hasn't elapsed yet, in which case it's
+ *  skipped entirely -- returns false, same as "nothing to do", so `runBot`'s own idle sleep applies and this
+ *  channel never gets hammered on every single pass. On success the record is cleared (the next distinct
+ *  failure starts counting from 1 again); on failure it grows and this still returns false -- a persistently
+ *  failing action (a stuck 409, an RPC blip) never reports as "acted" and so never skips the outer idle sleep
+ *  either, closing the hot loop the plain `return true` after every `.catch` used to leave open. One shared map
+ *  per channel across move/next-game/close/idle-close: they're mutually exclusive attention states in practice,
+ *  so sharing keeps this simple without meaningfully weakening the back-off. */
+async function runWithBackoff(
+  backoffs: Map<Hex, Backoff>,
+  id: Hex,
+  log: (line: string) => void,
+  label: string,
+  fn: () => Promise<void>,
+): Promise<boolean> {
+  const now = Date.now();
+  const prev = backoffs.get(id);
+  if (prev && now < prev.nextAttemptAt) return false;
+  try {
+    await fn();
+    backoffs.delete(id);
+    return true;
+  } catch (err) {
+    const attempts = (prev?.attempts ?? 0) + 1;
+    const wait = backoffDelayMs(attempts, ACTION_BACKOFF_START_MS, ACTION_BACKOFF_MAX_MS);
+    backoffs.set(id, { attempts, nextAttemptAt: now + wait });
+    log(`bot: ${label} on ${id} failed (attempt ${attempts}, retrying in ${Math.round(wait / 1000)}s): ${errorText(err)}`);
+    return false;
+  }
+}
+
 type ActCtx = {
   rng: Rng;
   log: (line: string) => void;
@@ -188,6 +225,8 @@ type ActCtx = {
    *  challenged again too. Cleared whenever a status for this channel is no longer `opponent-silent` (see
    *  `actOnChannel`), so a fresh episode always starts a fresh schedule. */
   challengeAttempts: Map<Hex, Backoff>;
+  /** Fix round (important 2): the generic back-off `runWithBackoff` uses for move/next-game/close/idle-close. */
+  actionBackoff: Map<Hex, Backoff>;
   signal?: AbortSignal;
 };
 
@@ -231,22 +270,18 @@ async function actOnChannel(daemon: ArenaDaemon, st: ChannelStatus, ctx: ActCtx)
   switch (st.attention) {
     case "your-turn": {
       await sleep(ctx.moveDelayMs, ctx.signal);
-      if (ctx.signal?.aborted) return true;
+      if (ctx.signal?.aborted) return false;
       const move = pickMove(st.fen, ctx.rng);
-      await daemon.move(id, move, { actor: "agent" }).catch((err) => ctx.log(`bot: move ${move} on ${id} failed: ${errorText(err)}`));
-      return true;
+      return runWithBackoff(ctx.actionBackoff, id, ctx.log, `move ${move}`, () => daemon.move(id, move, { actor: "agent" }));
     }
     case "new-game-proposed":
-      await daemon.nextGame(id, "agent").catch((err) => ctx.log(`bot: next-game on ${id} failed: ${errorText(err)}`));
-      return true;
+      return runWithBackoff(ctx.actionBackoff, id, ctx.log, "next-game", () => daemon.nextGame(id, "agent"));
     case "close-requested":
-      await daemon.close(id, "agent").catch((err) => ctx.log(`bot: close on ${id} failed: ${errorText(err)}`));
-      return true;
+      return runWithBackoff(ctx.actionBackoff, id, ctx.log, "close", () => daemon.close(id, "agent"));
     case "game-over": {
       const elapsed = gameOverElapsedMs(ctx.gameOverSince, id, st.gameIndex);
       if (elapsed < ctx.idleCloseMs) return false;
-      await daemon.close(id, "agent").catch((err) => ctx.log(`bot: idle-close on ${id} failed: ${errorText(err)}`));
-      return true;
+      return runWithBackoff(ctx.actionBackoff, id, ctx.log, "idle-close", () => daemon.close(id, "agent"));
     }
     case "opponent-silent":
       return attemptChallenge(daemon, st, ctx);
@@ -285,6 +320,7 @@ export async function runBot(daemon: ArenaDaemon, opts: BotOptions): Promise<voi
     challengeBackoffMaxMs,
     gameOverSince: new Map(),
     challengeAttempts: new Map(),
+    actionBackoff: new Map(),
     signal,
   };
   const offerState = { fundsShort: false };

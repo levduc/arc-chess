@@ -23,22 +23,28 @@ function fakeStatus(overrides: Partial<ChannelStatus> = {}): ChannelStatus {
   } as unknown as ChannelStatus;
 }
 
-/** A fake `ArenaDaemon` exposing only the surface `runBot` touches -- `channels` and `challenge` are given by
- *  the caller; everything else is a harmless no-op/empty stub (the standing-offer check still runs every pass
- *  with `offers: 0`, so `listOffers`/`hub.feeConfig` must resolve to something, even though `maintainOffers`
- *  returns before ever reading them when `need <= 0`). */
-function fakeDaemon(channels: () => Promise<ChannelStatus[]>, challenge: (id: Hex, actor: string) => Promise<void>): ArenaDaemon {
+/** A fake `ArenaDaemon` exposing only the surface `runBot` touches -- `channels` is required; `challenge`/
+ *  `move`/`nextGame`/`close` default to a harmless no-op and are overridden by whichever one a test cares
+ *  about. The standing-offer check still runs every pass with `offers: 0`, so `listOffers`/`hub.feeConfig` must
+ *  resolve to something, even though `maintainOffers` returns before ever reading them when `need <= 0`. */
+function fakeDaemon(overrides: {
+  channels: () => Promise<ChannelStatus[]>;
+  challenge?: (id: Hex, actor: string) => Promise<void>;
+  move?: (id: Hex, move: string, opts: { actor: string }) => Promise<void>;
+  nextGame?: (id: Hex, actor: string) => Promise<void>;
+  close?: (id: Hex, actor: string) => Promise<void>;
+}): ArenaDaemon {
   return {
     wait: async () => ({ channelId: null, reason: "timeout" }),
-    channels,
+    channels: overrides.channels,
     listOffers: async () => [],
     hub: { feeConfig: async () => ({ feePerPlayer: 0n, feeRecipient: "0x0000000000000000000000000000000000000000" as Address }) },
     client: { readContract: async () => 0n },
     wallet: { address: "0x0000000000000000000000000000000000000000" as Address },
-    challenge,
-    move: async () => {},
-    nextGame: async () => {},
-    close: async () => {},
+    challenge: overrides.challenge ?? (async () => {}),
+    move: overrides.move ?? (async () => {}),
+    nextGame: overrides.nextGame ?? (async () => {}),
+    close: overrides.close ?? (async () => {}),
   } as unknown as ArenaDaemon;
 }
 
@@ -100,7 +106,7 @@ describe("runBot: the opponent-silent challenge retries instead of giving up aft
     // Once the real `challenge()` succeeds, attention goes quiet (see the cooldown test below for why) -- without
     // this, the fake would keep reporting `opponent-silent` forever and the bot would (correctly, for a *real*
     // silent opponent) keep challenging again on every pass, which isn't what this test is about.
-    const daemon = fakeDaemon(async () => [fakeStatus({ attention: challenged ? null : "opponent-silent" })], challenge);
+    const daemon = fakeDaemon({ channels: async () => [fakeStatus({ attention: challenged ? null : "opponent-silent" })], challenge });
     const controller = new AbortController();
     const logs: string[] = [];
     const done = runBot(daemon, {
@@ -155,7 +161,7 @@ describe("runBot: the opponent-silent challenge retries instead of giving up aft
       const remaining = Math.max(0, cooldownSecondsAt0 - elapsedS);
       return [fakeStatus({ cooldown: { meSeconds: Math.ceil(remaining), opponentSeconds: 0 } })];
     };
-    const daemon = fakeDaemon(channels, challenge);
+    const daemon = fakeDaemon({ channels, challenge });
     const controller = new AbortController();
     const done = runBot(daemon, {
       usdc: "0x0000000000000000000000000000000000000000" as Address,
@@ -190,7 +196,7 @@ describe("runBot: the opponent-silent challenge retries instead of giving up aft
     const challenge = vi.fn(async () => {
       throw new Error("boom");
     });
-    const daemon = fakeDaemon(async () => [fakeStatus({ attention })], challenge);
+    const daemon = fakeDaemon({ channels: async () => [fakeStatus({ attention })], challenge });
     const controller = new AbortController();
     const done = runBot(daemon, {
       usdc: "0x0000000000000000000000000000000000000000" as Address,
@@ -216,6 +222,51 @@ describe("runBot: the opponent-silent challenge retries instead of giving up aft
     attention = "opponent-silent";
     await vi.advanceTimersByTimeAsync(1_500);
     expect(challenge).toHaveBeenCalledTimes(2);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(100);
+    await done;
+  }, 5_000);
+});
+
+// ------------------------------------------------------------------------ runBot's generic action retry (fake daemon)
+
+describe("runBot: a persistently failing action backs off instead of hot-looping", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+  it("fix round (important 2): a move that always fails is retried on a bounded, growing schedule, not every pass", async () => {
+    vi.useFakeTimers();
+    const move = vi.fn(async () => {
+      throw new Error("boom: always fails");
+    });
+    const daemon = fakeDaemon({ channels: async () => [fakeStatus({ attention: "your-turn", fen: START_FEN })], move });
+    const controller = new AbortController();
+    const logs: string[] = [];
+    const done = runBot(daemon, {
+      usdc: "0x0000000000000000000000000000000000000000" as Address,
+      deposit: 0n,
+      stake: 0n,
+      offers: 0,
+      offerRecheckMs: 1_000_000,
+      waitTimeoutMs: 50,
+      moveDelayMs: 0,
+      rng: mulberry32(99),
+      log: (l) => logs.push(l),
+      signal: controller.signal,
+    });
+
+    // 60s of fake time: with 1s-doubling-to-30s back-off, that's at most ~1+1+2+4+8+16+30 ~= a handful of
+    // attempts -- a world away from "once per pass" (the loop's own 1s idle floor alone would allow ~60).
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(move.mock.calls.length).toBeGreaterThanOrEqual(5); // it does keep retrying...
+    expect(move.mock.calls.length).toBeLessThanOrEqual(10); // ...but on a bounded, growing schedule
+    expect(logs.some((l) => /move .* failed \(attempt 1, retrying in 1s\)/.test(l))).toBe(true);
+    expect(logs.some((l) => /retrying in 30s/.test(l))).toBe(true); // it did reach the cap within 60s
 
     controller.abort();
     await vi.advanceTimersByTimeAsync(100);
