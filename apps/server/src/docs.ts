@@ -243,10 +243,10 @@ export function indexHtml(channels: ChannelRow[]): string {
  *  `watchHtml`, which JSON-encodes it) -- everything else here is static. Escapes to `<` are neutralized by the
  *  caller so a malicious id can't break out of the surrounding `<script>` element. */
 const WATCH_SCRIPT = `
-  const GLYPH = {
-    p: "\\u265F", n: "\\u265E", b: "\\u265D", r: "\\u265C", q: "\\u265B", k: "\\u265A",
-    P: "\\u2659", N: "\\u2658", B: "\\u2657", R: "\\u2656", Q: "\\u2655", K: "\\u2654",
-  };
+  // The filled glyph set for both colours, coloured by CSS (as the daemon's /board does): the outline set and the
+  // font fallback for the filled set both render inconsistently across systems. U+FE0E asks for text
+  // presentation, so the pawn never turns into an emoji.
+  const GLYPH = { p: "\\u265F", n: "\\u265E", b: "\\u265D", r: "\\u265C", q: "\\u265B", k: "\\u265A" };
   const STATUS_NAME = ["playing", "draw offered", "white won", "black won", "draw"];
 
   function renderBoard(fen) {
@@ -266,7 +266,13 @@ const WATCH_SCRIPT = `
           const sq = document.createElement("div");
           const dark = (rank + file) % 2 === 1;
           sq.className = "sq " + (dark ? "dark" : "light");
-          sq.textContent = GLYPH[ch] || "";
+          const glyph = GLYPH[ch.toLowerCase()];
+          if (glyph) {
+            const piece = document.createElement("span");
+            piece.className = "piece " + (ch === ch.toUpperCase() ? "piece-w" : "piece-b");
+            piece.textContent = glyph + "\\uFE0E";
+            sq.appendChild(piece);
+          }
           board.appendChild(sq);
           file += 1;
         }
@@ -310,7 +316,7 @@ const WATCH_SCRIPT = `
     const statusName = STATUS_NAME[data.latest.status] || String(data.latest.status);
     info.textContent =
       "phase: " + phase +
-      " | game " + data.latest.gameIndex +
+      " | game " + (Number(data.latest.gameIndex) + 1) +
       " | balances: " + fmtUsdc(data.latest.balanceA) + " / " + fmtUsdc(data.latest.balanceB) + " USDC" +
       " | status: " + statusName;
   }
@@ -336,9 +342,14 @@ export function watchHtml(channelId: Hex): string {
     "h1{font-size:1rem;font-weight:normal}",
     "#board{display:grid;grid-template-columns:repeat(8,2.5rem);grid-template-rows:repeat(8,2.5rem);" +
       "border:2px solid #555;width:max-content}",
-    ".sq{display:flex;align-items:center;justify-content:center;font-size:1.8rem}",
-    ".light{background:#e8e8e8;color:#111}",
-    ".dark{background:#4a4a4a;color:#111}",
+    ".sq{display:flex;align-items:center;justify-content:center}",
+    ".light{background:#dee3e6}",
+    ".dark{background:#8ca2ad}",
+    // Same glyph font stack and piece colouring as the daemon's /board (packages/cli/src/board/style.css).
+    '.piece{font-family:"Noto Sans Symbols 2","Segoe UI Symbol","DejaVu Sans","Apple Symbols","Symbola",sans-serif;' +
+      "font-size:2rem;line-height:1}",
+    ".piece-w{color:#fdfdfd;-webkit-text-stroke:1px #1b1d21;text-shadow:0 1px 2px rgba(0,0,0,0.38)}",
+    ".piece-b{color:#1b1d21;-webkit-text-stroke:0.5px #000;text-shadow:0 0 1px rgba(255,255,255,0.35)}",
     "#info{margin-top:1rem}",
     "</style>",
     "</head><body>",
