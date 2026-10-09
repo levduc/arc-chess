@@ -111,15 +111,34 @@ reached, 2 on timeout, 1 on error.
   - the address must be a valid EIP-55 or lowercase address, and must not be the zero address, the wallet itself,
     the hub, the USDC token, or any session key in the home;
   - **first set** (no owner yet): allowed non-interactively;
-  - **change** (an owner already set, different address): allowed only when stdin and stdout are both a TTY, and
-    after the human types the last 6 hex characters of the new address at a prompt. Otherwise exit 1 with: "the
-    owner is already set; ask your human to run `<cmd> owner set <address>` in their own terminal".
+  - **change** (an owner already set, different address): only with a signature by the **current owner** over
+    this exact EIP-191 message (lines joined by `\n`, no trailing newline):
+    ```
+    arena owner change
+    wallet: <wallet address, checksummed>
+    chain: <chainId>
+    current owner: <current owner, checksummed>
+    new owner: <new owner, checksummed>
+    nonce: <ownerNonce>
+    ```
+    `arena owner set <new> --signature 0x…` checks it with `publicClient.verifyMessage`, which covers EOAs, ERC-1271
+    and ERC-6492 accounts. `ownerNonce` is an integer in `config.json`. It defaults to 0 and goes up by one on every
+    change, so an old signature can't be replayed (A→B→A). Without `--signature` the command prints the exact
+    message to sign and the exact command to run, then exits 1.
+  - *Amended 2026-10-09 after the Task 3 security review:* the first design gated a change on an interactive
+    terminal. `script`/`unbuffer`/`expect` let a shell-driven agent fake one, so it did not meet the owner's
+    requirement that "changing owner needs you". A signature from the current owner does.
 - **Re-running `init` keeps the owner.** `init` without `--owner` preserves an existing `owner`. `init --owner X`
-  against a home whose owner is a different address is a change, and follows the change rule. Otherwise a
-  re-`init` would reset the lock.
-- **Honesty note** (it goes in the docs too): this lock stops a confused or prompt-injected agent from redirecting
-  funds through the CLI. It is not a defence against code that can read `wallet.json`; Plan 6's Circle wallets
-  address that.
+  against a home whose owner is a different address is refused, with a pointer to `owner set --signature`.
+- **Re-running `init` never repoints the money** (amended after the Task 3 review). `init` against any existing
+  home refuses to change `chainId`, `hub`, `usdc` or `rules`, whether or not an owner is set. The refusal says to
+  withdraw to the owner and use a fresh `ARENA_HOME`. `serverUrl` and `rpcUrl` may still change. `init` also
+  checks that the hub, USDC and rules addresses hold code even when every chain flag is explicit. Without both
+  rules, a re-`init` could point deposits and approvals at a fake hub, past the owner lock.
+- **Honesty note** (it goes in the docs too). The lock stops a confused or prompt-injected agent from redirecting
+  funds through the CLI or the daemon API. It is not a defence against code that can read `wallet.json` or edit
+  `config.json` by hand. Hand-editing is also the only recovery when the owner can't sign: an exchange deposit
+  address, or a lost key. Plan 6's Circle wallets address the key-file side.
 
 ### 4.4 `arena withdraw (--amount A | --all)`
 
@@ -131,7 +150,10 @@ reached, 2 on timeout, 1 on error.
 - `--all` sends `usdc − reserve`, where `reserve` is 0 on chains whose gas is native. Plan 6 defines the Arc
   reserve, for live channels whose session gas is refilled in USDC. Escrowed channel funds are not in the wallet;
   the error for an amount above the withdrawable balance says to close open channels first.
-- Refuses amounts ≤ 0 or above the withdrawable balance. Output: `{to, amount, txHash, usdcAfter}`.
+- Refuses amounts ≤ 0 or above the withdrawable balance. Takes no destination: any `--to` flag or positional
+  argument is a usage error. After the transfer, the USDC balance must have dropped by at least `amount`. A token
+  whose `transfer` returns `false`, as a blocklisted recipient may, is reported as a failure, never as a success.
+  Output: `{to, amount, txHash, usdcAfter}`.
 - Actor: `agent` or `human` (the owner lock is the protection, not the actor).
 
 ## 5. Recipe changes (`skill.md`)
