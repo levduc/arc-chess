@@ -452,7 +452,18 @@ export async function startApi(
       }
     })();
   });
-  await new Promise<void>((resolve) => server.listen(opts.port, host, resolve));
+  // Plan 5.6 Task 3 fix round (I1): a listen failure (the port is taken -- by another home's daemon, or anything
+  // else) must reject, not surface as an unhandled 'error' event that kills the process. `startDaemonProcess` then
+  // tears down what it started and releases the home lock -- and a no-daemon `arena withdraw` fails cleanly, with
+  // exit 1 and a message naming the port, instead of crashing mid-tick with the lock left behind.
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(new Error(`the daemon's local API cannot listen on ${host}:${opts.port}: ${err.message}`));
+    server.once("error", onError);
+    server.listen(opts.port, host, () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
   boundPort = (server.address() as AddressInfo).port;
   // Plan 5 Task 2: server.close() otherwise hangs -- an open SSE response is a keep-alive connection that never
   // ends on its own, and http.Server#close() only finishes once every connection has. Force each one closed

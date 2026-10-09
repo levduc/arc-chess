@@ -264,6 +264,22 @@ describe("arena withdraw (spec §4.4)", () => {
     expect(await usdcBalance(env.usdc, wallet)).toBe(6_500_000n);
   });
 
+  it("fix round I1: a busy config.port fails a no-daemon withdraw cleanly -- exit 1 naming the port, lock released, nothing moved", async () => {
+    const port = await freePort();
+    const { env, home, wallet } = await walletHome({ port });
+    await firstSet(home, newAddress());
+    const squatter = createServer();
+    await new Promise<void>((r) => squatter.listen(port, "127.0.0.1", () => r()));
+    cleanups.push(() => new Promise<void>((r) => squatter.close(() => r())));
+
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain(`127.0.0.1:${port}`);
+    expect(t.err.join("\n")).toMatch(/EADDRINUSE/);
+    expect(livePidHoldingLock(home)).toBeNull();
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+  });
+
   it("refuses (exit 1) when another live process holds the lock but serves no API -- it never starts a second daemon", async () => {
     const port = await freePort(); // nothing listens here
     const { env, home, wallet } = await walletHome({ port });
