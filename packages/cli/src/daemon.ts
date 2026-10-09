@@ -67,6 +67,7 @@ import { formatUsdc6 } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
+import { selfCommand } from "./version.js";
 
 export type Actor = "agent" | "human";
 
@@ -708,7 +709,7 @@ export class ArenaDaemon {
       const withdrawable = balance > reserve ? balance - reserve : 0n;
       const amount = "all" in req ? withdrawable : req.amount;
       const closeFirst =
-        "funds escrowed in channels are not in the wallet: close open channels first (arena close), then withdraw";
+        `funds escrowed in channels are not in the wallet: close open channels first (${selfCommand()} close), then withdraw`;
       if (amount <= 0n) throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC; ${closeFirst}`);
       if (amount > withdrawable) {
         throw new DaemonError(
@@ -772,7 +773,7 @@ export class ArenaDaemon {
     } catch (err) {
       throw new DaemonError(500, errorText(err));
     }
-    if (raw === null) throw new DaemonError(400, noOwnerMessage());
+    if (raw === null) throw new DaemonError(400, noOwnerMessage(selfCommand()));
     try {
       return validateOwner(raw, forbiddenOwners(this.opts.home, this.opts.config, this.wallet.address));
     } catch (err) {

@@ -200,7 +200,7 @@ async function main(): Promise<void> {
         // already gone
       }
     }
-    // M7: the agent's own daemon (nohup'd per skill.md's recipe step 2) otherwise outlives this script --
+    // M7: the agent's own daemon (nohup'd per skill.md's recipe step 3) otherwise outlives this script --
     // holding funds in any open channel, and the next dev-up run wipes its home out from underneath it. Read
     // the pid this specific ARENA_HOME's lock names, and stop only that, only if it is still alive and still
     // looks like an arena daemon (not some unrelated process that has since reused the same pid).

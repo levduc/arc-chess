@@ -36,7 +36,7 @@ export type CliIo = {
  *  package/version (the host's required one, from /templates), not this build's own. */
 const CLI_COMMAND = selfCommand();
 
-const USAGE = `usage: arena <command> [options]
+const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--owner ADDR] [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
        [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false] [--no-faucet]
@@ -892,7 +892,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // (Review Focus 1). Reject it by name instead of trusting a zero read.
       if (feePerPlayerRaw === "0x") {
         throw new Error(
-          `the hub at ${cfg.hub} has no contract code on chain ${cfg.chainId} -- re-run "arena init" against ` +
+          `the hub at ${cfg.hub} has no contract code on chain ${cfg.chainId} -- re-run "${CLI_COMMAND} init" against ` +
             "the server (or pass --hub explicitly) before funding",
         );
       }

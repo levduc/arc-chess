@@ -114,7 +114,10 @@ describe("build-cli", () => {
       env: { PATH: dirname(process.execPath) },
     });
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("usage: arena");
+    // Fix round 1 (M1): USAGE's header now names this build's own selfCommand() -- in this default build
+    // (ARENA_CLI_PACKAGE unset) that's "npx -y @arena/cli@0.1.0", never the bare word "arena" an agent running
+    // under a pinned npx install could not actually type back.
+    expect(result.stderr).toContain("usage: npx -y @arena/cli@0.1.0");
   });
 
   it("names the manifest from ARENA_CLI_PACKAGE", async () => {
