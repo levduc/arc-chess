@@ -164,7 +164,9 @@ reached, 2 on timeout, 1 on error.
 - Success means the transfer's receipt contains a `Transfer(wallet → owner, amount)` log emitted by the configured
   USDC. Balance deltas are not used: they are skewed by same-block inflows and, on Arc, by USDC gas. A token whose
   `transfer` returns `false`, as a blocklisted recipient may, emits no such log, so it is reported as a failure.
-  The failure message gives the tx hash and says to check it before retrying.
+  The failure message gives the tx hash and says to check it before retrying. If the balance cannot be read after
+  a confirmed transfer, `withdraw` still reports success, with `usdcAfter: null` and the note "sent in tx <hash>;
+  the balance could not be read".
   Output: `{to, amount, txHash, usdcAfter}`.
 - Actor: `agent` or `human` (the owner lock is the protection, not the actor).
 

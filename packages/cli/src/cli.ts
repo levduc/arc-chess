@@ -357,7 +357,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; faucet?: string } = {};
         if (!haveAllExplicit) {
           const templatesUrl = `${server.replace(/\/$/, "")}/templates`;
-          const res = await io.fetch(templatesUrl);
+          // init holds the home lock for its whole run (N2), so a stalled server must not hold it for minutes.
+          const res = await io.fetch(templatesUrl, { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) });
           if (!res.ok) throw new Error(`fetching ${templatesUrl} failed with status ${res.status}`);
           const list = (await res.json()) as unknown;
           const chess = Array.isArray(list)
@@ -793,7 +794,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const templatesUrl = `${cfg.serverUrl.replace(/\/$/, "")}/templates`;
       let tres: Response;
       try {
-        tres = await io.fetch(templatesUrl);
+        tres = await io.fetch(templatesUrl, { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) });
       } catch (err) {
         throw new Error(`fetching ${templatesUrl} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
