@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Address, Hex } from "viem";
+import { createTestClient, http, type Address, type Hex } from "viem";
+import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -189,16 +191,54 @@ describe("arena withdraw (spec §4.4)", () => {
     expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
   });
 
-  it("a hand-edited forbidden owner (the wallet itself) is refused by the daemon, and nothing moves", async () => {
+  it("a hand-edited forbidden owner -- the wallet, the USDC token, the hub, the rules or a session key -- is refused by the daemon, and nothing moves", async () => {
     const { env, home, wallet } = await walletHome();
-    writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), owner: wallet });
-    const t = cliIo(home);
-    expect(await runCli(["withdraw", "--amount", "1"], t.io)).toBe(1);
-    expect(t.err.join("\n")).toMatch(/cannot be paid/);
-    writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), owner: env.usdc });
-    expect(await runCli(["withdraw", "--amount", "1"], cliIo(home).io)).toBe(1);
+    // A settled (and swept) channel record in this home, holding a session key.
+    const sessionKey = generatePrivateKey();
+    const channelId = `0x${randomBytes(32).toString("hex")}` as Hex;
+    writeJsonAtomic(arenaPaths(home).channelRecord(channelId), { channelId, sessionKey, me: 0, finalized: true, swept: true });
+    const forbidden: Array<[string, Address]> = [
+      ["the wallet", wallet],
+      ["the USDC token", env.usdc],
+      ["the hub", env.hub],
+      ["the rules contract", env.rules],
+      ["a session key", privateKeyToAccount(sessionKey).address],
+    ];
+    for (const [what, owner] of forbidden) {
+      writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), owner });
+      const t = cliIo(home);
+      expect(await runCli(["withdraw", "--amount", "1"], t.io), what).toBe(1);
+      expect(t.err.join("\n"), what).toMatch(/cannot be paid/);
+      expect(livePidHoldingLock(home), what).toBeNull();
+    }
     expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+  });
+
+  it("fix round M3: a token whose transfer returns false without moving anything is a failure (502), never reported as sent", async () => {
+    const { home, wallet } = await walletHome();
+    // A stand-in "USDC" (set with anvil_setCode): balanceOf(...) answers 10 USDC, every other call -- transfer
+    // included -- returns one zero word (false) without reverting, and nothing ever moves.
+    //   PUSH1 0 CALLDATALOAD PUSH1 0xe0 SHR DUP1 PUSH4 balanceOf EQ PUSH1 0x15 JUMPI   (selector dispatch)
+    //   PUSH1 0x20 PUSH1 0 RETURN                                                      (32 zero bytes: false)
+    //   JUMPDEST PUSH4 10_000_000 PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN             (the balance)
+    const fakeUsdc = newAddress();
+    const anvil = createTestClient({ mode: "anvil", chain: foundry, transport: http(RPC) });
+    const code = ["600035", "60e01c", "80", "6370a08231", "14", "6015", "57", "60206000f3", "5b", "6300989680", "600052", "60206000f3"];
+    await anvil.setCode({ address: fakeUsdc, bytecode: `0x${code.join("")}` });
+    writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), usdc: fakeUsdc });
+    const owner = newAddress();
+    await firstSet(home, owner);
+
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "3"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain("the token reported success but the balance did not move");
+    expect(t.out).toEqual([]); // no {to, amount, txHash, usdcAfter}: nothing claims it was sent
     expect(livePidHoldingLock(home)).toBeNull();
+    // The transfer really was mined as a success -- that is exactly what must not be trusted on its own.
+    const tx = /tx (0x[0-9a-f]{64})/.exec(t.err.join("\n"))?.[1] as Hex;
+    const receipt = await publicClient().getTransactionReceipt({ hash: tx });
+    expect(receipt.status).toBe("success");
+    expect(receipt.from.toLowerCase()).toBe(wallet.toLowerCase());
   });
 
   it("with a daemon holding the lock, the CLI goes through its API; an owner change is picked up without a restart", async () => {
@@ -357,4 +397,5 @@ describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
     expect(ok.status, await ok.clone().text()).toBe(200);
     expect(await usdcBalance(pair.env.usdc, owner)).toBe(1_000_000n);
   });
+
 });

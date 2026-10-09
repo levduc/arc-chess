@@ -683,12 +683,24 @@ export class ArenaDaemon {
         );
       }
       if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
-      let txHash: Hex;
+      let receipt: Awaited<ReturnType<HubClient["transfer"]>>;
       try {
-        txHash = (await this.hub.transfer(this.wallet, usdc, owner, amount)).transactionHash;
+        receipt = await this.hub.transfer(this.wallet, usdc, owner, amount);
       } catch (err) {
         if (err instanceof HubRevertError) throw new DaemonError(409, `the USDC transfer to ${owner} was refused: ${err.message}`);
         throw err;
+      }
+      const txHash = receipt.transactionHash;
+      // Task 3 fix round 1 (M3, spec §4.4): a mined, successful transfer is not proof the money moved -- a token can
+      // return `false` (as a blocklisted recipient may) without reverting. The wallet's balance must have dropped by
+      // at least `amount` across the transfer's own block: read at that block and the one before it, so USDC that
+      // reaches the wallet in some other block (a settlement, a top-up) can never mask a transfer that did nothing.
+      const [before, after] = await Promise.all([
+        this.usdcBalance(usdc, receipt.blockNumber - 1n),
+        this.usdcBalance(usdc, receipt.blockNumber),
+      ]);
+      if (after > before - amount) {
+        throw new DaemonError(502, `the token reported success but the balance did not move (tx ${txHash}): treat this withdraw as failed`);
       }
       const usdcAfter = await this.usdcBalance(usdc);
       this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
@@ -698,8 +710,15 @@ export class ArenaDaemon {
     }
   }
 
-  private usdcBalance(usdc: Address): Promise<bigint> {
-    return this.client.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [this.wallet.address] });
+  /** The wallet's USDC balance, at `blockNumber` if given (else the latest block). */
+  private usdcBalance(usdc: Address, blockNumber?: bigint): Promise<bigint> {
+    return this.client.readContract({
+      address: usdc,
+      abi: erc20Abi,
+      functionName: "balanceOf",
+      args: [this.wallet.address],
+      ...(blockNumber !== undefined ? { blockNumber } : {}),
+    });
   }
 
   /** The owner `withdraw()` pays, read from config.json now (never from `opts.config`, which is the config at
