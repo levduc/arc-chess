@@ -1,9 +1,18 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-import { KNOWN_DEPLOYMENTS, arenaPaths, loadConfig, runCli, writeJsonAtomic } from "../src/index.js";
+import {
+  KNOWN_DEPLOYMENTS,
+  RPC_TIMEOUT_MS,
+  arenaPaths,
+  livePidHoldingLock,
+  loadConfig,
+  runCli,
+  startDaemonProcess,
+  writeJsonAtomic,
+} from "../src/index.js";
 
 function templatesResponse(overrides: Record<string, unknown> = {}) {
   return [
@@ -115,6 +124,92 @@ describe("arena init --server", () => {
       err: () => undefined,
     });
     expect(code).toBe(0);
+    expect(livePidHoldingLock(home)).toBeNull(); // init took the stale lock over, then released it
+  });
+
+  it("Task 3 fix round 4 (N2): init holds the home lock for its whole run -- no daemon can start while it waits on a slow RPC", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const base = stubFetch();
+    let unstall!: () => void;
+    const stall = new Promise<void>((r) => (unstall = r));
+    let reached!: () => void;
+    const reachedChainId = new Promise<void>((r) => (reached = r));
+    const fetchStub = (async (url: string, init?: RequestInit) => {
+      if (!url.endsWith("/templates") && (JSON.parse(String(init?.body)) as { method: string }).method === "eth_chainId") {
+        reached();
+        await stall; // a slow (or hostile) RPC: init sits here, after its checks and before its write
+      }
+      return base.fetchStub(url, init);
+    }) as typeof fetch;
+    const err: string[] = [];
+    const running = runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    await reachedChainId;
+    expect(livePidHoldingLock(home)).toBe(process.pid);
+    await expect(startDaemonProcess(home, { log: () => {} })).rejects.toThrow(`another arena daemon (pid ${process.pid}) is using ${home}`);
+    unstall();
+    expect(await running, err.join("\n")).toBe(0);
+    expect(loadConfig(home).rpcUrl).toBe("http://rpc.test");
+    expect(livePidHoldingLock(home)).toBeNull();
+    expect(existsSync(join(home, "daemon.lock"))).toBe(false);
+  });
+
+  it("Task 3 fix round 4 (N2): a brand-new ARENA_HOME is created for the lock; a failed first init leaves no empty home behind", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const home = join(parent, "not", "yet");
+    const ok = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: stubFetch().fetchStub,
+      out: () => undefined,
+      err: () => undefined,
+    });
+    expect(ok).toBe(0);
+    expect(loadConfig(home).chainId).toBe(31337);
+    expect(existsSync(join(home, "daemon.lock"))).toBe(false);
+
+    const failed = join(parent, "refused");
+    const err: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: failed },
+      fetch: stubFetch({ chainId: 1 }).fetchStub, // the RPC serves another chain: refused before anything is written
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    expect(code).toBe(1);
+    expect(err.join("\n")).toContain("serves chain 0x1, not chain 31337");
+    expect(existsSync(failed)).toBe(false);
+  });
+
+  it("Task 3 fix round 4 (N2): every RPC call carries a timeout, and an RPC that never answers fails init with a clear error", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const base = stubFetch();
+    const signals: unknown[] = [];
+    const fetchStub = (async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/templates")) return base.fetchStub(url, init);
+      signals.push(init?.signal);
+      // What fetch rejects with when its AbortSignal.timeout fires (here after 1 ms, not RPC_TIMEOUT_MS).
+      const fired = AbortSignal.timeout(1);
+      await new Promise((r) => setTimeout(r, 20));
+      throw fired.reason;
+    }) as typeof fetch;
+    const err: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    expect(code).toBe(1);
+    expect(err.join("\n")).toContain(`RPC http://rpc.test did not answer eth_chainId within ${RPC_TIMEOUT_MS / 1000} s`);
+    expect(RPC_TIMEOUT_MS).toBe(30_000);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(livePidHoldingLock(home)).toBeNull();
+    expect(existsSync(arenaPaths(home).config)).toBe(false);
   });
 
   it("verifies the adopted chain over its RPC and prints every adopted value with a trust line (I8)", async () => {

@@ -1,7 +1,8 @@
+import { existsSync, mkdirSync, rmdirSync } from "node:fs";
 import { encodeFunctionData, formatUnits, parseUnits, type Address, type Hex } from "viem";
 import { channelHubAbi, DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
 import { runBot } from "./bot.js";
-import { livePidHoldingLock } from "./lock.js";
+import { acquireHomeLock, livePidHoldingLock } from "./lock.js";
 import {
   arenaPaths,
   defaultHome,
@@ -170,23 +171,35 @@ export function invalidOfferTimeoutReason(
   return null;
 }
 
-/** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors. */
+/** Task 3 fix round 4 (N2): the longest one `rpcCall` may take, reply body included. Without it a hostile or dead RPC
+ *  could hold `init` -- and the home lock it holds -- open for minutes (undici's own header and body timeouts). */
+export const RPC_TIMEOUT_MS = 30_000;
+
+/** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors, and when
+ *  no full reply arrives within `RPC_TIMEOUT_MS`. */
 async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]): Promise<unknown> {
+  const signal = AbortSignal.timeout(RPC_TIMEOUT_MS);
+  // fetch rejects with the signal's reason, a DOMException named "TimeoutError", when the signal fires.
+  const timedOut = (err: unknown) => signal.aborted || (err as { name?: unknown } | null)?.name === "TimeoutError";
+  const timeoutError = () => new Error(`RPC ${url} did not answer ${method} within ${RPC_TIMEOUT_MS / 1000} s`);
   let res: Response;
   try {
     res = await io.fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal,
     });
   } catch (err) {
+    if (timedOut(err)) throw timeoutError();
     throw new Error(`RPC ${url} is unreachable (${method}): ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!res.ok) throw new Error(`RPC ${url} answered ${method} with status ${res.status}`);
   let body: { result?: unknown; error?: { message?: string } };
   try {
     body = (await res.json()) as typeof body;
-  } catch {
+  } catch (err) {
+    if (timedOut(err)) throw timeoutError();
     throw new Error(`RPC ${url} answered ${method} with a body that is not JSON`);
   }
   if (body === null || typeof body !== "object") throw new Error(`RPC ${url} answered ${method} with a malformed body`);
@@ -329,231 +342,249 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             "run init against a different ARENA_HOME.",
         );
       }
-      const explicitFields = ["rpc", "chain-id", "hub", "usdc", "rules"];
-      const haveAllExplicit = explicitFields.every((name) => flag(name) !== undefined);
-      let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; faucet?: string } = {};
-      if (!haveAllExplicit) {
-        const templatesUrl = `${server.replace(/\/$/, "")}/templates`;
-        const res = await io.fetch(templatesUrl);
-        if (!res.ok) throw new Error(`fetching ${templatesUrl} failed with status ${res.status}`);
-        const list = (await res.json()) as unknown;
-        const chess = Array.isArray(list)
-          ? (list as Array<Record<string, unknown>>).find((t) => t.id === "chess")
-          : undefined;
-        if (!chess) throw new Error(`server ${server} offers no chess template`);
-        template = {
-          rpcUrl: typeof chess.rpcUrl === "string" ? chess.rpcUrl : undefined,
-          // Left as a string here (not coerced to a number) so a missing/non-numeric template chainId falls
-          // through to the same "--chain-id is required" / NaN-rejecting checks below as a missing flag, instead
-          // of silently becoming the string "undefined" or "NaN".
-          chainId: chess.chainId === undefined || chess.chainId === null ? undefined : String(chess.chainId),
-          hub: typeof chess.hub === "string" ? chess.hub : undefined,
-          usdc: typeof chess.usdc === "string" ? chess.usdc : undefined,
-          rules: typeof chess.rules === "string" ? chess.rules : undefined,
-          // Plan 5.5 Task 1 (Global Constraints): only ever set by a dev server whose faucet guard is fully
-          // satisfied -- a real deployment's /templates never carries this key at all.
-          faucet: typeof chess.faucet === "string" ? chess.faucet : undefined,
-        };
-      }
-      const rpcUrl = flag("rpc") ?? template.rpcUrl;
-      const chainIdRaw = flag("chain-id") ?? template.chainId;
-      const hubRaw = flag("hub") ?? template.hub;
-      const usdcRaw = flag("usdc") ?? template.usdc;
-      const rulesRaw = flag("rules") ?? template.rules;
-      if (!rpcUrl) throw new UsageError("--rpc is required (the server offered no template value)");
-      if (!/^https?:\/\//i.test(rpcUrl)) throw new UsageError("--rpc must be an http:// or https:// URL");
-      if (!chainIdRaw) throw new UsageError("--chain-id is required (the server offered no template value)");
-      const chainId = Number(chainIdRaw);
-      if (!Number.isInteger(chainId) || chainId <= 0) {
-        throw new UsageError("--chain-id must be a positive integer (the server's template value was not)");
-      }
-      if (!hubRaw) throw new UsageError("--hub is required (the server offered no template value)");
-      if (!usdcRaw) throw new UsageError("--usdc is required (the server offered no template value)");
-      if (!rulesRaw) throw new UsageError("--rules is required (the server offered no template value)");
-      const asAddress = (name: string, v: string): Address => {
-        if (!ADDRESS_RE.test(v)) throw new UsageError(`--${name} must be an address (0x + 40 hex characters)`);
-        return v as Address;
-      };
-      const hub = asAddress("hub", hubRaw);
-      const usdc = asAddress("usdc", usdcRaw);
-      const rules = asAddress("rules", rulesRaw);
-      // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
-      // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
-      // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl may
-      // still change; rpcUrl only once no channel is open (fix round 3, below). Checked before any network call (other
-      // than a --server's /templates), and before anything is written.
-      let prior: { chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown } | null;
+      // Task 3 fix round 4 (N2, spec §4.3): init holds the home lock for its whole run. Otherwise a daemon could start,
+      // and open a channel under the old RPC, between the checks below (the repoint check, the RPC pin) and the
+      // write -- while this init waits on a slow RPC. A brand-new ARENA_HOME is created first: the lock file lives in
+      // it. A failed first init removes it again (only if still empty), so no empty home is left behind.
+      const homeExisted = existsSync(home);
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const lock = acquireHomeLock(home);
       try {
-        prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown }>(arenaPaths(home).config);
-      } catch (err) {
-        throw new Error(
-          `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}): fix or remove it first`,
-        );
-      }
-      if (prior !== null) {
-        const sameAddress = (a: unknown, b: Address) => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
-        const changed = [
-          ...(prior.chainId === chainId ? [] : ["chainId"]),
-          ...(sameAddress(prior.hub, hub) ? [] : ["hub"]),
-          ...(sameAddress(prior.usdc, usdc) ? [] : ["usdc"]),
-          ...(sameAddress(prior.rules, rules) ? [] : ["rules"]),
-        ];
-        if (changed.length > 0) {
+        const explicitFields = ["rpc", "chain-id", "hub", "usdc", "rules"];
+        const haveAllExplicit = explicitFields.every((name) => flag(name) !== undefined);
+        let template: { rpcUrl?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; faucet?: string } = {};
+        if (!haveAllExplicit) {
+          const templatesUrl = `${server.replace(/\/$/, "")}/templates`;
+          const res = await io.fetch(templatesUrl);
+          if (!res.ok) throw new Error(`fetching ${templatesUrl} failed with status ${res.status}`);
+          const list = (await res.json()) as unknown;
+          const chess = Array.isArray(list)
+            ? (list as Array<Record<string, unknown>>).find((t) => t.id === "chess")
+            : undefined;
+          if (!chess) throw new Error(`server ${server} offers no chess template`);
+          template = {
+            rpcUrl: typeof chess.rpcUrl === "string" ? chess.rpcUrl : undefined,
+            // Left as a string here (not coerced to a number) so a missing/non-numeric template chainId falls
+            // through to the same "--chain-id is required" / NaN-rejecting checks below as a missing flag, instead
+            // of silently becoming the string "undefined" or "NaN".
+            chainId: chess.chainId === undefined || chess.chainId === null ? undefined : String(chess.chainId),
+            hub: typeof chess.hub === "string" ? chess.hub : undefined,
+            usdc: typeof chess.usdc === "string" ? chess.usdc : undefined,
+            rules: typeof chess.rules === "string" ? chess.rules : undefined,
+            // Plan 5.5 Task 1 (Global Constraints): only ever set by a dev server whose faucet guard is fully
+            // satisfied -- a real deployment's /templates never carries this key at all.
+            faucet: typeof chess.faucet === "string" ? chess.faucet : undefined,
+          };
+        }
+        const rpcUrl = flag("rpc") ?? template.rpcUrl;
+        const chainIdRaw = flag("chain-id") ?? template.chainId;
+        const hubRaw = flag("hub") ?? template.hub;
+        const usdcRaw = flag("usdc") ?? template.usdc;
+        const rulesRaw = flag("rules") ?? template.rules;
+        if (!rpcUrl) throw new UsageError("--rpc is required (the server offered no template value)");
+        if (!/^https?:\/\//i.test(rpcUrl)) throw new UsageError("--rpc must be an http:// or https:// URL");
+        if (!chainIdRaw) throw new UsageError("--chain-id is required (the server offered no template value)");
+        const chainId = Number(chainIdRaw);
+        if (!Number.isInteger(chainId) || chainId <= 0) {
+          throw new UsageError("--chain-id must be a positive integer (the server's template value was not)");
+        }
+        if (!hubRaw) throw new UsageError("--hub is required (the server offered no template value)");
+        if (!usdcRaw) throw new UsageError("--usdc is required (the server offered no template value)");
+        if (!rulesRaw) throw new UsageError("--rules is required (the server offered no template value)");
+        const asAddress = (name: string, v: string): Address => {
+          if (!ADDRESS_RE.test(v)) throw new UsageError(`--${name} must be an address (0x + 40 hex characters)`);
+          return v as Address;
+        };
+        const hub = asAddress("hub", hubRaw);
+        const usdc = asAddress("usdc", usdcRaw);
+        const rules = asAddress("rules", rulesRaw);
+        // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
+        // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
+        // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl may
+        // still change; rpcUrl only once no channel is open (fix round 3, below). Checked before any network call (other
+        // than a --server's /templates), and before anything is written.
+        let prior: { chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown } | null;
+        try {
+          prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown }>(arenaPaths(home).config);
+        } catch (err) {
           throw new Error(
-            `this home's funds are bound to hub ${String(prior.hub)} on chain ${String(prior.chainId)}; withdraw to your owner, ` +
-              `then use a fresh ARENA_HOME (refusing to change ${changed.join(", ")})`,
+            `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}): fix or remove it first`,
           );
         }
-        // Task 3 fix round 3: the RPC is this daemon's only view of its channels (phases, challenges, deadlines) and
-        // its only way to broadcast a respond. While a channel is still live, a new RPC that hides a challenge (or
-        // drops the answer) lets a stale state finalize against this player -- so the RPC, whether from --rpc or
-        // from a new --server's /templates, may change only once every channel record is finalized. A record that
-        // cannot be read counts as open: it cannot be shown to be settled.
-        if (prior.rpcUrl !== rpcUrl) {
-          const open = new RecordStore(home)
-            .scanChannels()
-            .filter((e) => e.record === null || e.record.finalized !== true)
-            .map((e) => e.channelId);
-          if (open.length > 0) {
+        if (prior !== null) {
+          const sameAddress = (a: unknown, b: Address) => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
+          const changed = [
+            ...(prior.chainId === chainId ? [] : ["chainId"]),
+            ...(sameAddress(prior.hub, hub) ? [] : ["hub"]),
+            ...(sameAddress(prior.usdc, usdc) ? [] : ["usdc"]),
+            ...(sameAddress(prior.rules, rules) ? [] : ["rules"]),
+          ];
+          if (changed.length > 0) {
             throw new Error(
-              `refusing to change the RPC from ${String(prior.rpcUrl)} to ${rpcUrl} while ${open.length} channel(s) are not ` +
-                `finalized (${open.join(", ").slice(0, 300)}): an RPC that hides a challenge can cost an open channel its ` +
-                `funds. Finish or close the open channels first, or keep the current RPC (--rpc ${String(prior.rpcUrl)})`,
+              `this home's funds are bound to hub ${String(prior.hub)} on chain ${String(prior.chainId)}; withdraw to your owner, ` +
+                `then use a fresh ARENA_HOME (refusing to change ${changed.join(", ")})`,
             );
           }
+          // Task 3 fix round 3: the RPC is this daemon's only view of its channels (phases, challenges, deadlines) and
+          // its only way to broadcast a respond. While a channel is still live, a new RPC that hides a challenge (or
+          // drops the answer) lets a stale state finalize against this player -- so the RPC, whether from --rpc or
+          // from a new --server's /templates, may change only once every channel record is finalized. A record that
+          // cannot be read counts as open: it cannot be shown to be settled.
+          if (prior.rpcUrl !== rpcUrl) {
+            const open = new RecordStore(home)
+              .scanChannels()
+              .filter((e) => e.record === null || e.record.finalized !== true)
+              .map((e) => e.channelId);
+            if (open.length > 0) {
+              throw new Error(
+                `refusing to change the RPC from ${String(prior.rpcUrl)} to ${rpcUrl} while ${open.length} channel(s) are not ` +
+                  `finalized (${open.join(", ").slice(0, 300)}): an RPC that hides a challenge can cost an open channel its ` +
+                  `funds. Finish or close the open channels first, or keep the current RPC (--rpc ${String(prior.rpcUrl)})`,
+              );
+            }
+          }
         }
-      }
-      const fromServer = !haveAllExplicit;
-      if (fromServer && /^http:\/\//i.test(server) && !isLoopbackUrl(server)) {
-        io.err(
-          `warning: ${server} is plain http: anyone on the path can rewrite the contract addresses and RPC it ` +
-            "hands you. Use https, or pass --rpc/--hub/--usdc/--rules explicitly.",
-        );
-      }
-      // I8, and Task 3 fix round 1 (I3): the RPC serves `chainId` and the hub, the USDC token and the rules all hold
-      // code -- checked even when every chain flag is explicit (an EOA "hub" would otherwise reach approve/deposit
-      // unverified).
-      await verifyChain(io, rpcUrl, chainId, { hub, usdc, rules });
-      // Final review I2: on a chain with a known canonical deployment, a different hub or rules is loud.
-      for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
-      // Final review C1: the session key's dispute gas is derived from the chain unless given. A key that cannot pay
-      // for a respond cannot answer a stale challenge, and an unanswered one can roll the channel back.
-      const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
-      let sessionGasWei: bigint;
-      if (flag("session-gas-wei") !== undefined) sessionGasWei = BigInt(flag("session-gas-wei")!);
-      else {
-        const price = await rpcCall(io, rpcUrl, "eth_gasPrice", []);
-        if (typeof price !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(price)) {
-          throw new Error(`RPC ${rpcUrl} returned a malformed eth_gasPrice: ${JSON.stringify(price)?.slice(0, 80)} (or pass --session-gas-wei)`);
-        }
-        sessionGasWei = defaultSessionGasWei(feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI, BigInt(price));
-      }
-      // Plan 5 Task 1: a floor above the target would refill to a target the check itself never sees as "enough".
-      const sessionGasFloor = flag("session-gas-floor") !== undefined ? BigInt(flag("session-gas-floor")!) : undefined;
-      if (sessionGasFloor !== undefined && sessionGasFloor > sessionGasWei) {
-        throw new UsageError(`--session-gas-floor (${sessionGasFloor}) must not exceed --session-gas-wei (${sessionGasWei})`);
-      }
-      // Final fix wave (I1): on unless explicitly turned off.
-      const autoReturnRaw = flag("auto-return-on-challenge");
-      if (autoReturnRaw !== undefined && autoReturnRaw !== "true" && autoReturnRaw !== "false") {
-        throw new UsageError("--auto-return-on-challenge must be true or false");
-      }
-      const autoReturn = autoReturnRaw === undefined ? undefined : autoReturnRaw === "true";
-
-      // Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner, settled before anything is written. A re-init must
-      // never reset it: without --owner the recorded owner (and its ownerNonce) is carried over as is; --owner may
-      // only record a first owner or repeat the current one -- a change is refused here, pointing at `owner set
-      // --signature` (fix round 1, I2). Settling it ahead of initHome means a refusal leaves config.json as it was.
-      const paths = arenaPaths(home);
-      const currentOwner = readRecordedOwner(home); // throws on an unreadable config.json rather than drop the lock
-      const { privateKeyToAccount, generatePrivateKey } = await import("viem/accounts");
-      // The key initHome will use (an existing wallet.json always wins, as before), chosen here so the wallet's own
-      // address is known -- and forbidden as an owner -- before anything is written.
-      const walletKey: Hex =
-        readJson<{ key: Hex }>(paths.wallet)?.key ?? (flag("wallet-key") as Hex | undefined) ?? generatePrivateKey();
-      const walletAddress = privateKeyToAccount(walletKey).address;
-      const existingCfg = readJson<{ owner?: unknown; ownerNonce?: unknown }>(paths.config);
-      let owner: unknown = existingCfg?.owner ?? undefined; // kept verbatim
-      // Fix round 1 (I2): a re-init must never reset the nonce either -- back at 0, a signature from an earlier
-      // change (A→B at nonce 0, after B→A) would verify again.
-      const ownerNonce = existingCfg ? ownerNonceOf(existingCfg) : 0;
-      const ownerFlag = flag("owner");
-      if (ownerFlag !== undefined) {
-        const { owner: requested, kind } = classifyOwner(currentOwner, ownerFlag, forbiddenOwners(home, { hub, usdc, rules }, walletAddress));
-        if (kind === "change") {
-          throw new Error(
-            `the owner is already set to ${currentOwner}; init never changes it. Run "${CLI_COMMAND} owner set ${requested}" ` +
-              "for the message the current owner must sign, then run it again with --signature",
+        const fromServer = !haveAllExplicit;
+        if (fromServer && /^http:\/\//i.test(server) && !isLoopbackUrl(server)) {
+          io.err(
+            `warning: ${server} is plain http: anyone on the path can rewrite the contract addresses and RPC it ` +
+              "hands you. Use https, or pass --rpc/--hub/--usdc/--rules explicitly.",
           );
         }
-        owner = requested;
-      }
+        // I8, and Task 3 fix round 1 (I3): the RPC serves `chainId` and the hub, the USDC token and the rules all hold
+        // code -- checked even when every chain flag is explicit (an EOA "hub" would otherwise reach approve/deposit
+        // unverified).
+        await verifyChain(io, rpcUrl, chainId, { hub, usdc, rules });
+        // Final review I2: on a chain with a known canonical deployment, a different hub or rules is loud.
+        for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
+        // Final review C1: the session key's dispute gas is derived from the chain unless given. A key that cannot pay
+        // for a respond cannot answer a stale challenge, and an unanswered one can roll the channel back.
+        const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
+        let sessionGasWei: bigint;
+        if (flag("session-gas-wei") !== undefined) sessionGasWei = BigInt(flag("session-gas-wei")!);
+        else {
+          const price = await rpcCall(io, rpcUrl, "eth_gasPrice", []);
+          if (typeof price !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(price)) {
+            throw new Error(`RPC ${rpcUrl} returned a malformed eth_gasPrice: ${JSON.stringify(price)?.slice(0, 80)} (or pass --session-gas-wei)`);
+          }
+          sessionGasWei = defaultSessionGasWei(feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI, BigInt(price));
+        }
+        // Plan 5 Task 1: a floor above the target would refill to a target the check itself never sees as "enough".
+        const sessionGasFloor = flag("session-gas-floor") !== undefined ? BigInt(flag("session-gas-floor")!) : undefined;
+        if (sessionGasFloor !== undefined && sessionGasFloor > sessionGasWei) {
+          throw new UsageError(`--session-gas-floor (${sessionGasFloor}) must not exceed --session-gas-wei (${sessionGasWei})`);
+        }
+        // Final fix wave (I1): on unless explicitly turned off.
+        const autoReturnRaw = flag("auto-return-on-challenge");
+        if (autoReturnRaw !== undefined && autoReturnRaw !== "true" && autoReturnRaw !== "false") {
+          throw new UsageError("--auto-return-on-challenge must be true or false");
+        }
+        const autoReturn = autoReturnRaw === undefined ? undefined : autoReturnRaw === "true";
 
-      const cfg: ArenaConfig = {
-        rpcUrl,
-        chainId,
-        hub,
-        usdc,
-        rules,
-        serverUrl: server,
-        port: Number(flag("port") ?? "7070"),
-        maxFeePerPlayer: BigInt(flag("max-fee") ?? "10000"),
-        sessionGasWei,
-        ...(sessionGasFloor !== undefined ? { sessionGasFloor } : {}),
-        pollMs: Number(flag("poll-ms") ?? "2000"),
-        logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
-        ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),
-        ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
-        ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
-        ...(owner !== undefined && owner !== null ? { owner: owner as Address } : {}),
-        ...(ownerNonce !== 0 ? { ownerNonce } : {}),
-      };
-      initHome(home, cfg, walletKey);
-      const summary: Record<string, unknown> = {
-        home,
-        wallet: walletAddress,
-        port: cfg.port,
-        rpcUrl,
-        chainId,
-        hub,
-        usdc,
-        rules,
-        sessionGasWei: cfg.sessionGasWei.toString(),
-        owner: cfg.owner ?? null,
-      };
-      if (fromServer) {
-        summary.trust =
-          `these contract addresses and the RPC come from ${server}; verify them against a source you trust, ` +
-          "or pass --rpc/--hub/--usdc/--rules explicitly";
-      }
-      // Plan 5.5 Task 1: only when the template actually advertised a faucet (a real deployment's /templates
-      // never does) -- a server without one leaves `summary` with no `faucet` key at all. `--no-faucet` turns
-      // this off without reading the balance or reaching the faucet. A faucet failure is reported here, never
-      // thrown: auto-funding is a convenience, not a reason to fail `init`.
-      if (template.faucet !== undefined) {
-        if (flags.has("no-faucet")) {
-          summary.faucet = "skipped: --no-faucet";
-        } else {
-          try {
-            const balance = await usdcBalanceOf(io, rpcUrl, usdc, walletAddress);
-            if (balance < FAUCET_MIN_USDC_BALANCE) {
-              // Plan 5.6 Task 2: the call itself (origin pin, timeout, redirect refusal, payload shape) now
-              // lives in the shared callFaucet, used by `fund` too.
-              const funded = await callFaucet(io, template.faucet, server, walletAddress);
-              // Plan 5.5 Task 3 carry-forward: formatted the same way `arena wallet` does rather than passed
-              // through unchanged, so a human (or agent) reading init's own summary sees "100.000000"/"1.0",
-              // not "100000000"/"1000000000000000000".
-              summary.faucet = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
-            } else {
-              summary.faucet = "skipped: balance already at or above 20 USDC";
+        // Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner, settled before anything is written. A re-init must
+        // never reset it: without --owner the recorded owner (and its ownerNonce) is carried over as is; --owner may
+        // only record a first owner or repeat the current one -- a change is refused here, pointing at `owner set
+        // --signature` (fix round 1, I2). Settling it ahead of initHome means a refusal leaves config.json as it was.
+        const paths = arenaPaths(home);
+        const currentOwner = readRecordedOwner(home); // throws on an unreadable config.json rather than drop the lock
+        const { privateKeyToAccount, generatePrivateKey } = await import("viem/accounts");
+        // The key initHome will use (an existing wallet.json always wins, as before), chosen here so the wallet's own
+        // address is known -- and forbidden as an owner -- before anything is written.
+        const walletKey: Hex =
+          readJson<{ key: Hex }>(paths.wallet)?.key ?? (flag("wallet-key") as Hex | undefined) ?? generatePrivateKey();
+        const walletAddress = privateKeyToAccount(walletKey).address;
+        const existingCfg = readJson<{ owner?: unknown; ownerNonce?: unknown }>(paths.config);
+        let owner: unknown = existingCfg?.owner ?? undefined; // kept verbatim
+        // Fix round 1 (I2): a re-init must never reset the nonce either -- back at 0, a signature from an earlier
+        // change (A→B at nonce 0, after B→A) would verify again.
+        const ownerNonce = existingCfg ? ownerNonceOf(existingCfg) : 0;
+        const ownerFlag = flag("owner");
+        if (ownerFlag !== undefined) {
+          const { owner: requested, kind } = classifyOwner(currentOwner, ownerFlag, forbiddenOwners(home, { hub, usdc, rules }, walletAddress));
+          if (kind === "change") {
+            throw new Error(
+              `the owner is already set to ${currentOwner}; init never changes it. Run "${CLI_COMMAND} owner set ${requested}" ` +
+                "for the message the current owner must sign, then run it again with --signature",
+            );
+          }
+          owner = requested;
+        }
+
+        const cfg: ArenaConfig = {
+          rpcUrl,
+          chainId,
+          hub,
+          usdc,
+          rules,
+          serverUrl: server,
+          port: Number(flag("port") ?? "7070"),
+          maxFeePerPlayer: BigInt(flag("max-fee") ?? "10000"),
+          sessionGasWei,
+          ...(sessionGasFloor !== undefined ? { sessionGasFloor } : {}),
+          pollMs: Number(flag("poll-ms") ?? "2000"),
+          logChunkBlocks: Number(flag("log-chunk-blocks") ?? String(DEFAULT_LOG_CHUNK_BLOCKS)),
+          ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),
+          ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
+          ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
+          ...(owner !== undefined && owner !== null ? { owner: owner as Address } : {}),
+          ...(ownerNonce !== 0 ? { ownerNonce } : {}),
+        };
+        initHome(home, cfg, walletKey);
+        const summary: Record<string, unknown> = {
+          home,
+          wallet: walletAddress,
+          port: cfg.port,
+          rpcUrl,
+          chainId,
+          hub,
+          usdc,
+          rules,
+          sessionGasWei: cfg.sessionGasWei.toString(),
+          owner: cfg.owner ?? null,
+        };
+        if (fromServer) {
+          summary.trust =
+            `these contract addresses and the RPC come from ${server}; verify them against a source you trust, ` +
+            "or pass --rpc/--hub/--usdc/--rules explicitly";
+        }
+        // Plan 5.5 Task 1: only when the template actually advertised a faucet (a real deployment's /templates
+        // never does) -- a server without one leaves `summary` with no `faucet` key at all. `--no-faucet` turns
+        // this off without reading the balance or reaching the faucet. A faucet failure is reported here, never
+        // thrown: auto-funding is a convenience, not a reason to fail `init`.
+        if (template.faucet !== undefined) {
+          if (flags.has("no-faucet")) {
+            summary.faucet = "skipped: --no-faucet";
+          } else {
+            try {
+              const balance = await usdcBalanceOf(io, rpcUrl, usdc, walletAddress);
+              if (balance < FAUCET_MIN_USDC_BALANCE) {
+                // Plan 5.6 Task 2: the call itself (origin pin, timeout, redirect refusal, payload shape) now
+                // lives in the shared callFaucet, used by `fund` too.
+                const funded = await callFaucet(io, template.faucet, server, walletAddress);
+                // Plan 5.5 Task 3 carry-forward: formatted the same way `arena wallet` does rather than passed
+                // through unchanged, so a human (or agent) reading init's own summary sees "100.000000"/"1.0",
+                // not "100000000"/"1000000000000000000".
+                summary.faucet = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
+              } else {
+                summary.faucet = "skipped: balance already at or above 20 USDC";
+              }
+            } catch (err) {
+              summary.faucet = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
             }
-          } catch (err) {
-            summary.faucet = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
+          }
+        }
+        io.out(JSON.stringify(summary, null, 2));
+        return 0;
+      } finally {
+        lock.release();
+        if (!homeExisted) {
+          try {
+            rmdirSync(home); // fails (ENOTEMPTY) once initHome has written: then the home stays, as it should
+          } catch {
+            // not empty: init got far enough to write it
           }
         }
       }
-      io.out(JSON.stringify(summary, null, 2));
-      return 0;
     }
 
     if (cmd === "daemon") {
