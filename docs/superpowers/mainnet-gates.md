@@ -76,6 +76,9 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - init: require `--force` to switch an existing home's chain/server/hub, and record the chain's genesis hash so
   records from a previous chain are never acted on (ghost channels after a dev-up restart).
 
+### Plan 5.6
+- Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC and set feeCeilingWei for Arc in Plan 6.
+
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
 1. **Arc chain facts verified and written down.**
