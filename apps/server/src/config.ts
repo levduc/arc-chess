@@ -19,6 +19,11 @@ export const DEFAULT_LIMITS: Limits = {
   maxOpenOffersPerIp: 5, maxWatchedOffers: 256, maxJoinsPerConnection: 64,
 };
 
+/** Plan 5.6 Task 4 (spec §3): a published, pinned CLI version this host advertises in `/templates`, so an agent
+ *  always installs and runs an exact version instead of `@latest`. `minVersion` (when set) is the floor `init`
+ *  refuses below; `version` is the one the derived `cliCommand` and skill.md's Install step actually pin to. */
+export type CliConfig = { package: string; version: string; minVersion?: string };
+
 export type ServerConfig = {
   host: string;
   port: number;
@@ -32,6 +37,8 @@ export type ServerConfig = {
   offerMaxLifetime: bigint;
   defaults: { deposit: bigint; stakePerGame: bigint; challengeTimeout: bigint };
   cliCommand: string;
+  /** Set only when this host pins a published CLI (see `CliConfig`); published in `/templates` the same way. */
+  cli?: CliConfig;
   audit: string;
   indexer: { pollMs: number; chunkBlocks: number; startBlock: bigint };
   limits: Limits;
@@ -53,6 +60,23 @@ const MAX_FUNDING_WINDOW = 7200n;
 const MIN_FUNDING_WINDOW = 60n;
 
 const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+// Plan 5.6 Task 4 (spec §3): npm package-name syntax (lowercase, optionally `@scope/name`) and plain `x.y.z`
+// semver. Duplicated from `packages/cli/src/version.ts`'s own `SEMVER`, not imported -- `@arena/cli` is only a
+// devDependency of `@arena/server` (used in tests), so the server's runtime has no dependency on the CLI package.
+const CLI_PACKAGE_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
+const CLI_SEMVER_RE = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+
+/** Orders two strings already matched against `CLI_SEMVER_RE`. */
+function compareCliSemver(a: string, b: string): -1 | 0 | 1 {
+  const pa = CLI_SEMVER_RE.exec(a)!;
+  const pb = CLI_SEMVER_RE.exec(b)!;
+  for (let i = 1; i <= 3; i++) {
+    const d = Number(pa[i]) - Number(pb[i]);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
 
 /** Thrown when a config field is missing or malformed; the message leads with the field name (e.g. `/hub/`). */
 class FieldError extends Error {
@@ -140,6 +164,32 @@ function parseLimits(obj: Record<string, unknown>): Limits {
   return out;
 }
 
+/** Plan 5.6 Task 4 (spec §3): `cli`, or `undefined` when the config carries none. Each violation names the
+ *  offending field (`cli.package`/`cli.version`/`cli.minVersion`). */
+function parseCli(obj: Record<string, unknown>): CliConfig | undefined {
+  const raw = obj.cli;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail("cli", "must be an object");
+  const r = raw as Record<string, unknown>;
+
+  const pkg = r.package;
+  if (typeof pkg !== "string") fail("cli.package", "is required and must be a string");
+  if (pkg.length > 214 || !CLI_PACKAGE_RE.test(pkg)) {
+    fail("cli.package", "must be a valid npm package name (lowercase, optionally scoped as @scope/name), at most 214 characters");
+  }
+
+  const version = r.version;
+  if (typeof version !== "string") fail("cli.version", "is required and must be a string");
+  if (!CLI_SEMVER_RE.test(version)) fail("cli.version", "must be a plain x.y.z version");
+
+  if (r.minVersion === undefined) return { package: pkg, version };
+  const minVersion = r.minVersion;
+  if (typeof minVersion !== "string") fail("cli.minVersion", "must be a string");
+  if (!CLI_SEMVER_RE.test(minVersion)) fail("cli.minVersion", "must be a plain x.y.z version");
+  if (compareCliSemver(minVersion, version) > 0) fail("cli.minVersion", `must be <= cli.version (${version})`);
+  return { package: pkg, version, minVersion };
+}
+
 /** Plain-JSON config (bigints as decimal strings, optional fields defaulted); throws with the offending field name. */
 export function parseServerConfig(raw: unknown): ServerConfig {
   const obj = asRecord(raw);
@@ -173,7 +223,11 @@ export function parseServerConfig(raw: unknown): ServerConfig {
     challengeTimeout: bigint(defaultsRaw, "defaults.challengeTimeout", 900n),
   };
 
-  const cliCommand = str(obj, "cliCommand", "arena");
+  const cli = parseCli(obj);
+  // Plan 5.6 Task 4 (spec §3): derived only when the raw config has no `cliCommand` key at all -- an explicit
+  // `cliCommand` always wins over a configured `cli`, even an empty string (`obj.cliCommand !== undefined`, not
+  // `str`'s own fallback, so this distinguishes "not given" from "given but falsy").
+  const cliCommand = obj.cliCommand !== undefined ? str(obj, "cliCommand") : cli !== undefined ? `npx -y ${cli.package}@${cli.version}` : "arena";
   // Final review m21: `audit` is published in /templates. Outside a local Anvil chain it must be set, and must not be
   // the development default: the mainnet value states the truth (e.g. "unaudited; guarded launch, caps X/Y").
   const local = chainId === ANVIL_CHAIN_ID;
@@ -193,6 +247,6 @@ export function parseServerConfig(raw: unknown): ServerConfig {
 
   return {
     host, port, publicUrl, rpcUrl, publicRpcUrl, chainId, hub, usdc, rules, dbPath,
-    fundingWindow, offerMaxLifetime, defaults, cliCommand, audit, indexer, limits, trustProxy, devFaucet,
+    fundingWindow, offerMaxLifetime, defaults, cliCommand, ...(cli !== undefined ? { cli } : {}), audit, indexer, limits, trustProxy, devFaucet,
   };
 }
