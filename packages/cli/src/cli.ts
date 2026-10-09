@@ -15,6 +15,7 @@ import {
   type ArenaConfig,
 } from "./config.js";
 import { startDaemonProcess } from "./run.js";
+import { cliVersion } from "./version.js";
 
 export type CliIo = {
   env: NodeJS.ProcessEnv;
@@ -46,7 +47,8 @@ const USAGE = `usage: arena <command> [options]
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
   resign | accept-draw | next-game | close | challenge | reclaim | sweep [--channel ID]
-  handoff human|agent [--note TEXT] [--channel ID]`;
+  handoff human|agent [--note TEXT] [--channel ID]
+  version  (prints this CLI's version)`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
@@ -213,6 +215,10 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
 
 export async function runCli(argv: string[], io: CliIo): Promise<number> {
   try {
+    if (argv[0] === "--version" || argv[0] === "version") {
+      io.out(cliVersion());
+      return 0;
+    }
     const { positional, flags } = parse(argv);
     const [cmd, arg] = positional;
     const home = defaultHome(io.env);
