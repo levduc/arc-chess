@@ -214,6 +214,30 @@ describe("arena withdraw (spec §4.4)", () => {
     expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
   });
 
+  it("fix round M2: withdraw takes no destination -- --to, a bare address or any other flag is a usage error, and nothing moves", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const evil = newAddress();
+    for (const args of [
+      ["withdraw", "--all", "--to", evil],
+      ["withdraw", "--amount", "1", "--to", evil],
+      ["withdraw", evil, "--all"],
+      ["withdraw", "--all", evil],
+      ["withdraw", "--amount", "1", "--channel", `0x${"ab".repeat(32)}`],
+      ["withdraw", "--all", "--offer-draw"],
+    ]) {
+      const t = cliIo(home);
+      expect(await runCli(args, t.io), args.join(" ")).toBe(2);
+      expect(t.err.join("\n"), args.join(" ")).toContain("withdraw always pays the recorded owner; it takes no destination");
+      expect(t.urls, args.join(" ")).toEqual([]);
+    }
+    expect(await usdcBalance(env.usdc, evil)).toBe(0n);
+    expect(await usdcBalance(env.usdc, owner)).toBe(0n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
   it("fix round M3: a token whose transfer returns false without moving anything is a failure (502), never reported as sent", async () => {
     const { home, wallet } = await walletHome();
     // A stand-in "USDC" (set with anvil_setCode): balanceOf(...) answers 10 USDC, every other call -- transfer

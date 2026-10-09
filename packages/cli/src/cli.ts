@@ -71,9 +71,10 @@ const USAGE = `usage: arena <command> [options]
            signer, command} and exits 1. Never the wallet, the hub, the USDC token, the rules contract, a session
            key or the zero address.)
   withdraw --amount A | --all
-          (sends USDC from this wallet to the recorded owner, through the daemon -- started in-process, and stopped
-           again, if none is running. Refused while a channel still awaits this wallet's deposit. Funds escrowed
-           in channels are not in the wallet: close open channels first. Prints {to, amount, txHash, usdcAfter}.)
+          (sends USDC from this wallet to the recorded owner -- it takes no destination -- through the daemon:
+           started in-process, and stopped again, if none is running. Refused while a channel still awaits this
+           wallet's deposit. Funds escrowed in channels are not in the wallet: close open channels first. Prints
+           {to, amount, txHash, usdcAfter}; a note on stderr if this wallet still has open offers.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -271,6 +272,8 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
     if (a === "--offer-draw") flags.set("offer-draw", true);
     else if (a === "--no-faucet") flags.set("no-faucet", true);
     else if (a === "--allow-real-chain") flags.set("allow-real-chain", true);
+    // Plan 5.6 Task 3 (fix round 1, M5): `--all` is a boolean for every command, not only `withdraw` -- a future
+    // command that wants `--all <value>` must special-case it here, or it will silently get `true`.
     else if (a === "--all") flags.set("all", true);
     else if (a.startsWith("--")) {
       const v = argv[i + 1];
@@ -848,6 +851,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // Plan 5.6 Task 3 (spec §4.4): always through a daemon -- the one that owns this wallet's transaction
       // ordering (`SerialTxSender`) -- and always to the owner the daemon reads from config.json itself: nothing
       // here, and nothing in the request, names a destination.
+      // Fix round 1 (M2, spec §4.4): so a destination the caller tries to name (`--to 0x…`, a bare address) -- or
+      // any other flag -- is a usage error, never silently ignored: a confused agent must not report "sent to X".
+      const unexpected = [...positional.slice(1), ...[...flags.keys()].filter((k) => k !== "amount" && k !== "all").map((k) => `--${k}`)];
+      if (unexpected.length > 0) {
+        throw new UsageError(
+          `withdraw always pays the recorded owner; it takes no destination (unexpected: ${unexpected.join(" ").slice(0, 120)})`,
+        );
+      }
       const all = flags.has("all");
       const amountRaw = flag("amount");
       if (all === (amountRaw !== undefined)) throw new UsageError("withdraw needs exactly one of --amount A or --all");
