@@ -377,6 +377,12 @@ function checkHandoffNote(note: string): void {
   }
 }
 
+/** The chain view of a settled channel whose full on-chain state is not (or no longer) at hand: only its final
+ *  phase matters to `buildStatus` once the record is finalized. */
+function finalChainView(phase: string): ChainView {
+  return { phase, funded: [false, false], deadline: 0n, challenger: 0, registeredTurn: null, cooldownUntil: [0n, 0n], now: 0n };
+}
+
 export class ArenaDaemon {
   readonly client: PublicClient;
   readonly hub: HubClient;
@@ -2381,17 +2387,7 @@ export class ArenaDaemon {
     } catch {
       return null; // a record for another hub or chain (see openChannel)
     }
-    const chain: ChainView | null = record.finalPhase
-      ? {
-          phase: record.finalPhase,
-          funded: [false, false],
-          deadline: 0n,
-          challenger: 0,
-          registeredTurn: null,
-          cooldownUntil: [0n, 0n],
-          now: 0n,
-        }
-      : null;
+    const chain: ChainView | null = record.finalPhase ? finalChainView(record.finalPhase) : null;
     return buildStatus({ record, snapshot: session.snapshot(), myTurn: session.isMyTurn(), chain, lastError: null });
   }
 
@@ -2474,6 +2470,10 @@ export class ArenaDaemon {
     if (phase === "Finalized" || phase === "Reclaimed") l.settledWake = true;
     // Plan 5 Task 1 (mainnet gates: settled index): recorded so the index start() loads can sort by settle time.
     l.record = { ...l.record, finalized: true, finalPhase: phase, settledAt: Date.now() };
+    // A settled channel's chain view is never refreshed again (status/channels skip it, I1), so it must carry the
+    // final phase from this moment on: settleCheck's own refresh lands one RPC later (or fails), and the reclaim and
+    // timeout paths never refresh at all -- without this, `status` kept reporting "Open"/"Challenged" for good.
+    l.chain = l.chain ? { ...l.chain, phase } : finalChainView(phase);
     this.records.saveChannel(l.record);
     this.opts.relay.leave(l.record.channelId);
   }

@@ -640,6 +640,9 @@ describe("watchtower", () => {
     // before the daemon's own call returns and sets `record.finalized` — the sync assignment right after
     // narrows this window to one RPC, it cannot close it. Wait for the flag rather than asserting it instantly.
     await waitFor(() => alice.daemon.handle(id).record.finalized, 5_000, "record.finalized");
+    // A settled channel's chain view is never refreshed again, so markFinalized itself must record the final phase:
+    // the dispute pass's timeout path used to leave `status` on "Challenged" for good.
+    expect((await alice.daemon.status(id)).phase).toBe("Finalized");
   });
 
   it("does not time out a challenge in which it is on move", async () => {
@@ -747,5 +750,7 @@ describe("watchtower", () => {
     await increaseTime(3601);
     await waitFor(async () => (await pair.alice.daemon.hub.channelInfo(id)).phase === "Reclaimed", 20_000, "reclaim");
     expect(await usdcBalance(pair.env.usdc, pair.alice.address)).toBe(START);
+    await waitFor(() => pair.alice.daemon.handle(id).record.finalized, 5_000, "record.finalized");
+    expect((await pair.alice.daemon.status(id)).phase).toBe("Reclaimed");
   });
 });
