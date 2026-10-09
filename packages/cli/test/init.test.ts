@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -34,7 +34,10 @@ function stubFetch(
   } = {},
 ) {
   const calls: Array<{ url: string; method?: string }> = [];
-  const withCode = new Set((opts.withCode ?? [`0x${"11".repeat(20)}`, `0x${"33".repeat(20)}`]).map((a) => a.toLowerCase()));
+  // Task 3 fix round 1 (I3): init checks the USDC token's code too, so the default chain has all three contracts.
+  const withCode = new Set(
+    (opts.withCode ?? [`0x${"11".repeat(20)}`, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`]).map((a) => a.toLowerCase()),
+  );
   const fetchStub = (async (url: string, init?: RequestInit) => {
     if (url.endsWith("/templates")) {
       calls.push({ url });
@@ -127,8 +130,9 @@ describe("arena init --server", () => {
     expect(code).toBe(0);
     expect(calls.filter((c) => c.method).map((c) => [c.url, c.method])).toEqual([
       ["http://rpc.test", "eth_chainId"],
-      ["http://rpc.test", "eth_getCode"],
-      ["http://rpc.test", "eth_getCode"],
+      ["http://rpc.test", "eth_getCode"], // hub
+      ["http://rpc.test", "eth_getCode"], // usdc (Task 3 fix round 1, I3)
+      ["http://rpc.test", "eth_getCode"], // rules
       ["http://rpc.test", "eth_gasPrice"], // the default sessionGasWei (final review C1)
     ]);
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
@@ -258,10 +262,11 @@ describe("arena init --server", () => {
     }
   });
 
-  it("fails when an adopted hub or rules address has no code", async () => {
-    for (const missing of ["hub", "rules"] as const) {
+  it("fails when an adopted hub, USDC or rules address has no code", async () => {
+    const all = { hub: `0x${"11".repeat(20)}`, usdc: `0x${"22".repeat(20)}`, rules: `0x${"33".repeat(20)}` };
+    for (const missing of ["hub", "usdc", "rules"] as const) {
       const home = mkdtempSync(join(tmpdir(), "arena-init-"));
-      const { fetchStub } = stubFetch({ withCode: missing === "hub" ? [`0x${"33".repeat(20)}`] : [`0x${"11".repeat(20)}`] });
+      const { fetchStub } = stubFetch({ withCode: Object.entries(all).filter(([k]) => k !== missing).map(([, v]) => v) });
       const err: string[] = [];
       const code = await runCli(["init", "--server", "http://host.test"], {
         env: { ARENA_HOME: home },
@@ -290,11 +295,9 @@ describe("arena init --server", () => {
     }
   });
 
-  it("with every chain setting (and --session-gas-wei) explicit, makes no network call and prints no trust line", async () => {
+  it("with every chain setting (and --session-gas-wei) explicit, reads no /templates and prints no trust line, but still checks the chain and all three contracts' code (fix round 1, I3)", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-init-"));
-    const fetchStub = (async () => {
-      throw new Error("no network call expected: every chain-setting flag is explicit");
-    }) as typeof fetch;
+    const { fetchStub, calls } = stubFetch();
     const out: string[] = [];
     const code = await runCli(
       ["init", "--server", "http://host.test", "--rpc", "http://rpc.test", "--chain-id", "31337",
@@ -306,6 +309,73 @@ describe("arena init --server", () => {
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
     expect(printed.hub).toBe(`0x${"11".repeat(20)}`);
     expect(printed.trust).toBeUndefined();
+    expect(calls).toEqual([
+      { url: "http://rpc.test", method: "eth_chainId" },
+      { url: "http://rpc.test", method: "eth_getCode" },
+      { url: "http://rpc.test", method: "eth_getCode" },
+      { url: "http://rpc.test", method: "eth_getCode" },
+    ]);
+  });
+
+  describe("Task 3 fix round 1 (I3, spec §4.3): init never repoints the money", () => {
+    const explicit = (o: { rpc?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; server?: string } = {}) => [
+      "init", "--server", o.server ?? "http://host.test", "--rpc", o.rpc ?? "http://rpc.test", "--chain-id", o.chainId ?? "31337",
+      "--hub", o.hub ?? `0x${"11".repeat(20)}`, "--usdc", o.usdc ?? `0x${"22".repeat(20)}`, "--rules", o.rules ?? `0x${"33".repeat(20)}`,
+      "--session-gas-wei", "10000000000000000",
+    ];
+    const run = async (home: string, args: string[], stub = stubFetch()) => {
+      const err: string[] = [];
+      const code = await runCli(args, { env: { ARENA_HOME: home }, fetch: stub.fetchStub, out: () => undefined, err: (s) => err.push(s) });
+      return { code, err: err.join("\n"), calls: stub.calls };
+    };
+
+    it("a re-init that would change the hub, USDC, rules or chain is refused (exit 1) before any network call, and writes nothing", async () => {
+      const otherCode = [`0x${"11".repeat(20)}`, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`, `0x${"44".repeat(20)}`];
+      for (const [what, args] of [
+        ["hub", explicit({ hub: `0x${"44".repeat(20)}` })],
+        ["usdc", explicit({ usdc: `0x${"44".repeat(20)}` })],
+        ["rules", explicit({ rules: `0x${"44".repeat(20)}` })],
+        ["chainId", explicit({ chainId: "1" })],
+      ] as const) {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        const r = await run(home, [...args], stubFetch({ withCode: otherCode, chainId: what === "chainId" ? 1 : 31337 }));
+        expect(r.code, what).toBe(1);
+        expect(r.err, what).toContain(`this home's funds are bound to hub 0x${"11".repeat(20)} on chain 31337; withdraw to your owner, then use a fresh ARENA_HOME`);
+        expect(r.err, what).toContain(`refusing to change ${what}`);
+        expect(r.calls, what).toEqual([]);
+        expect(readFileSync(join(home, "config.json"), "utf8"), what).toBe(before);
+      }
+    });
+
+    it("the same goes for a re-init whose new chain settings come from a server's /templates", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      expect((await run(home, explicit())).code).toBe(0);
+      const evil = stubFetch({ templates: templatesResponse({ hub: `0x${"44".repeat(20)}` }), withCode: [`0x${"44".repeat(20)}`, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`] });
+      const r = await run(home, ["init", "--server", "https://moved.example", "--session-gas-wei", "1"], evil);
+      expect(r.code).toBe(1);
+      expect(r.err).toMatch(/funds are bound to hub/);
+      expect(loadConfig(home).hub).toBe(`0x${"11".repeat(20)}`);
+      expect(loadConfig(home).serverUrl).toBe("http://host.test");
+    });
+
+    it("a re-init may change the RPC URL and the server URL (and still checks the code over the new RPC)", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      expect((await run(home, explicit())).code).toBe(0);
+      const r = await run(home, explicit({ rpc: "http://other-rpc.test", server: "http://other-host.test" }));
+      expect(r.code, r.err).toBe(0);
+      expect(r.calls.map((c) => c.url)).toEqual(Array(4).fill("http://other-rpc.test"));
+      expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://other-rpc.test", serverUrl: "http://other-host.test", hub: `0x${"11".repeat(20)}` });
+    });
+
+    it("a fresh init with every flag explicit refuses a hub that holds no code (an EOA)", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const r = await run(home, explicit({ hub: `0x${"44".repeat(20)}` })); // the stub chain has no code at 0x44..44
+      expect(r.code).toBe(1);
+      expect(r.err).toMatch(/hub 0x4{40} has no contract code on chain 31337/);
+      expect(() => loadConfig(home)).toThrow(); // nothing written
+    });
   });
 
   it("explicit flags override template values", async () => {

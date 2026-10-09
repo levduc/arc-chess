@@ -327,6 +327,11 @@ describe("arena owner (spec §4.3)", () => {
       expect(loadConfig(viaSet.home).port).toBe(7020);
       expect(ownerOnDisk(viaSet.home)).toBe(OWNER_A);
       expect(JSON.parse(re.out.join("\n")).owner).toBe(OWNER_A);
+      // Fix round 1 (I3): the same hub/USDC/rules given in lowercase are not a repoint.
+      const lower = initArgs(viaSet.walletKey).map((a) => (a === HUB || a === USDC || a === RULES ? a.toLowerCase() : a));
+      const l = ownerIo(viaSet.home);
+      expect(await runCli(lower, l.io), l.err.join("\n")).toBe(0);
+      expect(ownerOnDisk(viaSet.home)).toBe(OWNER_A);
     });
 
     it("init --owner <other> is refused (exit 1), pointing at owner set --signature, and writes nothing at all", async () => {

@@ -38,7 +38,8 @@ const USAGE = `usage: arena <command> [options]
        (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
         agent once max(60 s, challengeTimeout / 3) is left)
-       (missing chain settings are filled from the server's /templates and checked over the RPC;
+       (missing chain settings are filled from the server's /templates; every chain setting is checked over the RPC;
+        re-running init on an existing home never changes its chain-id, hub, usdc or rules -- use a fresh ARENA_HOME;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
        (when the server advertises a dev faucet and the wallet's USDC balance is below 20, init calls it;
         --no-faucet turns this off)
@@ -189,9 +190,10 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
   return body.result;
 }
 
-/** I8: checks, over the RPC the daemon will use, that the server-supplied chain settings are at least real: the
- *  RPC serves `chainId`, and the hub and rules addresses hold contracts. It cannot prove they are the genuine
- *  arena contracts -- the printed trust line says so. */
+/** I8: checks, over the RPC the daemon will use, that the chain settings are at least real: the RPC serves
+ *  `chainId`, and every address in `contracts` holds code (Task 3 fix round 1, I3: the hub, USDC and rules, on
+ *  every init -- explicit flags included). It cannot prove they are the genuine arena contracts -- the printed
+ *  trust line says so. */
 async function verifyChain(io: CliIo, rpcUrl: string, chainId: number, contracts: Record<string, Address>): Promise<void> {
   const reported = await rpcCall(io, rpcUrl, "eth_chainId", []);
   if (typeof reported !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(reported)) {
@@ -369,16 +371,44 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const hub = asAddress("hub", hubRaw);
       const usdc = asAddress("usdc", usdcRaw);
       const rules = asAddress("rules", rulesRaw);
-      const fromServer = !haveAllExplicit;
-      if (fromServer) {
-        if (/^http:\/\//i.test(server) && !isLoopbackUrl(server)) {
-          io.err(
-            `warning: ${server} is plain http: anyone on the path can rewrite the contract addresses and RPC it ` +
-              "hands you. Use https, or pass --rpc/--hub/--usdc/--rules explicitly.",
+      // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
+      // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
+      // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl and
+      // rpcUrl may still change. Checked before any network call, and before anything is written.
+      let prior: { chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown } | null;
+      try {
+        prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown }>(arenaPaths(home).config);
+      } catch (err) {
+        throw new Error(
+          `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}): fix or remove it first`,
+        );
+      }
+      if (prior !== null) {
+        const sameAddress = (a: unknown, b: Address) => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
+        const changed = [
+          ...(prior.chainId === chainId ? [] : ["chainId"]),
+          ...(sameAddress(prior.hub, hub) ? [] : ["hub"]),
+          ...(sameAddress(prior.usdc, usdc) ? [] : ["usdc"]),
+          ...(sameAddress(prior.rules, rules) ? [] : ["rules"]),
+        ];
+        if (changed.length > 0) {
+          throw new Error(
+            `this home's funds are bound to hub ${String(prior.hub)} on chain ${String(prior.chainId)}; withdraw to your owner, ` +
+              `then use a fresh ARENA_HOME (refusing to change ${changed.join(", ")})`,
           );
         }
-        await verifyChain(io, rpcUrl, chainId, { hub, rules });
       }
+      const fromServer = !haveAllExplicit;
+      if (fromServer && /^http:\/\//i.test(server) && !isLoopbackUrl(server)) {
+        io.err(
+          `warning: ${server} is plain http: anyone on the path can rewrite the contract addresses and RPC it ` +
+            "hands you. Use https, or pass --rpc/--hub/--usdc/--rules explicitly.",
+        );
+      }
+      // I8, and Task 3 fix round 1 (I3): the RPC serves `chainId` and the hub, the USDC token and the rules all hold
+      // code -- checked even when every chain flag is explicit (an EOA "hub" would otherwise reach approve/deposit
+      // unverified).
+      await verifyChain(io, rpcUrl, chainId, { hub, usdc, rules });
       // Final review I2: on a chain with a known canonical deployment, a different hub or rules is loud.
       for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
       // Final review C1: the session key's dispute gas is derived from the chain unless given. A key that cannot pay

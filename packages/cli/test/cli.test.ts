@@ -5,14 +5,28 @@ import type { Address } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
-import { daemonStartLine, invalidOfferTimeoutReason, loadConfig, runCli } from "../src/index.js";
+import { arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, runCli, writeJsonAtomic } from "../src/index.js";
 import { computeFundingNeed, fundMessage } from "../src/funding.js";
 
-function io(home: string, responses: Array<{ status: number; body: unknown }> = []) {
+function io(home: string, responses: Array<{ status: number; body: unknown }> = [], opts: { chainId?: number } = {}) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const out: string[] = [];
   const err: string[] = [];
   const fetchFn = (async (url: string, init: RequestInit) => {
+    // Task 3 fix round 1 (I3): init checks the chain id and the hub/USDC/rules code over the RPC on every run, even
+    // with every chain flag explicit. Answered here as a chain (31337 unless `opts.chainId`) on which every address
+    // holds code -- never taken from `responses`, never recorded in `calls`. (Tests that need the real check use
+    // the real chain: see `fundIo`/`initEmptyWallet` below, and owner.test.ts.)
+    let method: unknown;
+    try {
+      method = (JSON.parse(String(init?.body)) as { method?: unknown }).method;
+    } catch {
+      method = undefined;
+    }
+    if (method === "eth_chainId" || method === "eth_getCode") {
+      const result = method === "eth_chainId" ? `0x${(opts.chainId ?? 31337).toString(16)}` : "0x6080";
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
+    }
     calls.push({ url, init });
     const r = responses.shift() ?? { status: 200, body: {} };
     return new Response(JSON.stringify(r.body), { status: r.status });
@@ -235,7 +249,7 @@ describe("arena CLI", () => {
   it("Plan 5.5 Task 2: arena bot refuses a non-31337 chain without --allow-real-chain, before touching the daemon", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     const mainnetInit = INIT.map((v) => (v === "31337" ? "1" : v));
-    await runCli(mainnetInit, io(home).io);
+    await runCli(mainnetInit, io(home, [], { chainId: 1 }).io);
     expect(loadConfig(home).chainId).toBe(1);
 
     const refused = io(home);
@@ -316,12 +330,9 @@ function fundIo(
 
 /** Writes a fresh ARENA_HOME against a real, freshly deployed hub, with a fresh (empty: 0 USDC, 0 native)
  *  wallet -- a random key is never one of Anvil's own pre-funded dev accounts. Every field is explicit, so
- *  `init` itself makes no network call at all (final review C1's own `--session-gas-wei` trick, reused here). */
-async function initEmptyWallet(
-  env: { hub: Address; usdc: Address; rules: Address },
-  server = "http://127.0.0.1:3000",
-  opts: { hubOverride?: Address } = {},
-) {
+ *  `init` reads no /templates (final review C1's own `--session-gas-wei` trick, reused here); its chain and code
+ *  checks (Task 3 fix round 1, I3) go to the real Anvil chain through `fundIo`. */
+async function initEmptyWallet(env: { hub: Address; usdc: Address; rules: Address }, server = "http://127.0.0.1:3000") {
   const walletKey = generatePrivateKey();
   const address = privateKeyToAccount(walletKey).address;
   const home = mkdtempSync(join(tmpdir(), "arena-cli-fund-"));
@@ -333,7 +344,7 @@ async function initEmptyWallet(
       "--chain-id",
       "31337",
       "--hub",
-      opts.hubOverride ?? env.hub,
+      env.hub,
       "--usdc",
       env.usdc,
       "--rules",
@@ -348,7 +359,7 @@ async function initEmptyWallet(
       walletKey,
       "--no-faucet",
     ],
-    io(home).io,
+    fundIo(home).io,
   );
   if (code !== 0) throw new Error(`test setup: init failed with code ${code}`);
   return { home, address, walletKey };
@@ -444,11 +455,12 @@ describe("Plan 5.6 Task 2: arena fund", () => {
 
   it("Fix round 1 (Important): a hub address with no contract code exits 1, naming the hub and chain", async () => {
     const env = await deployArena();
-    // init with every chain flag explicit skips verifyChain entirely (cli.ts's own haveAllExplicit path), so
-    // a fresh EOA -- never deployed, never given code -- reaches `fund` completely unverified, exactly as the
-    // review describes: this is the first command to touch cfg.hub on the chain at all.
+    // Task 3 fix round 1 (I3): init now refuses a no-code hub itself, even with every chain flag explicit, so a
+    // home naming one can only be one written before that (or a hand-edited config.json) -- simulated here by
+    // rewriting config.json's hub after a normal init. fund must still refuse it by name.
     const noCodeHub = privateKeyToAccount(generatePrivateKey()).address;
-    const { home } = await initEmptyWallet(env, "http://127.0.0.1:3000", { hubOverride: noCodeHub });
+    const { home } = await initEmptyWallet(env, "http://127.0.0.1:3000");
+    writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), hub: noCodeHub });
     const t = fundIo(home, { templatesBody: CHESS_TEMPLATE() });
 
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(1);
