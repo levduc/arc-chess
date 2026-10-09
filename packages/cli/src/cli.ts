@@ -49,8 +49,12 @@ const USAGE = `usage: arena <command> [options]
         feePerPlayer, and this wallet's balances -- no daemon needed. deposit defaults to min(N x X, cap).
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
         Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
-        message is a ready-to-relay sentence. Exit 0 whenever the computation succeeds -- a shortfall is
-        data, not an error.)
+        message is a ready-to-relay sentence. faucet is present only when a faucet call was attempted: on
+        success it is {usdc, native} (the wallet's new balances, formatted like "arena faucet"); on failure
+        (unreachable, rate-limited, wrong origin, ...) it is the string "skipped: <reason>" instead, and the
+        usdc/native fields above keep reporting the shortfall as it actually stands. Exit 0 whenever the
+        computation succeeds -- a shortfall is data, not an error; exit 1 if the server or the hub cannot be
+        read at all (for example, a hub address with no contract code on this chain).)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -672,6 +676,17 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         { to: cfg.hub, data: encodeFunctionData({ abi: channelHubAbi, functionName: "feePerPlayer" }) },
         "latest",
       ]);
+      // Fix round 1 (Important): `init` only verifies the hub holds code when it derived chain settings from
+      // the server (`verifyChain`, skipped whenever every chain flag was given explicitly) -- so `cfg.hub` can
+      // reach `fund` completely unverified. A no-code address answers eth_call with "0x", not a revert, and
+      // `hexToBigIntOrThrow` would silently turn that into a fee of 0n, under-asking the human by the real fee
+      // (Review Focus 1). Reject it by name instead of trusting a zero read.
+      if (feePerPlayerRaw === "0x") {
+        throw new Error(
+          `the hub at ${cfg.hub} has no contract code on chain ${cfg.chainId} -- re-run "arena init" against ` +
+            "the server (or pass --hub explicitly) before funding",
+        );
+      }
       const feePerPlayer = hexToBigIntOrThrow(feePerPlayerRaw, `RPC ${cfg.rpcUrl} eth_call (feePerPlayer)`);
       const feeCeilingWei = cfg.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
 

@@ -317,7 +317,11 @@ function fundIo(
 /** Writes a fresh ARENA_HOME against a real, freshly deployed hub, with a fresh (empty: 0 USDC, 0 native)
  *  wallet -- a random key is never one of Anvil's own pre-funded dev accounts. Every field is explicit, so
  *  `init` itself makes no network call at all (final review C1's own `--session-gas-wei` trick, reused here). */
-async function initEmptyWallet(env: { hub: Address; usdc: Address; rules: Address }, server = "http://127.0.0.1:3000") {
+async function initEmptyWallet(
+  env: { hub: Address; usdc: Address; rules: Address },
+  server = "http://127.0.0.1:3000",
+  opts: { hubOverride?: Address } = {},
+) {
   const walletKey = generatePrivateKey();
   const address = privateKeyToAccount(walletKey).address;
   const home = mkdtempSync(join(tmpdir(), "arena-cli-fund-"));
@@ -329,7 +333,7 @@ async function initEmptyWallet(env: { hub: Address; usdc: Address; rules: Addres
       "--chain-id",
       "31337",
       "--hub",
-      env.hub,
+      opts.hubOverride ?? env.hub,
       "--usdc",
       env.usdc,
       "--rules",
@@ -437,6 +441,45 @@ describe("Plan 5.6 Task 2: arena fund", () => {
     expect(await runCli(["fund", "--games", "1", "--stake", "1"], t.io)).toBe(1);
     expect(t.err.join("\n")).toContain("http://127.0.0.1:3000/templates");
   });
+
+  it("Fix round 1 (Important): a hub address with no contract code exits 1, naming the hub and chain", async () => {
+    const env = await deployArena();
+    // init with every chain flag explicit skips verifyChain entirely (cli.ts's own haveAllExplicit path), so
+    // a fresh EOA -- never deployed, never given code -- reaches `fund` completely unverified, exactly as the
+    // review describes: this is the first command to touch cfg.hub on the chain at all.
+    const noCodeHub = privateKeyToAccount(generatePrivateKey()).address;
+    const { home } = await initEmptyWallet(env, "http://127.0.0.1:3000", { hubOverride: noCodeHub });
+    const t = fundIo(home, { templatesBody: CHESS_TEMPLATE() });
+
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain(noCodeHub);
+    expect(t.err.join("\n")).toMatch(/no contract code on chain 31337/);
+    expect(t.err.join("\n")).toMatch(/arena init/); // tells the agent how to recover
+    expect(t.out).toEqual([]); // never prints a feePerPlayer: "0.000000" under-ask
+  });
+
+  it("Fix round 1 (Minor): a faucet failure (500) is reported as faucet: \"skipped: ...\", still exit 0", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env, "http://127.0.0.1:3000");
+    let faucetCalls = 0;
+    const t = fundIo(home, {
+      templatesBody: CHESS_TEMPLATE({ faucet: "http://127.0.0.1:3000/faucet" }),
+      faucetHandler: async () => {
+        faucetCalls++;
+        return { status: 500, body: { error: "faucet exploded" } };
+      },
+    });
+
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
+    expect(faucetCalls).toBe(1);
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "faucet", "message"]);
+    expect(printed.faucet).toMatch(/^skipped:/);
+    expect(printed.faucet as string).toMatch(/faucet exploded|500/);
+    // The shortfall still reflects the (unchanged) balances -- a failed top-up never fakes success.
+    expect(printed.usdc).toEqual({ have: "0.000000", need: "3.005000", shortfall: "3.005000" });
+    expect(printed.native).toEqual({ have: "0.0", need: "0.06", shortfall: "0.06" });
+  });
 });
 
 describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", () => {
@@ -448,6 +491,7 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
     const code = await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "5"], t.io);
     expect(code).toBe(2);
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "usdc", "native", "reached", "waitedSeconds"]);
     expect(printed.reached).toBe(false);
     expect(printed.waitedSeconds as number).toBeGreaterThanOrEqual(5);
   }, 20_000);
@@ -467,8 +511,12 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
 
     expect(code).toBe(0);
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "usdc", "native", "reached", "waitedSeconds"]);
     expect(printed.reached).toBe(true);
     expect(typeof printed.waitedSeconds).toBe("number");
+    // Detects promptly: the mint/setBalance lands at ~1s with a 200ms poll interval, well inside the 15s
+    // --timeout -- an explicit upper bound makes "detects promptly", not just "eventually", part of the test.
+    expect(printed.waitedSeconds as number).toBeLessThanOrEqual(10);
     expect(printed.usdc).toBe("1.000000");
     expect(printed.native).toBe("1.0"); // proves --wait-for-native is actually checked, not just accepted
   }, 20_000);
