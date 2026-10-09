@@ -864,7 +864,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       const cfg = loadConfig(home);
 
-      let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint };
+      let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint; openOffers?: string[] };
       if (livePidHoldingLock(home) !== null) {
         // A daemon is running (`arena daemon`, `arena bot`, or another withdraw): go through its API.
         const token = loadToken(home);
@@ -880,7 +880,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             `a daemon holds ${home} but cannot be reached on 127.0.0.1:${cfg.port}: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-        const payload = (await res.json().catch(() => ({}))) as { error?: unknown; to?: unknown; amount?: unknown; txHash?: unknown; usdcAfter?: unknown };
+        const payload = (await res.json().catch(() => ({}))) as {
+          error?: unknown;
+          to?: unknown;
+          amount?: unknown;
+          txHash?: unknown;
+          usdcAfter?: unknown;
+          openOffers?: unknown;
+        };
         if (!res.ok) {
           io.err(`error: ${typeof payload.error === "string" ? payload.error : res.statusText}`);
           return 1;
@@ -897,6 +904,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           throw new Error(`the daemon answered withdraw with a malformed result: ${JSON.stringify(payload).slice(0, 200)}`);
         }
         result = { to: payload.to, amount: BigInt(payload.amount), txHash: payload.txHash, usdcAfter: BigInt(payload.usdcAfter) };
+        if (Array.isArray(payload.openOffers)) result.openOffers = payload.openOffers.filter((o): o is string => typeof o === "string");
       } else {
         // No daemon: refuse before starting one if there is no owner at all (the daemon would refuse anyway).
         if (readRecordedOwner(home) === null) throw new Error(noOwnerMessage(CLI_COMMAND));
@@ -916,6 +924,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           2,
         ),
       );
+      // Fix round 1 (M1): a warning, not a refusal -- an open offer holds no funds yet, but one matched from now on
+      // may find the wallet short; its channel then retires unfunded at its funding deadline (no funds are lost).
+      if (result.openOffers !== undefined && result.openOffers.length > 0) {
+        io.err(
+          `note: this wallet still has ${result.openOffers.length} open offer(s) (${result.openOffers.join(", ")}): if one is ` +
+            "matched now, its deposit may fail for lack of USDC, and that channel retires unfunded at its funding deadline",
+        );
+      }
       return 0;
     }
 

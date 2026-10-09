@@ -651,7 +651,9 @@ export class ArenaDaemon {
    * place in the wallet's one nonce sequence. Refused (409) while any channel still awaits this wallet's own
    * deposit (`channelsAwaitingOwnDeposit`, Review Focus 4), so it never starves a deposit the daemon is about to make.
    */
-  async withdraw(req: { amount: bigint } | { all: true }): Promise<{ to: Address; amount: bigint; txHash: Hex; usdcAfter: bigint }> {
+  async withdraw(
+    req: { amount: bigint } | { all: true },
+  ): Promise<{ to: Address; amount: bigint; txHash: Hex; usdcAfter: bigint; openOffers?: Hex[] }> {
     if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
     if (this.withdrawing) throw new DaemonError(409, "a withdraw is already in progress: retry shortly");
     this.withdrawing = true;
@@ -704,7 +706,10 @@ export class ArenaDaemon {
       }
       const usdcAfter = await this.usdcBalance(usdc);
       this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
-      return { to: owner, amount, txHash, usdcAfter };
+      // M1: this wallet's open offers (posted, or accepted and not yet matched) are not refused -- they hold no funds
+      // yet -- but one matched now may find the wallet short, so they are reported for the caller to warn about.
+      const openOffers = this.records.offers().map((r) => r.offerId);
+      return { to: owner, amount, txHash, usdcAfter, ...(openOffers.length > 0 ? { openOffers } : {}) };
     } finally {
       this.withdrawing = false;
     }
@@ -746,7 +751,8 @@ export class ArenaDaemon {
    * main pass (`watch`) will still call `fund()` -- not only `wantsToFund`'s "fund on this tick": an accepter
    * (player 1) waiting for the offerer's deposit deposits the moment it lands. A channel past its deadline never
    * gets this wallet's deposit (it is retired, or reclaimed), so it does not hold a withdraw up. A match being
-   * turned into a channel record right now (`claiming`) is about to become such a channel, so it counts too.
+   * turned into a channel record right now (`claiming`), or waiting in `retryMatches` for the next pass (fix round
+   * 1, M1), is about to become such a channel, so it counts too.
    * A chain read that fails throws: whether a deposit is pending must be known, not assumed.
    */
   protected async channelsAwaitingOwnDeposit(): Promise<string[]> {
@@ -778,6 +784,11 @@ export class ArenaDaemon {
       }
     }
     for (const offerId of this.claiming) out.push(`offer ${offerId} is being matched into a channel that will await this wallet's deposit`);
+    // Task 3 fix round 1 (M1): a match whose handling failed (or was deferred by a withdraw) and is retried on the
+    // next pass is just as close to becoming such a channel.
+    for (const offerId of this.retryMatches.keys()) {
+      if (!this.claiming.has(offerId)) out.push(`offer ${offerId} was matched and its channel, still being set up, will await this wallet's deposit`);
+    }
     return out;
   }
 
@@ -963,6 +974,14 @@ export class ArenaDaemon {
     // offer watched forever is exactly what exhausted the host connection's per-connection watch-slot cap and
     // left this daemon permanently unable to hear of new matches as an offerer -- see the Task 11 report.
     this.opts.lobby.unwatch([offerId]);
+    // Task 3 fix round 1 (M1): a withdraw in flight is moving this wallet's USDC. A match handled now could open a
+    // channel whose deposit then finds the wallet short, so it waits for the next pass (`retryMatches`), after the
+    // transfer. Synchronous with the check above: no await separates the two, so a retried match is re-deferred
+    // atomically. withdraw()'s 409 check counts deferred matches, so a later withdraw waits for them in turn.
+    if (this.withdrawing) {
+      this.retryMatches.set(offerId, m);
+      return;
+    }
     // I3: claim the offerId synchronously, before any await, so a second match event for the same offer
     // (concurrent or back-to-back) bails here instead of racing this call to open a second channel.
     if (this.claiming.has(offerId)) return;

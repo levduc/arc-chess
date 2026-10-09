@@ -241,6 +241,24 @@ describe("arena withdraw (spec §4.4)", () => {
     expect(receipt.from.toLowerCase()).toBe(wallet.toLowerCase());
   });
 
+  it("fix round M1: open offers are reported as a note on stderr (a warning, not a refusal); the JSON keeps its four keys", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const offerId = `0x${randomBytes(32).toString("hex")}` as Hex;
+    writeJsonAtomic(arenaPaths(home).offerRecord(offerId), {
+      offerId,
+      offer: { expiresAt: 2n ** 40n },
+      sessionKey: generatePrivateKey(),
+      role: "offerer",
+    });
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], t.io), t.err.join("\n")).toBe(0);
+    expect(Object.keys(t.json())).toEqual(["to", "amount", "txHash", "usdcAfter"]);
+    expect(t.err.join("\n")).toMatch(new RegExp(`^note: this wallet still has 1 open offer\\(s\\) \\(${offerId}\\)`));
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+  });
+
   it("with a daemon holding the lock, the CLI goes through its API; an owner change is picked up without a restart", async () => {
     const port = await freePort();
     const { env, home, wallet } = await walletHome({ port });
@@ -398,4 +416,34 @@ describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
     expect(await usdcBalance(pair.env.usdc, owner)).toBe(1_000_000n);
   });
 
+  it("fix round M1: a match arriving while a withdraw is in flight waits for the next pass; a deferred match holds the next withdraw up (409)", async () => {
+    const pair = await startPair();
+    cleanups.push(() => pair.cleanup());
+    const bob = pair.bob.daemon as unknown as { withdrawing: boolean; retryMatches: Map<Hex, unknown> };
+    const owner = newAddress();
+    await firstSet(pair.bob.home, owner);
+
+    // Bob's withdraw is "in flight" while the host matches his accept: the match is deferred, not handled.
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    bob.withdrawing = true;
+    await pair.bob.daemon.acceptOffer(offerId);
+    await waitFor(() => bob.retryMatches.has(offerId), 20_000, "bob's deferred match");
+    await waitFor(() => pair.alice.daemon.channelIds().length === 1, 20_000, "alice's channel");
+    await new Promise((r) => setTimeout(r, 500)); // several main passes (pollMs 100): each one defers it again
+    expect(pair.bob.daemon.channelIds()).toEqual([]);
+    expect(bob.retryMatches.has(offerId)).toBe(true);
+
+    // The next withdraw starts in the same synchronous step the first one "ends" in: it sets `withdrawing` again
+    // before any pass can run, so the match stays deferred -- and the 409 names it.
+    bob.withdrawing = false;
+    const refused = pair.bob.daemon.withdraw({ amount: 1n });
+    await expect(refused).rejects.toMatchObject({ code: 409 });
+    await expect(refused).rejects.toThrow(offerId);
+    expect(await usdcBalance(pair.env.usdc, owner)).toBe(0n);
+
+    // With no withdraw in flight, the next pass handles the match: Bob's channel opens and funds as usual.
+    const id = await waitFor(() => pair.bob.daemon.channelIds()[0], 20_000, "bob's channel after the withdraw");
+    expect(id).toBe(pair.alice.daemon.channelIds()[0]);
+    await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(id)).phase === "Open", 30_000, "open");
+  });
 });
