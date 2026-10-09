@@ -19,7 +19,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createPublicClient, http, type Address, type Hex } from "viem";
+import { createPublicClient, http, parseUnits, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
 import { channelHubAbi } from "@arena/sdk";
@@ -34,6 +34,9 @@ const REPO_ROOT = join(import.meta.dirname, "../..");
 function recipeCommands(wrapper: string): string[] {
   return [
     `${wrapper} init --server`,
+    `${wrapper} fund --games N --stake X`,
+    `${wrapper} wallet --wait-for-usdc`,
+    `${wrapper} owner set`,
     `${wrapper} daemon`,
     `${wrapper} channels`,
     `${wrapper} wallet`,
@@ -46,6 +49,7 @@ function recipeCommands(wrapper: string): string[] {
     `${wrapper} next-game --channel <channelId>`,
     `${wrapper} close --channel <channelId>`,
     `${wrapper} challenge`,
+    `${wrapper} withdraw --all`,
   ];
 }
 
@@ -177,6 +181,8 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
   it(
     "inits with auto-fund, accepts a house bot's offer, plays 3 games (resigning game 2), closes, and settles with exact accounting",
     async () => {
+      // Moved up from the play loop below (Plan 5.6 Task 4) so the new fund step can size `--games` the same way.
+      const GAMES_TO_PLAY = 3;
       dir = mkdtempSync(join(tmpdir(), "agent-recipe-"));
       const wrapperPath = writeArenaWrapper(dir, CLI_BIN);
       // Final review I1: automine freezes chain time between transactions (startStack's own default, and never
@@ -213,7 +219,17 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       const balanceAfterInit = await usdcBalanceOf(stack, agentAddress);
       expect(balanceAfterInit).toBe(100_000_000n); // exactly the faucet's 100 USDC; the wallet started at 0
 
-      // --- Step 2: start the daemon, keep it running ---
+      // --- Step 2: fund (already covered by init's own faucet) and record the human's owner address ---
+      const fundResult = await runWrapperJson(wrapperPath, ["fund", "--games", String(GAMES_TO_PLAY), "--stake", "1"], agentHome);
+      // init's faucet (100 USDC + 10 native) already covers 3 games at $1 plus the fee and the gas reserve.
+      expect(fundResult.usdc.shortfall).toBe("0.000000");
+      expect(fundResult.native.shortfall).toBe("0.0"); // native amounts are ether decimals, not 6-dp USDC
+      expect(fundResult.owner).toBeNull();
+      const humanAddress = privateKeyToAccount(generatePrivateKey()).address;
+      const ownerSetResult = await runWrapperJson(wrapperPath, ["owner", "set", humanAddress], agentHome);
+      expect(ownerSetResult.owner.toLowerCase()).toBe(humanAddress.toLowerCase());
+
+      // --- Step 3: start the daemon, keep it running ---
       agentDaemon = spawn(wrapperPath, ["daemon"], {
         cwd: REPO_ROOT,
         env: { ...process.env, ARENA_HOME: agentHome },
@@ -229,7 +245,7 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
         }
       });
 
-      // --- Step 3: wallet check ---
+      // --- sanity check: wallet balance (folded into skill.md's fund step; kept here as a direct balance read) ---
       const walletBefore = await runWrapperJson(wrapperPath, ["wallet"], agentHome);
       // Final review I3: wallet reports whole-USDC decimals (e.g. "100.000000"), not base units -- assert the
       // shape, not just this one value, so the units claim in skill.md's recipe is actually tested.
@@ -270,7 +286,6 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       console.log(`[agent-recipe] channel ${channelId} open with house bot ${houseBot!.address}`);
 
       // --- Step 5: the play loop -- 3 games at $1, always resigning game index 1 ("game 2") ---
-      const GAMES_TO_PLAY = 3;
       const RESIGN_GAME_INDEX = 1;
       const MAX_PLY_PER_GAME = 60;
       const rng = (() => {
@@ -356,6 +371,19 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       // it never touches this balance, so it needs no separate term here.
       expect(actualDelta).toBe(expectedDelta);
       expect(walletAfter.usdc).not.toBe(walletBefore.usdc); // sanity: the formatted wallet output moved too
+
+      // --- Step 7: ask to withdraw now; withdraw --all (the daemon is still running, so this goes through its
+      // API, not the in-process-daemon fallback) -- the owner's USDC delta must equal exactly what was withdrawn,
+      // and the agent's own wallet must end at zero (the dev reserve is 0). ---
+      const ownerBalanceBeforeWithdraw = await usdcBalanceOf(stack, humanAddress);
+      const withdrawResult = await runWrapperJson(wrapperPath, ["withdraw", "--all"], agentHome);
+      expect(withdrawResult.to.toLowerCase()).toBe(humanAddress.toLowerCase());
+      const withdrawnAmount = parseUnits(withdrawResult.amount as string, 6);
+      expect(withdrawnAmount).toBe(balanceAfterClose); // --all drains the whole wallet; dev reserve is 0
+      const ownerBalanceAfterWithdraw = await usdcBalanceOf(stack, humanAddress);
+      expect(ownerBalanceAfterWithdraw - ownerBalanceBeforeWithdraw).toBe(withdrawnAmount);
+      const walletAfterWithdraw = await runWrapperJson(wrapperPath, ["wallet"], agentHome);
+      expect(walletAfterWithdraw.usdc).toBe("0.000000");
 
       // --- the house bot's own daemon never got stuck (no lastError on this channel) ---
       const botStatus = await runCli(["status", "--channel", channelId], houseBot!.home);
