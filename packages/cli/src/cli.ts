@@ -18,6 +18,7 @@ import {
 import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
 import { readJson } from "./jsonfile.js";
 import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecordedOwner, setOwner, UsageError } from "./owner.js";
+import { RecordStore } from "./records.js";
 import { startDaemonProcess } from "./run.js";
 import { cliVersion } from "./version.js";
 
@@ -39,7 +40,8 @@ const USAGE = `usage: arena <command> [options]
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
         agent once max(60 s, challengeTimeout / 3) is left)
        (missing chain settings are filled from the server's /templates; every chain setting is checked over the RPC;
-        re-running init on an existing home never changes its chain-id, hub, usdc or rules -- use a fresh ARENA_HOME;
+        re-running init on an existing home never changes its chain-id, hub, usdc or rules -- use a fresh ARENA_HOME --
+        and changes its RPC only once every channel is finalized;
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
        (when the server advertises a dev faucet and the wallet's USDC balance is below 20, init calls it;
         --no-faucet turns this off)
@@ -377,11 +379,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const rules = asAddress("rules", rulesRaw);
       // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
       // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
-      // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl and
-      // rpcUrl may still change. Checked before any network call, and before anything is written.
-      let prior: { chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown } | null;
+      // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl may
+      // still change; rpcUrl only once no channel is open (fix round 3, below). Checked before any network call (other
+      // than a --server's /templates), and before anything is written.
+      let prior: { chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown } | null;
       try {
-        prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown }>(arenaPaths(home).config);
+        prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown }>(arenaPaths(home).config);
       } catch (err) {
         throw new Error(
           `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}): fix or remove it first`,
@@ -400,6 +403,24 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             `this home's funds are bound to hub ${String(prior.hub)} on chain ${String(prior.chainId)}; withdraw to your owner, ` +
               `then use a fresh ARENA_HOME (refusing to change ${changed.join(", ")})`,
           );
+        }
+        // Task 3 fix round 3: the RPC is this daemon's only view of its channels (phases, challenges, deadlines) and
+        // its only way to broadcast a respond. While a channel is still live, a new RPC that hides a challenge (or
+        // drops the answer) lets a stale state finalize against this player -- so the RPC, whether from --rpc or
+        // from a new --server's /templates, may change only once every channel record is finalized. A record that
+        // cannot be read counts as open: it cannot be shown to be settled.
+        if (prior.rpcUrl !== rpcUrl) {
+          const open = new RecordStore(home)
+            .scanChannels()
+            .filter((e) => e.record === null || e.record.finalized !== true)
+            .map((e) => e.channelId);
+          if (open.length > 0) {
+            throw new Error(
+              `refusing to change the RPC from ${String(prior.rpcUrl)} to ${rpcUrl} while ${open.length} channel(s) are not ` +
+                `finalized (${open.join(", ").slice(0, 300)}): an RPC that hides a challenge can cost an open channel its ` +
+                `funds. Finish or close the open channels first, or keep the current RPC (--rpc ${String(prior.rpcUrl)})`,
+            );
+          }
         }
       }
       const fromServer = !haveAllExplicit;

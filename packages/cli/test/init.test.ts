@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { KNOWN_DEPLOYMENTS, loadConfig, runCli } from "../src/index.js";
+import { randomBytes } from "node:crypto";
+import { KNOWN_DEPLOYMENTS, arenaPaths, loadConfig, runCli, writeJsonAtomic } from "../src/index.js";
 
 function templatesResponse(overrides: Record<string, unknown> = {}) {
   return [
@@ -367,6 +368,73 @@ describe("arena init --server", () => {
       expect(r.code, r.err).toBe(0);
       expect(r.calls.map((c) => c.url)).toEqual(Array(4).fill("http://other-rpc.test"));
       expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://other-rpc.test", serverUrl: "http://other-host.test", hub: `0x${"11".repeat(20)}` });
+    });
+
+    describe("fix round 3: the RPC changes only once every channel is finalized", () => {
+      /** A channel record in `home` (only the fields the check reads), finalized or not. */
+      const channel = (home: string, finalized: boolean): string => {
+        const channelId = `0x${randomBytes(32).toString("hex")}`;
+        writeJsonAtomic(arenaPaths(home).channelRecord(channelId as `0x${string}`), { channelId, finalized, sessionKey: `0x${"01".repeat(32)}` });
+        return channelId;
+      };
+
+      it("an open channel and a different --rpc: refused (exit 1) saying why and what to do; config.json unchanged", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, true);
+        const open = channel(home, false);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        const r = await run(home, explicit({ rpc: "http://other-rpc.test" }));
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("refusing to change the RPC from http://rpc.test to http://other-rpc.test while 1 channel(s) are not finalized");
+        expect(r.err).toContain(open);
+        expect(r.err).toContain("an RPC that hides a challenge can cost an open channel its funds");
+        expect(r.err).toContain("Finish or close the open channels first, or keep the current RPC (--rpc http://rpc.test)");
+        expect(r.calls).toEqual([]); // refused before any network call
+        expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+      });
+
+      it("an open channel and a new --server whose /templates publish another RPC: refused too", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, false);
+        const moved = stubFetch({ templates: templatesResponse({ rpcUrl: "http://evil-rpc.test" }) });
+        const r = await run(home, ["init", "--server", "https://moved.example", "--session-gas-wei", "1"], moved);
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("refusing to change the RPC from http://rpc.test to http://evil-rpc.test");
+        expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://rpc.test", serverUrl: "http://host.test" });
+      });
+
+      it("an open channel, the same RPC and a new --server: accepted", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, false);
+        const r = await run(home, explicit({ server: "http://other-host.test" }));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://rpc.test", serverUrl: "http://other-host.test" });
+      });
+
+      it("every channel finalized (or none at all) and a different --rpc: accepted", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, true);
+        channel(home, true);
+        const r = await run(home, explicit({ rpc: "http://other-rpc.test" }));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home).rpcUrl).toBe("http://other-rpc.test");
+      });
+
+      it("a channel entry that cannot be read counts as open", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        const channelId = `0x${randomBytes(32).toString("hex")}`;
+        mkdirSync(join(home, "channels", channelId), { recursive: true });
+        writeFileSync(join(home, "channels", channelId, "record.json"), "{ not json");
+        const r = await run(home, explicit({ rpc: "http://other-rpc.test" }));
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(channelId);
+        expect(loadConfig(home).rpcUrl).toBe("http://rpc.test");
+      });
     });
 
     it("a fresh init with every flag explicit refuses a hub that holds no code (an EOA)", async () => {
