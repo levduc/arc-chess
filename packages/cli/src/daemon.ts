@@ -356,6 +356,17 @@ export const SWEEP_PENDING_PROBES = 3;
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
 
+/** Plan 5.6 Task 3 fix round 4 (N3): a match whose handling fails this many times in a row (`retryMatches`) is
+ *  dropped, with one log line, instead of being retried -- and holding every withdraw at 409 -- for the daemon's
+ *  lifetime. Retries run once per main pass, so 20 is at least 40 s of failures at the default 2 s `pollMs`, and
+ *  minutes when each attempt waits out RPC timeouts: long enough to ride out an RPC blip. What still fails after
+ *  that (a corrupt offer record, a full disk, a dead RPC) is not fixed by retrying. Dropping loses nothing: the
+ *  offer record stays on disk, the next `start()` watches it again and the host replays the match. That is why the
+ *  withdraw 409 says to restart the daemon if it persists. Only failures count; a match deferred by a withdraw in
+ *  flight is not a failure. Like `MAX_OPEN_ATTEMPTS`, which degrades a channel that keeps failing to open (an
+ *  `openChannel` failure counts here too, so that cap is reached first). */
+export const MAX_MATCH_RETRIES = 20;
+
 /** The hub error names that mean "this deposit cannot go through right now because of a launch limit" (spec §13),
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
@@ -446,6 +457,9 @@ export class ArenaDaemon {
    *  next tick. The host sends a match once per subscription, so without a retry one failed read at match time
    *  left the channel unopened (and unfunded) for good. Explicit rejections are never retried. */
   private readonly retryMatches = new Map<Hex, MatchEvent>();
+  /** Fix round 4 (N3): consecutive failed attempts to handle a match, by offerId -- capped at `MAX_MATCH_RETRIES`.
+   *  Cleared by any attempt that does not fail. */
+  private readonly matchFailures = new Map<Hex, number>();
   private readonly aborter = new AbortController();
   /** Plan 4.5 Task 10 re-review (M5): failed attempts to open a recorded channel, by channel id. */
   private readonly openFailures = new Map<Hex, number>();
@@ -662,11 +676,13 @@ export class ArenaDaemon {
       if ("amount" in req && req.amount <= 0n) throw new DaemonError(400, "amount must be greater than 0");
 
       const awaiting = await this.channelsAwaitingOwnDeposit();
-      if (awaiting.length > 0) {
+      if (awaiting.reasons.length > 0) {
         throw new DaemonError(
           409,
-          `${awaiting.join("; ")} -- a withdraw now could leave it without the USDC to deposit. Retry once it is ` +
-            "funded, or once its funding window has closed",
+          `${awaiting.reasons.join("; ")} -- a withdraw now could leave it without the USDC to deposit. Retry once it is ` +
+            "funded, or once its funding window has closed" +
+            // Fix round 4 (N3): a retried match that keeps failing holds withdraws up until MAX_MATCH_RETRIES drops it.
+            (awaiting.retriedMatches > 0 ? ". If this persists, restart the daemon." : ""),
         );
       }
 
@@ -752,10 +768,11 @@ export class ArenaDaemon {
    * (player 1) waiting for the offerer's deposit deposits the moment it lands. A channel past its deadline never
    * gets this wallet's deposit (it is retired, or reclaimed), so it does not hold a withdraw up. A match being
    * turned into a channel record right now (`claiming`), or waiting in `retryMatches` for the next pass (fix round
-   * 1, M1), is about to become such a channel, so it counts too.
+   * 1, M1), is about to become such a channel, so it counts too -- but only while this home still holds an offer
+   * record or a channel record for it (fix round 4, N3). `retriedMatches` counts those.
    * A chain read that fails throws: whether a deposit is pending must be known, not assumed.
    */
-  protected async channelsAwaitingOwnDeposit(): Promise<string[]> {
+  protected async channelsAwaitingOwnDeposit(): Promise<{ reasons: string[]; retriedMatches: number }> {
     const candidates = new Map<Hex, ChannelRecord>();
     for (const l of this.live.values()) if (!l.record.finalized) candidates.set(l.record.channelId, l.record);
     for (const r of this.records.channels()) {
@@ -785,11 +802,28 @@ export class ArenaDaemon {
     }
     for (const offerId of this.claiming) out.push(`offer ${offerId} is being matched into a channel that will await this wallet's deposit`);
     // Task 3 fix round 1 (M1): a match whose handling failed (or was deferred by a withdraw) and is retried on the
-    // next pass is just as close to becoming such a channel.
+    // next pass is just as close to becoming such a channel. Fix round 4 (N3): only if this home can still turn it
+    // into one. A match the host pushed for an offer this home never posted is deferred too (the deferral comes
+    // before onMatch's own record check), and is dropped on the next pass: it must not hold a withdraw up.
+    let retriedMatches = 0;
     for (const offerId of this.retryMatches.keys()) {
-      if (!this.claiming.has(offerId)) out.push(`offer ${offerId} was matched and its channel, still being set up, will await this wallet's deposit`);
+      if (this.claiming.has(offerId) || !this.hasMatchRecord(offerId)) continue;
+      retriedMatches++;
+      out.push(`offer ${offerId} was matched and its channel, still being set up, will await this wallet's deposit`);
     }
-    return out;
+    return { reasons: out, retriedMatches };
+  }
+
+  /** Fix round 4 (N3): true when this home holds a channel record or an offer record for `offerId`. An offer record
+   *  that cannot be read counts: it is still this home's offer, and `MAX_MATCH_RETRIES` bounds how long its match
+   *  is retried. `offerId` is canonical here (`onMatch` checks it before deferring), so it is a safe file name. */
+  private hasMatchRecord(offerId: Hex): boolean {
+    if (this.channelForOffer(offerId) !== null) return true;
+    try {
+      return this.records.offer(offerId) !== null;
+    } catch {
+      return true;
+    }
   }
 
   // ------------------------------------------------------------------ lobby
@@ -995,6 +1029,7 @@ export class ArenaDaemon {
         claimed = false;
       }
     };
+    let failed = false;
     try {
       // Plan 4.5 Task 10 review: a retried match whose channel record is already on disk but not live (openChannel
       // failed after the record was saved) opens that channel now, instead of being ignored as a duplicate.
@@ -1121,9 +1156,24 @@ export class ArenaDaemon {
       this.notify();
       this.fireAndForget("tick", this.tick());
     } catch (err) {
+      failed = true;
       release();
+      // Fix round 4 (N3): retried on the next pass, but not forever -- see MAX_MATCH_RETRIES.
+      const failures = (this.matchFailures.get(offerId) ?? 0) + 1;
+      if (failures >= MAX_MATCH_RETRIES) {
+        this.matchFailures.delete(offerId);
+        this.retryMatches.delete(offerId);
+        this.log(
+          `giving up on the match for offer ${offerId} after ${failures} failed attempts: ${errorText(err)} ` +
+            "(a daemon restart watches its offer again, and the host replays the match)",
+        );
+        return;
+      }
+      this.matchFailures.set(offerId, failures);
       if (!this.stopped) this.retryMatches.set(offerId, m);
       this.log(`match handling failed (retried on the next tick): ${errorText(err)}`);
+    } finally {
+      if (!failed) this.matchFailures.delete(offerId);
     }
   }
 

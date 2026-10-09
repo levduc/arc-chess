@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  MAX_MATCH_RETRIES,
   arenaPaths,
   initHome,
   livePidHoldingLock,
@@ -469,5 +470,82 @@ describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
     const id = await waitFor(() => pair.bob.daemon.channelIds()[0], 20_000, "bob's channel after the withdraw");
     expect(id).toBe(pair.alice.daemon.channelIds()[0]);
     await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(id)).phase === "Open", 30_000, "open");
+  });
+
+  /** The daemon internals the N3 tests drive: a match handed to `onMatch` as the host would push it. */
+  type MatchInternals = { withdrawing: boolean; retryMatches: Map<Hex, unknown>; onMatch(m: unknown): Promise<void> };
+  const randomId = () => `0x${randomBytes(32).toString("hex")}` as Hex;
+
+  it("fix round 4 (N3): a deferred match for an offer this home never posted holds no withdraw up; one for its own offer does", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    const d = proc.daemon as unknown as MatchInternals;
+
+    // The host pushes a match for an offer this home never posted while a withdraw is in flight: it is deferred like
+    // any other (the deferral comes before onMatch's own record check).
+    const stranger = randomId();
+    d.withdrawing = true;
+    await d.onMatch({ offerId: stranger, params: {} });
+    expect(d.retryMatches.has(stranger)).toBe(true);
+    d.withdrawing = false;
+    // The next withdraw starts before any main pass can drop it -- its 409 check runs synchronously here, as there is
+    // no channel to read -- and goes through.
+    const sent = await proc.daemon.withdraw({ amount: 1_000_000n });
+    expect(sent.to).toBe(owner);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+    await waitFor(() => !d.retryMatches.has(stranger), 20_000, "the stranger's match dropped by a main pass");
+
+    // The very same sequence for an offer this home did post (its record is on disk) is refused, naming the offer
+    // and saying what to do if it persists.
+    const own = randomId();
+    writeJsonAtomic(arenaPaths(home).offerRecord(own), {
+      offerId: own,
+      offer: { expiresAt: 2n ** 40n },
+      sessionKey: generatePrivateKey(),
+      role: "offerer",
+    });
+    d.withdrawing = true;
+    await d.onMatch({ offerId: own, params: {} });
+    d.withdrawing = false;
+    const refused = proc.daemon.withdraw({ amount: 1_000_000n });
+    await expect(refused).rejects.toMatchObject({ code: 409 });
+    await expect(refused).rejects.toThrow(`offer ${own} was matched`);
+    await expect(refused).rejects.toThrow(/funding window has closed\. If this persists, restart the daemon\.$/);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+  });
+
+  it("fix round 4 (N3): a match that fails on every pass holds withdraws up only until MAX_MATCH_RETRIES drops it, logged once", async () => {
+    const { env, home } = await walletHome(); // pollMs 100: a main pass, and so a retry, every 100 ms
+    const owner = newAddress();
+    await firstSet(home, owner);
+    // This home's own offer, but its record is corrupt: every attempt to handle its match throws (readJson).
+    const offerId = randomId();
+    mkdirSync(arenaPaths(home).offers, { recursive: true, mode: 0o700 });
+    writeFileSync(arenaPaths(home).offerRecord(offerId), "{ not json");
+    const logs: string[] = [];
+    const proc = await startDaemonProcess(home, { log: (l) => logs.push(l) });
+    cleanups.push(() => proc.stop());
+    const d = proc.daemon as unknown as MatchInternals;
+
+    await d.onMatch({ offerId, params: {} }); // the first failure: retried on the next pass
+    expect(d.retryMatches.has(offerId)).toBe(true);
+    const refused = proc.daemon.withdraw({ amount: 1_000_000n });
+    await expect(refused).rejects.toMatchObject({ code: 409 });
+    await expect(refused).rejects.toThrow(offerId);
+    await expect(refused).rejects.toThrow("If this persists, restart the daemon.");
+
+    const givingUp = () => logs.filter((l) => l.startsWith(`giving up on the match for offer ${offerId}`));
+    await waitFor(() => givingUp().length > 0, 30_000, "the capped match given up");
+    expect(givingUp()[0]).toContain(`after ${MAX_MATCH_RETRIES} failed attempts`);
+    expect(logs.filter((l) => l.startsWith("match handling failed"))).toHaveLength(MAX_MATCH_RETRIES - 1);
+    await new Promise((r) => setTimeout(r, 500)); // several more passes: it stays dropped, and is logged once
+    expect(d.retryMatches.has(offerId)).toBe(false);
+    expect(givingUp()).toHaveLength(1);
+
+    const sent = await proc.daemon.withdraw({ amount: 1_000_000n });
+    expect(sent.to).toBe(owner);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
   });
 });
