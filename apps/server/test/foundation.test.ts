@@ -32,6 +32,21 @@ describe("config", () => {
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "nope" })).toThrow(/hub/);
     expect(() => parseServerConfig({ rpcUrl: "http://x", chainId: 31337, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20), fundingWindow: "9000" })).toThrow(/fundingWindow/); // > 7200
   });
+  it("Fix round 1 (M3): defaults.* and indexer.* overrides actually take effect (bare-key lookup, dotted-path error naming)", () => {
+    const base = validBase();
+    const c = parseServerConfig({
+      ...base,
+      defaults: { deposit: "5000000", stakePerGame: "250000", challengeTimeout: "1200" },
+      indexer: { pollMs: 500, chunkBlocks: 2000, startBlock: "42" },
+    });
+    expect(c.defaults).toEqual({ deposit: 5_000_000n, stakePerGame: 250_000n, challengeTimeout: 1_200n });
+    expect(c.indexer).toEqual({ pollMs: 500, chunkBlocks: 2000, startBlock: 42n });
+    // A bad value still names the full dotted path, not the bare key `bigint`/`num` look the value up by.
+    expect(() => parseServerConfig({ ...base, defaults: { deposit: "not-a-number" } })).toThrow(/defaults\.deposit/);
+    expect(() => parseServerConfig({ ...base, defaults: { challengeTimeout: "not-a-number" } })).toThrow(/defaults\.challengeTimeout/);
+    expect(() => parseServerConfig({ ...base, indexer: { pollMs: "not-a-number" } })).toThrow(/indexer\.pollMs/);
+    expect(() => parseServerConfig({ ...base, indexer: { startBlock: "not-a-number" } })).toThrow(/indexer\.startBlock/);
+  });
   it("final review m21: outside a local Anvil chain, audit must be set and must not be the development default", () => {
     const base = { rpcUrl: "http://x", chainId: 5042002, hub: "0x" + "11".repeat(20), usdc: "0x" + "22".repeat(20), rules: "0x" + "33".repeat(20) };
     expect(() => parseServerConfig(base)).toThrow(/audit: is required/);
@@ -614,6 +629,7 @@ describe("http foundation", () => {
       for (const fragment of [
         "fund --games N --stake X",
         "wallet --wait-for-usdc",
+        "reached: false` (exit 2) means it timed out.",
         "If it times out, tell your human what has and has not arrived, and stop.",
         "owner set",
         "messageToSign",
@@ -624,6 +640,33 @@ describe("http foundation", () => {
       ]) {
         expect(text).toContain(fragment);
       }
+      // Fix round 1 (I2): the reached:false cue sits just before the pinned timeout sentence, in reading order.
+      expect(text.indexOf("reached: false` (exit 2) means it timed out.")).toBeLessThan(
+        text.indexOf("If it times out, tell your human what has and has not arrived, and stop."),
+      );
+    });
+
+    it.each([
+      ["with cli", { cli: CLI, cliCommand: PINNED }],
+      ["without cli", {}],
+    ])("%s: Fix round 1 (I1) -- both hand-edit sentences are attributed to the human, with an explicit agent-never-edits line", async (_label, override) => {
+      server = await startServer(testConfig(override), { chain: new FakeChain() });
+      const text = await (await fetch(`${server.url}/skill.md`)).text();
+      expect(text).toContain("A smart-contract owner can only be changed by **your human**");
+      expect(text).toContain("You, the agent, must never edit `config.json` or `wallet.json` yourself.");
+      expect(text).toMatch(/RPC died while a channel is open:.*so ask your\s+human to hand-edit `rpcUrl`/s);
+    });
+
+    it.each([
+      ["with cli", { cli: CLI, cliCommand: PINNED }],
+      ["without cli", {}],
+    ])("%s: Fix round 1 (M5) -- the wait step chunks into short --timeout polls instead of one long call", async (_label, override) => {
+      server = await startServer(testConfig(override), { chain: new FakeChain() });
+      const text = await (await fetch(`${server.url}/skill.md`)).text();
+      expect(text).toContain("wallet --wait-for-usdc <usdc.need> --wait-for-native <native.need> --timeout 100");
+      // Pins the actual chunking behaviour (short --timeout, repeated while reached is false, ~30 min total),
+      // not just a filler word -- this fails if the repeat-while-false wording is dropped but the flag stays.
+      expect(text).toMatch(/--timeout 100`, repeated while\s+`reached` is `false`.{0,60}about 30 minutes total/s);
     });
   });
 

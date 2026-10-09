@@ -113,15 +113,22 @@ function address(obj: Record<string, unknown>, field: string): Address {
   return v as Address;
 }
 
-function num(obj: Record<string, unknown>, field: string, fallback?: number): number {
+/**
+ * Fix round 1 (M3): `field` is the bare key looked up on `obj` (which may already be an unwrapped sub-object,
+ * e.g. `defaultsRaw.deposit`, not `defaultsRaw["defaults.deposit"]` -- the latter never exists, so a dotted
+ * `field` here silently always fell through to `fallback`). `displayName` (defaulting to `field`) is what
+ * `fail()` names, so a caller whose `obj` is a sub-object can still pass the full dotted path for error
+ * messages (e.g. `num(defaultsRaw, "deposit", 2000, "defaults.deposit")`).
+ */
+function num(obj: Record<string, unknown>, field: string, fallback?: number, displayName: string = field): number {
   const v = obj[field];
   if (v === undefined) {
-    if (fallback === undefined) fail(field, "is required");
+    if (fallback === undefined) fail(displayName, "is required");
     return fallback;
   }
   if (typeof v === "number" && Number.isFinite(v)) return v;
   if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
-  fail(field, "must be a number");
+  fail(displayName, "must be a number");
 }
 
 function bool(obj: Record<string, unknown>, field: string, fallback: boolean): boolean {
@@ -131,13 +138,14 @@ function bool(obj: Record<string, unknown>, field: string, fallback: boolean): b
   return v;
 }
 
-function bigint(obj: Record<string, unknown>, field: string, fallback: bigint): bigint {
+/** Fix round 1 (M3): same `field`-vs-`displayName` split as `num()` above, and for the same reason. */
+function bigint(obj: Record<string, unknown>, field: string, fallback: bigint, displayName: string = field): bigint {
   const v = obj[field];
   if (v === undefined) return fallback;
   if (typeof v === "bigint") return v;
   if (typeof v === "number" && Number.isInteger(v)) return BigInt(v);
   if (typeof v === "string" && /^-?[0-9]+$/.test(v)) return BigInt(v);
-  fail(field, "must be a decimal string or an integer number");
+  fail(displayName, "must be a decimal string or an integer number");
 }
 
 // these feed RateLimiter token buckets directly; zero or negative breaks refill math and makes take() nonsensical
@@ -217,10 +225,12 @@ export function parseServerConfig(raw: unknown): ServerConfig {
 
   const defaultsRaw = obj.defaults === undefined ? {} : asRecord(obj.defaults);
   const defaults = {
-    deposit: bigint(defaultsRaw, "defaults.deposit", 1_000_000n),
-    stakePerGame: bigint(defaultsRaw, "defaults.stakePerGame", 100_000n),
+    // Fix round 1 (M3): looked up by the bare key on `defaultsRaw` (already unwrapped); the dotted name is only
+    // for the error message, via `bigint()`'s `displayName` parameter.
+    deposit: bigint(defaultsRaw, "deposit", 1_000_000n, "defaults.deposit"),
+    stakePerGame: bigint(defaultsRaw, "stakePerGame", 100_000n, "defaults.stakePerGame"),
     // Final review I4: daemons refuse a challengeTimeout under 900 s by default, so the published default matches.
-    challengeTimeout: bigint(defaultsRaw, "defaults.challengeTimeout", 900n),
+    challengeTimeout: bigint(defaultsRaw, "challengeTimeout", 900n, "defaults.challengeTimeout"),
   };
 
   const cli = parseCli(obj);
@@ -235,10 +245,11 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   if (!local && audit === DEV_AUDIT) fail("audit", `must describe this deployment, not the development default "${DEV_AUDIT}"`);
 
   const indexerRaw = obj.indexer === undefined ? {} : asRecord(obj.indexer);
+  // Fix round 1 (M3): same bare-key-lookup/dotted-display split as `defaults` above.
   const indexer = {
-    pollMs: num(indexerRaw, "indexer.pollMs", 2000),
-    chunkBlocks: num(indexerRaw, "indexer.chunkBlocks", 1000),
-    startBlock: bigint(indexerRaw, "indexer.startBlock", 0n),
+    pollMs: num(indexerRaw, "pollMs", 2000, "indexer.pollMs"),
+    chunkBlocks: num(indexerRaw, "chunkBlocks", 1000, "indexer.chunkBlocks"),
+    startBlock: bigint(indexerRaw, "startBlock", 0n, "indexer.startBlock"),
   };
 
   const limits = parseLimits(obj);

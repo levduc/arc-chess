@@ -291,7 +291,13 @@ async function main(): Promise<void> {
     dbPath: join(DEV_DIR, "server.sqlite"),
     fundingWindow: "3600",
     offerMaxLifetime: "86400",
-    defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" },
+    // Fix round 1 (M3): `defaults.challengeTimeout` overrides were silently ignored before this round's
+    // config.ts fix (a dotted-key lookup bug), so this "600" was always actually served as the daemon's real
+    // 900 s floor (final review I4) by accident. Now that the override takes effect, matching it to 900
+    // explicitly keeps /templates' published default consistent with what a daemon will actually accept --
+    // house bots never read this field anyway (they let the daemon apply its own minChallengeTimeoutOf), so
+    // nothing here depended on the old, silently-ignored "600".
+    defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "900" },
     // Plan 5.5 Task 3: the wrapper's absolute path, not the bare string "arena" -- skill.md then shows a command
     // a fresh agent can run from any directory with no PATH setup (see writeArenaWrapper).
     cliCommand: wrapperPath,
