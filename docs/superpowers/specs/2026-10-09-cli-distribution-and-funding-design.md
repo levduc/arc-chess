@@ -46,7 +46,7 @@ license are prerequisites, §6).
 - **Build:** `pnpm build:cli` runs `scripts/build-cli.ts`, which uses esbuild (already in the lockfile at 0.28.2 via
   vite/tsx; added as a direct devDependency at that exact version) to bundle `packages/cli/src/main.ts`, the SDK,
   viem and chess.js into `packages/cli/dist/arena.mjs`:
-  - ESM, `platform: "node"`, `target: "node22"`, banner `#!/usr/bin/env node`, not minified (the published code
+  - ESM, `platform: "node"`, `target: "node24"`, banner `#!/usr/bin/env node`, not minified (the published code
     stays readable for audit), no source maps shipped, executable bit set;
   - the entry calls `main(process.argv.slice(2))` directly — no `tsx` at runtime;
   - the board assets (`packages/cli/src/board/{index.html,app.js,board.js,api.js,style.css}`) are copied to
@@ -55,7 +55,7 @@ license are prerequisites, §6).
 - **Manifest:** the build writes `packages/cli/dist/package.json`:
   - `name` from `ARENA_CLI_PACKAGE` (default `@arena/cli`, a placeholder until the owner picks a name);
   - `version` from `packages/cli/package.json` (which gains `"version": "0.1.0"`);
-  - `bin: {"arena": "arena.mjs"}`, `type: "module"`, `engines: {"node": ">=22"}`, `files: ["arena.mjs", "board"]`;
+  - `bin: {"arena": "arena.mjs"}`, `type: "module"`, `engines: {"node": ">=24"}` (the project's Node floor; an earlier draft said 22, which nothing here tests), `files: ["arena.mjs", "board"]`;
   - no `dependencies`; `license` and `repository` from `ARENA_CLI_LICENSE` / `ARENA_CLI_REPOSITORY` (the build
     fails if either is unset when `--release` is passed; a dev build fills `UNLICENSED` and omits `repository`).
 - **`arena --version`** prints the version (the bundled build inlines it; the repo dev entry reads
@@ -68,7 +68,7 @@ license are prerequisites, §6).
   validated (npm package-name syntax; semver `x.y.z`; `minVersion <= version`).
 - **`/templates`:** each template carries `cli` when configured (absent otherwise).
 - **`skill.md`:** when `cli` is configured and `cliCommand` is not set explicitly, `cliCommand` becomes
-  `npx -y <package>@<version>`, and the recipe gains **step 0, Install**: check `node --version` (22 or newer;
+  `npx -y <package>@<version>`, and the recipe gains **step 0, Install**: check `node --version` (24 or newer;
   install Node if missing), then the first `npx` run downloads the pinned version. The text tells the agent to use
   that exact pinned command for every later step, never `@latest`. Without `cli`, the page is unchanged (dev).
 - **Version check in `init`:** when `/templates` publishes `cli`, `init` compares its own version: below
@@ -114,6 +114,9 @@ reached, 2 on timeout, 1 on error.
   - **change** (an owner already set, different address): allowed only when stdin and stdout are both a TTY, and
     after the human types the last 6 hex characters of the new address at a prompt. Otherwise exit 1 with: "the
     owner is already set; ask your human to run `<cmd> owner set <address>` in their own terminal".
+- **Re-running `init` keeps the owner.** `init` without `--owner` preserves an existing `owner`. `init --owner X`
+  against a home whose owner is a different address is a change, and follows the change rule. Otherwise a
+  re-`init` would reset the lock.
 - **Honesty note** (it goes in the docs too): this lock stops a confused or prompt-injected agent from redirecting
   funds through the CLI. It is not a defence against code that can read `wallet.json`; Plan 6's Circle wallets
   address that.
@@ -123,8 +126,8 @@ reached, 2 on timeout, 1 on error.
 - Requires an owner (exit 1 otherwise, with the `owner set` hint). Withdraws USDC only, never native.
 - Goes through the daemon (`POST /withdraw {amount} | {all: true}`), because the daemon owns the wallet's
   transaction ordering (`SerialTxSender`). The daemon re-reads `owner` from `config.json` on every request, so an
-  owner change does not need a restart. Without a running daemon, the CLI takes the home lock itself and sends
-  through a local `SerialTxSender` (the same refusal-under-lock pattern as `init`).
+  owner change does not need a restart. Without a running daemon, `withdraw` starts one in-process (exactly as
+  `arena bot` does, under the home lock), withdraws through it, and stops it.
 - `--all` sends `usdc − reserve`, where `reserve` is 0 on chains whose gas is native. Plan 6 defines the Arc
   reserve, for live channels whose session gas is refilled in USDC. Escrowed channel funds are not in the wallet;
   the error for an amount above the withdrawable balance says to close open channels first.
