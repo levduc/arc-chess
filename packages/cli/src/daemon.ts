@@ -5,10 +5,12 @@ import {
   defineChain,
   erc20Abi,
   http,
+  parseEventLogs,
   TransactionNotFoundError,
   type Address,
   type Chain,
   type Hex,
+  type Log,
   type PublicClient,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -381,6 +383,20 @@ export function withdrawReserve(): bigint {
   return 0n;
 }
 
+/**
+ * Plan 5.6 Task 3 fix round 4 (N4, N5; spec §4.4): true when `logs` -- a transfer's receipt logs -- hold an ERC-20
+ * `Transfer(from, to, amount)` emitted by `token`. It is the one proof `withdraw()` accepts that the money moved. A
+ * token whose `transfer` returns `false` emits no such log. A log from any other emitter, with any other party or
+ * amount, or that does not decode as the ERC-20 event (an ERC-721 `Transfer` indexes its third field), never counts.
+ * Other logs in the same receipt, such as USDC reaching the wallet in the same transaction, change nothing.
+ */
+export function confirmsTransfer(logs: Log[], t: { token: Address; from: Address; to: Address; amount: bigint }): boolean {
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  return parseEventLogs({ abi: erc20Abi, eventName: "Transfer", logs }).some(
+    (l) => same(l.address, t.token) && same(l.args.from, t.from) && same(l.args.to, t.to) && l.args.value === t.amount,
+  );
+}
+
 /** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
  *  cosmetic. */
@@ -667,7 +683,7 @@ export class ArenaDaemon {
    */
   async withdraw(
     req: { amount: bigint } | { all: true },
-  ): Promise<{ to: Address; amount: bigint; txHash: Hex; usdcAfter: bigint; openOffers?: Hex[] }> {
+  ): Promise<{ to: Address; amount: bigint; txHash: Hex; usdcAfter: bigint | null; note?: string; openOffers?: Hex[] }> {
     if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
     if (this.withdrawing) throw new DaemonError(409, "a withdraw is already in progress: retry shortly");
     this.withdrawing = true;
@@ -709,37 +725,42 @@ export class ArenaDaemon {
         throw err;
       }
       const txHash = receipt.transactionHash;
-      // Task 3 fix round 1 (M3, spec §4.4): a mined, successful transfer is not proof the money moved -- a token can
-      // return `false` (as a blocklisted recipient may) without reverting. The wallet's balance must have dropped by
-      // at least `amount` across the transfer's own block: read at that block and the one before it, so USDC that
-      // reaches the wallet in some other block (a settlement, a top-up) can never mask a transfer that did nothing.
-      const [before, after] = await Promise.all([
-        this.usdcBalance(usdc, receipt.blockNumber - 1n),
-        this.usdcBalance(usdc, receipt.blockNumber),
-      ]);
-      if (after > before - amount) {
-        throw new DaemonError(502, `the token reported success but the balance did not move (tx ${txHash}): treat this withdraw as failed`);
+      // Task 3 fix round 4 (N4, N5; spec §4.4): a mined, successful transfer is not proof the money moved -- a token
+      // can return `false` (as a blocklisted recipient may) without reverting. Success is the receipt's own
+      // Transfer(wallet -> owner, amount) log from the configured USDC, never a balance delta: a same-block inflow (a
+      // settlement payout, a top-up) or, on Arc, USDC gas skews those both ways (fix round 1's M3 check, replaced).
+      if (!confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: owner, amount })) {
+        throw new DaemonError(502, `could not confirm the transfer in tx ${txHash}; check it before retrying`);
       }
-      const usdcAfter = await this.usdcBalance(usdc);
       this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
+      // For display only: the transfer is confirmed, so a read that fails now (an RPC blip) must not turn it into an
+      // error that invites a second withdraw.
+      let usdcAfter: bigint | null = null;
+      let note: string | undefined;
+      try {
+        usdcAfter = await this.usdcBalance(usdc);
+      } catch {
+        note = `sent in tx ${txHash}; the balance could not be read`;
+      }
       // M1: this wallet's open offers (posted, or accepted and not yet matched) are not refused -- they hold no funds
       // yet -- but one matched now may find the wallet short, so they are reported for the caller to warn about.
       const openOffers = this.records.offers().map((r) => r.offerId);
-      return { to: owner, amount, txHash, usdcAfter, ...(openOffers.length > 0 ? { openOffers } : {}) };
+      return {
+        to: owner,
+        amount,
+        txHash,
+        usdcAfter,
+        ...(note !== undefined ? { note } : {}),
+        ...(openOffers.length > 0 ? { openOffers } : {}),
+      };
     } finally {
       this.withdrawing = false;
     }
   }
 
-  /** The wallet's USDC balance, at `blockNumber` if given (else the latest block). */
-  private usdcBalance(usdc: Address, blockNumber?: bigint): Promise<bigint> {
-    return this.client.readContract({
-      address: usdc,
-      abi: erc20Abi,
-      functionName: "balanceOf",
-      args: [this.wallet.address],
-      ...(blockNumber !== undefined ? { blockNumber } : {}),
-    });
+  /** The wallet's USDC balance at the latest block. */
+  private usdcBalance(usdc: Address): Promise<bigint> {
+    return this.client.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [this.wallet.address] });
   }
 
   /** The owner `withdraw()` pays, read from config.json now (never from `opts.config`, which is the config at

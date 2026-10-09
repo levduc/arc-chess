@@ -4,13 +4,25 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTestClient, http, type Address, type Hex } from "viem";
+import {
+  createTestClient,
+  encodeAbiParameters,
+  encodeEventTopics,
+  erc20Abi,
+  http,
+  pad,
+  toHex,
+  type Address,
+  type Hex,
+  type Log,
+} from "viem";
 import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_MATCH_RETRIES,
   arenaPaths,
+  confirmsTransfer,
   initHome,
   livePidHoldingLock,
   loadConfig,
@@ -239,7 +251,7 @@ describe("arena withdraw (spec §4.4)", () => {
     expect(livePidHoldingLock(home)).toBeNull();
   });
 
-  it("fix round M3: a token whose transfer returns false without moving anything is a failure (502), never reported as sent", async () => {
+  it("fix rounds M3 and 4 (N4): a token whose transfer returns false emits no Transfer log -- a 502, never reported as sent", async () => {
     const { home, wallet } = await walletHome();
     // A stand-in "USDC" (set with anvil_setCode): balanceOf(...) answers 10 USDC, every other call -- transfer
     // included -- returns one zero word (false) without reverting, and nothing ever moves.
@@ -256,14 +268,70 @@ describe("arena withdraw (spec §4.4)", () => {
 
     const t = cliIo(home);
     expect(await runCli(["withdraw", "--amount", "3"], t.io)).toBe(1);
-    expect(t.err.join("\n")).toContain("the token reported success but the balance did not move");
+    expect(t.err.join("\n")).toMatch(/could not confirm the transfer in tx 0x[0-9a-f]{64}; check it before retrying/);
     expect(t.out).toEqual([]); // no {to, amount, txHash, usdcAfter}: nothing claims it was sent
     expect(livePidHoldingLock(home)).toBeNull();
-    // The transfer really was mined as a success -- that is exactly what must not be trusted on its own.
+    // The transfer really was mined as a success -- that is exactly what must not be trusted on its own -- and its
+    // receipt holds no log at all.
     const tx = /tx (0x[0-9a-f]{64})/.exec(t.err.join("\n"))?.[1] as Hex;
     const receipt = await publicClient().getTransactionReceipt({ hash: tx });
     expect(receipt.status).toBe("success");
     expect(receipt.from.toLowerCase()).toBe(wallet.toLowerCase());
+    expect(receipt.to?.toLowerCase()).toBe(fakeUsdc.toLowerCase());
+    expect(receipt.logs).toEqual([]);
+  });
+
+  it("fix round 4 (N4): USDC reaching the wallet in the transfer's own block cannot fail a withdraw -- balances decide nothing", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    // The chain as the daemon reads it when 5 USDC (a settlement payout, a top-up) reaches the wallet in the transfer's
+    // own block: every balance read at a block after `start` shows it. Across that block the balance then goes up by
+    // 2 instead of down by 3, which fix round 1's balance-delta check (M3) took for a transfer that never happened.
+    const daemon = proc.daemon as unknown as { usdcBalance(usdc: Address, blockNumber?: bigint): Promise<bigint> };
+    const real = daemon.usdcBalance.bind(daemon);
+    const start = await publicClient().getBlockNumber();
+    const spy = vi.spyOn(daemon, "usdcBalance").mockImplementation(async (usdc, blockNumber) => {
+      const at = blockNumber ?? (await publicClient().getBlockNumber());
+      const balance = await real(usdc, blockNumber);
+      return at > start ? balance + 5_000_000n : balance;
+    });
+    cleanups.push(() => spy.mockRestore());
+
+    const sent = await proc.daemon.withdraw({ amount: 3_000_000n });
+    const receipt = await publicClient().getTransactionReceipt({ hash: sent.txHash });
+    expect(receipt.blockNumber).toBe(start + 1n); // the block the inflow is modelled in
+    expect(sent).toMatchObject({ to: owner, amount: 3_000_000n, usdcAfter: 12_000_000n }); // 10 - 3 + 5, as read
+    expect(await usdcBalance(env.usdc, owner)).toBe(3_000_000n); // the owner started at 0: the delta is exact
+  });
+
+  it("fix round 4 (N4): a confirmed transfer whose balance cannot be read afterwards is a success -- usdcAfter null, and a note", async () => {
+    const port = await freePort();
+    const { env, home, wallet } = await walletHome({ port });
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    // The first read (the withdrawable balance) goes through; every one after the transfer fails, as on an RPC blip.
+    const daemon = proc.daemon as unknown as { usdcBalance(usdc: Address): Promise<bigint> };
+    const real = daemon.usdcBalance.bind(daemon);
+    let reads = 0;
+    const spy = vi
+      .spyOn(daemon, "usdcBalance")
+      .mockImplementation((usdc) => (++reads === 1 ? real(usdc) : Promise.reject(new Error("RPC blip"))));
+    cleanups.push(() => spy.mockRestore());
+
+    // Through the API (the daemon holds the lock), so the null crosses the wire and the CLI's own check.
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "2"], t.io), t.err.join("\n")).toBe(0);
+    expect(t.urls).toEqual([`http://127.0.0.1:${port}/withdraw`]);
+    const printed = t.json();
+    expect(Object.keys(printed)).toEqual(["to", "amount", "txHash", "usdcAfter"]);
+    expect(printed).toMatchObject({ to: owner, amount: "2.000000", usdcAfter: null });
+    expect(t.err).toEqual([`note: sent in tx ${String(printed.txHash)}; the balance could not be read`]);
+    expect(reads).toBe(2);
+    expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(8_000_000n);
   });
 
   it("fix round M1: open offers are reported as a note on stderr (a warning, not a refusal); the JSON keeps its four keys", async () => {
@@ -547,5 +615,61 @@ describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
     const sent = await proc.daemon.withdraw({ amount: 1_000_000n });
     expect(sent.to).toBe(owner);
     expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+  });
+});
+
+describe("confirmsTransfer: the receipt check behind withdraw (fix round 4, N4/N5)", () => {
+  const TOKEN = newAddress();
+  const WALLET = newAddress();
+  const OWNER = newAddress();
+  const OTHER = newAddress();
+  const AMOUNT = 3_000_000n;
+  const want = { token: TOKEN, from: WALLET, to: OWNER, amount: AMOUNT };
+  let logIndex = 0;
+  const log = (address: Address, topics: Hex[], data: Hex): Log =>
+    ({
+      address,
+      topics,
+      data,
+      blockHash: `0x${"aa".repeat(32)}`,
+      blockNumber: 7n,
+      logIndex: logIndex++,
+      transactionHash: `0x${"bb".repeat(32)}`,
+      transactionIndex: 0,
+      removed: false,
+    }) as Log;
+  /** An ERC-20 Transfer(from, to, value) emitted by `emitter`. */
+  const transfer = (emitter: Address, from: Address, to: Address, value: bigint): Log =>
+    log(emitter, encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from, to } }) as Hex[], encodeAbiParameters([{ type: "uint256" }], [value]));
+
+  it("accepts exactly Transfer(wallet -> owner, amount) from the configured token, whatever else the receipt holds", () => {
+    expect(confirmsTransfer([transfer(TOKEN, WALLET, OWNER, AMOUNT)], want)).toBe(true);
+    // USDC reaching the wallet in the same receipt (or block) changes nothing.
+    expect(confirmsTransfer([transfer(TOKEN, OTHER, WALLET, 5_000_000n), transfer(TOKEN, WALLET, OWNER, AMOUNT)], want)).toBe(true);
+    // Addresses compare case-insensitively.
+    const lower = { token: TOKEN.toLowerCase() as Address, from: WALLET.toLowerCase() as Address, to: OWNER.toLowerCase() as Address, amount: AMOUNT };
+    expect(confirmsTransfer([transfer(TOKEN, WALLET, OWNER, AMOUNT)], lower)).toBe(true);
+  });
+
+  it("refuses no log, another emitter, another party, another amount, and an ERC-721 Transfer", () => {
+    const erc721 = log(
+      TOKEN,
+      [...(encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from: WALLET, to: OWNER } }) as Hex[]), pad(toHex(AMOUNT))],
+      "0x",
+    );
+    for (const [what, logs] of [
+      ["no log (a transfer that returned false)", []],
+      ["the right event from another contract", [transfer(OTHER, WALLET, OWNER, AMOUNT)]],
+      ["to someone else", [transfer(TOKEN, WALLET, OTHER, AMOUNT)]],
+      ["from someone else", [transfer(TOKEN, OTHER, OWNER, AMOUNT)]],
+      ["the reverse direction", [transfer(TOKEN, OWNER, WALLET, AMOUNT)]],
+      ["less", [transfer(TOKEN, WALLET, OWNER, AMOUNT - 1n)]],
+      ["more", [transfer(TOKEN, WALLET, OWNER, AMOUNT + 1n)]],
+      ["the amount split in two", [transfer(TOKEN, WALLET, OWNER, 1_000_000n), transfer(TOKEN, WALLET, OWNER, 2_000_000n)]],
+      ["an ERC-721 Transfer (tokenId indexed)", [erc721]],
+      ["only an inflow", [transfer(TOKEN, OTHER, WALLET, AMOUNT)]],
+    ] as Array<[string, Log[]]>) {
+      expect(confirmsTransfer(logs, want), what).toBe(false);
+    }
   });
 });

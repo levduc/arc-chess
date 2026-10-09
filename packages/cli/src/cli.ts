@@ -77,8 +77,10 @@ const USAGE = `usage: arena <command> [options]
   withdraw --amount A | --all
           (sends USDC from this wallet to the recorded owner -- it takes no destination -- through the daemon:
            started in-process, and stopped again, if none is running. Refused while a channel still awaits this
-           wallet's deposit. Funds escrowed in channels are not in the wallet: close open channels first. Prints
-           {to, amount, txHash, usdcAfter}; a note on stderr if this wallet still has open offers.)
+           wallet's deposit. Funds escrowed in channels are not in the wallet: close open channels first. Succeeds
+           only when the receipt shows the USDC Transfer to the owner. Prints {to, amount, txHash, usdcAfter}
+           (usdcAfter null, with a note, if the balance cannot be read after it); a note on stderr if this wallet
+           still has open offers.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -928,7 +930,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       const cfg = loadConfig(home);
 
-      let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint; openOffers?: string[] };
+      let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint | null; note?: string; openOffers?: string[] };
       if (livePidHoldingLock(home) !== null) {
         // A daemon is running (`arena daemon`, `arena bot`, or another withdraw): go through its API.
         const token = loadToken(home);
@@ -950,6 +952,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           amount?: unknown;
           txHash?: unknown;
           usdcAfter?: unknown;
+          note?: unknown;
           openOffers?: unknown;
         };
         if (!res.ok) {
@@ -962,12 +965,18 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           typeof payload.txHash !== "string" ||
           typeof payload.amount !== "string" ||
           !dec.test(payload.amount) ||
-          typeof payload.usdcAfter !== "string" ||
-          !dec.test(payload.usdcAfter)
+          // Fix round 4 (N4): null when the transfer is confirmed but the balance after it could not be read.
+          (payload.usdcAfter !== null && (typeof payload.usdcAfter !== "string" || !dec.test(payload.usdcAfter)))
         ) {
           throw new Error(`the daemon answered withdraw with a malformed result: ${JSON.stringify(payload).slice(0, 200)}`);
         }
-        result = { to: payload.to, amount: BigInt(payload.amount), txHash: payload.txHash, usdcAfter: BigInt(payload.usdcAfter) };
+        result = {
+          to: payload.to,
+          amount: BigInt(payload.amount),
+          txHash: payload.txHash,
+          usdcAfter: payload.usdcAfter === null ? null : BigInt(payload.usdcAfter),
+        };
+        if (typeof payload.note === "string") result.note = payload.note;
         if (Array.isArray(payload.openOffers)) result.openOffers = payload.openOffers.filter((o): o is string => typeof o === "string");
       } else {
         // No daemon: refuse before starting one if there is no owner at all (the daemon would refuse anyway).
@@ -983,11 +992,18 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       io.out(
         JSON.stringify(
-          { to: result.to, amount: formatUsdc6(result.amount), txHash: result.txHash, usdcAfter: formatUsdc6(result.usdcAfter) },
+          {
+            to: result.to,
+            amount: formatUsdc6(result.amount),
+            txHash: result.txHash,
+            usdcAfter: result.usdcAfter === null ? null : formatUsdc6(result.usdcAfter),
+          },
           null,
           2,
         ),
       );
+      // Fix round 4 (N4): the transfer is confirmed by its receipt; only the balance shown after it is missing.
+      if (result.note !== undefined) io.err(`note: ${result.note}`);
       // Fix round 1 (M1): a warning, not a refusal -- an open offer holds no funds yet, but one matched from now on
       // may find the wallet short; its channel then retires unfunded at its funding deadline (no funds are lost).
       if (result.openOffers !== undefined && result.openOffers.length > 0) {
