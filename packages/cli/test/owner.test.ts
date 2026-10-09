@@ -9,7 +9,7 @@ import { zeroAddress, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { arenaPaths, loadConfig, loadToken, runCli, startApi, writeJsonAtomic, type ArenaDaemon, type CliIo } from "../src/index.js";
-import { ownerChangeMessage, setOwner, validateOwner, UsageError } from "../src/owner.js";
+import { ownerChangeMessage, ownerNonceOf, setOwner, validateOwner, UsageError } from "../src/owner.js";
 import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
 
 // Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner lock. Fix round 1 (I2): an owner change needs the
@@ -259,6 +259,29 @@ describe("arena owner (spec §4.3)", () => {
       expect(await runCli(initArgs(walletKey), re.io), re.err.join("\n")).toBe(0);
       expect(nonceOnDisk(home)).toBe(2);
       expect((await ownerSet(home, OWNER_B, aToB)).code).toBe(1);
+      expect(ownerOnDisk(home)).toBe(OWNER_A);
+    });
+
+    it("fix round 4 (N6): only a missing ownerNonce is 0 -- null or any other non-integer is refused, never read as 0", async () => {
+      expect(ownerNonceOf({})).toBe(0);
+      expect(ownerNonceOf({ ownerNonce: undefined })).toBe(0);
+      expect(ownerNonceOf({ ownerNonce: 0 })).toBe(0);
+      expect(ownerNonceOf({ ownerNonce: 3 })).toBe(3);
+      for (const junk of [null, 1.5, -1, "1", "0", true, {}, [], 2 ** 53]) {
+        expect(() => ownerNonceOf({ ownerNonce: junk }), JSON.stringify(junk)).toThrow(/ownerNonce is not a non-negative integer/);
+      }
+
+      // A hand-edited `"ownerNonce": null` refuses an owner change (even one validly signed at nonce 0) and a re-init.
+      const { home, wallet, walletKey } = await homeWithOwnerA();
+      writeJsonAtomic(arenaPaths(home).config, { ...rawConfig(home), ownerNonce: null });
+      const before = readFileSync(arenaPaths(home).config, "utf8");
+      const r = await ownerSet(home, OWNER_B, await sign(KEY_A, expectedMessage(wallet, OWNER_A, OWNER_B, 0)));
+      expect(r.code).toBe(1);
+      expect(r.err).toContain("ownerNonce is not a non-negative integer (null)");
+      const re = ownerIo(home);
+      expect(await runCli(initArgs(walletKey), re.io)).toBe(1);
+      expect(re.err.join("\n")).toContain("ownerNonce is not a non-negative integer (null)");
+      expect(readFileSync(arenaPaths(home).config, "utf8")).toBe(before);
       expect(ownerOnDisk(home)).toBe(OWNER_A);
     });
 

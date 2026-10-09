@@ -114,9 +114,10 @@ export function readRecordedOwner(home: string): string | null {
 }
 
 /** `config.json`'s `ownerNonce`: 0 when absent; anything but a non-negative safe integer is refused (a junk nonce
- *  must never quietly become 0, which would re-open old signatures to replay). */
+ *  must never quietly become 0, which would re-open old signatures to replay). Fix round 4 (N6): only a missing key
+ *  is absent -- `null` is junk too. */
 export function ownerNonceOf(cfg: { ownerNonce?: unknown }): number {
-  const n = cfg.ownerNonce ?? 0;
+  const n = cfg.ownerNonce === undefined ? 0 : cfg.ownerNonce;
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) {
     throw new Error(`config.json's ownerNonce is not a non-negative integer (${JSON.stringify(n)?.slice(0, 40)})`);
   }
