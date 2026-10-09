@@ -17,7 +17,7 @@ import {
 } from "./config.js";
 import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
 import { readJson } from "./jsonfile.js";
-import { decideOwner, forbiddenOwners, noOwnerMessage, readRecordedOwner, setOwner, UsageError } from "./owner.js";
+import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecordedOwner, setOwner, UsageError } from "./owner.js";
 import { startDaemonProcess } from "./run.js";
 import { cliVersion } from "./version.js";
 
@@ -26,15 +26,9 @@ export type CliIo = {
   fetch: typeof fetch;
   out(s: string): void;
   err(s: string): void;
-  /** Plan 5.6 Task 3 (spec §4.3): whether stdin / stdout are a terminal. An owner change needs both, plus `prompt`;
-   *  absent counts as false, so only `main.ts` (which reads the real streams) can ever allow one. */
-  stdinIsTTY?: boolean;
-  stdoutIsTTY?: boolean;
-  /** Plan 5.6 Task 3: asks the human at the terminal a question and resolves to the line they typed. */
-  prompt?(question: string): Promise<string>;
 };
 
-/** The command name the owner-change refusal tells an agent to have its human run. */
+/** The command name `owner set` builds its printed `command` from (`setOwner`'s `cmd`). */
 const CLI_COMMAND = "arena";
 
 const USAGE = `usage: arena <command> [options]
@@ -48,7 +42,8 @@ const USAGE = `usage: arena <command> [options]
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
        (when the server advertises a dev faucet and the wallet's USDC balance is below 20, init calls it;
         --no-faucet turns this off)
-       (--owner follows the same rules as "owner set"; re-running init without --owner keeps the recorded owner)
+       (--owner records a first owner, or repeats the recorded one; it never changes one -- that takes "owner set"
+        with the current owner's signature. Re-running init keeps the recorded owner)
   daemon [start]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
@@ -69,10 +64,11 @@ const USAGE = `usage: arena <command> [options]
         computation succeeds -- a shortfall is data, not an error; exit 1 if the server or the hub cannot be
         read at all (for example, a hub address with no contract code on this chain).)
   owner   (prints {owner}: the address withdraw pays, or null)
-  owner set ADDR
-          (records the human owner's address -- the only place withdraw ever sends USDC. The first set needs no
-           terminal; changing it needs the human at a real terminal, typing the new address's last 6 characters.
-           Never the wallet, the hub, the USDC token, the rules contract, a session key or the zero address.)
+  owner set ADDR [--signature 0x...]
+          (records the human owner's address -- the only place withdraw ever sends USDC. The first set is free;
+           changing it needs the CURRENT owner's EIP-191 signature: without --signature it prints {messageToSign,
+           signer, command} and exits 1. Never the wallet, the hub, the USDC token, the rules contract, a session
+           key or the zero address.)
   withdraw --amount A | --all
           (sends USDC from this wallet to the recorded owner, through the daemon -- started in-process, and stopped
            again, if none is running. Refused while a channel still awaits this wallet's deposit. Funds escrowed
@@ -410,9 +406,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const autoReturn = autoReturnRaw === undefined ? undefined : autoReturnRaw === "true";
 
       // Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner, settled before anything is written. A re-init must
-      // never reset it: without --owner the recorded one is carried over as is; with --owner the same rules as
-      // `owner set` apply (a different address is a change: TTY + typed suffix, or refused). Settling it here, ahead
-      // of initHome, means a refused change leaves config.json exactly as it was.
+      // never reset it: without --owner the recorded owner (and its ownerNonce) is carried over as is; --owner may
+      // only record a first owner or repeat the current one -- a change is refused here, pointing at `owner set
+      // --signature` (fix round 1, I2). Settling it ahead of initHome means a refusal leaves config.json as it was.
       const paths = arenaPaths(home);
       const currentOwner = readRecordedOwner(home); // throws on an unreadable config.json rather than drop the lock
       const { privateKeyToAccount, generatePrivateKey } = await import("viem/accounts");
@@ -421,11 +417,21 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const walletKey: Hex =
         readJson<{ key: Hex }>(paths.wallet)?.key ?? (flag("wallet-key") as Hex | undefined) ?? generatePrivateKey();
       const walletAddress = privateKeyToAccount(walletKey).address;
-      let owner: unknown = readJson<{ owner?: unknown }>(paths.config)?.owner ?? undefined; // kept verbatim
+      const existingCfg = readJson<{ owner?: unknown; ownerNonce?: unknown }>(paths.config);
+      let owner: unknown = existingCfg?.owner ?? undefined; // kept verbatim
+      // Fix round 1 (I2): a re-init must never reset the nonce either -- back at 0, a signature from an earlier
+      // change (A→B at nonce 0, after B→A) would verify again.
+      const ownerNonce = existingCfg ? ownerNonceOf(existingCfg) : 0;
       const ownerFlag = flag("owner");
       if (ownerFlag !== undefined) {
-        const decided = await decideOwner(currentOwner, ownerFlag, forbiddenOwners(home, { hub, usdc, rules }, walletAddress), io, CLI_COMMAND);
-        owner = decided.owner;
+        const { owner: requested, kind } = classifyOwner(currentOwner, ownerFlag, forbiddenOwners(home, { hub, usdc, rules }, walletAddress));
+        if (kind === "change") {
+          throw new Error(
+            `the owner is already set to ${currentOwner}; init never changes it. Run "${CLI_COMMAND} owner set ${requested}" ` +
+              "for the message the current owner must sign, then run it again with --signature",
+          );
+        }
+        owner = requested;
       }
 
       const cfg: ArenaConfig = {
@@ -445,6 +451,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
         ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
         ...(owner !== undefined && owner !== null ? { owner: owner as Address } : {}),
+        ...(ownerNonce !== 0 ? { ownerNonce } : {}),
       };
       initHome(home, cfg, walletKey);
       const summary: Record<string, unknown> = {
@@ -802,7 +809,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (arg !== "set") throw new UsageError(`unknown owner subcommand ${arg}`);
       const addr = positional[2];
       if (addr === undefined) throw new UsageError("owner set needs an address");
-      await setOwner(home, addr, io, CLI_COMMAND);
+      await setOwner(home, addr, io, CLI_COMMAND, flag("signature"));
       io.out(JSON.stringify({ owner: readRecordedOwner(home) }));
       return 0;
     }

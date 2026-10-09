@@ -21,7 +21,7 @@ import {
   type CliIo,
   type DaemonProcess,
 } from "../src/index.js";
-import { setOwner } from "../src/owner.js";
+import { ownerChangeMessage, setOwner } from "../src/owner.js";
 import { RPC, deployArena, increaseTime, mintUsdc, publicClient, setEthBalance, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -72,7 +72,7 @@ async function walletHome(opts: { usdc?: bigint; port?: number } = {}) {
   return { env, home, wallet };
 }
 
-/** A CliIo with the real fetch (recorded), for an agent: no TTY. */
+/** A CliIo with the real fetch (recorded). */
 function cliIo(home: string) {
   const out: string[] = [];
   const err: string[] = [];
@@ -85,21 +85,22 @@ function cliIo(home: string) {
     }) as unknown as typeof fetch,
     out: (s: string) => out.push(s),
     err: (s: string) => err.push(s),
-    stdinIsTTY: false,
-    stdoutIsTTY: false,
   };
   return { out, err, urls, io, json: () => JSON.parse(out.join("\n")) as Record<string, unknown> };
 }
 
-/** The owner's first set, as an agent would do it (no TTY needed). */
+/** The owner's first set, as an agent would do it (no signature needed). */
 async function firstSet(home: string, owner: Address): Promise<void> {
   await setOwner(home, owner, cliIo(home).io, "arena");
   expect(loadConfig(home).owner).toBe(owner);
 }
 
-/** A human at a terminal confirming a change to `owner`. */
-function humanAt(home: string, owner: Address): CliIo {
-  return { ...cliIo(home).io, stdinIsTTY: true, stdoutIsTTY: true, prompt: async () => owner.slice(-6) };
+/** The current owner (`currentKey`) signing a change of `home`'s owner to `next`, at `nonce`, then `owner set`. */
+async function signedChange(home: string, wallet: Address, currentKey: Hex, next: Address, nonce: number): Promise<void> {
+  const current = privateKeyToAccount(currentKey);
+  const message = ownerChangeMessage({ wallet, chainId: 31337, currentOwner: current.address, newOwner: next, nonce });
+  await setOwner(home, next, cliIo(home).io, "arena", await current.signMessage({ message }));
+  expect(loadConfig(home).owner).toBe(next);
 }
 
 async function startDaemon(home: string): Promise<DaemonProcess> {
@@ -215,7 +216,8 @@ describe("arena withdraw (spec §4.4)", () => {
 
     // Owner A is recorded before the next daemon starts, so it is in that daemon's own start-time config too: the
     // change to B below is only seen if the daemon really re-reads config.json on every withdraw.
-    const ownerA = newAddress();
+    const keyA = generatePrivateKey();
+    const ownerA = privateKeyToAccount(keyA).address;
     await firstSet(home, ownerA);
     const proc = await startDaemon(home);
     const t1 = cliIo(home);
@@ -224,9 +226,9 @@ describe("arena withdraw (spec §4.4)", () => {
     expect(t1.json()).toMatchObject({ to: ownerA, amount: "1.000000", usdcAfter: "9.000000" });
     expect(await usdcBalance(env.usdc, ownerA)).toBe(1_000_000n);
 
-    // A human changes the owner (TTY path) while the same daemon keeps running: the next withdraw pays the new one.
+    // The owner changes (signed by A) while the same daemon keeps running: the next withdraw pays the new one.
     const ownerB = newAddress();
-    await setOwner(home, ownerB, humanAt(home, ownerB), "arena");
+    await signedChange(home, wallet, keyA, ownerB, 0);
     const t2 = cliIo(home);
     expect(await runCli(["withdraw", "--amount", "2"], t2.io), t2.err.join("\n")).toBe(0);
     expect(t2.json()).toMatchObject({ to: ownerB, amount: "2.000000", usdcAfter: "7.000000" });

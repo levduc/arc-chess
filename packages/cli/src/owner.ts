@@ -1,4 +1,4 @@
-import { getAddress, isAddress, zeroAddress, type Address, type Hex } from "viem";
+import { createPublicClient, getAddress, http, isAddress, zeroAddress, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arenaPaths, loadConfig, loadWalletKey, type ArenaConfig } from "./config.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
@@ -9,13 +9,15 @@ import { RecordStore } from "./records.js";
  *
  * `owner` in `<home>/config.json` is the one address `arena withdraw` ever pays (the hub, through deposits, is
  * the only other place this wallet's USDC goes). The first set is free -- an agent can record the address its
- * human gives it. A change needs a human at a real terminal: stdin and stdout both a TTY, and the last 6
- * characters of the new address typed at a prompt. No daemon API route reads a new owner from a request, and
- * re-running `init` keeps the recorded one.
+ * human gives it. A change needs the **current owner's signature** (EIP-191 `personal_sign`) over
+ * `ownerChangeMessage`, which binds the wallet, the chain, both owners and `ownerNonce` -- something no agent can
+ * produce. (Fix round 1, I2: the first design's interactive-terminal gate was faked by `script`/`unbuffer`/`expect`
+ * in one shell line, so it was removed outright rather than kept as a fallback.) No daemon API route reads a new
+ * owner from a request, and re-running `init` keeps the recorded owner and its nonce.
  *
- * Honesty note (spec §4.3): this stops a confused or prompt-injected agent from redirecting funds through the CLI.
- * It is no defence against code that can read `wallet.json` (or write `config.json`) itself; Plan 6's Circle
- * wallets address that.
+ * Honesty note (spec §4.3): this stops a confused or prompt-injected agent from redirecting funds through the CLI
+ * or the daemon API. It is no defence against code that can read `wallet.json` or edit `config.json` by hand --
+ * which is also the only recovery when the owner cannot sign. Plan 6's Circle wallets address the key-file side.
  */
 
 /** A malformed command line (exit 2, with the usage text). Lives here, not in `cli.ts`, so `validateOwner` can
@@ -27,16 +29,11 @@ export class UsageError extends Error {
   }
 }
 
-/** The exact prompt a human answers to confirm an owner change (Task 3 brief). */
-export const OWNER_CONFIRM_PROMPT = "Type the last 6 characters of the new owner address to confirm: ";
-
 /** What the owner rules need from the CLI's I/O -- a structural subset of `CliIo`, so this module never imports
- *  `cli.ts`. Missing TTY flags count as false: only a caller that positively knows it is at a terminal says so. */
+ *  `cli.ts`. */
 export type OwnerIo = {
+  out(s: string): void;
   err(s: string): void;
-  stdinIsTTY?: boolean;
-  stdoutIsTTY?: boolean;
-  prompt?(question: string): Promise<string>;
 };
 
 /** The error `withdraw` gives (CLI and daemon alike) when no owner is recorded. One line, naming `owner set`. */
@@ -114,58 +111,122 @@ export function readRecordedOwner(home: string): string | null {
   return typeof raw === "string" ? raw : JSON.stringify(raw);
 }
 
+/** `config.json`'s `ownerNonce`: 0 when absent; anything but a non-negative safe integer is refused (a junk nonce
+ *  must never quietly become 0, which would re-open old signatures to replay). */
+export function ownerNonceOf(cfg: { ownerNonce?: unknown }): number {
+  const n = cfg.ownerNonce ?? 0;
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) {
+    throw new Error(`config.json's ownerNonce is not a non-negative integer (${JSON.stringify(n)?.slice(0, 40)})`);
+  }
+  return n;
+}
+
 /**
- * The owner rules (spec §4.3), shared by `owner set` and `init --owner`: the owner to record for `requested`,
- * given the `current` one (null if none). Every refusal is a plain `Error` (exit 1, never the usage error's 2):
- * - an invalid or forbidden address is refused;
- * - **first set** (`current` null): allowed, TTY or not;
- * - the **same** address again (case-insensitive): a no-op, `changed: false`, no TTY needed;
- * - a **change**: only with stdin and stdout both a TTY and a prompt to ask with, and only once the human types the
- *   new address's last 6 characters (case-insensitive, surrounding whitespace ignored). Otherwise refused with
- *   "the owner is already set; ask your human to run `<cmd> owner set <address>` in their own terminal".
+ * Fix round 1 (I2, spec §4.3): the exact text the current owner signs (EIP-191 `personal_sign`) to approve an owner
+ * change -- lines joined by `\n`, no trailing newline. It binds the wallet (so a signature for one home never works
+ * on another), the chain, both owners and `ownerNonce` (which goes up by one on every change, so A→B→A can never be
+ * replayed back to B).
  */
-export async function decideOwner(
+export function ownerChangeMessage(p: { wallet: Address; chainId: number; currentOwner: Address; newOwner: Address; nonce: number }): string {
+  return [
+    "arena owner change",
+    `wallet: ${getAddress(p.wallet)}`,
+    `chain: ${p.chainId}`,
+    `current owner: ${getAddress(p.currentOwner)}`,
+    `new owner: ${getAddress(p.newOwner)}`,
+    `nonce: ${p.nonce}`,
+  ].join("\n");
+}
+
+/** True if `signature` is `address`'s signature over `message`, checked with viem's `verifyMessage` over `rpcUrl`
+ *  -- an EOA, an ERC-1271 contract wallet, or a counterfactual ERC-6492 one. Throws if it cannot tell (the RPC is
+ *  down and the signature does not recover to the address either). */
+export async function verifyOwnerSignature(rpcUrl: string, address: Address, message: string, signature: Hex): Promise<boolean> {
+  const client = createPublicClient({ transport: http(rpcUrl) });
+  return client.verifyMessage({ address, message, signature });
+}
+
+/**
+ * The owner rules' first step (spec §4.3), shared by `owner set` and `init --owner`: validates `requested` (an
+ * invalid or forbidden address is a plain `Error`, exit 1 -- a refusal, not the usage error's 2) and says what
+ * recording it would be, given the `current` owner (null if none): a **first** set, the **same** owner again
+ * (case-insensitive; a no-op), or a **change** -- which only `setOwner` can make, and only with a signature.
+ */
+export function classifyOwner(
   current: string | null,
   requested: string,
   forbidden: Address[],
-  io: OwnerIo,
-  cmd: string,
-): Promise<{ owner: Address; changed: boolean }> {
+): { owner: Address; kind: "first" | "same" | "change" } {
   let owner: Address;
   try {
     owner = validateOwner(requested, forbidden);
   } catch (err) {
-    // A refused owner is a refusal (exit 1), not a malformed command line (exit 2): the brief pins exit 1.
     if (err instanceof UsageError) throw new Error(err.message);
     throw err;
   }
-  if (current === null) return { owner, changed: true };
-  if (current.toLowerCase() === owner.toLowerCase()) return { owner, changed: false };
-  if (io.stdinIsTTY !== true || io.stdoutIsTTY !== true || typeof io.prompt !== "function") {
-    throw new Error(`the owner is already set; ask your human to run \`${cmd} owner set ${owner}\` in their own terminal`);
-  }
-  io.err(`changing the owner from ${current} to ${owner}`);
-  const typed = await io.prompt(OWNER_CONFIRM_PROMPT);
-  if (typeof typed !== "string" || typed.trim().toLowerCase() !== owner.slice(-6).toLowerCase()) {
-    throw new Error(`that is not the last 6 characters of ${owner}: the owner is unchanged (still ${current})`);
-  }
-  return { owner, changed: true };
+  if (current === null) return { owner, kind: "first" };
+  return { owner, kind: current.toLowerCase() === owner.toLowerCase() ? "same" : "change" };
 }
 
 /**
- * `arena owner set <addr>` (spec §4.3): applies `decideOwner` against this home's config.json, wallet and session
- * keys, and records the result (only `owner` changes; every other config field is written back as read). A
- * running daemon needs no restart: it re-reads `owner` from config.json on every withdraw.
+ * `arena owner set <addr> [--signature 0x…]` (spec §4.3). A first set is recorded at once, and the same owner again
+ * is a no-op. A change is recorded only with `signature`: the current owner's EIP-191 signature over
+ * `ownerChangeMessage(wallet, chain, current, new, ownerNonce)`, verified over `cfg.rpcUrl`; it then records the
+ * new owner and `ownerNonce + 1`. Without `signature`, it prints `{messageToSign, signer, command}` on stdout --
+ * `command` built from `cmd` (Task 4 passes the pinned `npx` form) -- and refuses (exit 1). A malformed or wrong
+ * signature is refused too, and the owner and nonce stay as they were. Only `owner` and `ownerNonce` change; every
+ * other config field is written back as read. A running daemon needs no restart: it re-reads `owner` on every
+ * withdraw.
  */
-export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: string): Promise<void> {
+export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: string, signature?: string): Promise<void> {
   const cfg = loadConfig(home);
   const wallet = privateKeyToAccount(loadWalletKey(home)).address;
   const current = readRecordedOwner(home);
-  const { owner, changed } = await decideOwner(current, addr, forbiddenOwners(home, cfg, wallet), io, cmd);
-  if (!changed) return;
-  // Re-read right before writing, so the write-back carries config.json as it is now, not as it was before the
-  // (possibly slow, human-paced) prompt above -- and refuse if the owner itself moved in the meantime, since the
-  // rule above was decided against the old one.
-  if (readRecordedOwner(home) !== current) throw new Error("the owner changed while this command was running: run it again");
-  writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), owner });
+  const { owner, kind } = classifyOwner(current, addr, forbiddenOwners(home, cfg, wallet));
+  const path = arenaPaths(home).config;
+  if (kind === "same") return;
+  if (kind === "first") {
+    writeJsonAtomic(path, { ...cfg, owner });
+    return;
+  }
+  // A change. `current` is non-null here; if it is not an address at all, nobody can sign for it.
+  if (current === null || !isAddress(current, { strict: false })) {
+    throw new Error(
+      `the recorded owner ${JSON.stringify(current)?.slice(0, 60)} is not an address, so nobody can sign a change: only a hand edit of ${path} can fix it`,
+    );
+  }
+  const currentOwner = getAddress(current);
+  const nonce = ownerNonceOf(cfg);
+  const message = ownerChangeMessage({ wallet, chainId: cfg.chainId, currentOwner, newOwner: owner, nonce });
+  if (signature === undefined) {
+    io.out(JSON.stringify({ messageToSign: message, signer: currentOwner, command: `${cmd} owner set ${owner} --signature <signature>` }, null, 2));
+    throw new Error(
+      `the owner is already set to ${currentOwner}: changing it needs that owner's signature. Ask your human to sign ` +
+        "messageToSign (printed above) with the current owner's wallet (EIP-191 personal_sign), then run the command with it",
+    );
+  }
+  if (!/^0x([0-9a-fA-F]{2})+$/.test(signature)) {
+    throw new Error("--signature must be the 0x-prefixed hex signature; the owner is unchanged");
+  }
+  let valid: boolean;
+  try {
+    valid = await verifyOwnerSignature(cfg.rpcUrl, currentOwner, message, signature as Hex);
+  } catch (err) {
+    throw new Error(
+      `could not verify the signature over ${cfg.rpcUrl} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); the owner is unchanged`,
+    );
+  }
+  if (!valid) {
+    throw new Error(
+      `that is not ${currentOwner}'s signature over this change (nonce ${nonce}): the owner is unchanged. Run ` +
+        `"${cmd} owner set ${owner}" without --signature for the exact message to sign`,
+    );
+  }
+  // Re-read right before writing: the write-back carries config.json as it is now, and the change is refused if
+  // the owner or nonce moved while the signature was being checked (it was verified against the old ones).
+  const now = loadConfig(home);
+  if (readRecordedOwner(home) !== current || ownerNonceOf(now) !== nonce) {
+    throw new Error("the owner changed while this command was running: run it again");
+  }
+  writeJsonAtomic(path, { ...now, owner, ownerNonce: nonce + 1 });
 }

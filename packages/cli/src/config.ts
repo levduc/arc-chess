@@ -36,10 +36,13 @@ export type ArenaConfig = {
    *  a human who walked away. Default true; `arena init --auto-return-on-challenge false` turns it off. */
   autoReturnOnChallenge?: boolean;
   /** Plan 5.6 Task 3 (spec §4.3): the human owner's address -- the only place `arena withdraw` ever sends USDC.
-   *  Set by `arena owner set` or `arena init --owner` (first set free; a change needs a human at a TTY, see
-   *  `owner.ts`), kept by a re-`init`, and re-read from disk by the daemon on every withdraw. No daemon API route
-   *  sets it. Absent until first set. */
+   *  Set by `arena owner set` or `arena init --owner` (first set free; a change needs the current owner's
+   *  signature, see `owner.ts`), kept by a re-`init`, and re-read from disk by the daemon on every withdraw. No
+   *  daemon API route sets it. Absent until first set. */
   owner?: Address;
+  /** Task 3 fix round 1 (I2): goes up by one on every owner change and is part of the message the current owner
+   *  signs, so an old signature can never be replayed (A→B→A). Absent = 0. Kept by a re-`init`. */
+  ownerNonce?: number;
 };
 
 /** A canonical arena deployment on one chain (final review I2). */

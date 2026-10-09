@@ -1,62 +1,60 @@
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAddress, zeroAddress, type Address, type Hex } from "viem";
+import { createTestClient, getAddress, http, zeroAddress, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { afterEach, describe, expect, it } from "vitest";
+import { foundry } from "viem/chains";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { arenaPaths, loadConfig, loadToken, runCli, startApi, writeJsonAtomic, type ArenaDaemon, type CliIo } from "../src/index.js";
-import { setOwner, validateOwner, UsageError } from "../src/owner.js";
+import { ownerChangeMessage, setOwner, validateOwner, UsageError } from "../src/owner.js";
+import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
 
-// Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner lock. Every test here runs `init` with every chain flag
-// (and --session-gas-wei) explicit, so no command reaches the network at all -- the stub fetch below throws if one
-// ever tries.
+// Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner lock. Fix round 1 (I2): an owner change needs the
+// current owner's EIP-191 signature, verified over the home's RPC (Anvil 8546 here) -- the interactive-terminal
+// gate is gone. Every home here is initialized against a real, freshly deployed hub/USDC/rules, every chain flag
+// explicit; the CLI's io.fetch reaches only that RPC.
 
-const HUB = "0x000000000000000000000000000000000000beef";
-const USDC = "0x000000000000000000000000000000000000cafe";
-const RULES = "0x00000000000000000000000000000000000000e5";
+let HUB: Address;
+let USDC: Address;
+let RULES: Address;
+beforeAll(async () => {
+  const env = await deployArena();
+  HUB = env.hub;
+  USDC = env.usdc;
+  RULES = env.rules;
+});
 
-/** Two distinct, valid owner addresses, in checksummed form. */
-const OWNER_A = privateKeyToAccount(generatePrivateKey()).address;
-const OWNER_B = privateKeyToAccount(generatePrivateKey()).address;
+/** Owners with keys, so tests can sign as them. */
+const KEY_A = generatePrivateKey();
+const KEY_B = generatePrivateKey();
+const KEY_C = generatePrivateKey();
+const OWNER_A = privateKeyToAccount(KEY_A).address;
+const OWNER_B = privateKeyToAccount(KEY_B).address;
+const OWNER_C = privateKeyToAccount(KEY_C).address;
 
-type TtyOpts = { stdinIsTTY?: boolean; stdoutIsTTY?: boolean; prompt?: (q: string) => Promise<string> };
+const sign = (key: Hex, message: string): Promise<Hex> => privateKeyToAccount(key).signMessage({ message });
 
-function ownerIo(home: string, tty: TtyOpts = {}) {
-  const out: string[] = [];
-  const err: string[] = [];
-  const prompts: string[] = [];
-  const fetchFn = (async () => {
-    throw new Error("owner tests must not reach the network");
-  }) as unknown as typeof fetch;
-  const io: CliIo = {
-    env: { ARENA_HOME: home },
-    fetch: fetchFn,
-    out: (s: string) => out.push(s),
-    err: (s: string) => err.push(s),
-    ...(tty.stdinIsTTY !== undefined ? { stdinIsTTY: tty.stdinIsTTY } : {}),
-    ...(tty.stdoutIsTTY !== undefined ? { stdoutIsTTY: tty.stdoutIsTTY } : {}),
-    ...(tty.prompt
-      ? {
-          prompt: async (q: string) => {
-            prompts.push(q);
-            return tty.prompt!(q);
-          },
-        }
-      : {}),
-  };
-  return { out, err, prompts, io };
+/** The exact text the spec pins, built by hand here (not with `ownerChangeMessage`), so the format itself is tested. */
+function expectedMessage(wallet: Address, current: Address, next: Address, nonce: number): string {
+  return `arena owner change\nwallet: ${wallet}\nchain: 31337\ncurrent owner: ${current}\nnew owner: ${next}\nnonce: ${nonce}`;
 }
 
-/** A terminal a human is sitting at: both TTY flags true, and a prompt that answers `answer`. */
-const human = (answer: string): TtyOpts => ({ stdinIsTTY: true, stdoutIsTTY: true, prompt: async () => answer });
-/** An agent's pipe: no TTY at all. */
-const agent: TtyOpts = { stdinIsTTY: false, stdoutIsTTY: false };
+function ownerIo(home: string) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const fetchFn = (async (url: string, init?: RequestInit) => {
+    if (url === RPC) return fetch(url, init);
+    throw new Error(`owner tests must reach nothing but the chain's RPC (got ${url})`);
+  }) as unknown as typeof fetch;
+  const io: CliIo = { env: { ARENA_HOME: home }, fetch: fetchFn, out: (s: string) => out.push(s), err: (s: string) => err.push(s) };
+  return { out, err, io };
+}
 
 function initArgs(walletKey: Hex, extra: string[] = []): string[] {
   return [
-    "init", "--rpc", "http://127.0.0.1:8546", "--chain-id", "31337", "--hub", HUB, "--usdc", USDC, "--rules", RULES,
+    "init", "--rpc", RPC, "--chain-id", "31337", "--hub", HUB, "--usdc", USDC, "--rules", RULES,
     "--server", "http://127.0.0.1:3000", "--port", "7010", "--session-gas-wei", "10000000000000000",
     "--wallet-key", walletKey, ...extra,
   ];
@@ -65,17 +63,20 @@ function initArgs(walletKey: Hex, extra: string[] = []): string[] {
 async function freshHome(extra: string[] = []) {
   const home = mkdtempSync(join(tmpdir(), "arena-owner-"));
   const walletKey = generatePrivateKey();
-  const t = ownerIo(home, agent);
+  const t = ownerIo(home);
   const code = await runCli(initArgs(walletKey, extra), t.io);
   expect(code, t.err.join("\n")).toBe(0);
   return { home, walletKey, wallet: privateKeyToAccount(walletKey).address };
 }
 
+const rawConfig = (home: string) => JSON.parse(readFileSync(arenaPaths(home).config, "utf8")) as { owner?: unknown; ownerNonce?: unknown };
 /** The raw `owner` field of config.json (undefined when absent). */
-const ownerOnDisk = (home: string): unknown => (JSON.parse(readFileSync(arenaPaths(home).config, "utf8")) as { owner?: unknown }).owner;
+const ownerOnDisk = (home: string): unknown => rawConfig(home).owner;
+/** `ownerNonce` as config.json holds it (0 when absent). */
+const nonceOnDisk = (home: string): unknown => rawConfig(home).ownerNonce ?? 0;
 
 async function printedOwner(home: string): Promise<unknown> {
-  const t = ownerIo(home, agent);
+  const t = ownerIo(home);
   expect(await runCli(["owner"], t.io)).toBe(0);
   return (JSON.parse(t.out.join("")) as { owner: unknown }).owner;
 }
@@ -87,28 +88,35 @@ function breakChecksum(addr: Address): string {
   return addr.slice(0, i) + (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase()) + addr.slice(i + 1);
 }
 
+/** `owner set <addr> [--signature sig]`, returning the exit code and output. */
+async function ownerSet(home: string, addr: string, signature?: string) {
+  const t = ownerIo(home);
+  const code = await runCli(["owner", "set", addr, ...(signature !== undefined ? ["--signature", signature] : [])], t.io);
+  return { code, out: t.out.join("\n"), err: t.err.join("\n") };
+}
+
 describe("arena owner (spec §4.3)", () => {
   it("prints {\"owner\":null} on a fresh home -- and on a home that was never initialized", async () => {
     const { home } = await freshHome();
-    const t = ownerIo(home, agent);
+    const t = ownerIo(home);
     expect(await runCli(["owner"], t.io)).toBe(0);
     expect(t.out).toEqual(['{"owner":null}']);
 
     const empty = mkdtempSync(join(tmpdir(), "arena-owner-empty-"));
-    const e = ownerIo(empty, agent);
+    const e = ownerIo(empty);
     expect(await runCli(["owner"], e.io)).toBe(0);
     expect(e.out).toEqual(['{"owner":null}']);
   });
 
-  it("first set is allowed with no TTY at all, and stores the checksummed address", async () => {
+  it("first set needs no signature, and stores the checksummed address (the nonce stays 0)", async () => {
     const { home } = await freshHome();
-    const t = ownerIo(home, agent);
-    expect(await runCli(["owner", "set", OWNER_A.toLowerCase()], t.io), t.err.join("\n")).toBe(0);
-    expect(t.prompts).toEqual([]); // a first set never prompts
+    const r = await ownerSet(home, OWNER_A.toLowerCase());
+    expect(r.code, r.err).toBe(0);
     expect(ownerOnDisk(home)).toBe(OWNER_A); // checksummed, though it was given in lowercase
+    expect(nonceOnDisk(home)).toBe(0);
     expect(loadConfig(home).owner).toBe(OWNER_A);
     expect(await printedOwner(home)).toBe(OWNER_A);
-    expect(JSON.parse(t.out.join(""))).toEqual({ owner: OWNER_A });
+    expect(JSON.parse(r.out)).toEqual({ owner: OWNER_A });
     // The rest of config.json is untouched by owner set.
     expect(loadConfig(home).port).toBe(7010);
     expect(loadConfig(home).sessionGasWei).toBe(10_000_000_000_000_000n);
@@ -129,7 +137,7 @@ describe("arena owner (spec §4.3)", () => {
       ["the wallet itself", wallet],
       ["the wallet itself, lowercase", wallet.toLowerCase()],
       ["the hub", HUB],
-      ["the hub, checksummed", getAddress(HUB)],
+      ["the hub, lowercase", HUB.toLowerCase()],
       ["the USDC token", USDC],
       ["the rules contract", RULES],
       ["a channel's session key", privateKeyToAccount(channelSessionKey).address],
@@ -141,12 +149,12 @@ describe("arena owner (spec §4.3)", () => {
       ["malformed: whitespace", ` ${OWNER_A}`],
     ];
     for (const [what, addr] of forbidden) {
-      const t = ownerIo(home, agent);
-      expect(await runCli(["owner", "set", addr], t.io), what).toBe(1);
-      expect(t.err.join("\n"), what).toMatch(/^error: /);
+      const r = await ownerSet(home, addr);
+      expect(r.code, what).toBe(1);
+      expect(r.err, what).toMatch(/^error: /);
       expect(ownerOnDisk(home), what).toBeUndefined();
       // init --owner applies exactly the same rules.
-      const i = ownerIo(home, agent);
+      const i = ownerIo(home);
       expect(await runCli(initArgs(generatePrivateKey(), ["--owner", addr]), i.io), `init --owner ${what}`).toBe(1);
       expect(ownerOnDisk(home), `init --owner ${what}`).toBeUndefined();
     }
@@ -155,78 +163,146 @@ describe("arena owner (spec §4.3)", () => {
 
   it("owner set with no address is a usage error (exit 2)", async () => {
     const { home } = await freshHome();
-    const t = ownerIo(home, agent);
-    expect(await runCli(["owner", "set"], t.io)).toBe(2);
-    expect(await runCli(["owner", "bogus"], ownerIo(home, agent).io)).toBe(2);
+    expect(await runCli(["owner", "set"], ownerIo(home).io)).toBe(2);
+    expect(await runCli(["owner", "bogus"], ownerIo(home).io)).toBe(2);
   });
 
-  describe("changing an owner already set", () => {
+  describe("changing an owner already set (fix round 1, I2: the current owner's signature)", () => {
     async function homeWithOwnerA() {
       const h = await freshHome();
-      expect(await runCli(["owner", "set", OWNER_A], ownerIo(h.home, agent).io)).toBe(0);
+      expect((await ownerSet(h.home, OWNER_A)).code).toBe(0);
       return h;
     }
 
-    it("is refused with no TTY, naming the command the human must run in their own terminal", async () => {
-      const { home } = await homeWithOwnerA();
-      for (const tty of [agent, {}, { stdinIsTTY: true, stdoutIsTTY: false }, { stdinIsTTY: false, stdoutIsTTY: true }] as TtyOpts[]) {
-        const t = ownerIo(home, { ...tty, prompt: async () => OWNER_B.slice(-6) });
-        expect(await runCli(["owner", "set", OWNER_B], t.io)).toBe(1);
-        expect(t.err.join("\n")).toContain("the owner is already set; ask your human to run");
-        expect(t.err.join("\n")).toContain(`arena owner set ${OWNER_B}`);
-        expect(t.err.join("\n")).toContain("in their own terminal");
-        expect(t.prompts).toEqual([]); // never even asked
-        expect(ownerOnDisk(home)).toBe(OWNER_A);
-      }
-    });
-
-    it("is refused with both TTYs but no way to prompt", async () => {
-      const { home } = await homeWithOwnerA();
-      const t = ownerIo(home, { stdinIsTTY: true, stdoutIsTTY: true });
-      expect(await runCli(["owner", "set", OWNER_B], t.io)).toBe(1);
+    it("without --signature: exit 1, printing the exact message to sign, its signer and the command; nothing changes", async () => {
+      const { home, wallet } = await homeWithOwnerA();
+      const r = await ownerSet(home, OWNER_B.toLowerCase());
+      expect(r.code).toBe(1);
+      expect(JSON.parse(r.out)).toEqual({
+        messageToSign: expectedMessage(wallet, OWNER_A, OWNER_B, 0),
+        signer: OWNER_A,
+        command: `arena owner set ${OWNER_B} --signature <signature>`,
+      });
+      expect(r.err.split("\n")).toHaveLength(1); // one line of explanation
+      expect(r.err).toMatch(/^error: the owner is already set to .*signature/);
       expect(ownerOnDisk(home)).toBe(OWNER_A);
+      expect(nonceOnDisk(home)).toBe(0);
+      // The library builds the same text the spec pins.
+      expect(ownerChangeMessage({ wallet, chainId: 31337, currentOwner: OWNER_A, newOwner: OWNER_B, nonce: 0 })).toBe(
+        expectedMessage(wallet, OWNER_A, OWNER_B, 0),
+      );
     });
 
-    it("is refused at a TTY when the typed suffix is wrong", async () => {
-      const { home } = await homeWithOwnerA();
-      for (const wrong of ["", "000000", OWNER_A.slice(-6), OWNER_B.slice(-5), OWNER_B.slice(-7)]) {
-        const t = ownerIo(home, human(wrong));
-        expect(await runCli(["owner", "set", OWNER_B], t.io), JSON.stringify(wrong)).toBe(1);
-        expect(t.prompts).toEqual(["Type the last 6 characters of the new owner address to confirm: "]);
-        expect(ownerOnDisk(home)).toBe(OWNER_A);
-      }
-    });
-
-    it("is accepted at a TTY when the typed suffix is right, in any case", async () => {
-      const { home } = await homeWithOwnerA();
-      const t = ownerIo(home, human(OWNER_B.slice(-6).toUpperCase()));
-      expect(await runCli(["owner", "set", OWNER_B.toLowerCase()], t.io), t.err.join("\n")).toBe(0);
-      expect(t.prompts).toEqual(["Type the last 6 characters of the new owner address to confirm: "]);
+    it("a valid signature by the current owner changes it, and the nonce goes up by one", async () => {
+      const { home, wallet } = await homeWithOwnerA();
+      const sig = await sign(KEY_A, expectedMessage(wallet, OWNER_A, OWNER_B, 0));
+      const r = await ownerSet(home, OWNER_B, sig);
+      expect(r.code, r.err).toBe(0);
+      expect(JSON.parse(r.out)).toEqual({ owner: OWNER_B });
       expect(ownerOnDisk(home)).toBe(OWNER_B);
+      expect(nonceOnDisk(home)).toBe(1);
       expect(await printedOwner(home)).toBe(OWNER_B);
+      // The next change is signed by B, at nonce 1.
+      const sig2 = await sign(KEY_B, expectedMessage(wallet, OWNER_B, OWNER_C, 1));
+      expect((await ownerSet(home, OWNER_C, sig2)).code).toBe(0);
+      expect(ownerOnDisk(home)).toBe(OWNER_C);
+      expect(nonceOnDisk(home)).toBe(2);
+    });
 
-      const back = ownerIo(home, human(` ${OWNER_A.slice(-6).toLowerCase()}\n`)); // surrounding whitespace is ignored
-      expect(await runCli(["owner", "set", OWNER_A], back.io)).toBe(0);
+    it("refuses every signature that is not the current owner's over this exact change; nothing changes", async () => {
+      const { home, wallet, walletKey } = await homeWithOwnerA();
+      const right = expectedMessage(wallet, OWNER_A, OWNER_B, 0);
+      const cases: Array<[string, string, Promise<Hex> | string]> = [
+        ["signed by the new owner instead", OWNER_B, sign(KEY_B, right)],
+        ["signed by the wallet itself", OWNER_B, sign(walletKey, right)],
+        ["the wrong nonce", OWNER_B, sign(KEY_A, expectedMessage(wallet, OWNER_A, OWNER_B, 1))],
+        ["the wrong chain", OWNER_B, sign(KEY_A, right.replace("chain: 31337", "chain: 1"))],
+        ["a tampered new owner (signed for B, used for C)", OWNER_C, sign(KEY_A, right)],
+        ["malformed: too short", OWNER_B, "0x1234"],
+        ["malformed: not hex", OWNER_B, "nothex"],
+        ["malformed: empty", OWNER_B, "0x"],
+        ["malformed: odd length", OWNER_B, "0xabc"],
+      ];
+      for (const [what, next, sigP] of cases) {
+        const r = await ownerSet(home, next, await sigP);
+        expect(r.code, what).toBe(1);
+        expect(r.err, what).toMatch(/the owner is unchanged/);
+        expect(ownerOnDisk(home), what).toBe(OWNER_A);
+        expect(nonceOnDisk(home), what).toBe(0);
+      }
+    });
+
+    it("refuses a replay: another home's signature, and A→B→A then the old A→B signature -- even across a re-init", async () => {
+      const { home, wallet, walletKey } = await homeWithOwnerA();
+      // A signature for another home (another wallet) with the very same owners and nonce.
+      const other = await freshHome();
+      expect((await ownerSet(other.home, OWNER_A)).code).toBe(0);
+      const otherSig = await sign(KEY_A, expectedMessage(other.wallet, OWNER_A, OWNER_B, 0));
+      expect((await ownerSet(home, OWNER_B, otherSig)).code).toBe(1);
+      expect(ownerOnDisk(home)).toBe(OWNER_A);
+
+      const aToB = await sign(KEY_A, expectedMessage(wallet, OWNER_A, OWNER_B, 0));
+      expect((await ownerSet(home, OWNER_B, aToB)).code).toBe(0);
+      const bToA = await sign(KEY_B, expectedMessage(wallet, OWNER_B, OWNER_A, 1));
+      expect((await ownerSet(home, OWNER_A, bToA)).code).toBe(0);
+      expect(ownerOnDisk(home)).toBe(OWNER_A);
+      expect(nonceOnDisk(home)).toBe(2);
+      const replay = await ownerSet(home, OWNER_B, aToB);
+      expect(replay.code).toBe(1);
+      expect(ownerOnDisk(home)).toBe(OWNER_A);
+
+      // A re-init keeps the nonce: back at 0, the old A→B signature would verify again.
+      const re = ownerIo(home);
+      expect(await runCli(initArgs(walletKey), re.io), re.err.join("\n")).toBe(0);
+      expect(nonceOnDisk(home)).toBe(2);
+      expect((await ownerSet(home, OWNER_B, aToB)).code).toBe(1);
       expect(ownerOnDisk(home)).toBe(OWNER_A);
     });
 
-    it("setting the same address again is a no-op, even with no TTY (not a change)", async () => {
+    it("setting the same address again is a no-op with no signature (not a change)", async () => {
       const { home } = await homeWithOwnerA();
       for (const same of [OWNER_A, OWNER_A.toLowerCase()]) {
-        const t = ownerIo(home, agent);
-        expect(await runCli(["owner", "set", same], t.io), t.err.join("\n")).toBe(0);
+        const r = await ownerSet(home, same);
+        expect(r.code, r.err).toBe(0);
         expect(ownerOnDisk(home)).toBe(OWNER_A);
+        expect(nonceOnDisk(home)).toBe(0);
       }
     });
 
-    it("setOwner applies the same rules when called directly", async () => {
-      const { home } = await homeWithOwnerA();
-      const noTty = ownerIo(home, agent);
-      await expect(setOwner(home, OWNER_B, noTty.io, "npx -y @x/arena@0.3.0")).rejects.toThrow(
-        `the owner is already set; ask your human to run \`npx -y @x/arena@0.3.0 owner set ${OWNER_B}\` in their own terminal`,
-      );
-      await setOwner(home, OWNER_B, ownerIo(home, human(OWNER_B.slice(-6))).io, "arena");
+    it("setOwner builds the printed command from its cmd (Task 4 passes the pinned npx form)", async () => {
+      const { home, wallet } = await homeWithOwnerA();
+      const t = ownerIo(home);
+      await expect(setOwner(home, OWNER_B, t.io, "npx -y @x/arena@0.3.0")).rejects.toThrow(/signature/);
+      expect(JSON.parse(t.out.join("\n")).command).toBe(`npx -y @x/arena@0.3.0 owner set ${OWNER_B} --signature <signature>`);
+      await setOwner(home, OWNER_B, t.io, "arena", await sign(KEY_A, expectedMessage(wallet, OWNER_A, OWNER_B, 0)));
       expect(ownerOnDisk(home)).toBe(OWNER_B);
+    });
+
+    it("an ERC-1271 contract owner is asked on-chain: one that approves the signature allows the change, one that refuses does not", async () => {
+      // Minimal 1271 "wallets" at fresh addresses: runtime code that answers every call with the given bytes4
+      // left-aligned in one word (PUSH4 v, PUSH1 0xe0, SHL, PUSH1 0, MSTORE, PUSH1 0x20, PUSH1 0, RETURN).
+      const anvil = createTestClient({ mode: "anvil", chain: foundry, transport: http(RPC) });
+      const answering = async (bytes4: string): Promise<Address> => {
+        const address = privateKeyToAccount(generatePrivateKey()).address;
+        await anvil.setCode({ address, bytecode: `0x63${bytes4}60e01b60005260206000f3` });
+        return address;
+      };
+      const approving = await answering("1626ba7e"); // isValidSignature's magic value
+      const refusing = await answering("ffffffff");
+      const anySig = `0x${"11".repeat(65)}` as Hex;
+
+      const ok = await freshHome();
+      expect((await ownerSet(ok.home, approving)).code).toBe(0);
+      const r = await ownerSet(ok.home, OWNER_B, anySig);
+      expect(r.code, r.err).toBe(0);
+      expect(ownerOnDisk(ok.home)).toBe(OWNER_B);
+      expect(nonceOnDisk(ok.home)).toBe(1);
+
+      const no = await freshHome();
+      expect((await ownerSet(no.home, refusing)).code).toBe(0);
+      expect((await ownerSet(no.home, OWNER_B, anySig)).code).toBe(1);
+      expect(ownerOnDisk(no.home)).toBe(getAddress(refusing));
+      expect(nonceOnDisk(no.home)).toBe(0);
     });
   });
 
@@ -239,13 +315,13 @@ describe("arena owner (spec §4.3)", () => {
 
     it("init again without --owner keeps it -- whether it came from init --owner or from owner set", async () => {
       const viaInit = await freshHome(["--owner", OWNER_A]);
-      expect(await runCli(initArgs(viaInit.walletKey), ownerIo(viaInit.home, agent).io)).toBe(0);
+      expect(await runCli(initArgs(viaInit.walletKey), ownerIo(viaInit.home).io)).toBe(0);
       expect(ownerOnDisk(viaInit.home)).toBe(OWNER_A);
 
       const viaSet = await freshHome();
-      expect(await runCli(["owner", "set", OWNER_A], ownerIo(viaSet.home, agent).io)).toBe(0);
+      expect((await ownerSet(viaSet.home, OWNER_A)).code).toBe(0);
       // A re-init that changes other settings still keeps the owner.
-      const re = ownerIo(viaSet.home, agent);
+      const re = ownerIo(viaSet.home);
       const repointed = initArgs(viaSet.walletKey).map((a) => (a === "7010" ? "7020" : a));
       expect(await runCli(repointed, re.io), re.err.join("\n")).toBe(0);
       expect(loadConfig(viaSet.home).port).toBe(7020);
@@ -253,39 +329,30 @@ describe("arena owner (spec §4.3)", () => {
       expect(JSON.parse(re.out.join("\n")).owner).toBe(OWNER_A);
     });
 
-    it("init --owner <other> with no TTY exits 1 and writes nothing at all", async () => {
+    it("init --owner <other> is refused (exit 1), pointing at owner set --signature, and writes nothing at all", async () => {
       const { home, walletKey } = await freshHome();
-      expect(await runCli(["owner", "set", OWNER_A], ownerIo(home, agent).io)).toBe(0);
+      expect((await ownerSet(home, OWNER_A)).code).toBe(0);
       const before = readFileSync(arenaPaths(home).config, "utf8");
-      const t = ownerIo(home, agent);
+      const t = ownerIo(home);
       const args = initArgs(walletKey, ["--owner", OWNER_B]).map((a) => (a === "7010" ? "7099" : a));
       expect(await runCli(args, t.io)).toBe(1);
-      expect(t.err.join("\n")).toContain("the owner is already set; ask your human to run");
+      expect(t.err.join("\n")).toContain(`owner set ${OWNER_B}`);
+      expect(t.err.join("\n")).toContain("--signature");
       expect(ownerOnDisk(home)).toBe(OWNER_A);
       expect(readFileSync(arenaPaths(home).config, "utf8")).toBe(before); // not even the port changed
     });
 
-    it("init --owner <other> at a TTY follows the change rule: wrong suffix refused, right suffix accepted", async () => {
+    it("init --owner <same> exits 0", async () => {
       const { home, walletKey } = await freshHome(["--owner", OWNER_A]);
-      expect(await runCli(initArgs(walletKey, ["--owner", OWNER_B]), ownerIo(home, human("zzzzzz")).io)).toBe(1);
-      expect(ownerOnDisk(home)).toBe(OWNER_A);
-      expect(await runCli(initArgs(walletKey, ["--owner", OWNER_B]), ownerIo(home, human(OWNER_B.slice(-6))).io)).toBe(0);
-      expect(ownerOnDisk(home)).toBe(OWNER_B);
-    });
-
-    it("init --owner <same> exits 0 with no TTY", async () => {
-      const { home, walletKey } = await freshHome(["--owner", OWNER_A]);
-      const t = ownerIo(home, agent);
+      const t = ownerIo(home);
       expect(await runCli(initArgs(walletKey, ["--owner", OWNER_A.toLowerCase()]), t.io), t.err.join("\n")).toBe(0);
-      expect(t.prompts).toEqual([]);
       expect(ownerOnDisk(home)).toBe(OWNER_A);
     });
 
     it("init refuses to run over a config.json it cannot read, rather than silently dropping an owner", async () => {
       const { home, walletKey } = await freshHome(["--owner", OWNER_A]);
-      const { writeFileSync } = await import("node:fs");
       writeFileSync(arenaPaths(home).config, "{ not json");
-      const t = ownerIo(home, agent);
+      const t = ownerIo(home);
       expect(await runCli(initArgs(walletKey), t.io)).toBe(1);
       expect(t.err.join("\n")).toMatch(/config\.json/);
       expect(readFileSync(arenaPaths(home).config, "utf8")).toBe("{ not json");
@@ -335,7 +402,7 @@ describe("no daemon route sets the owner (Review Focus 3)", () => {
   it("api.ts names no route containing 'owner' (static check of every route the router matches)", () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/api.ts"), "utf8");
     const routes = [...src.matchAll(/"(GET|POST|PUT|PATCH|DELETE) (\/[^"]*)"/g)].map((m) => `${m[1]} ${m[2]}`);
-    expect(routes).toContain("POST /handoff"); // sanity: the scan does see the route table
+    expect(routes).toContain("POST /withdraw"); // sanity: the scan does see the route table
     expect(routes.filter((r) => /owner/i.test(r))).toEqual([]);
     const rawPaths = [...src.matchAll(/rawPath === "([^"]*)"/g)].map((m) => m[1]);
     expect(rawPaths.filter((p) => /owner/i.test(p))).toEqual([]);
