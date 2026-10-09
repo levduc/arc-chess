@@ -144,6 +144,13 @@ export class HubClient {
     return this.write(sender, token, encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.hub, amount] }), opts);
   }
 
+  /** Plan 5.6 Task 3: an ERC-20 `transfer` of `amount` of `token` to `to`, through the same simulate-send-wait path
+   *  (`write`) `approve` uses -- so a refused transfer surfaces as a `HubRevertError` like any other write. The
+   *  CLI's only caller is the daemon's owner-locked `withdraw()`, which passes the recorded owner as `to`. */
+  transfer(sender: TxSender, token: Address, to: Address, amount: bigint, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.write(sender, token, encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [to, amount] }), opts);
+  }
+
   deposit(sender: TxSender, p: Params, opts?: WriteOptions): Promise<TransactionReceipt> {
     return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "deposit", args: [encodeParams(p)] }), opts);
   }

@@ -424,6 +424,22 @@ export async function startApi(
             await daemon.handoff(ch, to, note);
             return send(res, 200, await daemon.status(ch));
           }
+          case "POST /withdraw": {
+            // Plan 5.6 Task 3 (spec §4.4): either actor may ask -- the owner lock, not the actor, is the protection.
+            // The destination is never read from the request: the daemon pays the owner recorded in config.json,
+            // and no route sets that. A body that tries to name one (or anything else) is refused outright, so a
+            // confused caller learns that instead of assuming its `to` was honoured.
+            const extra = Object.keys(b).filter((k) => k !== "amount" && k !== "all");
+            if (extra.length > 0) {
+              throw new DaemonError(
+                400,
+                `withdraw takes only {"amount": "<base units>"} or {"all": true} and always pays the recorded owner; unexpected: ${extra.join(", ").slice(0, 100)}`,
+              );
+            }
+            if (b.all !== undefined && b.all !== true) throw new DaemonError(400, "all must be true when given");
+            if ((b.all === true) === (b.amount !== undefined)) throw new DaemonError(400, "withdraw needs exactly one of amount or all");
+            return send(res, 200, await daemon.withdraw(b.all === true ? { all: true } : { amount: amount(b.amount, "amount") }));
+          }
           default:
             return send(res, 404, { error: `no route ${route}` });
         }

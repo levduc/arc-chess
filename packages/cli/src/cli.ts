@@ -17,7 +17,7 @@ import {
 } from "./config.js";
 import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
 import { readJson } from "./jsonfile.js";
-import { decideOwner, forbiddenOwners, readRecordedOwner, setOwner, UsageError } from "./owner.js";
+import { decideOwner, forbiddenOwners, noOwnerMessage, readRecordedOwner, setOwner, UsageError } from "./owner.js";
 import { startDaemonProcess } from "./run.js";
 import { cliVersion } from "./version.js";
 
@@ -73,6 +73,10 @@ const USAGE = `usage: arena <command> [options]
           (records the human owner's address -- the only place withdraw ever sends USDC. The first set needs no
            terminal; changing it needs the human at a real terminal, typing the new address's last 6 characters.
            Never the wallet, the hub, the USDC token, the rules contract, a session key or the zero address.)
+  withdraw --amount A | --all
+          (sends USDC from this wallet to the recorded owner, through the daemon -- started in-process, and stopped
+           again, if none is running. Refused while a channel still awaits this wallet's deposit. Funds escrowed
+           in channels are not in the wallet: close open channels first. Prints {to, amount, txHash, usdcAfter}.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -269,6 +273,7 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
     if (a === "--offer-draw") flags.set("offer-draw", true);
     else if (a === "--no-faucet") flags.set("no-faucet", true);
     else if (a === "--allow-real-chain") flags.set("allow-real-chain", true);
+    else if (a === "--all") flags.set("all", true);
     else if (a.startsWith("--")) {
       const v = argv[i + 1];
       if (v === undefined || v.startsWith("--")) throw new UsageError(`missing value for ${a}`);
@@ -799,6 +804,81 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (addr === undefined) throw new UsageError("owner set needs an address");
       await setOwner(home, addr, io, CLI_COMMAND);
       io.out(JSON.stringify({ owner: readRecordedOwner(home) }));
+      return 0;
+    }
+
+    if (cmd === "withdraw") {
+      // Plan 5.6 Task 3 (spec §4.4): always through a daemon -- the one that owns this wallet's transaction
+      // ordering (`SerialTxSender`) -- and always to the owner the daemon reads from config.json itself: nothing
+      // here, and nothing in the request, names a destination.
+      const all = flags.has("all");
+      const amountRaw = flag("amount");
+      if (all === (amountRaw !== undefined)) throw new UsageError("withdraw needs exactly one of --amount A or --all");
+      let req: { amount: bigint } | { all: true };
+      if (all) req = { all: true };
+      else {
+        if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(amountRaw!)) {
+          throw new UsageError("--amount must be a USDC amount with at most 6 decimal places");
+        }
+        const amount = parseUnits(amountRaw!, 6);
+        // A refusal (exit 1), like the daemon's own: checked here too so no daemon is started just to refuse it.
+        if (amount <= 0n) throw new Error("--amount must be greater than 0");
+        req = { amount };
+      }
+      const cfg = loadConfig(home);
+
+      let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint };
+      if (livePidHoldingLock(home) !== null) {
+        // A daemon is running (`arena daemon`, `arena bot`, or another withdraw): go through its API.
+        const token = loadToken(home);
+        let res: Response;
+        try {
+          res = await io.fetch(`http://127.0.0.1:${cfg.port}/withdraw`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
+            body: JSON.stringify("all" in req ? { all: true } : { amount: req.amount.toString() }),
+          });
+        } catch (err) {
+          throw new Error(
+            `a daemon holds ${home} but cannot be reached on 127.0.0.1:${cfg.port}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        const payload = (await res.json().catch(() => ({}))) as { error?: unknown; to?: unknown; amount?: unknown; txHash?: unknown; usdcAfter?: unknown };
+        if (!res.ok) {
+          io.err(`error: ${typeof payload.error === "string" ? payload.error : res.statusText}`);
+          return 1;
+        }
+        const dec = /^[0-9]+$/;
+        if (
+          typeof payload.to !== "string" ||
+          typeof payload.txHash !== "string" ||
+          typeof payload.amount !== "string" ||
+          !dec.test(payload.amount) ||
+          typeof payload.usdcAfter !== "string" ||
+          !dec.test(payload.usdcAfter)
+        ) {
+          throw new Error(`the daemon answered withdraw with a malformed result: ${JSON.stringify(payload).slice(0, 200)}`);
+        }
+        result = { to: payload.to, amount: BigInt(payload.amount), txHash: payload.txHash, usdcAfter: BigInt(payload.usdcAfter) };
+      } else {
+        // No daemon: refuse before starting one if there is no owner at all (the daemon would refuse anyway).
+        if (readRecordedOwner(home) === null) throw new Error(noOwnerMessage(CLI_COMMAND));
+        // Exactly as `arena bot` does: the in-process daemon takes the home lock, so nothing else can send from
+        // this wallet meanwhile; it is stopped (and the lock released) whether or not the withdraw succeeds.
+        const proc = await startDaemonProcess(home, { log: () => {} });
+        try {
+          result = await proc.daemon.withdraw(req);
+        } finally {
+          await proc.stop();
+        }
+      }
+      io.out(
+        JSON.stringify(
+          { to: result.to, amount: formatUsdc6(result.amount), txHash: result.txHash, usdcAfter: formatUsdc6(result.usdcAfter) },
+          null,
+          2,
+        ),
+      );
       return 0;
     }
 

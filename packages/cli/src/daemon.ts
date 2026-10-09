@@ -1,6 +1,16 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, http, TransactionNotFoundError, type Chain, type Hex, type PublicClient } from "viem";
+import {
+  createPublicClient,
+  defineChain,
+  erc20Abi,
+  http,
+  TransactionNotFoundError,
+  type Address,
+  type Chain,
+  type Hex,
+  type PublicClient,
+} from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -51,6 +61,8 @@ import {
   type ArenaConfig,
 } from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
+import { formatUsdc6 } from "./funding.js";
+import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
 
@@ -348,6 +360,16 @@ export const MAX_OPEN_ATTEMPTS = 5;
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
 
+/**
+ * Plan 5.6 Task 3 (spec §4.4): the USDC `withdraw()` always leaves in the wallet. 0 on every chain this daemon runs
+ * on today, whose gas is native, so `withdraw --all` empties the wallet's USDC.
+ * Plan 6: Arc USDC-gas reserve -- on Arc, gas is paid in USDC, and live channels' session keys are refilled from
+ * this wallet (`ensureSessionGas`), so a reserve for those refills belongs here.
+ */
+export function withdrawReserve(): bigint {
+  return 0n;
+}
+
 /** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
  *  cosmetic. */
@@ -402,6 +424,9 @@ export class ArenaDaemon {
   protected readonly sweepQueue = new Map<Hex, SweepQueueEntry>();
   /** Plan 5 fix round (I5): `sweep()` is single-flight -- a concurrent call is refused with 409. */
   private sweeping = false;
+  /** Plan 5.6 Task 3: `withdraw()` is single-flight too -- two concurrent `--all`s would both read the same
+   *  balance and race to send it. A concurrent call is refused with 409. */
+  private withdrawing = false;
   protected readonly changes = new EventEmitter();
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
@@ -613,6 +638,128 @@ export class ArenaDaemon {
     const l = this.live.get(id);
     if (!l) throw new DaemonError(404, `unknown channel ${id}`);
     return l;
+  }
+
+  // ------------------------------------------------------------------ wallet: withdraw (Plan 5.6 Task 3)
+
+  /**
+   * Plan 5.6 Task 3 (spec §4.4): sends `amount` USDC (or, with `all`, everything above `withdrawReserve()`) from
+   * this wallet to the owner recorded in `<home>/config.json` -- re-read on every call, so `arena owner set` needs
+   * no restart, and re-validated, so a hand-edited owner that is malformed, the zero address, this wallet, the hub,
+   * the token, the rules contract or a session key is refused rather than paid. The destination is never a
+   * parameter. Sent through `this.wallet`, the same `SerialTxSender` every deposit and refill uses, so it takes its
+   * place in the wallet's one nonce sequence. Refused (409) while any channel still awaits this wallet's own
+   * deposit (`channelsAwaitingOwnDeposit`, Review Focus 4), so it never starves a deposit the daemon is about to make.
+   */
+  async withdraw(req: { amount: bigint } | { all: true }): Promise<{ to: Address; amount: bigint; txHash: Hex; usdcAfter: bigint }> {
+    if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
+    if (this.withdrawing) throw new DaemonError(409, "a withdraw is already in progress: retry shortly");
+    this.withdrawing = true;
+    try {
+      const owner = this.recordedOwner();
+      if ("amount" in req && req.amount <= 0n) throw new DaemonError(400, "amount must be greater than 0");
+
+      const awaiting = await this.channelsAwaitingOwnDeposit();
+      if (awaiting.length > 0) {
+        throw new DaemonError(
+          409,
+          `${awaiting.join("; ")} -- a withdraw now could leave it without the USDC to deposit. Retry once it is ` +
+            "funded, or once its funding window has closed",
+        );
+      }
+
+      const usdc = this.opts.config.usdc;
+      const balance = await this.usdcBalance(usdc);
+      const reserve = withdrawReserve();
+      const withdrawable = balance > reserve ? balance - reserve : 0n;
+      const amount = "all" in req ? withdrawable : req.amount;
+      const closeFirst =
+        "funds escrowed in channels are not in the wallet: close open channels first (arena close), then withdraw";
+      if (amount <= 0n) throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC; ${closeFirst}`);
+      if (amount > withdrawable) {
+        throw new DaemonError(
+          400,
+          `${formatUsdc6(amount)} USDC is more than this wallet can withdraw (${formatUsdc6(withdrawable)} USDC); ${closeFirst}`,
+        );
+      }
+      if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
+      let txHash: Hex;
+      try {
+        txHash = (await this.hub.transfer(this.wallet, usdc, owner, amount)).transactionHash;
+      } catch (err) {
+        if (err instanceof HubRevertError) throw new DaemonError(409, `the USDC transfer to ${owner} was refused: ${err.message}`);
+        throw err;
+      }
+      const usdcAfter = await this.usdcBalance(usdc);
+      this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
+      return { to: owner, amount, txHash, usdcAfter };
+    } finally {
+      this.withdrawing = false;
+    }
+  }
+
+  private usdcBalance(usdc: Address): Promise<bigint> {
+    return this.client.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [this.wallet.address] });
+  }
+
+  /** The owner `withdraw()` pays, read from config.json now (never from `opts.config`, which is the config at
+   *  start) and checked against the same rules `arena owner set` applies. */
+  private recordedOwner(): Address {
+    let raw: string | null;
+    try {
+      raw = readRecordedOwner(this.opts.home);
+    } catch (err) {
+      throw new DaemonError(500, errorText(err));
+    }
+    if (raw === null) throw new DaemonError(400, noOwnerMessage());
+    try {
+      return validateOwner(raw, forbiddenOwners(this.opts.home, this.opts.config, this.wallet.address));
+    } catch (err) {
+      throw new DaemonError(400, `the owner recorded in config.json cannot be paid: ${errorText(err)}`);
+    }
+  }
+
+  /**
+   * Plan 5.6 Task 3 (Review Focus 4): every channel that still awaits this wallet's own deposit, each described
+   * in one phrase naming its id -- empty when none does. A channel awaits it when it is not finalized (live, or
+   * recorded on disk and not degraded) and, read from the chain now, its phase is `None` or `Funding`, this
+   * player's side is not funded, and the funding deadline has not passed. That is every state from which the
+   * main pass (`watch`) will still call `fund()` -- not only `wantsToFund`'s "fund on this tick": an accepter
+   * (player 1) waiting for the offerer's deposit deposits the moment it lands. A channel past its deadline never
+   * gets this wallet's deposit (it is retired, or reclaimed), so it does not hold a withdraw up. A match being
+   * turned into a channel record right now (`claiming`) is about to become such a channel, so it counts too.
+   * A chain read that fails throws: whether a deposit is pending must be known, not assumed.
+   */
+  protected async channelsAwaitingOwnDeposit(): Promise<string[]> {
+    const candidates = new Map<Hex, ChannelRecord>();
+    for (const l of this.live.values()) if (!l.record.finalized) candidates.set(l.record.channelId, l.record);
+    for (const r of this.records.channels()) {
+      if (!r.finalized && !candidates.has(r.channelId) && !this.degraded.has(r.channelId) && !this.live.has(r.channelId)) {
+        candidates.set(r.channelId, r);
+      }
+    }
+    const out: string[] = [];
+    if (candidates.size > 0) {
+      let now: bigint;
+      try {
+        now = (await this.client.getBlock()).timestamp;
+      } catch (err) {
+        throw new DaemonError(503, `could not read the chain to check for pending deposits: ${errorText(err)}`);
+      }
+      for (const r of candidates.values()) {
+        let info: Awaited<ReturnType<HubClient["channelInfo"]>>;
+        try {
+          info = await this.hub.channelInfo(r.channelId);
+        } catch (err) {
+          throw new DaemonError(503, `could not read channel ${r.channelId} to check for a pending deposit: ${errorText(err)}`);
+        }
+        if ((info.phase === "None" || info.phase === "Funding") && !info.funded[r.me] && now <= r.params.fundingDeadline) {
+          out.push(`channel ${r.channelId} still awaits this wallet's deposit (funding deadline ${r.params.fundingDeadline})`);
+        }
+      }
+    }
+    for (const offerId of this.claiming) out.push(`offer ${offerId} is being matched into a channel that will await this wallet's deposit`);
+    return out;
   }
 
   // ------------------------------------------------------------------ lobby
