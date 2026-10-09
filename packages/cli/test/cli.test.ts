@@ -52,7 +52,8 @@ describe("arena CLI", () => {
     expect(await runCli(["offers"], t.io)).toBe(1);
     expect(t.err.join("\n")).toMatch(/127\.0\.0\.1:7010/);
     expect(t.err.join("\n")).toMatch(/arena daemon/);
-    expect(t.err.join("\n")).toMatch(/recipe step 2/);
+    // Plan 5.6 Task 4: the fund/owner step inserted ahead of it bumped "start the daemon" from step 2 to step 3.
+    expect(t.err.join("\n")).toMatch(/recipe step 3/);
   });
 
   it("init writes the home", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cliVersion, compareSemver } from "../src/version.js";
+import { cliVersion, compareSemver, selfCommand } from "../src/version.js";
 import { runCli } from "../src/cli.js";
 
 describe("version", () => {
@@ -22,5 +22,8 @@ describe("version", () => {
       expect(code).toBe(0);
       expect(out).toEqual([cliVersion()]);
     }
+  });
+  it("Plan 5.6 Task 4 (ruling 3): selfCommand() is the bare word \"arena\" under tsx (no __ARENA_CLI_PACKAGE__ define)", () => {
+    expect(selfCommand()).toBe("arena");
   });
 });

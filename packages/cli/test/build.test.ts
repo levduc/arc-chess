@@ -125,6 +125,16 @@ describe("build-cli", () => {
     expect(pkg.name).toBe("@x/arena-test");
   }, 180_000);
 
+  it("Plan 5.6 Task 4 (ruling 3): __ARENA_CLI_PACKAGE__ is substituted into the bundle, for selfCommand()'s npx form", async () => {
+    // The default build (ARENA_CLI_PACKAGE unset) embeds the manifest's own default package name.
+    expect(bundleText).toContain('"@arena/cli"');
+    const out = freshDir("arena-cli-selfcmd-");
+    const result = await buildCli(out, { ARENA_CLI_PACKAGE: "@x/arena-test" });
+    expect(result.status).toBe(0);
+    const text = readFileSync(join(out, "arena.mjs"), "utf8");
+    expect(text).toContain('"@x/arena-test"');
+  }, 180_000);
+
   it("--release fails, naming ARENA_CLI_LICENSE, when it is unset", async () => {
     const out = freshDir("arena-cli-release-fail-");
     const result = await run(TSX_BIN, [BUILD_SCRIPT, "--out", out, "--release"], { cwd: REPO_ROOT, env: baseEnv() });

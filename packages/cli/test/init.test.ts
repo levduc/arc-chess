@@ -13,6 +13,7 @@ import {
   startDaemonProcess,
   writeJsonAtomic,
 } from "../src/index.js";
+import { cliVersion } from "../src/version.js";
 
 function templatesResponse(overrides: Record<string, unknown> = {}) {
   return [
@@ -812,5 +813,91 @@ describe("arena init --server", () => {
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
     expect(printed.faucet).toMatch(/^skipped:/);
     expect(printed.faucet).toMatch(/malformed amount/);
+  });
+
+  describe("Plan 5.6 Task 4 (spec §3): the init version gate", () => {
+    it("refuses when cli.minVersion is above cliVersion(), naming the required version and the install command -- before any other network call", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub, calls } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: "9.9.9", minVersion: "9.9.0" } }),
+      });
+      const err: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+      });
+      expect(code).toBe(1);
+      expect(err.join("\n")).toContain("9.9.0"); // the required version (minVersion)
+      // The install command pins the host's published `version`, not the bare `minVersion` floor -- otherwise an
+      // agent installing exactly the floor would immediately see a cliUpgrade note on its very next init.
+      expect(err.join("\n")).toContain("npx -y @x/arena@9.9.9");
+      // Refused right after /templates, before verifyChain's eth_chainId/getCode or eth_gasPrice.
+      expect(calls).toEqual([{ url: "http://host.test/templates" }]);
+    });
+
+    it("exit 0 with a cliUpgrade note (naming both versions) when cli.version is above cliVersion() but minVersion is not", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: "9.9.9", minVersion: cliVersion() } }),
+      });
+      const out: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: (s) => out.push(s),
+        err: () => undefined,
+      });
+      expect(code).toBe(0);
+      const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+      expect(printed.cliUpgrade).toContain("9.9.9");
+      expect(printed.cliUpgrade).toContain(cliVersion());
+    });
+
+    it("no cliUpgrade key when cli.version equals cliVersion(), or when /templates carries no cli at all", async () => {
+      const home1 = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub: equalStub } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: cliVersion() } }),
+      });
+      const out1: string[] = [];
+      const code1 = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home1 },
+        fetch: equalStub,
+        out: (s) => out1.push(s),
+        err: () => undefined,
+      });
+      expect(code1).toBe(0);
+      expect(Object.prototype.hasOwnProperty.call(JSON.parse(out1.join("\n")), "cliUpgrade")).toBe(false);
+
+      const home2 = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub: noCliStub } = stubFetch({ templates: templatesResponse() });
+      const out2: string[] = [];
+      const code2 = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home2 },
+        fetch: noCliStub,
+        out: (s) => out2.push(s),
+        err: () => undefined,
+      });
+      expect(code2).toBe(0);
+      expect(Object.prototype.hasOwnProperty.call(JSON.parse(out2.join("\n")), "cliUpgrade")).toBe(false);
+    });
+
+    it("a malformed cli.version in /templates fails with a clear message (exit 1), never a crash", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: "not-a-semver" } }),
+      });
+      const err: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+      });
+      expect(code).toBe(1);
+      expect(err.join("\n")).toMatch(/not-a-semver/);
+      expect(err.join("\n")).not.toMatch(/Uncaught|at Object|at async/); // a plain refusal, not a raw stack trace
+    });
   });
 });

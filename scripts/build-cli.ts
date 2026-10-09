@@ -69,7 +69,7 @@ async function main(): Promise<void> {
     sourcemap: false,
     legalComments: "inline",
     absWorkingDir: REPO_ROOT,
-    define: { __ARENA_CLI_VERSION__: JSON.stringify(version) },
+    define: { __ARENA_CLI_VERSION__: JSON.stringify(version), __ARENA_CLI_PACKAGE__: JSON.stringify(name) },
     // CJS dependencies bundled into ESM call require() for Node built-ins (and viem's WebSocket shim, `isows`,
     // statically imports `ws`, whose optional native accelerators `bufferutil`/`utf-8-validate` are requested
     // inside their own try/catch and are never installed here) -- give the bundle one `require`.
