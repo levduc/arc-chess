@@ -134,7 +134,14 @@ reached, 2 on timeout, 1 on error.
   against a home whose owner is a different address is refused, with a pointer to `owner set --signature`.
 - **Re-running `init` never repoints the money** (amended after the Task 3 review). `init` against any existing
   home refuses to change `chainId`, `hub`, `usdc` or `rules`, whether or not an owner is set. The refusal says to
-  withdraw to the owner and use a fresh `ARENA_HOME`. `serverUrl` and `rpcUrl` may still change. `init` also
+  withdraw to the owner and use a fresh `ARENA_HOME`.
+- `serverUrl` may still change. `rpcUrl` may change only while every channel record is finalized. An RPC that
+  hides a challenge can cost an open channel, so the RPC is pinned while one is open. An unreadable record counts
+  as open, and the URLs are compared as exact strings.
+- If the RPC dies while a channel is open, the human recovers by hand-editing `rpcUrl` in `config.json` and
+  restarting the daemon.
+- `init` holds the home lock for its whole run, so a daemon can't start (and open a channel) between its checks
+  and its write. `init` also
   checks that the hub, USDC and rules addresses hold code even when every chain flag is explicit. Without both
   rules, a re-`init` could point deposits and approvals at a fake hub, past the owner lock.
 - **Honesty note** (it goes in the docs too). The lock stops a confused or prompt-injected agent from redirecting
@@ -153,8 +160,11 @@ reached, 2 on timeout, 1 on error.
   reserve, for live channels whose session gas is refilled in USDC. Escrowed channel funds are not in the wallet;
   the error for an amount above the withdrawable balance says to close open channels first.
 - Refuses amounts ≤ 0 or above the withdrawable balance. Takes no destination: any `--to` flag or positional
-  argument is a usage error. After the transfer, the USDC balance must have dropped by at least `amount`. A token
-  whose `transfer` returns `false`, as a blocklisted recipient may, is reported as a failure, never as a success.
+  argument is a usage error.
+- Success means the transfer's receipt contains a `Transfer(wallet → owner, amount)` log emitted by the configured
+  USDC. Balance deltas are not used: they are skewed by same-block inflows and, on Arc, by USDC gas. A token whose
+  `transfer` returns `false`, as a blocklisted recipient may, emits no such log, so it is reported as a failure.
+  The failure message gives the tx hash and says to check it before retrying.
   Output: `{to, amount, txHash, usdcAfter}`.
 - Actor: `agent` or `human` (the owner lock is the protection, not the actor).
 
