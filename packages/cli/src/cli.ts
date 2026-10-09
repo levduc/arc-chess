@@ -68,8 +68,9 @@ const USAGE = `usage: arena <command> [options]
   owner set ADDR [--signature 0x...]
           (records the human owner's address -- the only place withdraw ever sends USDC. The first set is free;
            changing it needs the CURRENT owner's EIP-191 signature: without --signature it prints {messageToSign,
-           signer, command} and exits 1. Never the wallet, the hub, the USDC token, the rules contract, a session
-           key or the zero address.)
+           signer, command} and exits 1. The signature is checked locally (ECDSA, never through the RPC), so a
+           smart-contract owner cannot be changed here -- only by hand-editing config.json. Never the wallet, the
+           hub, the USDC token, the rules contract, a session key or the zero address.)
   withdraw --amount A | --all
           (sends USDC from this wallet to the recorded owner -- it takes no destination -- through the daemon:
            started in-process, and stopped again, if none is running. Refused while a channel still awaits this

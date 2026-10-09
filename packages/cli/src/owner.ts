@@ -1,4 +1,4 @@
-import { createPublicClient, getAddress, http, isAddress, zeroAddress, type Address, type Hex } from "viem";
+import { getAddress, isAddress, recoverMessageAddress, zeroAddress, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arenaPaths, loadConfig, loadWalletKey, type ArenaConfig } from "./config.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
@@ -12,7 +12,9 @@ import { RecordStore } from "./records.js";
  * human gives it. A change needs the **current owner's signature** (EIP-191 `personal_sign`) over
  * `ownerChangeMessage`, which binds the wallet, the chain, both owners and `ownerNonce` -- something no agent can
  * produce. (Fix round 1, I2: the first design's interactive-terminal gate was faked by `script`/`unbuffer`/`expect`
- * in one shell line, so it was removed outright rather than kept as a fallback.) No daemon API route reads a new
+ * in one shell line, so it was removed outright rather than kept as a fallback.) The signature is checked locally,
+ * by ECDSA recovery, never through the RPC (fix round 2): a smart-contract owner therefore cannot be changed
+ * through the CLI at all -- only by hand-editing config.json. No daemon API route reads a new
  * owner from a request, and re-running `init` keeps the recorded owner and its nonce.
  *
  * Honesty note (spec §4.3): this stops a confused or prompt-injected agent from redirecting funds through the CLI
@@ -138,12 +140,20 @@ export function ownerChangeMessage(p: { wallet: Address; chainId: number; curren
   ].join("\n");
 }
 
-/** True if `signature` is `address`'s signature over `message`, checked with viem's `verifyMessage` over `rpcUrl`
- *  -- an EOA, an ERC-1271 contract wallet, or a counterfactual ERC-6492 one. Throws if it cannot tell (the RPC is
- *  down and the signature does not recover to the address either). */
-export async function verifyOwnerSignature(rpcUrl: string, address: Address, message: string, signature: Hex): Promise<boolean> {
-  const client = createPublicClient({ transport: http(rpcUrl) });
-  return client.verifyMessage({ address, message, signature });
+/**
+ * Task 3 fix round 2 (spec §4.3): true only if ECDSA recovery of `signature` over the EIP-191 `message` yields
+ * `address` -- pure local cryptography (viem's `recoverMessageAddress`), with no RPC anywhere in the decision. The
+ * public client's `verifyMessage` was dropped: it asks the RPC (an ERC-6492 `eth_call`) first and trusts the
+ * boolean it returns, even for an EOA, so an RPC that lies -- and a re-init may point `rpcUrl` anywhere -- could
+ * forge any owner change. The cost: an ERC-1271/6492 (smart-contract) owner can never sign a change; its only
+ * route is a hand edit of config.json. A signature that cannot be parsed or recovered at all is simply not valid.
+ */
+export async function verifyOwnerSignature(address: Address, message: string, signature: Hex): Promise<boolean> {
+  try {
+    return (await recoverMessageAddress({ message, signature })).toLowerCase() === address.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -171,7 +181,8 @@ export function classifyOwner(
 /**
  * `arena owner set <addr> [--signature 0x…]` (spec §4.3). A first set is recorded at once, and the same owner again
  * is a no-op. A change is recorded only with `signature`: the current owner's EIP-191 signature over
- * `ownerChangeMessage(wallet, chain, current, new, ownerNonce)`, verified over `cfg.rpcUrl`; it then records the
+ * `ownerChangeMessage(wallet, chain, current, new, ownerNonce)`, verified locally by ECDSA recovery (no RPC; fix
+ * round 2); it then records the
  * new owner and `ownerNonce + 1`. Without `signature`, it prints `{messageToSign, signer, command}` on stdout --
  * `command` built from `cmd` (Task 4 passes the pinned `npx` form) -- and refuses (exit 1). A malformed or wrong
  * signature is refused too, and the owner and nonce stay as they were. Only `owner` and `ownerNonce` change; every
@@ -202,21 +213,15 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
     io.out(JSON.stringify({ messageToSign: message, signer: currentOwner, command: `${cmd} owner set ${owner} --signature <signature>` }, null, 2));
     throw new Error(
       `the owner is already set to ${currentOwner}: changing it needs that owner's signature. Ask your human to sign ` +
-        "messageToSign (printed above) with the current owner's wallet (EIP-191 personal_sign), then run the command with it",
+        "messageToSign (printed above) with the current owner's wallet (EIP-191 personal_sign), then run the command with it. " +
+        `The signature is checked locally, so only an ordinary key can sign: if ${currentOwner} is a smart-contract ` +
+        `wallet, the only way to change it is to hand-edit ${path}`,
     );
   }
   if (!/^0x([0-9a-fA-F]{2})+$/.test(signature)) {
     throw new Error("--signature must be the 0x-prefixed hex signature; the owner is unchanged");
   }
-  let valid: boolean;
-  try {
-    valid = await verifyOwnerSignature(cfg.rpcUrl, currentOwner, message, signature as Hex);
-  } catch (err) {
-    throw new Error(
-      `could not verify the signature over ${cfg.rpcUrl} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); the owner is unchanged`,
-    );
-  }
-  if (!valid) {
+  if (!(await verifyOwnerSignature(currentOwner, message, signature as Hex))) {
     throw new Error(
       `that is not ${currentOwner}'s signature over this change (nonce ${nonce}): the owner is unchanged. Run ` +
         `"${cmd} owner set ${owner}" without --signature for the exact message to sign`,

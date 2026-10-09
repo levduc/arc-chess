@@ -1,19 +1,20 @@
 import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createTestClient, getAddress, http, zeroAddress, type Address, type Hex } from "viem";
+import { zeroAddress, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { foundry } from "viem/chains";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { arenaPaths, loadConfig, loadToken, runCli, startApi, writeJsonAtomic, type ArenaDaemon, type CliIo } from "../src/index.js";
 import { ownerChangeMessage, setOwner, validateOwner, UsageError } from "../src/owner.js";
 import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
 
 // Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner lock. Fix round 1 (I2): an owner change needs the
-// current owner's EIP-191 signature, verified over the home's RPC (Anvil 8546 here) -- the interactive-terminal
-// gate is gone. Every home here is initialized against a real, freshly deployed hub/USDC/rules, every chain flag
+// current owner's EIP-191 signature, verified locally by ECDSA recovery (fix round 2: never through the RPC) -- the
+// interactive-terminal gate is gone. Every home here is initialized against a real, freshly deployed hub/USDC/rules, every chain flag
 // explicit; the CLI's io.fetch reaches only that RPC.
 
 let HUB: Address;
@@ -185,6 +186,8 @@ describe("arena owner (spec §4.3)", () => {
       });
       expect(r.err.split("\n")).toHaveLength(1); // one line of explanation
       expect(r.err).toMatch(/^error: the owner is already set to .*signature/);
+      // Fix round 2: a smart-contract owner cannot sign here; the refusal says the only route is a hand edit.
+      expect(r.err).toMatch(/smart-contract wallet, the only way to change it is to hand-edit .*config\.json/);
       expect(ownerOnDisk(home)).toBe(OWNER_A);
       expect(nonceOnDisk(home)).toBe(0);
       // The library builds the same text the spec pins.
@@ -278,31 +281,54 @@ describe("arena owner (spec §4.3)", () => {
       expect(ownerOnDisk(home)).toBe(OWNER_B);
     });
 
-    it("an ERC-1271 contract owner is asked on-chain: one that approves the signature allows the change, one that refuses does not", async () => {
-      // Minimal 1271 "wallets" at fresh addresses: runtime code that answers every call with the given bytes4
-      // left-aligned in one word (PUSH4 v, PUSH1 0xe0, SHL, PUSH1 0, MSTORE, PUSH1 0x20, PUSH1 0, RETURN).
-      const anvil = createTestClient({ mode: "anvil", chain: foundry, transport: http(RPC) });
-      const answering = async (bytes4: string): Promise<Address> => {
-        const address = privateKeyToAccount(generatePrivateKey()).address;
-        await anvil.setCode({ address, bytecode: `0x63${bytes4}60e01b60005260206000f3` });
-        return address;
-      };
-      const approving = await answering("1626ba7e"); // isValidSignature's magic value
-      const refusing = await answering("ffffffff");
-      const anySig = `0x${"11".repeat(65)}` as Hex;
+    it("fix round 2: the check is local ECDSA -- an RPC that lies, or none at all, changes nothing", async () => {
+      const { home, wallet } = await homeWithOwnerA();
+      // A "lying" RPC: answers every JSON-RPC request with a true-looking word (an ERC-6492/1271 verifier call
+      // through it would say "valid"), and counts how often it is asked.
+      let asked = 0;
+      const liar = createServer((req, res) => {
+        asked++;
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          const id = (() => {
+            try {
+              return (JSON.parse(body) as { id?: unknown }).id ?? 1;
+            } catch {
+              return 1;
+            }
+          })();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id, result: `0x${"0".repeat(63)}1` }));
+        });
+      });
+      await new Promise<void>((r) => liar.listen(0, "127.0.0.1", () => r()));
+      try {
+        const liarUrl = `http://127.0.0.1:${(liar.address() as AddressInfo).port}`;
+        writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), rpcUrl: liarUrl });
+        const right = expectedMessage(wallet, OWNER_A, OWNER_B, 0);
+        for (const [what, sig] of [
+          ["junk 0x00", "0x00"],
+          ["65 junk bytes", `0x${"11".repeat(65)}`],
+          ["a well-formed signature by a non-owner", await sign(KEY_C, right)],
+        ] as const) {
+          const r = await ownerSet(home, OWNER_B, sig);
+          expect(r.code, what).toBe(1);
+          expect(ownerOnDisk(home), what).toBe(OWNER_A);
+          expect(nonceOnDisk(home), what).toBe(0);
+        }
+        expect(asked).toBe(0); // the decision never reached the RPC at all
 
-      const ok = await freshHome();
-      expect((await ownerSet(ok.home, approving)).code).toBe(0);
-      const r = await ownerSet(ok.home, OWNER_B, anySig);
-      expect(r.code, r.err).toBe(0);
-      expect(ownerOnDisk(ok.home)).toBe(OWNER_B);
-      expect(nonceOnDisk(ok.home)).toBe(1);
-
-      const no = await freshHome();
-      expect((await ownerSet(no.home, refusing)).code).toBe(0);
-      expect((await ownerSet(no.home, OWNER_B, anySig)).code).toBe(1);
-      expect(ownerOnDisk(no.home)).toBe(getAddress(refusing));
-      expect(nonceOnDisk(no.home)).toBe(0);
+        // No RPC reachable at all: a valid signature by the current owner still succeeds.
+        writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), rpcUrl: "http://127.0.0.1:9" });
+        const r = await ownerSet(home, OWNER_B, await sign(KEY_A, right));
+        expect(r.code, r.err).toBe(0);
+        expect(ownerOnDisk(home)).toBe(OWNER_B);
+        expect(nonceOnDisk(home)).toBe(1);
+        expect(asked).toBe(0);
+      } finally {
+        await new Promise<void>((r) => liar.close(() => r()));
+      }
     });
   });
 
