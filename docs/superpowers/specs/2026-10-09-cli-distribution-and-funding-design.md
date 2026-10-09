@@ -121,8 +121,10 @@ reached, 2 on timeout, 1 on error.
     new owner: <new owner, checksummed>
     nonce: <ownerNonce>
     ```
-    `arena owner set <new> --signature 0x…` checks it with `publicClient.verifyMessage`, which covers EOAs, ERC-1271
-    and ERC-6492 accounts. `ownerNonce` is an integer in `config.json`. It defaults to 0 and goes up by one on every
+    `arena owner set <new> --signature 0x…` checks it **locally**, by ECDSA recovery of the signer, which must equal
+    the current owner. No RPC is involved, because an RPC that lies about an ERC-1271/6492 check would forge the
+    change, and a re-`init` may change `rpcUrl`. A smart-contract owner therefore can't be changed through the CLI;
+    the only route is hand-editing `config.json` (see the honesty note). `ownerNonce` is an integer in `config.json`. It defaults to 0 and goes up by one on every
     change, so an old signature can't be replayed (A→B→A). Without `--signature` the command prints the exact
     message to sign and the exact command to run, then exits 1.
   - *Amended 2026-10-09 after the Task 3 security review:* the first design gated a change on an interactive
