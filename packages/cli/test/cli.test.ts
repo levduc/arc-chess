@@ -187,6 +187,9 @@ describe("arena CLI", () => {
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
     expect(printed).toMatchObject({ chainId: 31337, usdc: "100.000000", native: "1.0" });
     expect(printed.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    // Plan 5.6 Task 2: exactly the same four keys as before --wait-for-* existed -- toMatchObject above would
+    // not catch a leaked fifth key (e.g. a stray reached/waitedSeconds).
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "usdc", "native"]);
   });
 
   it("Plan 5.5 Task 1: arena faucet POSTs to the server and prints its result, or fails clearly", async () => {
@@ -449,23 +452,25 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
     expect(printed.waitedSeconds as number).toBeGreaterThanOrEqual(5);
   }, 20_000);
 
-  it("funding that arrives mid-wait returns exit 0 with reached:true before the timeout", async () => {
+  it("funding that arrives mid-wait returns exit 0 with reached:true before the timeout (both thresholds)", async () => {
     const env = await deployArena();
     const { home, address } = await initEmptyWallet(env);
     const t = fundIo(home, { env: { ARENA_WAIT_POLL_MS: "200" } });
 
-    const mintDone = (async () => {
+    const fundingDone = (async () => {
       await new Promise((r) => setTimeout(r, 1_000));
       await mintUsdc(env.usdc, address, 1_000_000n); // 1 USDC: meets the --wait-for-usdc 1 threshold
+      await setEthBalance(address, 10n ** 18n); // 1 ether: meets the --wait-for-native 0.5 threshold
     })();
-    const code = await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "15"], t.io);
-    await mintDone; // never leave the mint dangling, whatever the outcome above
+    const code = await runCli(["wallet", "--wait-for-usdc", "1", "--wait-for-native", "0.5", "--timeout", "15"], t.io);
+    await fundingDone; // never leave the mint/setBalance dangling, whatever the outcome above
 
     expect(code).toBe(0);
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
     expect(printed.reached).toBe(true);
     expect(typeof printed.waitedSeconds).toBe("number");
     expect(printed.usdc).toBe("1.000000");
+    expect(printed.native).toBe("1.0"); // proves --wait-for-native is actually checked, not just accepted
   }, 20_000);
 
   it("--timeout above 3600s exits 1 naming the maximum, for --wait-for-usdc and --wait-for-native alike", async () => {
@@ -479,5 +484,19 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
     const t2 = fundIo(home);
     expect(await runCli(["wallet", "--wait-for-native", "0.5", "--timeout", "3601"], t2.io)).toBe(1);
     expect(t2.err.join("\n")).toMatch(/3600/);
+  });
+
+  it("a malformed --wait-for-usdc/--wait-for-native/--timeout exits 1, not the usual usage-error 2 (spec §4.2 reserves 2 for an elapsed timeout)", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+
+    const t1 = fundIo(home);
+    expect(await runCli(["wallet", "--wait-for-usdc", "abc"], t1.io)).toBe(1);
+
+    const t2 = fundIo(home);
+    expect(await runCli(["wallet", "--wait-for-native", "abc"], t2.io)).toBe(1);
+
+    const t3 = fundIo(home);
+    expect(await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "abc"], t3.io)).toBe(1);
   });
 });

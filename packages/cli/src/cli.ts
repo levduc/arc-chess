@@ -515,27 +515,27 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         return 0;
       }
 
-      // Plan 5.6 Task 2 (spec §4.2, Review Focus 2): a malformed --wait-for-* amount is a syntax mistake, same
-      // as any other malformed flag (UsageError, exit 2). An in-range-syntax but out-of-bounds --timeout is
-      // deliberately *not* a UsageError: the convention elsewhere in this CLI maps UsageError to exit 2, but
-      // spec §4.2 reserves 2 for "timed out while waiting" -- a bad --timeout is "1 on error", same as any
-      // other input problem this command can't even start to act on.
+      // Plan 5.6 Task 2 (spec §4.2, Review Focus 2): spec §4.2's exit codes are an exhaustive partition -- 0
+      // once reached, 2 on an actual elapsed timeout, 1 on error -- so every input problem on this path
+      // (a malformed --wait-for-* amount, a malformed --timeout, or one outside [1, 3600]) is deliberately a
+      // plain Error, not this CLI's usual UsageError (exit 2): an agent that sees exit 2 here must read it as
+      // "timed out, not malfunctioned", never as "bad flags", so no input mistake may share that code.
       let usdcThreshold: bigint | undefined;
       if (waitUsdcRaw !== undefined) {
         if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(waitUsdcRaw)) {
-          throw new UsageError("--wait-for-usdc must be a non-negative USDC amount with at most 6 decimal places");
+          throw new Error("--wait-for-usdc must be a non-negative USDC amount with at most 6 decimal places");
         }
         usdcThreshold = parseUnits(waitUsdcRaw, 6);
       }
       let nativeThreshold: bigint | undefined;
       if (waitNativeRaw !== undefined) {
         if (!/^[0-9]+(\.[0-9]{1,18})?$/.test(waitNativeRaw)) {
-          throw new UsageError("--wait-for-native must be a non-negative native amount with at most 18 decimal places");
+          throw new Error("--wait-for-native must be a non-negative native amount with at most 18 decimal places");
         }
         nativeThreshold = parseUnits(waitNativeRaw, 18);
       }
       const timeoutRaw = flag("timeout") ?? "1800";
-      if (!/^[0-9]+$/.test(timeoutRaw)) throw new UsageError("--timeout must be a non-negative integer number of seconds");
+      if (!/^[0-9]+$/.test(timeoutRaw)) throw new Error("--timeout must be a non-negative integer number of seconds");
       const timeoutSeconds = Number(timeoutRaw);
       if (timeoutSeconds < 1 || timeoutSeconds > 3600) {
         throw new Error(`--timeout must be between 1 and 3600 seconds (the maximum is 3600s); got ${timeoutSeconds}`);
