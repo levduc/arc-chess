@@ -35,6 +35,11 @@ export type ArenaConfig = {
    *  back to the agent once `autoReturnSecondsOf(challengeTimeout)` or less is left, so a forfeit never depends on
    *  a human who walked away. Default true; `arena init --auto-return-on-challenge false` turns it off. */
   autoReturnOnChallenge?: boolean;
+  /** Plan 5.6 Task 3 (spec §4.3): the human owner's address -- the only place `arena withdraw` ever sends USDC.
+   *  Set by `arena owner set` or `arena init --owner` (first set free; a change needs a human at a TTY, see
+   *  `owner.ts`), kept by a re-`init`, and re-read from disk by the daemon on every withdraw. No daemon API route
+   *  sets it. Absent until first set. */
+  owner?: Address;
 };
 
 /** A canonical arena deployment on one chain (final review I2). */

@@ -3,6 +3,7 @@ import { channelHubAbi, DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
 import { runBot } from "./bot.js";
 import { livePidHoldingLock } from "./lock.js";
 import {
+  arenaPaths,
   defaultHome,
   initHome,
   loadConfig,
@@ -15,6 +16,8 @@ import {
   type ArenaConfig,
 } from "./config.js";
 import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
+import { readJson } from "./jsonfile.js";
+import { decideOwner, forbiddenOwners, readRecordedOwner, setOwner, UsageError } from "./owner.js";
 import { startDaemonProcess } from "./run.js";
 import { cliVersion } from "./version.js";
 
@@ -23,11 +26,20 @@ export type CliIo = {
   fetch: typeof fetch;
   out(s: string): void;
   err(s: string): void;
+  /** Plan 5.6 Task 3 (spec §4.3): whether stdin / stdout are a terminal. An owner change needs both, plus `prompt`;
+   *  absent counts as false, so only `main.ts` (which reads the real streams) can ever allow one. */
+  stdinIsTTY?: boolean;
+  stdoutIsTTY?: boolean;
+  /** Plan 5.6 Task 3: asks the human at the terminal a question and resolves to the line they typed. */
+  prompt?(question: string): Promise<string>;
 };
+
+/** The command name the owner-change refusal tells an agent to have its human run. */
+const CLI_COMMAND = "arena";
 
 const USAGE = `usage: arena <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
-       [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
+       [--owner ADDR] [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
        [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false] [--no-faucet]
        (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
@@ -36,6 +48,7 @@ const USAGE = `usage: arena <command> [options]
         the wallet key must not be used anywhere else: the daemon replaces pending transactions it did not send)
        (when the server advertises a dev faucet and the wallet's USDC balance is below 20, init calls it;
         --no-faucet turns this off)
+       (--owner follows the same rules as "owner set"; re-running init without --owner keeps the recorded owner)
   daemon [start]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
@@ -55,6 +68,11 @@ const USAGE = `usage: arena <command> [options]
         usdc/native fields above keep reporting the shortfall as it actually stands. Exit 0 whenever the
         computation succeeds -- a shortfall is data, not an error; exit 1 if the server or the hub cannot be
         read at all (for example, a hub address with no contract code on this chain).)
+  owner   (prints {owner}: the address withdraw pays, or null)
+  owner set ADDR
+          (records the human owner's address -- the only place withdraw ever sends USDC. The first set needs no
+           terminal; changing it needs the human at a real terminal, typing the new address's last 6 characters.
+           Never the wallet, the hub, the USDC token, the rules contract, a session key or the zero address.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -101,8 +119,6 @@ function formatNativeBalance(wei: bigint): string {
   const s = formatUnits(wei, 18);
   return s.includes(".") ? s : `${s}.0`;
 }
-
-class UsageError extends Error {}
 
 /**
  * Plan 5 Task 2 fix round, CRITICAL 1: the JSON line `arena daemon` prints on stdout at startup. This must never
@@ -387,6 +403,26 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         throw new UsageError("--auto-return-on-challenge must be true or false");
       }
       const autoReturn = autoReturnRaw === undefined ? undefined : autoReturnRaw === "true";
+
+      // Plan 5.6 Task 3 (spec §4.3, Review Focus 3): the owner, settled before anything is written. A re-init must
+      // never reset it: without --owner the recorded one is carried over as is; with --owner the same rules as
+      // `owner set` apply (a different address is a change: TTY + typed suffix, or refused). Settling it here, ahead
+      // of initHome, means a refused change leaves config.json exactly as it was.
+      const paths = arenaPaths(home);
+      const currentOwner = readRecordedOwner(home); // throws on an unreadable config.json rather than drop the lock
+      const { privateKeyToAccount, generatePrivateKey } = await import("viem/accounts");
+      // The key initHome will use (an existing wallet.json always wins, as before), chosen here so the wallet's own
+      // address is known -- and forbidden as an owner -- before anything is written.
+      const walletKey: Hex =
+        readJson<{ key: Hex }>(paths.wallet)?.key ?? (flag("wallet-key") as Hex | undefined) ?? generatePrivateKey();
+      const walletAddress = privateKeyToAccount(walletKey).address;
+      let owner: unknown = readJson<{ owner?: unknown }>(paths.config)?.owner ?? undefined; // kept verbatim
+      const ownerFlag = flag("owner");
+      if (ownerFlag !== undefined) {
+        const decided = await decideOwner(currentOwner, ownerFlag, forbiddenOwners(home, { hub, usdc, rules }, walletAddress), io, CLI_COMMAND);
+        owner = decided.owner;
+      }
+
       const cfg: ArenaConfig = {
         rpcUrl,
         chainId,
@@ -403,10 +439,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         ...(feeCeilingWei !== undefined ? { feeCeilingWei } : {}),
         ...(flag("min-challenge-timeout") !== undefined ? { minChallengeTimeout: BigInt(flag("min-challenge-timeout")!) } : {}),
         ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
+        ...(owner !== undefined && owner !== null ? { owner: owner as Address } : {}),
       };
-      const { walletKey } = initHome(home, cfg, flag("wallet-key") as Hex | undefined);
-      const { privateKeyToAccount } = await import("viem/accounts");
-      const walletAddress = privateKeyToAccount(walletKey).address;
+      initHome(home, cfg, walletKey);
       const summary: Record<string, unknown> = {
         home,
         wallet: walletAddress,
@@ -417,6 +452,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         usdc,
         rules,
         sessionGasWei: cfg.sessionGasWei.toString(),
+        owner: cfg.owner ?? null,
       };
       if (fromServer) {
         summary.trust =
@@ -729,9 +765,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         }
       }
 
-      // Task 3 will store a real owner in config.json; until then, fund always asks for one. Read forward-
-      // compatibly so Task 3 needs no change here.
-      const owner = (cfg as ArenaConfig & { owner?: Address }).owner ?? null;
+      // Plan 5.6 Task 3: the owner recorded in config.json (`arena owner set` / `init --owner`), or null.
+      const owner = cfg.owner ?? null;
       const message = fundMessage(funding, { address, chainId: cfg.chainId, ownerSet: owner !== null, games, stake });
 
       const body: Record<string, unknown> = {
@@ -750,6 +785,20 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (faucetReported !== undefined) body.faucet = faucetReported;
       body.message = message;
       io.out(JSON.stringify(body, null, 2));
+      return 0;
+    }
+
+    if (cmd === "owner") {
+      // Plan 5.6 Task 3 (spec §4.3). Read-only without a subcommand: a home with no config (or no owner) is null.
+      if (arg === undefined) {
+        io.out(JSON.stringify({ owner: readRecordedOwner(home) }));
+        return 0;
+      }
+      if (arg !== "set") throw new UsageError(`unknown owner subcommand ${arg}`);
+      const addr = positional[2];
+      if (addr === undefined) throw new UsageError("owner set needs an address");
+      await setOwner(home, addr, io, CLI_COMMAND);
+      io.out(JSON.stringify({ owner: readRecordedOwner(home) }));
       return 0;
     }
 
