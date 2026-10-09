@@ -1,5 +1,5 @@
-import { formatUnits, parseUnits, type Address, type Hex } from "viem";
-import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
+import { encodeFunctionData, formatUnits, parseUnits, type Address, type Hex } from "viem";
+import { channelHubAbi, DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
 import { runBot } from "./bot.js";
 import { livePidHoldingLock } from "./lock.js";
 import {
@@ -14,6 +14,7 @@ import {
   knownDeploymentWarnings,
   type ArenaConfig,
 } from "./config.js";
+import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
 import { startDaemonProcess } from "./run.js";
 import { cliVersion } from "./version.js";
 
@@ -38,7 +39,18 @@ const USAGE = `usage: arena <command> [options]
   daemon [start]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
+          [--wait-for-usdc A] [--wait-for-native B] [--timeout SECONDS (default 1800, max 3600)]
+          (with a --wait-for-* flag: polls every 5s -- override with ARENA_WAIT_POLL_MS -- until every given
+           threshold holds or the timeout passes, then prints the same JSON plus {reached, waitedSeconds}.
+           Exit 0 once reached, 2 on timeout, 1 on error.)
   faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
+  fund --games N --stake X [--deposit D]
+       (works out what to ask your human for: reads /templates' deposit cap and faucet, the hub's
+        feePerPlayer, and this wallet's balances -- no daemon needed. deposit defaults to min(N x X, cap).
+        Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
+        Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
+        message is a ready-to-relay sentence. Exit 0 whenever the computation succeeds -- a shortfall is
+        data, not an error.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -76,14 +88,6 @@ async function usdcBalanceOf(io: CliIo, rpcUrl: string, usdc: Address, address: 
 async function nativeBalanceOf(io: CliIo, rpcUrl: string, address: Address): Promise<bigint> {
   const raw = await rpcCall(io, rpcUrl, "eth_getBalance", [address, "latest"]);
   return hexToBigIntOrThrow(raw, `RPC ${rpcUrl} eth_getBalance`);
-}
-
-/** USDC amounts always print with exactly 6 decimal places (e.g. `100.000000`), unlike `formatUnits`, which
- *  trims trailing zeros -- a fixed width makes balances easy to compare at a glance. */
-function formatUsdc6(amount: bigint): string {
-  const negative = amount < 0n;
-  const digits = (negative ? -amount : amount).toString().padStart(7, "0");
-  return `${negative ? "-" : ""}${digits.slice(0, -6) || "0"}.${digits.slice(-6)}`;
 }
 
 /** The native balance, formatted with `formatUnits` (which trims trailing zeros and, for a whole amount, the
@@ -182,6 +186,48 @@ async function verifyChain(io: CliIo, rpcUrl: string, chainId: number, contracts
       throw new Error(`${name} ${address} has no contract code on chain ${chainId} (via ${rpcUrl})`);
     }
   }
+}
+
+/**
+ * Plan 5.6 Task 2: the one place that calls a server's dev faucet, shared by `init`'s auto-fund check and
+ * `fund`'s shortfall top-up -- same origin pin, same 30s abort signal, same refusal to follow a redirect (M3),
+ * same malformed-payload check. Returns the wallet's reported balances (base units) on success; throws on any
+ * failure (wrong origin, unreachable, non-2xx, malformed payload) with a message naming the faucet URL and
+ * reason -- callers decide whether that is fatal (`init` and `fund` both treat it as a skip, not a failure).
+ */
+async function callFaucet(io: CliIo, faucetUrl: string, serverUrl: string, address: Address): Promise<{ usdc: bigint; native: bigint }> {
+  // M3: the faucet URL comes from the same /templates response as the hub/RPC addresses, but costs nothing
+  // extra to pin -- refuse a faucet whose origin differs from the server's, rather than ever POSTing the
+  // wallet address somewhere else a compromised or careless server named.
+  if (new URL(faucetUrl).origin !== new URL(serverUrl).origin) {
+    throw new Error(`faucet ${faucetUrl} is not on ${serverUrl}'s origin; refusing to call it`);
+  }
+  let res: Response;
+  try {
+    res = await io.fetch(faucetUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address }),
+      // M3: a faucet that accepts and then stalls must not hang the caller forever, and a redirect is refused
+      // outright rather than followed somewhere off the pinned origin.
+      signal: AbortSignal.timeout(30_000),
+      redirect: "error",
+    });
+  } catch (err) {
+    throw new Error(`faucet ${faucetUrl} is unreachable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const payload = (await res.json().catch(() => ({}))) as { usdc?: unknown; native?: unknown; error?: unknown };
+  if (!res.ok) {
+    const detail = typeof payload.error === "string" ? `: ${payload.error}` : "";
+    throw new Error(`faucet ${faucetUrl} answered with status ${res.status}${detail}`);
+  }
+  // The server reports raw base-unit decimal strings (matching every other /templates amount); callers format
+  // them the same way `arena wallet` does, rather than passing them through unchanged.
+  const decStr = /^[0-9]+$/;
+  if (typeof payload.usdc !== "string" || !decStr.test(payload.usdc) || typeof payload.native !== "string" || !decStr.test(payload.native)) {
+    throw new Error(`faucet ${faucetUrl} answered with a malformed amount: ${JSON.stringify(payload)}`);
+  }
+  return { usdc: BigInt(payload.usdc), native: BigInt(payload.native) };
 }
 
 /** True for a URL whose host is this machine, where plain http cannot be intercepted on the way. */
@@ -384,41 +430,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           try {
             const balance = await usdcBalanceOf(io, rpcUrl, usdc, walletAddress);
             if (balance < FAUCET_MIN_USDC_BALANCE) {
-              // M3: the faucet URL comes from the same /templates response as the hub/RPC addresses, but costs
-              // nothing extra to pin -- refuse a faucet whose origin differs from --server's, rather than ever
-              // POSTing the wallet address somewhere else a compromised or careless server named.
-              if (new URL(template.faucet).origin !== new URL(server).origin) {
-                throw new Error(`faucet ${template.faucet} is not on ${server}'s origin; refusing to call it`);
-              }
-              let res: Response;
-              try {
-                res = await io.fetch(template.faucet, {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({ address: walletAddress }),
-                  // M3: a faucet that accepts and then stalls must not hang init forever ("never fails init"
-                  // does not cover a hang), and a redirect is refused outright rather than followed somewhere
-                  // off the pinned origin.
-                  signal: AbortSignal.timeout(30_000),
-                  redirect: "error",
-                });
-              } catch (err) {
-                throw new Error(`faucet ${template.faucet} is unreachable: ${err instanceof Error ? err.message : String(err)}`);
-              }
-              const payload = (await res.json().catch(() => ({}))) as { usdc?: unknown; native?: unknown; error?: unknown };
-              if (!res.ok) {
-                const detail = typeof payload.error === "string" ? `: ${payload.error}` : "";
-                throw new Error(`faucet ${template.faucet} answered with status ${res.status}${detail}`);
-              }
-              // Plan 5.5 Task 3 carry-forward: the server reports raw base-unit decimal strings (matching every
-              // other /templates amount); format them the same way `arena wallet` does rather than passing them
-              // through unchanged, so a human (or agent) reading init's own summary sees "100.000000"/"1.0", not
-              // "100000000"/"1000000000000000000".
-              const decStr = /^[0-9]+$/;
-              if (typeof payload.usdc !== "string" || !decStr.test(payload.usdc) || typeof payload.native !== "string" || !decStr.test(payload.native)) {
-                throw new Error(`faucet ${template.faucet} answered with a malformed amount: ${JSON.stringify(payload)}`);
-              }
-              summary.faucet = { usdc: formatUsdc6(BigInt(payload.usdc)), native: formatNativeBalance(BigInt(payload.native)) };
+              // Plan 5.6 Task 2: the call itself (origin pin, timeout, redirect refusal, payload shape) now
+              // lives in the shared callFaucet, used by `fund` too.
+              const funded = await callFaucet(io, template.faucet, server, walletAddress);
+              // Plan 5.5 Task 3 carry-forward: formatted the same way `arena wallet` does rather than passed
+              // through unchanged, so a human (or agent) reading init's own summary sees "100.000000"/"1.0",
+              // not "100000000"/"1000000000000000000".
+              summary.faucet = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
             } else {
               summary.faucet = "skipped: balance already at or above 20 USDC";
             }
@@ -481,16 +499,78 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const cfg = loadConfig(home);
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
-      const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-      const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
-      io.out(
-        JSON.stringify(
-          { address, chainId: cfg.chainId, usdc: formatUsdc6(usdcBalance), native: formatNativeBalance(nativeBalance) },
-          null,
-          2,
-        ),
-      );
-      return 0;
+
+      const waitUsdcRaw = flag("wait-for-usdc");
+      const waitNativeRaw = flag("wait-for-native");
+      if (waitUsdcRaw === undefined && waitNativeRaw === undefined) {
+        const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+        const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        io.out(
+          JSON.stringify(
+            { address, chainId: cfg.chainId, usdc: formatUsdc6(usdcBalance), native: formatNativeBalance(nativeBalance) },
+            null,
+            2,
+          ),
+        );
+        return 0;
+      }
+
+      // Plan 5.6 Task 2 (spec §4.2, Review Focus 2): a malformed --wait-for-* amount is a syntax mistake, same
+      // as any other malformed flag (UsageError, exit 2). An in-range-syntax but out-of-bounds --timeout is
+      // deliberately *not* a UsageError: the convention elsewhere in this CLI maps UsageError to exit 2, but
+      // spec §4.2 reserves 2 for "timed out while waiting" -- a bad --timeout is "1 on error", same as any
+      // other input problem this command can't even start to act on.
+      let usdcThreshold: bigint | undefined;
+      if (waitUsdcRaw !== undefined) {
+        if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(waitUsdcRaw)) {
+          throw new UsageError("--wait-for-usdc must be a non-negative USDC amount with at most 6 decimal places");
+        }
+        usdcThreshold = parseUnits(waitUsdcRaw, 6);
+      }
+      let nativeThreshold: bigint | undefined;
+      if (waitNativeRaw !== undefined) {
+        if (!/^[0-9]+(\.[0-9]{1,18})?$/.test(waitNativeRaw)) {
+          throw new UsageError("--wait-for-native must be a non-negative native amount with at most 18 decimal places");
+        }
+        nativeThreshold = parseUnits(waitNativeRaw, 18);
+      }
+      const timeoutRaw = flag("timeout") ?? "1800";
+      if (!/^[0-9]+$/.test(timeoutRaw)) throw new UsageError("--timeout must be a non-negative integer number of seconds");
+      const timeoutSeconds = Number(timeoutRaw);
+      if (timeoutSeconds < 1 || timeoutSeconds > 3600) {
+        throw new Error(`--timeout must be between 1 and 3600 seconds (the maximum is 3600s); got ${timeoutSeconds}`);
+      }
+      const timeoutMs = timeoutSeconds * 1000;
+      // A hidden test knob (Task 2 brief): production always polls every 5s.
+      const pollMsRaw = io.env.ARENA_WAIT_POLL_MS;
+      const pollMs = pollMsRaw !== undefined && /^[0-9]+$/.test(pollMsRaw) && Number(pollMsRaw) > 0 ? Number(pollMsRaw) : 5000;
+
+      const startedAt = Date.now();
+      for (;;) {
+        const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+        const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        const reached =
+          (usdcThreshold === undefined || usdcBalance >= usdcThreshold) &&
+          (nativeThreshold === undefined || nativeBalance >= nativeThreshold);
+        const elapsedMs = Date.now() - startedAt;
+        const body = {
+          address,
+          chainId: cfg.chainId,
+          usdc: formatUsdc6(usdcBalance),
+          native: formatNativeBalance(nativeBalance),
+          reached,
+          waitedSeconds: Math.floor(elapsedMs / 1000),
+        };
+        if (reached) {
+          io.out(JSON.stringify(body, null, 2));
+          return 0;
+        }
+        if (elapsedMs >= timeoutMs) {
+          io.out(JSON.stringify(body, null, 2));
+          return 2;
+        }
+        await new Promise((r) => setTimeout(r, Math.min(pollMs, timeoutMs - elapsedMs)));
+      }
     }
 
     if (cmd === "faucet") {
@@ -540,6 +620,121 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           2,
         ),
       );
+      return 0;
+    }
+
+    if (cmd === "fund") {
+      // Plan 5.6 Task 2 (spec §4.1): works out what to ask the human for -- no daemon needed.
+      const cfg = loadConfig(home);
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const address = privateKeyToAccount(loadWalletKey(home)).address;
+
+      const gamesRaw = need("games");
+      if (!/^[0-9]+$/.test(gamesRaw)) throw new UsageError("--games must be a positive whole number of games");
+      const games = BigInt(gamesRaw);
+
+      const stakeRaw = need("stake");
+      if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(stakeRaw)) {
+        throw new UsageError("--stake must be a non-negative USDC amount with at most 6 decimal places");
+      }
+      const stake = parseUnits(stakeRaw, 6);
+
+      let explicitDeposit: bigint | undefined;
+      const depositRaw = flag("deposit");
+      if (depositRaw !== undefined) {
+        if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(depositRaw)) {
+          throw new UsageError("--deposit must be a non-negative USDC amount with at most 6 decimal places");
+        }
+        explicitDeposit = parseUnits(depositRaw, 6);
+      }
+
+      // Read /templates for the chess template's deposit cap and (optional) faucet -- same shape init reads,
+      // but fund needs no other field from it (the chain settings already live in this home's config.json).
+      const templatesUrl = `${cfg.serverUrl.replace(/\/$/, "")}/templates`;
+      let tres: Response;
+      try {
+        tres = await io.fetch(templatesUrl);
+      } catch (err) {
+        throw new Error(`fetching ${templatesUrl} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!tres.ok) throw new Error(`fetching ${templatesUrl} failed with status ${tres.status}`);
+      const list = (await tres.json()) as unknown;
+      const chess = Array.isArray(list) ? (list as Array<Record<string, unknown>>).find((t) => t.id === "chess") : undefined;
+      if (!chess) throw new Error(`server ${cfg.serverUrl} offers no chess template`);
+      const limits = chess.limits as { maxDepositPerPlayer?: unknown } | null | undefined;
+      if (!limits || typeof limits.maxDepositPerPlayer !== "string" || !/^[0-9]+$/.test(limits.maxDepositPerPlayer)) {
+        throw new Error(`server ${cfg.serverUrl} published no usable deposit cap (/templates' limits.maxDepositPerPlayer)`);
+      }
+      const cap = BigInt(limits.maxDepositPerPlayer);
+      const faucetUrl = typeof chess.faucet === "string" ? chess.faucet : undefined;
+
+      const feePerPlayerRaw = await rpcCall(io, cfg.rpcUrl, "eth_call", [
+        { to: cfg.hub, data: encodeFunctionData({ abi: channelHubAbi, functionName: "feePerPlayer" }) },
+        "latest",
+      ]);
+      const feePerPlayer = hexToBigIntOrThrow(feePerPlayerRaw, `RPC ${cfg.rpcUrl} eth_call (feePerPlayer)`);
+      const feeCeilingWei = cfg.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
+
+      let usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+      let nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
+      let funding: FundingNeed = computeFundingNeed({
+        games,
+        stake,
+        deposit: explicitDeposit,
+        cap,
+        feePerPlayer,
+        sessionGasWei: cfg.sessionGasWei,
+        feeCeilingWei,
+        usdcHave,
+        nativeHave,
+      });
+
+      // spec §4.1: call the faucet (as init does) only when something is actually short and the template
+      // advertises one; never fails fund -- a failed top-up just leaves the shortfall for the human to cover.
+      let faucetReported: { usdc: string; native: string } | string | undefined;
+      if ((funding.usdc.shortfall > 0n || funding.native.shortfall > 0n) && faucetUrl !== undefined) {
+        try {
+          const funded = await callFaucet(io, faucetUrl, cfg.serverUrl, address);
+          faucetReported = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
+          usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+          nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
+          funding = computeFundingNeed({
+            games,
+            stake,
+            deposit: explicitDeposit,
+            cap,
+            feePerPlayer,
+            sessionGasWei: cfg.sessionGasWei,
+            feeCeilingWei,
+            usdcHave,
+            nativeHave,
+          });
+        } catch (err) {
+          faucetReported = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
+        }
+      }
+
+      // Task 3 will store a real owner in config.json; until then, fund always asks for one. Read forward-
+      // compatibly so Task 3 needs no change here.
+      const owner = (cfg as ArenaConfig & { owner?: Address }).owner ?? null;
+      const message = fundMessage(funding, { address, chainId: cfg.chainId, ownerSet: owner !== null, games, stake });
+
+      const body: Record<string, unknown> = {
+        address,
+        chainId: cfg.chainId,
+        deposit: formatUsdc6(funding.deposit),
+        feePerPlayer: formatUsdc6(funding.feePerPlayer),
+        usdc: { have: formatUsdc6(funding.usdc.have), need: formatUsdc6(funding.usdc.need), shortfall: formatUsdc6(funding.usdc.shortfall) },
+        native: {
+          have: formatNativeBalance(funding.native.have),
+          need: formatNativeBalance(funding.native.need),
+          shortfall: formatNativeBalance(funding.native.shortfall),
+        },
+        owner,
+      };
+      if (faucetReported !== undefined) body.faucet = faucetReported;
+      body.message = message;
+      io.out(JSON.stringify(body, null, 2));
       return 0;
     }
 

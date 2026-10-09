@@ -1,8 +1,12 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Address } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
+import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
 import { daemonStartLine, invalidOfferTimeoutReason, loadConfig, runCli } from "../src/index.js";
+import { computeFundingNeed, fundMessage } from "../src/funding.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = []) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -268,5 +272,212 @@ describe("arena CLI", () => {
     expect(invalidOfferTimeoutReason(604_800n, bounds, 60n)).toBeNull();
     // Above the hub's maximum.
     expect(invalidOfferTimeoutReason(604_801n, bounds, 60n)).toMatch(/above the hub's maximum of 604800s/);
+  });
+});
+
+// ------------------------------------------------------------- Plan 5.6 Task 2: fund, wallet --wait-for-* (Anvil)
+
+/** A hybrid `io.fetch`, following the shape of `io()` above: real JSON-RPC calls go to the real, deployed Anvil
+ *  chain (so `fund`'s `feePerPlayer` read and both commands' balance reads are genuine), while `/templates` and
+ *  `/faucet` are answered by the test -- the same split a real agent machine sees (one real chain, one real
+ *  server). Every request URL is recorded in `calls`. */
+function fundIo(
+  home: string,
+  opts: {
+    templatesBody?: unknown;
+    faucetHandler?: (address: Address) => Promise<{ status: number; body: unknown }>;
+    env?: Record<string, string>;
+  } = {},
+) {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const out: string[] = [];
+  const err: string[] = [];
+  const fetchFn = (async (url: string, init?: RequestInit) => {
+    calls.push({ url, init });
+    if (url.startsWith(RPC)) return fetch(url, init); // the real, deployed Anvil chain
+    if (url.endsWith("/templates")) return new Response(JSON.stringify(opts.templatesBody ?? []), { status: 200 });
+    if (url.endsWith("/faucet") && opts.faucetHandler) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { address: Address };
+      const r = await opts.faucetHandler(body.address);
+      return new Response(JSON.stringify(r.body), { status: r.status });
+    }
+    throw new Error(`fundIo: unexpected URL in test: ${url}`);
+  }) as unknown as typeof fetch;
+  return {
+    calls,
+    out,
+    err,
+    io: { env: { ARENA_HOME: home, ...opts.env }, fetch: fetchFn, out: (s: string) => out.push(s), err: (s: string) => err.push(s) },
+  };
+}
+
+/** Writes a fresh ARENA_HOME against a real, freshly deployed hub, with a fresh (empty: 0 USDC, 0 native)
+ *  wallet -- a random key is never one of Anvil's own pre-funded dev accounts. Every field is explicit, so
+ *  `init` itself makes no network call at all (final review C1's own `--session-gas-wei` trick, reused here). */
+async function initEmptyWallet(env: { hub: Address; usdc: Address; rules: Address }, server = "http://127.0.0.1:3000") {
+  const walletKey = generatePrivateKey();
+  const address = privateKeyToAccount(walletKey).address;
+  const home = mkdtempSync(join(tmpdir(), "arena-cli-fund-"));
+  const code = await runCli(
+    [
+      "init",
+      "--rpc",
+      RPC,
+      "--chain-id",
+      "31337",
+      "--hub",
+      env.hub,
+      "--usdc",
+      env.usdc,
+      "--rules",
+      env.rules,
+      "--server",
+      server,
+      "--port",
+      "7010",
+      "--session-gas-wei",
+      "10000000000000000", // 1e16 wei
+      "--wallet-key",
+      walletKey,
+      "--no-faucet",
+    ],
+    io(home).io,
+  );
+  if (code !== 0) throw new Error(`test setup: init failed with code ${code}`);
+  return { home, address, walletKey };
+}
+
+const CHESS_TEMPLATE = (overrides: Record<string, unknown> = {}) => [
+  { id: "chess", version: "1", limits: { maxDepositPerPlayer: "10000000", maxCommittedEscrow: "1000000000000", committedEscrow: "0", paused: false }, ...overrides },
+];
+
+describe("Plan 5.6 Task 2: arena fund", () => {
+  it("on an empty wallet: exit 0, deposit = min(games x stake, cap), exact shortfalls and message", async () => {
+    const env = await deployArena(); // feePerPlayer 5_000n, maxDepositPerPlayer 10_000_000n (see deployArena)
+    const { home, address } = await initEmptyWallet(env);
+    const t = fundIo(home, { templatesBody: CHESS_TEMPLATE() });
+
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "message"]);
+    expect(printed.address).toBe(address);
+    expect(printed.chainId).toBe(31337);
+    expect(printed.deposit).toBe("3.000000"); // 3 x 1 USDC, within the 10 USDC cap
+    expect(printed.feePerPlayer).toBe("0.005000"); // proves the eth_call read the real, deployed hub (not "0x")
+    expect(printed.usdc).toEqual({ have: "0.000000", need: "3.005000", shortfall: "3.005000" });
+    expect(printed.native).toEqual({ have: "0.0", need: "0.06", shortfall: "0.06" }); // 1e16 + 500_000 x 100 gwei
+    expect(printed.owner).toBeNull();
+
+    const need = computeFundingNeed({
+      games: 3n,
+      stake: 1_000_000n,
+      cap: 10_000_000n,
+      feePerPlayer: 5_000n,
+      sessionGasWei: 10_000_000_000_000_000n,
+      feeCeilingWei: 100_000_000_000n,
+      usdcHave: 0n,
+      nativeHave: 0n,
+    });
+    expect(printed.message).toBe(fundMessage(need, { address, chainId: 31337, ownerSet: false, games: 3n, stake: 1_000_000n }));
+  });
+
+  it("--deposit overrides the default; an out-of-range one exits 1 (not the usual usage-error 2)", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+
+    const t1 = fundIo(home, { templatesBody: CHESS_TEMPLATE() });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1", "--deposit", "2"], t1.io)).toBe(0);
+    expect((JSON.parse(t1.out.join("\n")) as Record<string, unknown>).deposit).toBe("2.000000");
+
+    // Review Focus 2's sibling for fund: an out-of-range --deposit is "1 on error", not the usual UsageError 2,
+    // because it comes from computeFundingNeed's own RangeError, not a flag-syntax mistake.
+    const t2 = fundIo(home, { templatesBody: CHESS_TEMPLATE() });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1", "--deposit", "0.5"], t2.io)).toBe(1);
+    expect(t2.err.join("\n")).toMatch(/deposit must be between the stake and the cap/);
+  });
+
+  it("with a server faucet: calls it once when short, re-reads the balances, and reports faucet: {usdc, native}", async () => {
+    const env = await deployArena();
+    const { home, address } = await initEmptyWallet(env, "http://127.0.0.1:3000");
+    let faucetCalls = 0;
+    const t = fundIo(home, {
+      templatesBody: CHESS_TEMPLATE({ faucet: "http://127.0.0.1:3000/faucet" }),
+      faucetHandler: async (addr) => {
+        faucetCalls++;
+        await mintUsdc(env.usdc, addr, 20_000_000n); // plenty to cover the 3.005 USDC need
+        await setEthBalance(addr, 10n ** 18n); // plenty to cover the 0.06 native need
+        const usdc = await readUsdcBalance(env.usdc, addr);
+        return { status: 200, body: { address: addr, usdc: usdc.toString(), native: (10n ** 18n).toString() } };
+      },
+    });
+
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
+    expect(faucetCalls).toBe(1); // called exactly once, even though both assets were short
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "faucet", "message"]);
+    expect(printed.faucet).toEqual({ usdc: "20.000000", native: "1.0" }); // formatted as `arena faucet` does
+    // Re-read balances after the faucet call: both shortfalls are now gone.
+    expect(printed.usdc).toEqual({ have: "20.000000", need: "3.005000", shortfall: "0.000000" });
+    expect(printed.native).toEqual({ have: "1.0", need: "0.06", shortfall: "0.0" });
+    // A free end-to-end pin of the "already holds enough" message variant.
+    expect(printed.message).toBe("This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me the address to return winnings to.");
+  });
+
+  it("an unreachable server exits 1, naming the server URL", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env, "http://127.0.0.1:3000");
+    const t = fundIo(home); // no templatesBody handler override needed: /templates throws below
+    (t.io as { fetch: typeof fetch }).fetch = (async (url: string) => {
+      if (url.endsWith("/templates")) throw new TypeError("fetch failed");
+      return fetch(url);
+    }) as unknown as typeof fetch;
+    expect(await runCli(["fund", "--games", "1", "--stake", "1"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain("http://127.0.0.1:3000/templates");
+  });
+});
+
+describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", () => {
+  it("times out at exit 2 with reached:false and waitedSeconds >= the --timeout given", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+    const t = fundIo(home, { env: { ARENA_WAIT_POLL_MS: "300" } });
+
+    const code = await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "5"], t.io);
+    expect(code).toBe(2);
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(printed.reached).toBe(false);
+    expect(printed.waitedSeconds as number).toBeGreaterThanOrEqual(5);
+  }, 20_000);
+
+  it("funding that arrives mid-wait returns exit 0 with reached:true before the timeout", async () => {
+    const env = await deployArena();
+    const { home, address } = await initEmptyWallet(env);
+    const t = fundIo(home, { env: { ARENA_WAIT_POLL_MS: "200" } });
+
+    const mintDone = (async () => {
+      await new Promise((r) => setTimeout(r, 1_000));
+      await mintUsdc(env.usdc, address, 1_000_000n); // 1 USDC: meets the --wait-for-usdc 1 threshold
+    })();
+    const code = await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "15"], t.io);
+    await mintDone; // never leave the mint dangling, whatever the outcome above
+
+    expect(code).toBe(0);
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(printed.reached).toBe(true);
+    expect(typeof printed.waitedSeconds).toBe("number");
+    expect(printed.usdc).toBe("1.000000");
+  }, 20_000);
+
+  it("--timeout above 3600s exits 1 naming the maximum, for --wait-for-usdc and --wait-for-native alike", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+
+    const t1 = fundIo(home);
+    expect(await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "3601"], t1.io)).toBe(1);
+    expect(t1.err.join("\n")).toMatch(/3600/);
+
+    const t2 = fundIo(home);
+    expect(await runCli(["wallet", "--wait-for-native", "0.5", "--timeout", "3601"], t2.io)).toBe(1);
+    expect(t2.err.join("\n")).toMatch(/3600/);
   });
 });
