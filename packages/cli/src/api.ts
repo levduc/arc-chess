@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
+import { selfCommand } from "./version.js";
 
 /**
  * Plan 5 Task 2 (Global Constraints): the board's own CSP, verbatim -- served on every response, JSON or static,
@@ -215,7 +216,7 @@ export async function startApi(
     const now = boardNow();
     while (sessionAttempts.length > 0 && sessionAttempts[0] <= now - 60_000) sessionAttempts.shift();
     if (sessionAttempts.length >= BOARD_SESSION_ATTEMPTS_PER_MINUTE) {
-      return send(res, 429, { error: "too many board sign-in attempts: wait a minute, then run `arena board` again" });
+      return send(res, 429, { error: `too many board sign-in attempts: wait a minute, then run \`${selfCommand()} board\` again` });
     }
     sessionAttempts.push(now);
     const b = await body(req);
@@ -223,7 +224,7 @@ export async function startApi(
     const expiresAt = boardCodes.get(code);
     if (expiresAt === undefined || expiresAt <= now) {
       if (expiresAt !== undefined) boardCodes.delete(code);
-      return send(res, 401, { error: "this board link has expired: run `arena board` again" });
+      return send(res, 401, { error: `this board link has expired: run \`${selfCommand()} board\` again` });
     }
     boardCodes.delete(code);
     return send(res, 200, { token: opts.token });
@@ -424,6 +425,22 @@ export async function startApi(
             await daemon.handoff(ch, to, note);
             return send(res, 200, await daemon.status(ch));
           }
+          case "POST /withdraw": {
+            // Plan 5.6 Task 3 (spec §4.4): either actor may ask -- the owner lock, not the actor, is the protection.
+            // The destination is never read from the request: the daemon pays the owner recorded in config.json,
+            // and no route sets that. A body that tries to name one (or anything else) is refused outright, so a
+            // confused caller learns that instead of assuming its `to` was honoured.
+            const extra = Object.keys(b).filter((k) => k !== "amount" && k !== "all");
+            if (extra.length > 0) {
+              throw new DaemonError(
+                400,
+                `withdraw takes only {"amount": "<base units>"} or {"all": true} and always pays the recorded owner; unexpected: ${extra.join(", ").slice(0, 100)}`,
+              );
+            }
+            if (b.all !== undefined && b.all !== true) throw new DaemonError(400, "all must be true when given");
+            if ((b.all === true) === (b.amount !== undefined)) throw new DaemonError(400, "withdraw needs exactly one of amount or all");
+            return send(res, 200, await daemon.withdraw(b.all === true ? { all: true } : { amount: amount(b.amount, "amount") }));
+          }
           default:
             return send(res, 404, { error: `no route ${route}` });
         }
@@ -436,7 +453,18 @@ export async function startApi(
       }
     })();
   });
-  await new Promise<void>((resolve) => server.listen(opts.port, host, resolve));
+  // Plan 5.6 Task 3 fix round (I1): a listen failure (the port is taken -- by another home's daemon, or anything
+  // else) must reject, not surface as an unhandled 'error' event that kills the process. `startDaemonProcess` then
+  // tears down what it started and releases the home lock -- and a no-daemon `arena withdraw` fails cleanly, with
+  // exit 1 and a message naming the port, instead of crashing mid-tick with the lock left behind.
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(new Error(`the daemon's local API cannot listen on ${host}:${opts.port}: ${err.message}`));
+    server.once("error", onError);
+    server.listen(opts.port, host, () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
   boundPort = (server.address() as AddressInfo).port;
   // Plan 5 Task 2: server.close() otherwise hangs -- an open SSE response is a keep-alive connection that never
   // ends on its own, and http.Server#close() only finishes once every connection has. Force each one closed

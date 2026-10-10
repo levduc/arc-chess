@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
+import { selfCommand } from "./version.js";
 
 export type ArenaConfig = {
   rpcUrl: string;
@@ -35,6 +36,14 @@ export type ArenaConfig = {
    *  back to the agent once `autoReturnSecondsOf(challengeTimeout)` or less is left, so a forfeit never depends on
    *  a human who walked away. Default true; `arena init --auto-return-on-challenge false` turns it off. */
   autoReturnOnChallenge?: boolean;
+  /** Plan 5.6 Task 3 (spec §4.3): the human owner's address -- the only place `arena withdraw` ever sends USDC.
+   *  Set by `arena owner set` or `arena init --owner` (first set free; a change needs the current owner's
+   *  signature, see `owner.ts`), kept by a re-`init`, and re-read from disk by the daemon on every withdraw. No
+   *  daemon API route sets it. Absent until first set. */
+  owner?: Address;
+  /** Task 3 fix round 1 (I2): goes up by one on every owner change and is part of the message the current owner
+   *  signs, so an old signature can never be replayed (A→B→A). Absent = 0. Kept by a re-`init`. */
+  ownerNonce?: number;
 };
 
 /** A canonical arena deployment on one chain (final review I2). */
@@ -165,7 +174,8 @@ export function initHome(home: string, cfg: ArenaConfig, walletKey?: Hex): { wal
 }
 
 function required<T>(value: T | null, what: string): T {
-  if (value === null) throw new Error(`${what} missing: run "arena init" first`);
+  // Final fix wave (M5): the command an agent can actually type back -- the pinned npx form in the bundle.
+  if (value === null) throw new Error(`${what} missing: run "${selfCommand()} init" first`);
   return value;
 }
 

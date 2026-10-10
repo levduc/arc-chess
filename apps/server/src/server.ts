@@ -165,6 +165,9 @@ async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader,
     // actually enabled -- `undefined` here is dropped by `toWire`'s JSON.stringify, so a disabled faucet leaves
     // no `faucet` key at all, not a null or false one a careless client might still act on.
     ...(faucetEnabled ? { faucet: `${url}/faucet` } : {}),
+    // Plan 5.6 Task 4 (spec §3): the pinned CLI version, when this host configures one -- same undefined-key
+    // omission as `faucet` above when it does not.
+    ...(cfg.cli !== undefined ? { cli: cfg.cli } : {}),
   };
 }
 

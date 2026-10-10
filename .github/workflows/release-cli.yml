@@ -1,0 +1,40 @@
+name: release-cli
+on:
+  push:
+    tags: ["cli-v*"]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: The tag names the CLI version being published
+        run: |
+          tag="${GITHUB_REF_NAME#cli-v}"
+          version="$(node -p "require('./packages/cli/package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match packages/cli/package.json's version $version" >&2
+            exit 1
+          fi
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:cli --release
+        env:
+          ARENA_CLI_PACKAGE: ${{ vars.ARENA_CLI_PACKAGE }}
+          ARENA_CLI_LICENSE: ${{ vars.ARENA_CLI_LICENSE }}
+          ARENA_CLI_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+      - run: pnpm --filter @arena/system-tests exec vitest run cli-clean-room.test.ts
+        env:
+          ARENA_CLEAN_ROOM_DIST: ${{ github.workspace }}/packages/cli/dist
+      - run: npm publish packages/cli/dist --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

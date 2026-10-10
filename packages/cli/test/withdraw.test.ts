@@ -1,0 +1,675 @@
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createServer, type AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createTestClient,
+  encodeAbiParameters,
+  encodeEventTopics,
+  erc20Abi,
+  http,
+  pad,
+  toHex,
+  type Address,
+  type Hex,
+  type Log,
+} from "viem";
+import { foundry } from "viem/chains";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  MAX_MATCH_RETRIES,
+  arenaPaths,
+  confirmsTransfer,
+  initHome,
+  livePidHoldingLock,
+  loadConfig,
+  loadToken,
+  runCli,
+  startApi,
+  startDaemonProcess,
+  withdrawReserve,
+  writeJsonAtomic,
+  type ArenaConfig,
+  type CliIo,
+  type DaemonProcess,
+} from "../src/index.js";
+import { ownerChangeMessage, setOwner } from "../src/owner.js";
+import { RPC, deployArena, increaseTime, mintUsdc, publicClient, setEthBalance, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { startPair, waitFor } from "./helpers/harness.js";
+
+// Plan 5.6 Task 3 (spec §4.4): `arena withdraw`, end to end against Anvil 8546. Every home here points its host
+// at a closed loopback port: a daemon's host connection only retries in the background, and withdraw never needs
+// the host -- so the CLI's in-process daemon (and a test's own startDaemonProcess) run for real.
+const NOWHERE = "http://127.0.0.1:9";
+
+let cleanups: Array<() => Promise<void> | void> = [];
+afterEach(async () => {
+  for (const c of cleanups.reverse()) await c();
+  cleanups = [];
+});
+
+/** A free TCP port on 127.0.0.1, for a daemon whose API the CLI must find through config.json's `port`. */
+async function freePort(): Promise<number> {
+  const s = createServer();
+  await new Promise<void>((r) => s.listen(0, "127.0.0.1", () => r()));
+  const port = (s.address() as AddressInfo).port;
+  await new Promise<void>((r) => s.close(() => r()));
+  return port;
+}
+
+const newAddress = (): Address => privateKeyToAccount(generatePrivateKey()).address;
+
+/** A fresh home against a freshly deployed hub, with a fresh wallet holding `usdc` USDC and 1 native. */
+async function walletHome(opts: { usdc?: bigint; port?: number } = {}) {
+  const env = await deployArena();
+  const walletKey = generatePrivateKey();
+  const wallet = privateKeyToAccount(walletKey).address;
+  const home = mkdtempSync(join(tmpdir(), "arena-withdraw-"));
+  const config: ArenaConfig = {
+    rpcUrl: RPC,
+    chainId: env.domain.chainId,
+    hub: env.hub,
+    usdc: env.usdc,
+    rules: env.rules,
+    serverUrl: NOWHERE,
+    port: opts.port ?? 0,
+    maxFeePerPlayer: 10_000n,
+    sessionGasWei: 10n ** 16n,
+    pollMs: 100,
+    minChallengeTimeout: 60n,
+  };
+  initHome(home, config, walletKey);
+  await mintUsdc(env.usdc, wallet, opts.usdc ?? 10_000_000n);
+  await setEthBalance(wallet, 10n ** 18n);
+  return { env, home, wallet };
+}
+
+/** A CliIo with the real fetch (recorded). */
+function cliIo(home: string) {
+  const out: string[] = [];
+  const err: string[] = [];
+  const urls: string[] = [];
+  const io: CliIo = {
+    env: { ARENA_HOME: home },
+    fetch: ((url: string, init?: RequestInit) => {
+      urls.push(url);
+      return fetch(url, init);
+    }) as unknown as typeof fetch,
+    out: (s: string) => out.push(s),
+    err: (s: string) => err.push(s),
+  };
+  return { out, err, urls, io, json: () => JSON.parse(out.join("\n")) as Record<string, unknown> };
+}
+
+/** The owner's first set, as an agent would do it (no signature needed). */
+async function firstSet(home: string, owner: Address): Promise<void> {
+  await setOwner(home, owner, cliIo(home).io, "arena");
+  expect(loadConfig(home).owner).toBe(owner);
+}
+
+/** The current owner (`currentKey`) signing a change of `home`'s owner to `next`, at `nonce`, then `owner set`. */
+async function signedChange(home: string, wallet: Address, currentKey: Hex, next: Address, nonce: number): Promise<void> {
+  const current = privateKeyToAccount(currentKey);
+  const message = ownerChangeMessage({ wallet, chainId: 31337, currentOwner: current.address, newOwner: next, nonce });
+  await setOwner(home, next, cliIo(home).io, "arena", await current.signMessage({ message }));
+  expect(loadConfig(home).owner).toBe(next);
+}
+
+async function startDaemon(home: string): Promise<DaemonProcess> {
+  const proc = await startDaemonProcess(home, { log: () => {} });
+  cleanups.push(() => proc.stop());
+  return proc;
+}
+
+describe("arena withdraw (spec §4.4)", () => {
+  it("withdrawReserve is 0 on this native-gas chain (the Plan 6 Arc seam)", () => {
+    expect(withdrawReserve()).toBe(0n);
+  });
+
+  it("with no owner set: exit 1 naming `owner set`, nothing moves, and no daemon is left running", async () => {
+    const { env, home, wallet } = await walletHome();
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--all"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain("owner set");
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
+  it("no running daemon: --amount 3 starts one in-process, sends exactly 3 USDC to the owner, and stops it", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "3"], t.io), t.err.join("\n")).toBe(0);
+    const printed = t.json();
+    expect(Object.keys(printed)).toEqual(["to", "amount", "txHash", "usdcAfter"]);
+    expect(printed.to).toBe(owner);
+    expect(printed.amount).toBe("3.000000");
+    expect(printed.usdcAfter).toBe("7.000000");
+    expect(printed.txHash).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(await usdcBalance(env.usdc, owner)).toBe(3_000_000n); // the owner started at 0: the delta is exact
+    expect(await usdcBalance(env.usdc, wallet)).toBe(7_000_000n);
+    // An ERC-20 transfer from the wallet to the token contract -- never to the hub, never anywhere else.
+    const receipt = await publicClient().getTransactionReceipt({ hash: printed.txHash as Hex });
+    expect(receipt.from.toLowerCase()).toBe(wallet.toLowerCase());
+    expect(receipt.to?.toLowerCase()).toBe(env.usdc.toLowerCase());
+    // No API call: the in-process path talks to its daemon directly.
+    expect(t.urls.filter((u) => u.includes("/withdraw"))).toEqual([]);
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
+  it("--all moves the whole USDC balance (reserve 0); the native balance pays the gas and nothing else", async () => {
+    const { env, home, wallet } = await walletHome({ usdc: 12_345_678n });
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const nativeBefore = await publicClient().getBalance({ address: wallet });
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--all"], t.io), t.err.join("\n")).toBe(0);
+    const printed = t.json();
+    expect(printed.amount).toBe("12.345678");
+    expect(printed.usdcAfter).toBe("0.000000");
+    expect(await usdcBalance(env.usdc, owner)).toBe(12_345_678n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(0n);
+    const receipt = await publicClient().getTransactionReceipt({ hash: printed.txHash as Hex });
+    const nativeAfter = await publicClient().getBalance({ address: wallet });
+    expect(nativeBefore - nativeAfter).toBe(receipt.gasUsed * receipt.effectiveGasPrice);
+    expect(await publicClient().getBalance({ address: owner })).toBe(0n); // USDC only, never native
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
+  it("refuses --amount 0 and an amount above the balance (exit 1, the latter saying to close open channels); bad flags are usage errors", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+
+    for (const zero of ["0", "0.000000"]) {
+      const t = cliIo(home);
+      expect(await runCli(["withdraw", "--amount", zero], t.io)).toBe(1);
+      expect(t.err.join("\n")).toMatch(/greater than 0/);
+    }
+
+    const over = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "10.000001"], over.io)).toBe(1);
+    expect(over.err.join("\n")).toMatch(/close open channels first/);
+    expect(over.err.join("\n")).toContain("10.000000 USDC"); // the withdrawable amount, formatted
+    expect(livePidHoldingLock(home)).toBeNull(); // the in-process daemon was stopped despite the refusal
+
+    for (const bad of [["withdraw"], ["withdraw", "--all", "--amount", "1"], ["withdraw", "--amount", "abc"], ["withdraw", "--amount", "1.0000001"]]) {
+      expect(await runCli(bad, cliIo(home).io), bad.join(" ")).toBe(2);
+    }
+    expect(await usdcBalance(env.usdc, owner)).toBe(0n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+  });
+
+  it("a hand-edited forbidden owner -- the wallet, the USDC token, the hub, the rules or a session key -- is refused by the daemon, and nothing moves", async () => {
+    const { env, home, wallet } = await walletHome();
+    // A settled (and swept) channel record in this home, holding a session key.
+    const sessionKey = generatePrivateKey();
+    const channelId = `0x${randomBytes(32).toString("hex")}` as Hex;
+    writeJsonAtomic(arenaPaths(home).channelRecord(channelId), { channelId, sessionKey, me: 0, finalized: true, swept: true });
+    const forbidden: Array<[string, Address]> = [
+      ["the wallet", wallet],
+      ["the USDC token", env.usdc],
+      ["the hub", env.hub],
+      ["the rules contract", env.rules],
+      ["a session key", privateKeyToAccount(sessionKey).address],
+    ];
+    for (const [what, owner] of forbidden) {
+      writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), owner });
+      const t = cliIo(home);
+      expect(await runCli(["withdraw", "--amount", "1"], t.io), what).toBe(1);
+      expect(t.err.join("\n"), what).toMatch(/cannot be paid/);
+      expect(livePidHoldingLock(home), what).toBeNull();
+    }
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+  });
+
+  it("fix round M2: withdraw takes no destination -- --to, a bare address or any other flag is a usage error, and nothing moves", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const evil = newAddress();
+    for (const args of [
+      ["withdraw", "--all", "--to", evil],
+      ["withdraw", "--amount", "1", "--to", evil],
+      ["withdraw", evil, "--all"],
+      ["withdraw", "--all", evil],
+      ["withdraw", "--amount", "1", "--channel", `0x${"ab".repeat(32)}`],
+      ["withdraw", "--all", "--offer-draw"],
+    ]) {
+      const t = cliIo(home);
+      expect(await runCli(args, t.io), args.join(" ")).toBe(2);
+      expect(t.err.join("\n"), args.join(" ")).toContain("withdraw always pays the recorded owner; it takes no destination");
+      expect(t.urls, args.join(" ")).toEqual([]);
+    }
+    expect(await usdcBalance(env.usdc, evil)).toBe(0n);
+    expect(await usdcBalance(env.usdc, owner)).toBe(0n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
+  it("fix rounds M3 and 4 (N4): a token whose transfer returns false emits no Transfer log -- a 502, never reported as sent", async () => {
+    const { home, wallet } = await walletHome();
+    // A stand-in "USDC" (set with anvil_setCode): balanceOf(...) answers 10 USDC, every other call -- transfer
+    // included -- returns one zero word (false) without reverting, and nothing ever moves.
+    //   PUSH1 0 CALLDATALOAD PUSH1 0xe0 SHR DUP1 PUSH4 balanceOf EQ PUSH1 0x15 JUMPI   (selector dispatch)
+    //   PUSH1 0x20 PUSH1 0 RETURN                                                      (32 zero bytes: false)
+    //   JUMPDEST PUSH4 10_000_000 PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN             (the balance)
+    const fakeUsdc = newAddress();
+    const anvil = createTestClient({ mode: "anvil", chain: foundry, transport: http(RPC) });
+    const code = ["600035", "60e01c", "80", "6370a08231", "14", "6015", "57", "60206000f3", "5b", "6300989680", "600052", "60206000f3"];
+    await anvil.setCode({ address: fakeUsdc, bytecode: `0x${code.join("")}` });
+    writeJsonAtomic(arenaPaths(home).config, { ...loadConfig(home), usdc: fakeUsdc });
+    const owner = newAddress();
+    await firstSet(home, owner);
+
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "3"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toMatch(/could not confirm the transfer in tx 0x[0-9a-f]{64}; check it before retrying/);
+    expect(t.out).toEqual([]); // no {to, amount, txHash, usdcAfter}: nothing claims it was sent
+    expect(livePidHoldingLock(home)).toBeNull();
+    // The transfer really was mined as a success -- that is exactly what must not be trusted on its own -- and its
+    // receipt holds no log at all.
+    const tx = /tx (0x[0-9a-f]{64})/.exec(t.err.join("\n"))?.[1] as Hex;
+    const receipt = await publicClient().getTransactionReceipt({ hash: tx });
+    expect(receipt.status).toBe("success");
+    expect(receipt.from.toLowerCase()).toBe(wallet.toLowerCase());
+    expect(receipt.to?.toLowerCase()).toBe(fakeUsdc.toLowerCase());
+    expect(receipt.logs).toEqual([]);
+  });
+
+  it("fix round 4 (N4): USDC reaching the wallet in the transfer's own block cannot fail a withdraw -- balances decide nothing", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    // The chain as the daemon reads it when 5 USDC (a settlement payout, a top-up) reaches the wallet in the transfer's
+    // own block: every balance read at a block after `start` shows it. Across that block the balance then goes up by
+    // 2 instead of down by 3, which fix round 1's balance-delta check (M3) took for a transfer that never happened.
+    const daemon = proc.daemon as unknown as { usdcBalance(usdc: Address, blockNumber?: bigint): Promise<bigint> };
+    const real = daemon.usdcBalance.bind(daemon);
+    const start = await publicClient().getBlockNumber();
+    const spy = vi.spyOn(daemon, "usdcBalance").mockImplementation(async (usdc, blockNumber) => {
+      const at = blockNumber ?? (await publicClient().getBlockNumber());
+      const balance = await real(usdc, blockNumber);
+      return at > start ? balance + 5_000_000n : balance;
+    });
+    cleanups.push(() => spy.mockRestore());
+
+    const sent = await proc.daemon.withdraw({ amount: 3_000_000n });
+    const receipt = await publicClient().getTransactionReceipt({ hash: sent.txHash });
+    expect(receipt.blockNumber).toBe(start + 1n); // the block the inflow is modelled in
+    expect(sent).toMatchObject({ to: owner, amount: 3_000_000n, usdcAfter: 12_000_000n }); // 10 - 3 + 5, as read
+    expect(await usdcBalance(env.usdc, owner)).toBe(3_000_000n); // the owner started at 0: the delta is exact
+  });
+
+  it("fix round 4 (N4): a confirmed transfer whose balance cannot be read afterwards is a success -- usdcAfter null, and a note", async () => {
+    const port = await freePort();
+    const { env, home, wallet } = await walletHome({ port });
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    // The first read (the withdrawable balance) goes through; every one after the transfer fails, as on an RPC blip.
+    const daemon = proc.daemon as unknown as { usdcBalance(usdc: Address): Promise<bigint> };
+    const real = daemon.usdcBalance.bind(daemon);
+    let reads = 0;
+    const spy = vi
+      .spyOn(daemon, "usdcBalance")
+      .mockImplementation((usdc) => (++reads === 1 ? real(usdc) : Promise.reject(new Error("RPC blip"))));
+    cleanups.push(() => spy.mockRestore());
+
+    // Through the API (the daemon holds the lock), so the null crosses the wire and the CLI's own check.
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "2"], t.io), t.err.join("\n")).toBe(0);
+    expect(t.urls).toEqual([`http://127.0.0.1:${port}/withdraw`]);
+    const printed = t.json();
+    expect(Object.keys(printed)).toEqual(["to", "amount", "txHash", "usdcAfter"]);
+    expect(printed).toMatchObject({ to: owner, amount: "2.000000", usdcAfter: null });
+    expect(t.err).toEqual([`note: sent in tx ${String(printed.txHash)}; the balance could not be read`]);
+    expect(reads).toBe(2);
+    expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(8_000_000n);
+  });
+
+  it("fix round M1: open offers are reported as a note on stderr (a warning, not a refusal); the JSON keeps its four keys", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const offerId = `0x${randomBytes(32).toString("hex")}` as Hex;
+    writeJsonAtomic(arenaPaths(home).offerRecord(offerId), {
+      offerId,
+      offer: { expiresAt: 2n ** 40n },
+      sessionKey: generatePrivateKey(),
+      role: "offerer",
+    });
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], t.io), t.err.join("\n")).toBe(0);
+    expect(Object.keys(t.json())).toEqual(["to", "amount", "txHash", "usdcAfter"]);
+    expect(t.err.join("\n")).toMatch(new RegExp(`^note: this wallet still has 1 open offer\\(s\\) \\(${offerId}\\)`));
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+  });
+
+  it("with a daemon holding the lock, the CLI goes through its API; an owner change is picked up without a restart", async () => {
+    const port = await freePort();
+    const { env, home, wallet } = await walletHome({ port });
+    const first = await startDaemon(home);
+    expect(livePidHoldingLock(home)).toBe(process.pid);
+
+    // No owner yet: the daemon's own refusal comes back through the API, naming `owner set`.
+    const none = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], none.io)).toBe(1);
+    expect(none.err.join("\n")).toContain("owner set");
+    expect(none.urls).toEqual([`http://127.0.0.1:${port}/withdraw`]);
+    await first.stop();
+
+    // Owner A is recorded before the next daemon starts, so it is in that daemon's own start-time config too: the
+    // change to B below is only seen if the daemon really re-reads config.json on every withdraw.
+    const keyA = generatePrivateKey();
+    const ownerA = privateKeyToAccount(keyA).address;
+    await firstSet(home, ownerA);
+    const proc = await startDaemon(home);
+    const t1 = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], t1.io), t1.err.join("\n")).toBe(0);
+    expect(t1.urls).toEqual([`http://127.0.0.1:${port}/withdraw`]);
+    expect(t1.json()).toMatchObject({ to: ownerA, amount: "1.000000", usdcAfter: "9.000000" });
+    expect(await usdcBalance(env.usdc, ownerA)).toBe(1_000_000n);
+
+    // The owner changes (signed by A) while the same daemon keeps running: the next withdraw pays the new one.
+    const ownerB = newAddress();
+    await signedChange(home, wallet, keyA, ownerB, 0);
+    const t2 = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "2"], t2.io), t2.err.join("\n")).toBe(0);
+    expect(t2.json()).toMatchObject({ to: ownerB, amount: "2.000000", usdcAfter: "7.000000" });
+    expect(await usdcBalance(env.usdc, ownerB)).toBe(2_000_000n);
+    expect(await usdcBalance(env.usdc, ownerA)).toBe(1_000_000n);
+    expect(livePidHoldingLock(home)).toBe(process.pid); // still the test's own daemon: the CLI started none
+
+    // The API itself: no request can name a destination, both actors may withdraw, and a bad body is a 400.
+    const token = loadToken(home);
+    const post = (body: unknown, actor = "agent") =>
+      fetch(`${proc.apiUrl}/withdraw`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": actor },
+        body: JSON.stringify(body),
+      });
+    const attacker = newAddress();
+    for (const body of [
+      { amount: "1000000", to: attacker },
+      { all: true, owner: attacker },
+      { all: true, amount: "1" },
+      { all: "yes" },
+      { amount: 1 },
+      { amount: "-1" },
+      {},
+    ]) {
+      const res = await post(body);
+      expect(res.status, JSON.stringify(body)).toBe(400);
+    }
+    expect(await usdcBalance(env.usdc, attacker)).toBe(0n);
+    const asHuman = await post({ amount: "500000" }, "human");
+    expect(asHuman.status).toBe(200);
+    const body = (await asHuman.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ to: ownerB, amount: "500000", usdcAfter: "6500000" }); // base units on the wire
+    expect(await usdcBalance(env.usdc, ownerB)).toBe(2_500_000n);
+    expect(await usdcBalance(env.usdc, wallet)).toBe(6_500_000n);
+  });
+
+  it("fix round I1: a busy config.port fails a no-daemon withdraw cleanly -- exit 1 naming the port, lock released, nothing moved", async () => {
+    const port = await freePort();
+    const { env, home, wallet } = await walletHome({ port });
+    await firstSet(home, newAddress());
+    const squatter = createServer();
+    await new Promise<void>((r) => squatter.listen(port, "127.0.0.1", () => r()));
+    cleanups.push(() => new Promise<void>((r) => squatter.close(() => r())));
+
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain(`127.0.0.1:${port}`);
+    expect(t.err.join("\n")).toMatch(/EADDRINUSE/);
+    expect(livePidHoldingLock(home)).toBeNull();
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+  });
+
+  it("refuses (exit 1) when another live process holds the lock but serves no API -- it never starts a second daemon", async () => {
+    const port = await freePort(); // nothing listens here
+    const { env, home, wallet } = await walletHome({ port });
+    await firstSet(home, newAddress());
+    const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
+    cleanups.push(() => {
+      other.kill("SIGKILL");
+    });
+    expect(other.pid).toBeGreaterThan(0);
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: other.pid }));
+    expect(livePidHoldingLock(home)).toBe(other.pid);
+
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "1"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toMatch(/cannot be reached/);
+    expect(t.urls).toEqual([`http://127.0.0.1:${port}/withdraw`]);
+    expect(livePidHoldingLock(home)).toBe(other.pid); // its lock is untouched
+    expect(await usdcBalance(env.usdc, wallet)).toBe(10_000_000n);
+  });
+});
+
+describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
+  it("POST /withdraw answers 409 naming the channel while it awaits this wallet's deposit, and proceeds once its window closes", async () => {
+    const pair = await startPair();
+    cleanups.push(() => pair.cleanup());
+    // Alice offers, then goes away before she can fund: Bob accepts, so Bob (player 1) holds a channel in phase
+    // None that still awaits his own deposit -- he deposits the moment Alice's lands. (`wantsToFund` is false for
+    // him right now: only "fund on this tick" -- which is why the 409 must not use it.)
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.alice.daemon.stop();
+    await pair.bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => pair.bob.daemon.channelIds()[0], 20_000, "bob's match");
+    expect(pair.bob.daemon.handle(id).record.me).toBe(1);
+    expect((await pair.bob.daemon.hub.channelInfo(id)).phase).toBe("None");
+
+    const owner = newAddress();
+    await firstSet(pair.bob.home, owner);
+    const token = loadToken(pair.bob.home);
+    const api = await startApi(pair.bob.daemon, { port: 0, token });
+    cleanups.push(() => {
+      api.server.close();
+    });
+    const post = (body: unknown) =>
+      fetch(`${api.url}/withdraw`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: JSON.stringify(body),
+      });
+
+    for (const body of [{ all: true }, { amount: "1" }]) {
+      const res = await post(body);
+      expect(res.status, JSON.stringify(body)).toBe(409);
+      const { error } = (await res.json()) as { error: string };
+      expect(error).toContain(id);
+      expect(error).toMatch(/awaits this wallet's deposit/);
+    }
+    expect(await usdcBalance(pair.env.usdc, owner)).toBe(0n);
+
+    // A match still being turned into a channel counts too (it is about to await a deposit).
+    const claiming = (pair.bob.daemon as unknown as { claiming: Set<Hex> }).claiming;
+    const inFlight = `0x${"ab".repeat(32)}` as Hex;
+    claiming.add(inFlight);
+    await increaseTime(3601); // past the channel's funding deadline: that channel no longer holds a withdraw up...
+    const stillClaiming = await post({ amount: "1" });
+    expect(stillClaiming.status).toBe(409);
+    const { error } = (await stillClaiming.json()) as { error: string };
+    expect(error).toContain(inFlight);
+    expect(error).not.toContain(id);
+    claiming.delete(inFlight);
+
+    // ...and with nothing pending, the withdraw goes through.
+    const ok = await post({ amount: "1000000" });
+    expect(ok.status, await ok.clone().text()).toBe(200);
+    expect(await usdcBalance(pair.env.usdc, owner)).toBe(1_000_000n);
+  });
+
+  it("fix round M1: a match arriving while a withdraw is in flight waits for the next pass; a deferred match holds the next withdraw up (409)", async () => {
+    const pair = await startPair();
+    cleanups.push(() => pair.cleanup());
+    const bob = pair.bob.daemon as unknown as { withdrawing: boolean; retryMatches: Map<Hex, unknown> };
+    const owner = newAddress();
+    await firstSet(pair.bob.home, owner);
+
+    // Bob's withdraw is "in flight" while the host matches his accept: the match is deferred, not handled.
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    bob.withdrawing = true;
+    await pair.bob.daemon.acceptOffer(offerId);
+    await waitFor(() => bob.retryMatches.has(offerId), 20_000, "bob's deferred match");
+    await waitFor(() => pair.alice.daemon.channelIds().length === 1, 20_000, "alice's channel");
+    await new Promise((r) => setTimeout(r, 500)); // several main passes (pollMs 100): each one defers it again
+    expect(pair.bob.daemon.channelIds()).toEqual([]);
+    expect(bob.retryMatches.has(offerId)).toBe(true);
+
+    // The next withdraw starts in the same synchronous step the first one "ends" in: it sets `withdrawing` again
+    // before any pass can run, so the match stays deferred -- and the 409 names it.
+    bob.withdrawing = false;
+    const refused = pair.bob.daemon.withdraw({ amount: 1n });
+    await expect(refused).rejects.toMatchObject({ code: 409 });
+    await expect(refused).rejects.toThrow(offerId);
+    expect(await usdcBalance(pair.env.usdc, owner)).toBe(0n);
+
+    // With no withdraw in flight, the next pass handles the match: Bob's channel opens and funds as usual.
+    const id = await waitFor(() => pair.bob.daemon.channelIds()[0], 20_000, "bob's channel after the withdraw");
+    expect(id).toBe(pair.alice.daemon.channelIds()[0]);
+    await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(id)).phase === "Open", 30_000, "open");
+  });
+
+  /** The daemon internals the N3 tests drive: a match handed to `onMatch` as the host would push it. */
+  type MatchInternals = { withdrawing: boolean; retryMatches: Map<Hex, unknown>; onMatch(m: unknown): Promise<void> };
+  const randomId = () => `0x${randomBytes(32).toString("hex")}` as Hex;
+
+  it("fix round 4 (N3): a deferred match for an offer this home never posted holds no withdraw up; one for its own offer does", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    const d = proc.daemon as unknown as MatchInternals;
+
+    // The host pushes a match for an offer this home never posted while a withdraw is in flight: it is deferred like
+    // any other (the deferral comes before onMatch's own record check).
+    const stranger = randomId();
+    d.withdrawing = true;
+    await d.onMatch({ offerId: stranger, params: {} });
+    expect(d.retryMatches.has(stranger)).toBe(true);
+    d.withdrawing = false;
+    // The next withdraw starts before any main pass can drop it -- its 409 check runs synchronously here, as there is
+    // no channel to read -- and goes through.
+    const sent = await proc.daemon.withdraw({ amount: 1_000_000n });
+    expect(sent.to).toBe(owner);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+    await waitFor(() => !d.retryMatches.has(stranger), 20_000, "the stranger's match dropped by a main pass");
+
+    // The very same sequence for an offer this home did post (its record is on disk) is refused, naming the offer
+    // and saying what to do if it persists.
+    const own = randomId();
+    writeJsonAtomic(arenaPaths(home).offerRecord(own), {
+      offerId: own,
+      offer: { expiresAt: 2n ** 40n },
+      sessionKey: generatePrivateKey(),
+      role: "offerer",
+    });
+    d.withdrawing = true;
+    await d.onMatch({ offerId: own, params: {} });
+    d.withdrawing = false;
+    const refused = proc.daemon.withdraw({ amount: 1_000_000n });
+    await expect(refused).rejects.toMatchObject({ code: 409 });
+    await expect(refused).rejects.toThrow(`offer ${own} was matched`);
+    await expect(refused).rejects.toThrow(/funding window has closed\. If this persists, restart the daemon\.$/);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+  });
+
+  it("fix round 4 (N3): a match that fails on every pass holds withdraws up only until MAX_MATCH_RETRIES drops it, logged once", async () => {
+    const { env, home } = await walletHome(); // pollMs 100: a main pass, and so a retry, every 100 ms
+    const owner = newAddress();
+    await firstSet(home, owner);
+    // This home's own offer, but its record is corrupt: every attempt to handle its match throws (readJson).
+    const offerId = randomId();
+    mkdirSync(arenaPaths(home).offers, { recursive: true, mode: 0o700 });
+    writeFileSync(arenaPaths(home).offerRecord(offerId), "{ not json");
+    const logs: string[] = [];
+    const proc = await startDaemonProcess(home, { log: (l) => logs.push(l) });
+    cleanups.push(() => proc.stop());
+    const d = proc.daemon as unknown as MatchInternals;
+
+    await d.onMatch({ offerId, params: {} }); // the first failure: retried on the next pass
+    expect(d.retryMatches.has(offerId)).toBe(true);
+    const refused = proc.daemon.withdraw({ amount: 1_000_000n });
+    await expect(refused).rejects.toMatchObject({ code: 409 });
+    await expect(refused).rejects.toThrow(offerId);
+    await expect(refused).rejects.toThrow("If this persists, restart the daemon.");
+
+    const givingUp = () => logs.filter((l) => l.startsWith(`giving up on the match for offer ${offerId}`));
+    await waitFor(() => givingUp().length > 0, 30_000, "the capped match given up");
+    expect(givingUp()[0]).toContain(`after ${MAX_MATCH_RETRIES} failed attempts`);
+    expect(logs.filter((l) => l.startsWith("match handling failed"))).toHaveLength(MAX_MATCH_RETRIES - 1);
+    await new Promise((r) => setTimeout(r, 500)); // several more passes: it stays dropped, and is logged once
+    expect(d.retryMatches.has(offerId)).toBe(false);
+    expect(givingUp()).toHaveLength(1);
+
+    const sent = await proc.daemon.withdraw({ amount: 1_000_000n });
+    expect(sent.to).toBe(owner);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+  });
+});
+
+describe("confirmsTransfer: the receipt check behind withdraw (fix round 4, N4/N5)", () => {
+  const TOKEN = newAddress();
+  const WALLET = newAddress();
+  const OWNER = newAddress();
+  const OTHER = newAddress();
+  const AMOUNT = 3_000_000n;
+  const want = { token: TOKEN, from: WALLET, to: OWNER, amount: AMOUNT };
+  let logIndex = 0;
+  const log = (address: Address, topics: Hex[], data: Hex): Log =>
+    ({
+      address,
+      topics,
+      data,
+      blockHash: `0x${"aa".repeat(32)}`,
+      blockNumber: 7n,
+      logIndex: logIndex++,
+      transactionHash: `0x${"bb".repeat(32)}`,
+      transactionIndex: 0,
+      removed: false,
+    }) as Log;
+  /** An ERC-20 Transfer(from, to, value) emitted by `emitter`. */
+  const transfer = (emitter: Address, from: Address, to: Address, value: bigint): Log =>
+    log(emitter, encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from, to } }) as Hex[], encodeAbiParameters([{ type: "uint256" }], [value]));
+
+  it("accepts exactly Transfer(wallet -> owner, amount) from the configured token, whatever else the receipt holds", () => {
+    expect(confirmsTransfer([transfer(TOKEN, WALLET, OWNER, AMOUNT)], want)).toBe(true);
+    // USDC reaching the wallet in the same receipt (or block) changes nothing.
+    expect(confirmsTransfer([transfer(TOKEN, OTHER, WALLET, 5_000_000n), transfer(TOKEN, WALLET, OWNER, AMOUNT)], want)).toBe(true);
+    // Addresses compare case-insensitively.
+    const lower = { token: TOKEN.toLowerCase() as Address, from: WALLET.toLowerCase() as Address, to: OWNER.toLowerCase() as Address, amount: AMOUNT };
+    expect(confirmsTransfer([transfer(TOKEN, WALLET, OWNER, AMOUNT)], lower)).toBe(true);
+  });
+
+  it("refuses no log, another emitter, another party, another amount, and an ERC-721 Transfer", () => {
+    const erc721 = log(
+      TOKEN,
+      [...(encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from: WALLET, to: OWNER } }) as Hex[]), pad(toHex(AMOUNT))],
+      "0x",
+    );
+    for (const [what, logs] of [
+      ["no log (a transfer that returned false)", []],
+      ["the right event from another contract", [transfer(OTHER, WALLET, OWNER, AMOUNT)]],
+      ["to someone else", [transfer(TOKEN, WALLET, OTHER, AMOUNT)]],
+      ["from someone else", [transfer(TOKEN, OTHER, OWNER, AMOUNT)]],
+      ["the reverse direction", [transfer(TOKEN, OWNER, WALLET, AMOUNT)]],
+      ["less", [transfer(TOKEN, WALLET, OWNER, AMOUNT - 1n)]],
+      ["more", [transfer(TOKEN, WALLET, OWNER, AMOUNT + 1n)]],
+      ["the amount split in two", [transfer(TOKEN, WALLET, OWNER, 1_000_000n), transfer(TOKEN, WALLET, OWNER, 2_000_000n)]],
+      ["an ERC-721 Transfer (tokenId indexed)", [erc721]],
+      ["only an inflow", [transfer(TOKEN, OTHER, WALLET, AMOUNT)]],
+    ] as Array<[string, Log[]]>) {
+      expect(confirmsTransfer(logs, want), what).toBe(false);
+    }
+  });
+});

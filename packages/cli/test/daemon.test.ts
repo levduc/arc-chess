@@ -10,6 +10,7 @@ import { START, startPair, waitFor } from "./helpers/harness.js";
 /** Test-only escape hatch: onMatch/records are private/protected, but fix-round tests need to craft events. */
 type Internals = {
   onMatch(m: MatchEvent): Promise<void>;
+  markFinalized(l: unknown, phase: string): void;
   records: { saveOffer(r: unknown): void; offer(id: Hex): unknown };
   opts: { log?: (line: string) => void };
 };
@@ -185,6 +186,39 @@ describe("ArenaDaemon core", () => {
     await increaseTime(300);
     await find();
     expect(alice.daemon.handle(id).chain).toBe(chainBefore);
+  });
+
+  it("final fix wave M1: a status refresh still in flight when the channel is finalized never puts back its older phase", async () => {
+    const { alice, id } = await matched();
+    const hub = alice.daemon.hub;
+    const realChannelInfo = hub.channelInfo.bind(hub);
+    let entered!: () => void;
+    const inFlight = new Promise<void>((r) => (entered = r));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let armed = false;
+    // The seam: the one channelInfo read that status() starts below reads the chain, then waits at the gate, and
+    // answers "Challenged" -- a refresh that read the channel mid-dispute, landing after the timeout finalized it.
+    (hub as { channelInfo: HubClient["channelInfo"] }).channelInfo = async (cid) => {
+      if (!armed || cid !== id) return realChannelInfo(cid);
+      armed = false;
+      const info = await realChannelInfo(cid);
+      entered();
+      await gate;
+      return { ...info, phase: "Challenged" };
+    };
+    // status() reaches channelInfo synchronously, so the armed read is status()'s own, never a background tick's.
+    armed = true;
+    const pending = alice.daemon.status(id);
+    armed = false;
+    await inFlight;
+    internals(alice.daemon).markFinalized(alice.daemon.handle(id), "Finalized");
+    release();
+    const st = await pending;
+    expect(st.phase).toBe("Finalized");
+    expect(alice.daemon.handle(id).chain?.phase).toBe("Finalized");
+    // And it stays so: a finalized channel is never refreshed again.
+    expect((await alice.daemon.status(id)).phase).toBe("Finalized");
   });
 
   it("final review I3: settled channels leave live after the grace period; status and channels still serve them", async () => {
@@ -640,6 +674,9 @@ describe("watchtower", () => {
     // before the daemon's own call returns and sets `record.finalized` — the sync assignment right after
     // narrows this window to one RPC, it cannot close it. Wait for the flag rather than asserting it instantly.
     await waitFor(() => alice.daemon.handle(id).record.finalized, 5_000, "record.finalized");
+    // A settled channel's chain view is never refreshed again, so markFinalized itself must record the final phase:
+    // the dispute pass's timeout path used to leave `status` on "Challenged" for good.
+    expect((await alice.daemon.status(id)).phase).toBe("Finalized");
   });
 
   it("does not time out a challenge in which it is on move", async () => {
@@ -747,5 +784,7 @@ describe("watchtower", () => {
     await increaseTime(3601);
     await waitFor(async () => (await pair.alice.daemon.hub.channelInfo(id)).phase === "Reclaimed", 20_000, "reclaim");
     expect(await usdcBalance(pair.env.usdc, pair.alice.address)).toBe(START);
+    await waitFor(() => pair.alice.daemon.handle(id).record.finalized, 5_000, "record.finalized");
+    expect((await pair.alice.daemon.status(id)).phase).toBe("Reclaimed");
   });
 });

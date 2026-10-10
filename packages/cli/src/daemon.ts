@@ -1,6 +1,18 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { createPublicClient, defineChain, erc20Abi, http, TransactionNotFoundError, type Chain, type Hex, type PublicClient } from "viem";
+import {
+  createPublicClient,
+  defineChain,
+  erc20Abi,
+  http,
+  parseEventLogs,
+  TransactionNotFoundError,
+  type Address,
+  type Chain,
+  type Hex,
+  type Log,
+  type PublicClient,
+} from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ArenaProtocolError,
@@ -51,8 +63,11 @@ import {
   type ArenaConfig,
 } from "./config.js";
 import { FileSessionStore } from "./fileStore.js";
+import { formatUsdc6 } from "./funding.js";
+import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
+import { selfCommand } from "./version.js";
 
 export type Actor = "agent" | "human";
 
@@ -344,9 +359,44 @@ export const SWEEP_PENDING_PROBES = 3;
  *  marked degraded (reported by channels(), never picked or watched) instead of being retried forever. */
 export const MAX_OPEN_ATTEMPTS = 5;
 
+/** Plan 5.6 Task 3 fix round 4 (N3): a match whose handling fails this many times in a row (`retryMatches`) is
+ *  dropped, with one log line, instead of being retried -- and holding every withdraw at 409 -- for the daemon's
+ *  lifetime. Retries run once per main pass, so 20 is at least 40 s of failures at the default 2 s `pollMs`, and
+ *  minutes when each attempt waits out RPC timeouts: long enough to ride out an RPC blip. What still fails after
+ *  that (a corrupt offer record, a full disk, a dead RPC) is not fixed by retrying. Dropping loses nothing: the
+ *  offer record stays on disk, the next `start()` watches it again and the host replays the match. That is why the
+ *  withdraw 409 says to restart the daemon if it persists. Only failures count; a match deferred by a withdraw in
+ *  flight is not a failure. Like `MAX_OPEN_ATTEMPTS`, which degrades a channel that keeps failing to open (an
+ *  `openChannel` failure counts here too, so that cap is reached first). */
+export const MAX_MATCH_RETRIES = 20;
+
 /** The hub error names that mean "this deposit cannot go through right now because of a launch limit" (spec §13),
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
+
+/**
+ * Plan 5.6 Task 3 (spec §4.4): the USDC `withdraw()` always leaves in the wallet. 0 on every chain this daemon runs
+ * on today, whose gas is native, so `withdraw --all` empties the wallet's USDC.
+ * Plan 6: Arc USDC-gas reserve -- on Arc, gas is paid in USDC, and live channels' session keys are refilled from
+ * this wallet (`ensureSessionGas`), so a reserve for those refills belongs here.
+ */
+export function withdrawReserve(): bigint {
+  return 0n;
+}
+
+/**
+ * Plan 5.6 Task 3 fix round 4 (N4, N5; spec §4.4): true when `logs` -- a transfer's receipt logs -- hold an ERC-20
+ * `Transfer(from, to, amount)` emitted by `token`. It is the one proof `withdraw()` accepts that the money moved. A
+ * token whose `transfer` returns `false` emits no such log. A log from any other emitter, with any other party or
+ * amount, or that does not decode as the ERC-20 event (an ERC-721 `Transfer` indexes its third field), never counts.
+ * Other logs in the same receipt, such as USDC reaching the wallet in the same transaction, change nothing.
+ */
+export function confirmsTransfer(logs: Log[], t: { token: Address; from: Address; to: Address; amount: bigint }): boolean {
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  return parseEventLogs({ abi: erc20Abi, eventName: "Transfer", logs }).some(
+    (l) => same(l.address, t.token) && same(l.args.from, t.from) && same(l.args.to, t.to) && l.args.value === t.amount,
+  );
+}
 
 /** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
@@ -377,6 +427,12 @@ function checkHandoffNote(note: string): void {
   }
 }
 
+/** The chain view of a settled channel whose full on-chain state is not (or no longer) at hand: only its final
+ *  phase matters to `buildStatus` once the record is finalized. */
+function finalChainView(phase: string): ChainView {
+  return { phase, funded: [false, false], deadline: 0n, challenger: 0, registeredTurn: null, cooldownUntil: [0n, 0n], now: 0n };
+}
+
 export class ArenaDaemon {
   readonly client: PublicClient;
   readonly hub: HubClient;
@@ -396,6 +452,9 @@ export class ArenaDaemon {
   protected readonly sweepQueue = new Map<Hex, SweepQueueEntry>();
   /** Plan 5 fix round (I5): `sweep()` is single-flight -- a concurrent call is refused with 409. */
   private sweeping = false;
+  /** Plan 5.6 Task 3: `withdraw()` is single-flight too -- two concurrent `--all`s would both read the same
+   *  balance and race to send it. A concurrent call is refused with 409. */
+  private withdrawing = false;
   protected readonly changes = new EventEmitter();
   private timer: NodeJS.Timeout | undefined;
   private unsubscribers: Array<() => void> = [];
@@ -415,6 +474,9 @@ export class ArenaDaemon {
    *  next tick. The host sends a match once per subscription, so without a retry one failed read at match time
    *  left the channel unopened (and unfunded) for good. Explicit rejections are never retried. */
   private readonly retryMatches = new Map<Hex, MatchEvent>();
+  /** Fix round 4 (N3): consecutive failed attempts to handle a match, by offerId -- capped at `MAX_MATCH_RETRIES`.
+   *  Cleared by any attempt that does not fail. */
+  private readonly matchFailures = new Map<Hex, number>();
   private readonly aborter = new AbortController();
   /** Plan 4.5 Task 10 re-review (M5): failed attempts to open a recorded channel, by channel id. */
   private readonly openFailures = new Map<Hex, number>();
@@ -609,6 +671,183 @@ export class ArenaDaemon {
     return l;
   }
 
+  // ------------------------------------------------------------------ wallet: withdraw (Plan 5.6 Task 3)
+
+  /**
+   * Plan 5.6 Task 3 (spec §4.4): sends `amount` USDC (or, with `all`, everything above `withdrawReserve()`) from
+   * this wallet to the owner recorded in `<home>/config.json` -- re-read on every call, so `arena owner set` needs
+   * no restart, and re-validated, so a hand-edited owner that is malformed, the zero address, this wallet, the hub,
+   * the token, the rules contract or a session key is refused rather than paid. The destination is never a
+   * parameter. Sent through `this.wallet`, the same `SerialTxSender` every deposit and refill uses, so it takes its
+   * place in the wallet's one nonce sequence. Refused (409) while any channel still awaits this wallet's own
+   * deposit (`channelsAwaitingOwnDeposit`, Review Focus 4), so it never starves a deposit the daemon is about to make.
+   */
+  async withdraw(
+    req: { amount: bigint } | { all: true },
+  ): Promise<{ to: Address; amount: bigint; txHash: Hex; usdcAfter: bigint | null; note?: string; openOffers?: Hex[] }> {
+    if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
+    if (this.withdrawing) throw new DaemonError(409, "a withdraw is already in progress: retry shortly");
+    this.withdrawing = true;
+    try {
+      const owner = this.recordedOwner();
+      if ("amount" in req && req.amount <= 0n) throw new DaemonError(400, "amount must be greater than 0");
+
+      const awaiting = await this.channelsAwaitingOwnDeposit();
+      if (awaiting.reasons.length > 0) {
+        throw new DaemonError(
+          409,
+          `${awaiting.reasons.join("; ")} -- a withdraw now could leave it without the USDC to deposit. Retry once it is ` +
+            "funded, or once its funding window has closed" +
+            // Fix round 4 (N3): a retried match that keeps failing holds withdraws up until MAX_MATCH_RETRIES drops it.
+            (awaiting.retriedMatches > 0 ? ". If this persists, restart the daemon." : ""),
+        );
+      }
+
+      const usdc = this.opts.config.usdc;
+      const balance = await this.usdcBalance(usdc);
+      const reserve = withdrawReserve();
+      const withdrawable = balance > reserve ? balance - reserve : 0n;
+      const amount = "all" in req ? withdrawable : req.amount;
+      const closeFirst =
+        `funds escrowed in channels are not in the wallet: close open channels first (${selfCommand()} close), then withdraw`;
+      if (amount <= 0n) throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC; ${closeFirst}`);
+      if (amount > withdrawable) {
+        throw new DaemonError(
+          400,
+          `${formatUsdc6(amount)} USDC is more than this wallet can withdraw (${formatUsdc6(withdrawable)} USDC); ${closeFirst}`,
+        );
+      }
+      if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
+      let receipt: Awaited<ReturnType<HubClient["transfer"]>>;
+      try {
+        receipt = await this.hub.transfer(this.wallet, usdc, owner, amount);
+      } catch (err) {
+        if (err instanceof HubRevertError) throw new DaemonError(409, `the USDC transfer to ${owner} was refused: ${err.message}`);
+        throw err;
+      }
+      const txHash = receipt.transactionHash;
+      // Task 3 fix round 4 (N4, N5; spec §4.4): a mined, successful transfer is not proof the money moved -- a token
+      // can return `false` (as a blocklisted recipient may) without reverting. Success is the receipt's own
+      // Transfer(wallet -> owner, amount) log from the configured USDC, never a balance delta: a same-block inflow (a
+      // settlement payout, a top-up) or, on Arc, USDC gas skews those both ways (fix round 1's M3 check, replaced).
+      if (!confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: owner, amount })) {
+        throw new DaemonError(502, `could not confirm the transfer in tx ${txHash}; check it before retrying`);
+      }
+      this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
+      // For display only: the transfer is confirmed, so a read that fails now (an RPC blip) must not turn it into an
+      // error that invites a second withdraw.
+      let usdcAfter: bigint | null = null;
+      let note: string | undefined;
+      try {
+        usdcAfter = await this.usdcBalance(usdc);
+      } catch {
+        note = `sent in tx ${txHash}; the balance could not be read`;
+      }
+      // M1: this wallet's open offers (posted, or accepted and not yet matched) are not refused -- they hold no funds
+      // yet -- but one matched now may find the wallet short, so they are reported for the caller to warn about.
+      const openOffers = this.records.offers().map((r) => r.offerId);
+      return {
+        to: owner,
+        amount,
+        txHash,
+        usdcAfter,
+        ...(note !== undefined ? { note } : {}),
+        ...(openOffers.length > 0 ? { openOffers } : {}),
+      };
+    } finally {
+      this.withdrawing = false;
+    }
+  }
+
+  /** The wallet's USDC balance at the latest block. */
+  private usdcBalance(usdc: Address): Promise<bigint> {
+    return this.client.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [this.wallet.address] });
+  }
+
+  /** The owner `withdraw()` pays, read from config.json now (never from `opts.config`, which is the config at
+   *  start) and checked against the same rules `arena owner set` applies. */
+  private recordedOwner(): Address {
+    let raw: string | null;
+    try {
+      raw = readRecordedOwner(this.opts.home);
+    } catch (err) {
+      throw new DaemonError(500, errorText(err));
+    }
+    if (raw === null) throw new DaemonError(400, noOwnerMessage(selfCommand()));
+    try {
+      return validateOwner(raw, forbiddenOwners(this.opts.home, this.opts.config, this.wallet.address));
+    } catch (err) {
+      throw new DaemonError(400, `the owner recorded in config.json cannot be paid: ${errorText(err)}`);
+    }
+  }
+
+  /**
+   * Plan 5.6 Task 3 (Review Focus 4): every channel that still awaits this wallet's own deposit, each described
+   * in one phrase naming its id -- empty when none does. A channel awaits it when it is not finalized (live, or
+   * recorded on disk and not degraded) and, read from the chain now, its phase is `None` or `Funding`, this
+   * player's side is not funded, and the funding deadline has not passed. That is every state from which the
+   * main pass (`watch`) will still call `fund()` -- not only `wantsToFund`'s "fund on this tick": an accepter
+   * (player 1) waiting for the offerer's deposit deposits the moment it lands. A channel past its deadline never
+   * gets this wallet's deposit (it is retired, or reclaimed), so it does not hold a withdraw up. A match being
+   * turned into a channel record right now (`claiming`), or waiting in `retryMatches` for the next pass (fix round
+   * 1, M1), is about to become such a channel, so it counts too -- but only while this home still holds an offer
+   * record or a channel record for it (fix round 4, N3). `retriedMatches` counts those.
+   * A chain read that fails throws: whether a deposit is pending must be known, not assumed.
+   */
+  protected async channelsAwaitingOwnDeposit(): Promise<{ reasons: string[]; retriedMatches: number }> {
+    const candidates = new Map<Hex, ChannelRecord>();
+    for (const l of this.live.values()) if (!l.record.finalized) candidates.set(l.record.channelId, l.record);
+    for (const r of this.records.channels()) {
+      if (!r.finalized && !candidates.has(r.channelId) && !this.degraded.has(r.channelId) && !this.live.has(r.channelId)) {
+        candidates.set(r.channelId, r);
+      }
+    }
+    const out: string[] = [];
+    if (candidates.size > 0) {
+      let now: bigint;
+      try {
+        now = (await this.client.getBlock()).timestamp;
+      } catch (err) {
+        throw new DaemonError(503, `could not read the chain to check for pending deposits: ${errorText(err)}`);
+      }
+      for (const r of candidates.values()) {
+        let info: Awaited<ReturnType<HubClient["channelInfo"]>>;
+        try {
+          info = await this.hub.channelInfo(r.channelId);
+        } catch (err) {
+          throw new DaemonError(503, `could not read channel ${r.channelId} to check for a pending deposit: ${errorText(err)}`);
+        }
+        if ((info.phase === "None" || info.phase === "Funding") && !info.funded[r.me] && now <= r.params.fundingDeadline) {
+          out.push(`channel ${r.channelId} still awaits this wallet's deposit (funding deadline ${r.params.fundingDeadline})`);
+        }
+      }
+    }
+    for (const offerId of this.claiming) out.push(`offer ${offerId} is being matched into a channel that will await this wallet's deposit`);
+    // Task 3 fix round 1 (M1): a match whose handling failed (or was deferred by a withdraw) and is retried on the
+    // next pass is just as close to becoming such a channel. Fix round 4 (N3): only if this home can still turn it
+    // into one. A match the host pushed for an offer this home never posted is deferred too (the deferral comes
+    // before onMatch's own record check), and is dropped on the next pass: it must not hold a withdraw up.
+    let retriedMatches = 0;
+    for (const offerId of this.retryMatches.keys()) {
+      if (this.claiming.has(offerId) || !this.hasMatchRecord(offerId)) continue;
+      retriedMatches++;
+      out.push(`offer ${offerId} was matched and its channel, still being set up, will await this wallet's deposit`);
+    }
+    return { reasons: out, retriedMatches };
+  }
+
+  /** Fix round 4 (N3): true when this home holds a channel record or an offer record for `offerId`. An offer record
+   *  that cannot be read counts: it is still this home's offer, and `MAX_MATCH_RETRIES` bounds how long its match
+   *  is retried. `offerId` is canonical here (`onMatch` checks it before deferring), so it is a safe file name. */
+  private hasMatchRecord(offerId: Hex): boolean {
+    if (this.channelForOffer(offerId) !== null) return true;
+    try {
+      return this.records.offer(offerId) !== null;
+    } catch {
+      return true;
+    }
+  }
+
   // ------------------------------------------------------------------ lobby
 
   /**
@@ -791,6 +1030,14 @@ export class ArenaDaemon {
     // offer watched forever is exactly what exhausted the host connection's per-connection watch-slot cap and
     // left this daemon permanently unable to hear of new matches as an offerer -- see the Task 11 report.
     this.opts.lobby.unwatch([offerId]);
+    // Task 3 fix round 1 (M1): a withdraw in flight is moving this wallet's USDC. A match handled now could open a
+    // channel whose deposit then finds the wallet short, so it waits for the next pass (`retryMatches`), after the
+    // transfer. Synchronous with the check above: no await separates the two, so a retried match is re-deferred
+    // atomically. withdraw()'s 409 check counts deferred matches, so a later withdraw waits for them in turn.
+    if (this.withdrawing) {
+      this.retryMatches.set(offerId, m);
+      return;
+    }
     // I3: claim the offerId synchronously, before any await, so a second match event for the same offer
     // (concurrent or back-to-back) bails here instead of racing this call to open a second channel.
     if (this.claiming.has(offerId)) return;
@@ -804,6 +1051,7 @@ export class ArenaDaemon {
         claimed = false;
       }
     };
+    let failed = false;
     try {
       // Plan 4.5 Task 10 review: a retried match whose channel record is already on disk but not live (openChannel
       // failed after the record was saved) opens that channel now, instead of being ignored as a duplicate.
@@ -930,9 +1178,24 @@ export class ArenaDaemon {
       this.notify();
       this.fireAndForget("tick", this.tick());
     } catch (err) {
+      failed = true;
       release();
+      // Fix round 4 (N3): retried on the next pass, but not forever -- see MAX_MATCH_RETRIES.
+      const failures = (this.matchFailures.get(offerId) ?? 0) + 1;
+      if (failures >= MAX_MATCH_RETRIES) {
+        this.matchFailures.delete(offerId);
+        this.retryMatches.delete(offerId);
+        this.log(
+          `giving up on the match for offer ${offerId} after ${failures} failed attempts: ${errorText(err)} ` +
+            "(a daemon restart watches its offer again, and the host replays the match)",
+        );
+        return;
+      }
+      this.matchFailures.set(offerId, failures);
       if (!this.stopped) this.retryMatches.set(offerId, m);
       this.log(`match handling failed (retried on the next tick): ${errorText(err)}`);
+    } finally {
+      if (!failed) this.matchFailures.delete(offerId);
     }
   }
 
@@ -2381,17 +2644,7 @@ export class ArenaDaemon {
     } catch {
       return null; // a record for another hub or chain (see openChannel)
     }
-    const chain: ChainView | null = record.finalPhase
-      ? {
-          phase: record.finalPhase,
-          funded: [false, false],
-          deadline: 0n,
-          challenger: 0,
-          registeredTurn: null,
-          cooldownUntil: [0n, 0n],
-          now: 0n,
-        }
-      : null;
+    const chain: ChainView | null = record.finalPhase ? finalChainView(record.finalPhase) : null;
     return buildStatus({ record, snapshot: session.snapshot(), myTurn: session.isMyTurn(), chain, lastError: null });
   }
 
@@ -2474,6 +2727,10 @@ export class ArenaDaemon {
     if (phase === "Finalized" || phase === "Reclaimed") l.settledWake = true;
     // Plan 5 Task 1 (mainnet gates: settled index): recorded so the index start() loads can sort by settle time.
     l.record = { ...l.record, finalized: true, finalPhase: phase, settledAt: Date.now() };
+    // A settled channel's chain view is never refreshed again (status/channels skip it, I1), so it must carry the
+    // final phase from this moment on: settleCheck's own refresh lands one RPC later (or fails), and the reclaim and
+    // timeout paths never refresh at all -- without this, `status` kept reporting "Open"/"Challenged" for good.
+    l.chain = l.chain ? { ...l.chain, phase } : finalChainView(phase);
     this.records.saveChannel(l.record);
     this.opts.relay.leave(l.record.channelId);
   }
@@ -2803,8 +3060,12 @@ export class ArenaDaemon {
       blockNow = block.timestamp;
     }
     const registeredTurn = info.hasRegistered ? (await this.hub.registeredState(id)).turnNum : null;
+    // Final fix wave (M1): a refresh started before the channel was finalized (a `status` that read "Challenged")
+    // can land after `markFinalized` -- and nothing refreshes a finalized channel again, so its phase must stay the
+    // final one rather than this read's older view.
+    const finalPhase = l.record.finalized ? l.record.finalPhase : undefined;
     l.chain = {
-      phase: info.phase,
+      phase: finalPhase ?? info.phase,
       funded: info.funded,
       deadline: info.deadline,
       challenger: info.challenger,
@@ -2866,7 +3127,7 @@ export class ArenaDaemon {
 
   protected requireController(l: ChannelHandle, actor: Actor): void {
     if (actor !== l.record.controller) {
-      throw new DaemonError(409, `the ${l.record.controller} is in control of this channel (use "arena handoff")`);
+      throw new DaemonError(409, `the ${l.record.controller} is in control of this channel (use "${selfCommand()} handoff")`);
     }
   }
 
