@@ -3060,8 +3060,12 @@ export class ArenaDaemon {
       blockNow = block.timestamp;
     }
     const registeredTurn = info.hasRegistered ? (await this.hub.registeredState(id)).turnNum : null;
+    // Final fix wave (M1): a refresh started before the channel was finalized (a `status` that read "Challenged")
+    // can land after `markFinalized` -- and nothing refreshes a finalized channel again, so its phase must stay the
+    // final one rather than this read's older view.
+    const finalPhase = l.record.finalized ? l.record.finalPhase : undefined;
     l.chain = {
-      phase: info.phase,
+      phase: finalPhase ?? info.phase,
       funded: info.funded,
       deadline: info.deadline,
       challenger: info.challenger,
