@@ -191,7 +191,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "  refills the channel on its next pass. Returned once; `status` keeps showing it until it is fixed.",
     "- `human-must-move`: the opponent challenged, and a human you handed the seat to must move before the deadline in",
     "  `status`. Tell your human. Returned once per challenge (see \"Handing off to a human\" below).",
-    "`status` always lists `suggestedActions` — prefer them, but they (and `daemon`'s `boardHint`) are written as",
+    "`status` always lists `suggestedActions` — prefer them, but they are written as",
     `\`arena <subcommand>\` (e.g. \`arena next-game\`): replace that leading \`arena\` with \`${cmd}\`, the command this`,
     "page names at the top, and add `--channel <id>` as in the recipe.",
     "",

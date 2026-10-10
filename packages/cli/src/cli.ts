@@ -62,7 +62,7 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
           [--wait-for-usdc A] [--wait-for-native B] [--timeout SECONDS (default 1800, max 3600)]
-          (with a --wait-for-* flag: polls every 5s -- override with ARENA_WAIT_POLL_MS -- until every given
+          (with a --wait-for-* flag: polls every 5s -- ARENA_WAIT_POLL_MS overrides it, never below 200 -- until every given
            threshold holds or the timeout passes, then prints the same JSON plus {reached, waitedSeconds}.
            Exit 0 once reached, 2 on timeout, 1 on error.)
   faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
@@ -106,6 +106,9 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   version  (prints this CLI's version)`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/** Final fix wave (M8): the fastest `wallet --wait-for-*` may poll, whatever `ARENA_WAIT_POLL_MS` says. */
+export const WAIT_POLL_FLOOR_MS = 200;
 
 /** Plan 5.5 Task 1: `init` auto-funds from the server's faucet only below this USDC balance (6 decimals). */
 const FAUCET_MIN_USDC_BALANCE = 20_000_000n;
@@ -156,7 +159,8 @@ export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: str
     pid: proc.pid,
     wallet: proc.wallet,
     board: `${proc.apiUrl}/board`,
-    boardHint: "run: arena board",
+    // Final fix wave (M5): the pinned npx form in the bundle, which an agent can run as is.
+    boardHint: `run: ${CLI_COMMAND} board`,
   };
 }
 
@@ -721,9 +725,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         throw new Error(`--timeout must be between 1 and 3600 seconds (the maximum is 3600s); got ${timeoutSeconds}`);
       }
       const timeoutMs = timeoutSeconds * 1000;
-      // A hidden test knob (Task 2 brief): production always polls every 5s.
+      // A hidden test knob (Task 2 brief): production always polls every 5s. Final fix wave (M8): never faster than
+      // every 200 ms -- this is the RPC the watchtower depends on, and a provider that rate-limits or bans this
+      // machine for a 1 ms poll degrades dispute handling.
       const pollMsRaw = io.env.ARENA_WAIT_POLL_MS;
-      const pollMs = pollMsRaw !== undefined && /^[0-9]+$/.test(pollMsRaw) && Number(pollMsRaw) > 0 ? Number(pollMsRaw) : 5000;
+      const pollMs = pollMsRaw !== undefined && /^[0-9]+$/.test(pollMsRaw) ? Math.max(WAIT_POLL_FLOOR_MS, Number(pollMsRaw)) : 5000;
 
       const startedAt = Date.now();
       for (;;) {
@@ -938,9 +944,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         { to: cfg.hub, data: encodeFunctionData({ abi: channelHubAbi, functionName: "feePerPlayer" }) },
         "latest",
       ]);
-      // Fix round 1 (Important): `init` only verifies the hub holds code when it derived chain settings from
-      // the server (`verifyChain`, skipped whenever every chain flag was given explicitly) -- so `cfg.hub` can
-      // reach `fund` completely unverified. A no-code address answers eth_call with "0x", not a revert, and
+      // Fix round 1 (Important): `init` checks the hub's code on every run (since Task 3 fix round 1, I3), but a
+      // home written before that, or a hand-edited config.json, can still name a hub with no code. A no-code
+      // address answers eth_call with "0x", not a revert, and
       // `hexToBigIntOrThrow` would silently turn that into a fee of 0n, under-asking the human by the real fee
       // (Review Focus 1). Reject it by name instead of trusting a zero read.
       if (feePerPlayerRaw === "0x") {
@@ -1129,7 +1135,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const cfg = loadConfig(home);
       if (cfg.chainId !== 31337 && !flags.has("allow-real-chain")) {
         throw new UsageError(
-          `refusing to run "arena bot" against chain ${cfg.chainId}: house bots are dev tooling for chain 31337 ` +
+          `refusing to run "${CLI_COMMAND} bot" against chain ${cfg.chainId}: house bots are dev tooling for chain 31337 ` +
             `only. Pass --allow-real-chain to run one on a real chain anyway.`,
         );
       }
@@ -1248,7 +1254,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         break;
       }
       case "move":
-        if (!arg) throw new UsageError("move needs a move, e.g. arena move e4");
+        if (!arg) throw new UsageError(`move needs a move, e.g. ${CLI_COMMAND} move e4`);
         request = {
           method: "POST",
           path: "/move",
@@ -1299,7 +1305,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     // Plan 5 fix round (I5): a daemon-wide sweep may not finish everything within its own time budget.
     if (cmd === "sweep" && typeof (payload as { remaining?: unknown }).remaining === "number") {
       const remaining = (payload as { remaining: number }).remaining;
-      if (remaining > 0) io.err(`note: ${remaining} channel(s) still need sweeping; rerun "arena sweep" to continue`);
+      if (remaining > 0) io.err(`note: ${remaining} channel(s) still need sweeping; rerun "${CLI_COMMAND} sweep" to continue`);
     }
     return 0;
   } catch (err) {

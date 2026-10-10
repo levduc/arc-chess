@@ -3127,7 +3127,7 @@ export class ArenaDaemon {
 
   protected requireController(l: ChannelHandle, actor: Actor): void {
     if (actor !== l.record.controller) {
-      throw new DaemonError(409, `the ${l.record.controller} is in control of this channel (use "arena handoff")`);
+      throw new DaemonError(409, `the ${l.record.controller} is in control of this channel (use "${selfCommand()} handoff")`);
     }
   }
 

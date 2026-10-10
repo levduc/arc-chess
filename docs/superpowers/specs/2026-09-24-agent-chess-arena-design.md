@@ -944,11 +944,12 @@ summary of what was actually built.
     shortfall is data, not an error; exit 1 only if the server or the hub cannot be read at all (including a hub
     address with no contract code — never silently read as a zero fee).
 52. **`arena wallet --wait-for-usdc A [--wait-for-native B] [--timeout S]`.** Polls both balances every 5 s
-    (overridable for tests via the hidden `ARENA_WAIT_POLL_MS`) until every given threshold holds or `--timeout`
+    (overridable for tests via the hidden `ARENA_WAIT_POLL_MS`, never below 200 ms) until every given threshold holds or `--timeout`
     (default 1800 s, max 3600 s) elapses, then prints `wallet`'s usual JSON plus `{reached, waitedSeconds}`. Exit
-    0 once reached, 2 on an actual elapsed timeout, 1 on a read error — a bad flag (a malformed amount, or a
-    timeout outside `[1, 3600]`) is deliberately a plain usage error, never exit 2, so an agent that sees exit 2
-    here reads it only as "timed out," never as "malfunctioned" (Review Focus 2). Plain `arena wallet` (no wait
+    0 once reached, 2 on an actual elapsed timeout, 1 on a read error — a bad value (a malformed amount, or a
+    timeout outside `[1, 3600]`) is deliberately a plain error (exit 1), not the CLI's usual usage error (exit 2),
+    so an agent that sees exit 2 here reads it only as "timed out," never as "malfunctioned" (Review Focus 2).
+    Only a flag given with no value at all is a usage error (exit 2), per the Task 2 ruling. Plain `arena wallet` (no wait
     flag) is unchanged.
 53. **The owner lock, amended after the Task 3 security review.** `owner` lives in `config.json`; `arena owner`
     reads `{owner}` (`null` if unset). The **first** set (`arena owner set <addr>` or `arena init --owner <addr>`)

@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
+import { selfCommand } from "./version.js";
 
 /**
  * Plan 5 Task 2 (Global Constraints): the board's own CSP, verbatim -- served on every response, JSON or static,
@@ -215,7 +216,7 @@ export async function startApi(
     const now = boardNow();
     while (sessionAttempts.length > 0 && sessionAttempts[0] <= now - 60_000) sessionAttempts.shift();
     if (sessionAttempts.length >= BOARD_SESSION_ATTEMPTS_PER_MINUTE) {
-      return send(res, 429, { error: "too many board sign-in attempts: wait a minute, then run `arena board` again" });
+      return send(res, 429, { error: `too many board sign-in attempts: wait a minute, then run \`${selfCommand()} board\` again` });
     }
     sessionAttempts.push(now);
     const b = await body(req);
@@ -223,7 +224,7 @@ export async function startApi(
     const expiresAt = boardCodes.get(code);
     if (expiresAt === undefined || expiresAt <= now) {
       if (expiresAt !== undefined) boardCodes.delete(code);
-      return send(res, 401, { error: "this board link has expired: run `arena board` again" });
+      return send(res, 401, { error: `this board link has expired: run \`${selfCommand()} board\` again` });
     }
     boardCodes.delete(code);
     return send(res, 200, { token: opts.token });

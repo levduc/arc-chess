@@ -158,6 +158,18 @@ describe("build-cli", () => {
     expect(result.stderr).toContain("usage: npx -y @arena/cli@0.1.0");
   });
 
+  it("final fix wave (M5): the bundle's own messages name the pinned npx command, never a bare \"arena\"", async () => {
+    const home = freshDir("arena-cli-noconfig-");
+    const result = await run(process.execPath, [join(outDir, "arena.mjs"), "wallet"], {
+      cwd: freshDir("arena-cli-run-"),
+      env: { PATH: dirname(process.execPath), HOME: home },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('run "npx -y @arena/cli@0.1.0 init" first');
+    // The startup line's board hint and the other agent-facing hints use the same selfCommand() form.
+    expect(bundleText).toContain("boardHint: `run: ${CLI_COMMAND} board`");
+  });
+
   it("names the manifest from ARENA_CLI_PACKAGE", async () => {
     const out = freshDir("arena-cli-pkg-");
     const result = await buildCli(out, { ARENA_CLI_PACKAGE: "@x/arena-test" });

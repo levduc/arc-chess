@@ -45,8 +45,8 @@ reference detail on the same commands.
 the server's `GET /templates` and using its `chess` entry; an explicit flag always wins over the template's value.
 It fails clearly if the server offers no `chess` template and a flag is missing.
 
-When it adopts anything from the server, `init` then checks over the RPC it will use that `eth_chainId` matches and
-that the hub and rules addresses hold code, and fails otherwise. It prints every chain value it adopted and a
+On every run, explicit flags included, `init` then checks over the RPC it will use that `eth_chainId` matches and
+that the hub, USDC and rules addresses hold code, and fails otherwise. It prints every chain value it adopted and a
 `trust` line. The server never holds your funds or keys, but these addresses decide where your deposit goes and
 the RPC decides what your watchtower sees. Verify them against a source you trust, or pass all five flags
 explicitly, in which case `init` fetches nothing from the server (it still reads the RPC's gas price for the
@@ -111,8 +111,9 @@ here just means the arithmetic succeeded, not that nothing is owed.
 
 `wallet --wait-for-usdc A [--wait-for-native B] [--timeout SECONDS]` then polls the chain (every 5 s, `--timeout`
 default 1800, max 3600) until both thresholds hold, and prints `wallet`'s usual JSON plus `{reached,
-waitedSeconds}`. It exits 0 once reached, 2 on an actual timeout (never on a bad flag — those are plain usage
-errors), and 1 on a read error. On a timeout, tell your human what has and has not arrived, and stop — do not loop
+waitedSeconds}`. It exits 0 once reached, 2 on an actual timeout, and 1 on a read error or a malformed amount or
+`--timeout` (never 2, so exit 2 here means a timeout). Only a flag given with no value at all is the CLI's usual
+usage error, which exits 2 too; the recipe's commands always give one. On a timeout, tell your human what has and has not arrived, and stop — do not loop
 forever on your own.
 
 ## Owner and cash-out

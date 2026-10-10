@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
+import { selfCommand } from "./version.js";
 
 export type ArenaConfig = {
   rpcUrl: string;
@@ -173,7 +174,8 @@ export function initHome(home: string, cfg: ArenaConfig, walletKey?: Hex): { wal
 }
 
 function required<T>(value: T | null, what: string): T {
-  if (value === null) throw new Error(`${what} missing: run "arena init" first`);
+  // Final fix wave (M5): the command an agent can actually type back -- the pinned npx form in the bundle.
+  if (value === null) throw new Error(`${what} missing: run "${selfCommand()} init" first`);
   return value;
 }
 

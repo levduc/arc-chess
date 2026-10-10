@@ -649,6 +649,18 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
     expect(printed.native).toBe("1.0"); // proves --wait-for-native is actually checked, not just accepted
   }, 20_000);
 
+  it("final fix wave (M8): ARENA_WAIT_POLL_MS never polls faster than every 200 ms", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+    const t = fundIo(home, { env: { ARENA_WAIT_POLL_MS: "1" } });
+    expect(await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "2"], t.io)).toBe(2);
+    // Two reads (USDC, native) per poll. Unclamped, a 1 ms poll would make hundreds of calls in 2 s; at the 200 ms
+    // floor it is at most 2 x (2000 / 200 + 1) = 22.
+    const rpcCalls = t.calls.filter((c) => c.url.startsWith(RPC)).length;
+    expect(rpcCalls).toBeGreaterThanOrEqual(4);
+    expect(rpcCalls).toBeLessThanOrEqual(22);
+  }, 20_000);
+
   it("--timeout above 3600s exits 1 naming the maximum, for --wait-for-usdc and --wait-for-native alike", async () => {
     const env = await deployArena();
     const { home } = await initEmptyWallet(env);
