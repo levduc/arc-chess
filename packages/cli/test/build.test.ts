@@ -107,7 +107,7 @@ describe("build-cli", () => {
       type: "module",
       bin: { arena: "arena.mjs" },
       engines: { node: ">=24" },
-      files: ["arena.mjs", "board"],
+      files: ["arena.mjs", "board", "THIRD_PARTY_LICENSES"],
       license: "UNLICENSED",
     });
     expect(Object.prototype.hasOwnProperty.call(pkg, "dependencies")).toBe(false);
@@ -183,15 +183,62 @@ describe("build-cli", () => {
     expect(result.stderr).toContain("ARENA_CLI_LICENSE");
   }, 180_000);
 
-  it("--release writes the license and repository when both are set", async () => {
+  it("--release writes the package name, license and repository when all three are set", async () => {
     const out = freshDir("arena-cli-release-ok-");
-    const env = { ...baseEnv(), ARENA_CLI_LICENSE: "MIT", ARENA_CLI_REPOSITORY: "https://github.com/example/arena" };
+    const env = {
+      ...baseEnv(),
+      ARENA_CLI_PACKAGE: "@example/arena",
+      ARENA_CLI_LICENSE: "MIT",
+      ARENA_CLI_REPOSITORY: "https://github.com/example/arena",
+    };
     const result = await run(TSX_BIN, [BUILD_SCRIPT, "--out", out, "--release"], { cwd: REPO_ROOT, env });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     const pkg = JSON.parse(readFileSync(join(out, "package.json"), "utf8"));
+    expect(pkg.name).toBe("@example/arena");
     expect(pkg.license).toBe("MIT");
     expect(pkg.repository).toEqual({ type: "git", url: "git+https://github.com/example/arena.git" });
   }, 180_000);
+
+  it("Final fix wave (M3, K3): --release needs ARENA_CLI_PACKAGE -- never the placeholder -- and an empty or invalid one always fails", async () => {
+    const releaseEnv = { ARENA_CLI_LICENSE: "MIT", ARENA_CLI_REPOSITORY: "https://github.com/example/arena" };
+    const cases: Array<[NodeJS.ProcessEnv, string[], RegExp]> = [
+      [releaseEnv, ["--release"], /--release needs ARENA_CLI_PACKAGE set/],
+      // An unset GitHub variable expands to "": that must fail, not fall back to @arena/cli.
+      [{ ...releaseEnv, ARENA_CLI_PACKAGE: "" }, ["--release"], /ARENA_CLI_PACKAGE is set but empty/],
+      [{ ARENA_CLI_PACKAGE: "" }, [], /ARENA_CLI_PACKAGE is set but empty/],
+      [{ ...releaseEnv, ARENA_CLI_PACKAGE: "Not A Name" }, ["--release"], /is not a valid npm package name/],
+      [{ ARENA_CLI_PACKAGE: "evil && curl x | sh" }, [], /is not a valid npm package name/],
+    ];
+    for (const [env, args, message] of cases) {
+      const out = freshDir("arena-cli-pkgname-");
+      const result = await buildCli(out, env, args);
+      expect(result.status, JSON.stringify(env)).not.toBe(0);
+      expect(result.stderr).toMatch(message);
+      expect(existsSync(join(out, "package.json"))).toBe(false);
+    }
+  }, 180_000);
+
+  it("Final fix wave (M4): ships THIRD_PARTY_LICENSES, holding the license text of every bundled package, viem's and chess.js's included", () => {
+    const notices = readFileSync(join(outDir, "THIRD_PARTY_LICENSES"), "utf8");
+    const pnpmStore = join(REPO_ROOT, "node_modules/.pnpm");
+    const pkgDir = (prefix: string, name: string) => {
+      const entry = readdirSync(pnpmStore).find((d) => d.startsWith(prefix));
+      if (!entry) throw new Error(`test setup: no ${prefix}* in ${pnpmStore}`);
+      return join(pnpmStore, entry, "node_modules", name);
+    };
+    for (const [prefix, name, header] of [
+      ["viem@2.56.8", "viem", "viem@2.56.8 (MIT)"],
+      ["chess.js@1.4.0", "chess.js", "chess.js@1.4.0 (BSD-2-Clause)"],
+    ] as const) {
+      const dir = pkgDir(prefix, name);
+      const licenseFile = readdirSync(dir).find((f) => /^licen[cs]e/i.test(f));
+      expect(licenseFile, name).toBeDefined();
+      expect(notices).toContain(header);
+      expect(notices).toContain(readFileSync(join(dir, licenseFile!), "utf8").trimEnd());
+    }
+    // The other inlined dependencies are named too (each one's text is checked the same way by the build itself).
+    for (const name of ["ox@", "abitype@", "@noble/curves@", "@noble/hashes@", "@scure/bip32@"]) expect(notices).toContain(`\n${name}`);
+  });
 
   it("Final fix wave (C1): the bundle's init refuses a host that pins a different package -- naming it, with no install command -- and writes nothing", async () => {
     for (const [cli, expected, forbidden] of [

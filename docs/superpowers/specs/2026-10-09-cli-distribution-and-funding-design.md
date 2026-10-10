@@ -55,9 +55,14 @@ license are prerequisites, §6).
 - **Manifest:** the build writes `packages/cli/dist/package.json`:
   - `name` from `ARENA_CLI_PACKAGE` (default `@arena/cli`, a placeholder until the owner picks a name);
   - `version` from `packages/cli/package.json` (which gains `"version": "0.1.0"`);
-  - `bin: {"arena": "arena.mjs"}`, `type: "module"`, `engines: {"node": ">=24"}` (the project's Node floor; an earlier draft said 22, which nothing here tests), `files: ["arena.mjs", "board"]`;
+  - `bin: {"arena": "arena.mjs"}`, `type: "module"`, `engines: {"node": ">=24"}` (the project's Node floor; an earlier draft said 22, which nothing here tests), `files: ["arena.mjs", "board", "THIRD_PARTY_LICENSES"]`;
   - no `dependencies`; `license` and `repository` from `ARENA_CLI_LICENSE` / `ARENA_CLI_REPOSITORY` (the build
     fails if either is unset when `--release` is passed; a dev build fills `UNLICENSED` and omits `repository`).
+  - *Final fix wave (M3, K3):* `--release` also requires `ARENA_CLI_PACKAGE`. A set `ARENA_CLI_PACKAGE` must be a
+    valid npm name; an empty one fails the build and never falls back to the placeholder.
+- **Third-party notices** (final fix wave, M4): the build writes `dist/THIRD_PARTY_LICENSES`, the license text of
+  every npm package the bundle inlines. It finds them from esbuild's metafile and reads each package's own LICENSE
+  file from `node_modules`. A bundled package with no license file fails the build.
 - **`arena --version`** prints the version (the bundled build inlines it; the repo dev entry reads
   `packages/cli/package.json`).
 - The repo's dev entry (`packages/cli/bin/arena.mjs` with `tsx`) is unchanged, and so is `dev:up`'s wrapper.
