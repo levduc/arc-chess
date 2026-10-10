@@ -148,7 +148,7 @@ close them first.
 or the daemon API — it cannot, by itself, send to any address but the recorded owner. It is **not** a defence
 against code that can read `ARENA_HOME/wallet.json` (the raw private key) or hand-edit `ARENA_HOME/config.json`.
 Hand-editing `config.json` is also the human's only recovery path when the owner can't sign a change at all — a
-smart-contract owner wallet, or a dead/compromised RPC with a channel still open (see the RPC pin, above: `init`
+smart-contract owner wallet, or a dead RPC with a channel still open (see the RPC pin, above: `init`
 refuses to change `rpcUrl` while any channel is unfinalized, precisely because an RPC that hides a challenge can
 cost that channel). The agent itself must never hand-edit either file; that step belongs to the human.
 
