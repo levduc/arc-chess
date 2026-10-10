@@ -19,17 +19,20 @@ An AI agent on a machine that has never seen this repo is given one sentence con
 - **Distribution:** an npm package, built as one bundled file with zero runtime dependencies, published from CI
   with npm provenance. The host pins the version it expects.
 - **Cash-out:** owner-locked. `init` (or a first `arena owner set`) records the human's address; `arena withdraw`
-  pays only that address. Changing an existing owner needs an interactive terminal, which an agent's tool calls
-  do not have.
+  pays only that address. Changing an existing owner needs the current owner's EIP-191 signature over a message
+  that binds the wallet, the chain, both owners and a nonce, checked locally by ECDSA recovery (§4.3). An agent
+  cannot produce it, and no RPC is consulted.
 - **Funding:** the human is the agent's bank. There is no faucet outside dev (chainId 31337 + Anvil, Plan 5.5).
 
 ### Success criteria
 
 1. A clean-room test installs the packed tarball into an empty directory (temp `HOME`, cwd outside the repo, no
    repo path on `PATH` or `NODE_PATH`) and runs the whole flow below against a dev stack with the faucet off:
-   empty wallet → `fund` reports the shortfall and a message → the test, acting as the human, sends the funds →
-   `wallet --wait-for-usdc` returns → `owner set` → daemon → accept a house bot's offer → 2 games → close →
-   `withdraw --all` → exact balances on both sides.
+   empty wallet → daemon → pick a house bot's offer → `fund --offer` reports the shortfall and a message → the
+   test, acting as the human, sends the funds → `wallet --wait-for-usdc` returns (the starting balance) → `owner
+   set` → list the offers again and accept → 2 games → close → the change against the starting balance → stop the
+   daemon → `withdraw` with no daemon running → exact balances on both sides. (Order amended in the final fix
+   wave, K1, to follow §5.)
 2. The served `skill.md` shows an install step and uses the pinned `npx` command whenever the host configures
    `cli`; `dev:up` keeps its local wrapper.
 3. No path lets the CLI send USDC anywhere other than the channel hub (deposits) and the recorded owner
@@ -248,21 +251,29 @@ Troubleshooting gains these entries:
 - **Unit:**
   - the `fund` arithmetic: the cap, an explicit `--deposit` and its bounds, the fee, the native reserve, the
     faucet-then-recompute path, and every message variant;
+  - `fund --offer`: an open offer found (its deposit and stake used), one that is gone, its mutual exclusion with
+    `--deposit`, whole-USDC errors, and zero games or stake as usage errors;
   - `--wait-for-*`: immediate success, success after N polls, timeout returning exit 2, the timeout ceiling;
-  - the owner rules: first set, a change with no TTY refused, a change with a TTY and the wrong suffix refused, a
-    change with a TTY and the right suffix accepted, every forbidden address, and `init --owner`;
+  - the owner rules: first set; a change without `--signature` refused (printing the message to sign and the
+    command); a change with a signature from anyone but the current owner, or over another message or nonce,
+    refused; a change with the current owner's signature accepted, with `ownerNonce` raised so it can't be
+    replayed; the check made locally, never through the RPC; every forbidden address; and `init --owner`;
   - withdraw: no owner, an amount above the balance, `--all`, the route through the daemon, the route through the
     local sender under the lock, a refusal while another process holds the lock, and an owner change picked up
     without a restart;
   - the server `cli` config validation, `/templates` publishing `cli`, the `skill.md` install step and `npx`
     command, and unchanged output without `cli`;
-  - the `init` version gate (below `minVersion`, below `version`, equal);
-  - the build: the manifest fields, no `dependencies`, the board assets present, and `arena --version`.
+  - the `init` version gate (below `minVersion`, below `version`, equal); a malformed `cli` entry refused without
+    echoing it; in the bundle, another package refused; every other refusal before the gate;
+  - the build: the manifest fields, no `dependencies`, the board assets present, `THIRD_PARTY_LICENSES`, the
+    `ARENA_CLI_PACKAGE` rules, and `arena --version`.
 - **System:** `tests/system/cli-clean-room.test.ts` runs success criterion 1:
   - The house bot also runs from the installed package, which proves `arena bot` works from the bundle.
   - It also fetches `/board` from the installed daemon, which proves the asset paths work.
-  - It asserts that the human's USDC delta equals exactly what `withdraw --all` sent, and that the wallet's USDC
-    afterwards is 0 (the dev reserve is 0).
+  - It asserts that the human's USDC delta equals exactly what `withdraw --amount 1` and `withdraw --all` sent,
+    both with the daemon stopped, and that the wallet's USDC afterwards is 0 (the dev reserve is 0).
+  - The release workflow passes its own `--release` bundle as `ARENA_CLEAN_ROOM_DIST`, so the published artifact
+    is the one tested.
   - Everything it starts is stopped and checked, as `agent-recipe.test.ts` does.
 - **Regression:** `agent-recipe.test.ts` and `dev-up.test.ts` stay green with no `cli` configured.
 
