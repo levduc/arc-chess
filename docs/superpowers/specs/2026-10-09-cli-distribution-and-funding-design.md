@@ -95,18 +95,30 @@ license are prerequisites, §6).
 All amounts on the command line and in this section's output are whole-USDC decimals (`"10.010000"`), like
 `wallet`; native amounts are ether-style decimals.
 
-### 4.1 `arena fund --games N --stake X [--deposit D]`
+### 4.1 `arena fund --games N --stake X [--deposit D]` and `arena fund --offer <offerId> [--games N]`
 
 - Reads `/templates` (cap, faucet) and the chain: the hub's `feePerPlayer`, the wallet's USDC and native
   balances. No daemon needed.
 - `deposit = D` if given (must satisfy `X <= D <= cap`), else `min(N × X, cap)`.
+- *Added in the final fix wave (K1, I2):* `--offer <offerId>` sizes the ask for one open offer. `fund` reads the
+  server's public `GET /offers` from `serverUrl`, decodes its `{"$bigint": …}` wire format, and finds the offer by
+  id. It then uses that offer's `deposit` as `D` and its `stakePerGame` as `X`, so the agent never converts the base
+  units `offers` prints.
+  - `--offer` cannot be combined with `--deposit` or `--stake` (a usage error).
+  - `--games` is optional with `--offer`. It only shapes the "enough to play N games" message, and defaults to the
+    number of games the deposit covers.
+  - An offer that is not in the list exits 1 with "offer <id> is not open any more; run offers again".
+  - The output gains `offerId` and `stakePerGame` (whole USDC) after `chainId`.
+- `--games 0` and a zero `--stake` are usage errors. Every amount in `fund`'s errors, the cap included, is whole
+  USDC. The out-of-range error reads "deposit must be between the stake and the cap: <stake> to <cap> USDC (asked
+  for <deposit> USDC)", plus a hint that names `--deposit` or the offer.
 - `need.usdc = deposit + feePerPlayer`.
 - `need.native = sessionGasWei + FUND_TX_GAS_UNITS × feeCeilingWei` (one channel's dispute-gas reserve plus
   approve/deposit/close transaction gas; `FUND_TX_GAS_UNITS = 500_000n`; both inputs come from `config.json`).
 - `shortfall = max(0, need − have)` per asset.
 - If any shortfall is positive and the template advertises a faucet, call it (as `init` does) and re-read.
-- Output: `{address, chainId, deposit, feePerPlayer, usdc: {have, need, shortfall}, native: {have, need,
-  shortfall}, owner, faucet?, message}`. `message` is a ready-to-relay sentence, e.g. "Please send 10.010000 USDC
+- Output: `{address, chainId, offerId?, stakePerGame?, deposit, feePerPlayer, usdc: {have, need, shortfall},
+  native: {have, need, shortfall}, owner, faucet?, message}`. `message` is a ready-to-relay sentence, e.g. "Please send 10.010000 USDC
   and 0.85 native gas to 0x… on chain 31337." When `owner` is unset, it adds: "Also tell me the address to return
   winnings to." When nothing is short, it says so. Exit 0 whenever the computation succeeds — a shortfall is data,
   not an error.

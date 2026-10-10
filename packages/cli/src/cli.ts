@@ -1,6 +1,13 @@
 import { existsSync, mkdirSync, rmdirSync } from "node:fs";
 import { encodeFunctionData, formatUnits, parseUnits, type Address, type Hex } from "viem";
-import { channelHubAbi, DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
+import {
+  channelHubAbi,
+  decodeWire,
+  DEFAULT_FEE_CEILING_WEI,
+  offerId as computeOfferId,
+  parseSignedOffer,
+  type SignedOffer,
+} from "@arena/sdk";
 import { runBot } from "./bot.js";
 import { acquireHomeLock, livePidHoldingLock } from "./lock.js";
 import {
@@ -59,9 +66,12 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            threshold holds or the timeout passes, then prints the same JSON plus {reached, waitedSeconds}.
            Exit 0 once reached, 2 on timeout, 1 on error.)
   faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
-  fund --games N --stake X [--deposit D]
+  fund --games N --stake X [--deposit D]  |  fund --offer OFFER_ID [--games N]
        (works out what to ask your human for: reads /templates' deposit cap and faucet, the hub's
         feePerPlayer, and this wallet's balances -- no daemon needed. deposit defaults to min(N x X, cap).
+        --offer takes the deposit and stake of that open offer from the server's own lobby instead (it cannot be
+        combined with --deposit or --stake), and adds {offerId, stakePerGame} to the output; an offer that is no
+        longer open exits 1. Every amount, in the output and in errors, is in whole USDC.
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
         Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
         message is a ready-to-relay sentence. faucet is present only when a faucet call was attempted: on
@@ -794,21 +804,33 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     }
 
     if (cmd === "fund") {
-      // Plan 5.6 Task 2 (spec §4.1): works out what to ask the human for -- no daemon needed.
-      const cfg = loadConfig(home);
-      const { privateKeyToAccount } = await import("viem/accounts");
-      const address = privateKeyToAccount(loadWalletKey(home)).address;
-
-      const gamesRaw = need("games");
-      if (!/^[0-9]+$/.test(gamesRaw)) throw new UsageError("--games must be a positive whole number of games");
-      const games = BigInt(gamesRaw);
-
-      const stakeRaw = need("stake");
-      if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(stakeRaw)) {
-        throw new UsageError("--stake must be a non-negative USDC amount with at most 6 decimal places");
+      // Plan 5.6 Task 2 (spec §4.1): works out what to ask the human for -- no daemon needed. Every flag is checked
+      // before anything is read, so a usage error never costs a network call.
+      // Final fix wave (K1, I2): `--offer <offerId>` sizes the ask from one open offer on the server's public lobby
+      // (its own deposit and stake, so the agent never converts the base units `offers` prints); it replaces
+      // `--deposit` and `--stake`, and `--games` (optional with it) only shapes the message.
+      const offerRaw = flag("offer");
+      if (offerRaw !== undefined) {
+        for (const other of ["deposit", "stake"]) {
+          if (flags.has(other)) throw new UsageError(`--offer and --${other} are mutually exclusive: --offer uses the offer's own ${other === "stake" ? "stake" : "deposit"}`);
+        }
+        if (!/^0x[0-9a-fA-F]{64}$/.test(offerRaw)) throw new UsageError("--offer must be an offer id (0x followed by 64 hex characters), as offers lists it");
       }
-      const stake = parseUnits(stakeRaw, 6);
-
+      let games: bigint | undefined;
+      const gamesRaw = offerRaw !== undefined ? flag("games") : need("games");
+      if (gamesRaw !== undefined) {
+        // Final fix wave (M10): 0 is not a positive number of games.
+        if (!/^[0-9]+$/.test(gamesRaw) || BigInt(gamesRaw) === 0n) throw new UsageError("--games must be a positive whole number of games");
+        games = BigInt(gamesRaw);
+      }
+      let stake: bigint | undefined;
+      if (offerRaw === undefined) {
+        const stakeRaw = need("stake");
+        if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(stakeRaw) || parseUnits(stakeRaw, 6) === 0n) {
+          throw new UsageError("--stake must be a positive USDC amount with at most 6 decimal places");
+        }
+        stake = parseUnits(stakeRaw, 6);
+      }
       let explicitDeposit: bigint | undefined;
       const depositRaw = flag("deposit");
       if (depositRaw !== undefined) {
@@ -817,6 +839,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         }
         explicitDeposit = parseUnits(depositRaw, 6);
       }
+
+      const cfg = loadConfig(home);
+      const { privateKeyToAccount } = await import("viem/accounts");
+      const address = privateKeyToAccount(loadWalletKey(home)).address;
 
       // Read /templates for the chess template's deposit cap and (optional) faucet -- same shape init reads,
       // but fund needs no other field from it (the chain settings already live in this home's config.json).
@@ -838,6 +864,76 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const cap = BigInt(limits.maxDepositPerPlayer);
       const faucetUrl = typeof chess.faucet === "string" ? chess.faucet : undefined;
 
+      // Final fix wave (K1): the chosen offer, from the server's public lobby (the same list the daemon's `offers`
+      // shows, in the server's own {"$bigint": ...} wire format). Only its deposit and stake are used, to size the
+      // ask; the daemon still re-reads and verifies the offer when it is accepted.
+      let offerId: Hex | undefined;
+      if (offerRaw !== undefined) {
+        const offersUrl = `${cfg.serverUrl.replace(/\/$/, "")}/offers`;
+        let ores: Response;
+        try {
+          ores = await io.fetch(offersUrl, { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) });
+        } catch (err) {
+          throw new Error(`fetching ${offersUrl} failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (!ores.ok) throw new Error(`fetching ${offersUrl} failed with status ${ores.status}`);
+        let listed: unknown;
+        try {
+          listed = decodeWire(await ores.text());
+        } catch {
+          throw new Error(`server ${cfg.serverUrl} answered ${offersUrl} with a malformed body`);
+        }
+        if (!Array.isArray(listed)) throw new Error(`server ${cfg.serverUrl} answered ${offersUrl} with something other than a list`);
+        const wanted = offerRaw.toLowerCase();
+        let found: SignedOffer | undefined;
+        for (const entry of listed) {
+          let so: SignedOffer;
+          try {
+            so = parseSignedOffer(entry);
+          } catch {
+            continue; // not a well-formed signed offer (the daemon's own listOffers drops these too)
+          }
+          if (computeOfferId(so.offer).toLowerCase() === wanted) {
+            found = so;
+            break;
+          }
+        }
+        if (found === undefined) throw new Error(`offer ${offerRaw} is not open any more; run offers again`);
+        offerId = wanted as Hex;
+        explicitDeposit = found.offer.deposit;
+        stake = found.offer.stakePerGame;
+        // Only the message's "enough to play N games" uses N here: by default, as many games as the deposit covers.
+        games ??= stake > 0n && explicitDeposit >= stake ? explicitDeposit / stake : 1n;
+      }
+      if (stake === undefined || games === undefined) throw new Error("fund: internal error: no stake or games"); // unreachable
+      const fundStake: bigint = stake;
+      const fundGames: bigint = games;
+      // Final fix wave (I2): the range error is in whole USDC already; say which input it was about.
+      const rangeHint =
+        offerRaw !== undefined
+          ? `; offer ${offerId}'s deposit is outside this host's current cap -- pick another offer`
+          : depositRaw !== undefined
+            ? " (--deposit takes whole USDC)"
+            : "";
+      const computeNeed = (usdcHave: bigint, nativeHave: bigint): FundingNeed => {
+        try {
+          return computeFundingNeed({
+            games: fundGames,
+            stake: fundStake,
+            deposit: explicitDeposit,
+            cap,
+            feePerPlayer,
+            sessionGasWei: cfg.sessionGasWei,
+            feeCeilingWei,
+            usdcHave,
+            nativeHave,
+          });
+        } catch (err) {
+          if (err instanceof RangeError) throw new Error(`${err.message}${rangeHint}`);
+          throw err;
+        }
+      };
+
       const feePerPlayerRaw = await rpcCall(io, cfg.rpcUrl, "eth_call", [
         { to: cfg.hub, data: encodeFunctionData({ abi: channelHubAbi, functionName: "feePerPlayer" }) },
         "latest",
@@ -858,17 +954,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
       let usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
       let nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
-      let funding: FundingNeed = computeFundingNeed({
-        games,
-        stake,
-        deposit: explicitDeposit,
-        cap,
-        feePerPlayer,
-        sessionGasWei: cfg.sessionGasWei,
-        feeCeilingWei,
-        usdcHave,
-        nativeHave,
-      });
+      let funding: FundingNeed = computeNeed(usdcHave, nativeHave);
 
       // spec §4.1: call the faucet (as init does) only when something is actually short and the template
       // advertises one; never fails fund -- a failed top-up just leaves the shortfall for the human to cover.
@@ -879,17 +965,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           faucetReported = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
           usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
           nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
-          funding = computeFundingNeed({
-            games,
-            stake,
-            deposit: explicitDeposit,
-            cap,
-            feePerPlayer,
-            sessionGasWei: cfg.sessionGasWei,
-            feeCeilingWei,
-            usdcHave,
-            nativeHave,
-          });
+          funding = computeNeed(usdcHave, nativeHave);
         } catch (err) {
           faucetReported = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
         }
@@ -897,11 +973,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
       // Plan 5.6 Task 3: the owner recorded in config.json (`arena owner set` / `init --owner`), or null.
       const owner = cfg.owner ?? null;
-      const message = fundMessage(funding, { address, chainId: cfg.chainId, ownerSet: owner !== null, games, stake });
+      const message = fundMessage(funding, { address, chainId: cfg.chainId, ownerSet: owner !== null, games: fundGames, stake: fundStake });
 
       const body: Record<string, unknown> = {
         address,
         chainId: cfg.chainId,
+        // Final fix wave (K1): only with --offer -- the offer sized for, and its stake in whole USDC.
+        ...(offerId !== undefined ? { offerId, stakePerGame: formatUsdc6(fundStake) } : {}),
         deposit: formatUsdc6(funding.deposit),
         feePerPlayer: formatUsdc6(funding.feePerPlayer),
         usdc: { have: formatUsdc6(funding.usdc.have), need: formatUsdc6(funding.usdc.need), shortfall: formatUsdc6(funding.usdc.shortfall) },

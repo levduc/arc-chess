@@ -1,7 +1,8 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Address } from "viem";
+import type { Address, Hex } from "viem";
+import { offerId as computeOfferId, signOffer, toWire, type Offer } from "@arena/sdk";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
@@ -305,6 +306,8 @@ function fundIo(
     templatesBody?: unknown;
     faucetHandler?: (address: Address) => Promise<{ status: number; body: unknown }>;
     env?: Record<string, string>;
+    /** Final fix wave (K1): the server's public `GET /offers` reply, sent as is (already in wire format). */
+    offersText?: string;
   } = {},
 ) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -314,6 +317,7 @@ function fundIo(
     calls.push({ url, init });
     if (url.startsWith(RPC)) return fetch(url, init); // the real, deployed Anvil chain
     if (url.endsWith("/templates")) return new Response(JSON.stringify(opts.templatesBody ?? []), { status: 200 });
+    if (url.endsWith("/offers") && opts.offersText !== undefined) return new Response(opts.offersText, { status: 200 });
     if (url.endsWith("/faucet") && opts.faucetHandler) {
       const body = JSON.parse(String(init?.body ?? "{}")) as { address: Address };
       const r = await opts.faucetHandler(body.address);
@@ -492,6 +496,117 @@ describe("Plan 5.6 Task 2: arena fund", () => {
     // The shortfall still reflects the (unchanged) balances -- a failed top-up never fakes success.
     expect(printed.usdc).toEqual({ have: "0.000000", need: "3.005000", shortfall: "3.005000" });
     expect(printed.native).toEqual({ have: "0.0", need: "0.06", shortfall: "0.06" });
+  });
+});
+
+/** Final fix wave (K1): one signed offer, as the server's lobby holds it, and its id. */
+async function signedOffer(o: { deposit: bigint; stakePerGame: bigint }): Promise<{ id: Hex; so: { offer: Offer; sig: Hex } }> {
+  const key = generatePrivateKey();
+  const account = privateKeyToAccount(key);
+  const offer: Offer = {
+    template: "chess",
+    player: privateKeyToAccount(generatePrivateKey()).address,
+    signer: account.address,
+    deposit: o.deposit,
+    stakePerGame: o.stakePerGame,
+    challengeTimeout: 900n,
+    expiresAt: 4_000_000_000n,
+    nonce: `0x${"5a".repeat(32)}`,
+  };
+  return { id: computeOfferId(offer), so: { offer, sig: await signOffer(key, offer) } };
+}
+
+describe("Final fix wave (K1, I2, M10): arena fund --offer, whole-USDC errors, and zero is a usage error", () => {
+  it("--offer sizes the ask from that open offer's own deposit and stake (read from the server's /offers, $bigint wire format)", async () => {
+    const env = await deployArena();
+    const { home, address } = await initEmptyWallet(env);
+    const other = await signedOffer({ deposit: 2_000_000n, stakePerGame: 500_000n });
+    const chosen = await signedOffer({ deposit: 4_000_000n, stakePerGame: 1_000_000n });
+    const offersText = toWire([other.so, { junk: true }, chosen.so]);
+    expect(offersText).toContain('"$bigint"'); // the server's own wire format, not plain decimals
+
+    const t = fundIo(home, { templatesBody: CHESS_TEMPLATE(), offersText });
+    expect(await runCli(["fund", "--offer", chosen.id.toUpperCase().replace("0X", "0x")], t.io)).toBe(0);
+    expect(t.calls.map((c) => c.url)).toContain("http://127.0.0.1:3000/offers");
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "offerId", "stakePerGame", "deposit", "feePerPlayer", "usdc", "native", "owner", "message"]);
+    expect(printed.offerId).toBe(chosen.id);
+    expect(printed.stakePerGame).toBe("1.000000");
+    expect(printed.deposit).toBe("4.000000"); // the offer's deposit, in whole USDC -- no conversion by the agent
+    expect(printed.usdc).toEqual({ have: "0.000000", need: "4.005000", shortfall: "4.005000" });
+    expect(printed.message).toBe(`Please send 4.005000 USDC and 0.06 native gas to ${address} on chain 31337. Also tell me the address to return winnings to.`);
+
+    // --games is optional with --offer, and only shapes the "enough to play" message.
+    await mintUsdc(env.usdc, address, 5_000_000n);
+    await setEthBalance(address, 10n ** 18n);
+    const t2 = fundIo(home, { templatesBody: CHESS_TEMPLATE(), offersText });
+    expect(await runCli(["fund", "--offer", chosen.id], t2.io)).toBe(0);
+    expect((JSON.parse(t2.out.join("\n")) as { message: string }).message).toBe(
+      "This wallet already holds enough to play 4 games at 1.000000 USDC. Tell me the address to return winnings to.",
+    );
+    const t3 = fundIo(home, { templatesBody: CHESS_TEMPLATE(), offersText });
+    expect(await runCli(["fund", "--offer", chosen.id, "--games", "2"], t3.io)).toBe(0);
+    const printed3 = JSON.parse(t3.out.join("\n")) as { deposit: string; message: string };
+    expect(printed3.deposit).toBe("4.000000");
+    expect(printed3.message).toMatch(/^This wallet already holds enough to play 2 games at 1\.000000 USDC\./);
+  });
+
+  it("--offer for an offer that is not open any more exits 1 with \"offer <id> is not open any more; run offers again\"", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+    const gone = await signedOffer({ deposit: 4_000_000n, stakePerGame: 1_000_000n });
+    const still = await signedOffer({ deposit: 2_000_000n, stakePerGame: 1_000_000n });
+    const t = fundIo(home, { templatesBody: CHESS_TEMPLATE(), offersText: toWire([still.so]) });
+    expect(await runCli(["fund", "--offer", gone.id], t.io)).toBe(1);
+    expect(t.err.join("\n")).toContain(`offer ${gone.id} is not open any more; run offers again`);
+    expect(t.out).toEqual([]);
+  });
+
+  it("--offer is mutually exclusive with --deposit (and --stake), and must look like an offer id: usage errors (exit 2) before any read", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-fund-")); // no config at all: flags are checked first
+    const id = `0x${"ab".repeat(32)}`;
+    for (const [args, message] of [
+      [["fund", "--offer", id, "--deposit", "10"], "--offer and --deposit are mutually exclusive"],
+      [["fund", "--offer", id, "--stake", "1"], "--offer and --stake are mutually exclusive"],
+      [["fund", "--offer", "0x1234"], "--offer must be an offer id"],
+      [["fund", "--offer", id, "--games", "0"], "--games must be a positive whole number of games"],
+    ] as const) {
+      const t = fundIo(home);
+      expect(await runCli([...args], t.io), args.join(" ")).toBe(2);
+      expect(t.err.join("\n")).toContain(message);
+      expect(t.calls).toEqual([]);
+    }
+  });
+
+  it("M10: --games 0 and --stake 0 are usage errors (exit 2), not a later RangeError", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-fund-"));
+    for (const [args, message] of [
+      [["fund", "--games", "0", "--stake", "1"], "--games must be a positive whole number of games"],
+      [["fund", "--games", "2", "--stake", "0"], "--stake must be a positive USDC amount"],
+      [["fund", "--games", "2", "--stake", "0.000000"], "--stake must be a positive USDC amount"],
+    ] as const) {
+      const t = fundIo(home);
+      expect(await runCli([...args], t.io), args.join(" ")).toBe(2);
+      expect(t.err.join("\n")).toContain(message);
+    }
+  });
+
+  it("every amount in fund's errors is whole USDC, the cap included -- for --deposit and for an offer above the cap", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+
+    const t1 = fundIo(home, { templatesBody: CHESS_TEMPLATE() });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1", "--deposit", "10000000"], t1.io)).toBe(1);
+    const e1 = t1.err.join("\n");
+    expect(e1).toContain("deposit must be between the stake and the cap: 1.000000 to 10.000000 USDC (asked for 10000000.000000 USDC) (--deposit takes whole USDC)");
+
+    const big = await signedOffer({ deposit: 20_000_000n, stakePerGame: 1_000_000n });
+    const t2 = fundIo(home, { templatesBody: CHESS_TEMPLATE(), offersText: toWire([big.so]) });
+    expect(await runCli(["fund", "--offer", big.id], t2.io)).toBe(1);
+    const e2 = t2.err.join("\n");
+    expect(e2).toContain("deposit must be between the stake and the cap: 1.000000 to 10.000000 USDC (asked for 20.000000 USDC)");
+    expect(e2).toContain(`offer ${big.id}'s deposit is outside this host's current cap -- pick another offer`);
+    for (const e of [e1, e2]) expect(e).not.toMatch(/\b10000000\b(?!\.)|\b20000000\b/); // never the cap or deposit in base units
   });
 });
 

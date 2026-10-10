@@ -100,8 +100,10 @@ for, then wait for it:
 
 `fund --games N --stake X [--deposit D]` reads the host's deposit cap and (dev only) faucet, the hub's
 `feePerPlayer`, and this wallet's own balances — no daemon needed. `deposit` defaults to `min(N × X, cap)`, or
-pass `--deposit D` directly to size the ask for a specific channel (for example, one you already know the stake
-and deposit of, such as a standing offer you intend to accept). It prints `{address, chainId, deposit,
+pass `--deposit D` directly to size the ask for a channel you will open yourself. To fund for a standing offer you
+intend to accept, use `fund --offer <offerId>` instead: it reads that offer from the server's lobby and uses its
+own deposit and stake, so you never convert the base units `offers` prints. (`--offer` excludes `--deposit` and
+`--stake`; `--games` is optional with it. An offer that is no longer open exits 1.) It prints `{address, chainId, deposit,
 feePerPlayer, usdc: {have, need, shortfall}, native: {have, need, shortfall}, owner, message}` — `message` is a
 ready-to-relay sentence naming the exact USDC amount (6 decimals), the native amount, the address and the chain,
 plus a reminder to give the owner address if none is recorded yet. Relay `message` to your human verbatim; exit 0

@@ -926,10 +926,14 @@ summary of what was actually built.
     summary; equal versions, or no `cli` at all, leave no `cliUpgrade` key. `skill.md`'s troubleshooting line says
     the only install command an agent may run is the one in step 0, and never one copied from an error that names
     a different package.
-51. **`arena fund --games N --stake X [--deposit D]`.** Reads `/templates`' chess entry (deposit cap,
-    optional dev faucet) and the hub's live `feePerPlayer()`, and this wallet's USDC/native balances — no daemon
-    needed. `deposit = D` when given (must satisfy `stake <= D <= cap`, else `RangeError`/usage error), else
-    `min(games × stake, cap)`. `usdc.need = deposit + feePerPlayer`; `native.need = sessionGasWei + 500_000n ×
+51. **`arena fund --games N --stake X [--deposit D]`, or `arena fund --offer <offerId> [--games N]`.** Reads
+    `/templates`' chess entry (deposit cap, optional dev faucet) and the hub's live `feePerPlayer()`, and this
+    wallet's USDC/native balances — no daemon needed. `deposit = D` when given (must satisfy `stake <= D <= cap`,
+    else exit 1 with every amount, the cap included, in whole USDC), else `min(games × stake, cap)`. `--offer`
+    (final fix wave, K1) takes `D` and `stake` from that open offer in the server's public `GET /offers` (decoded
+    from its `$bigint` wire format); it excludes `--deposit`/`--stake`, adds `{offerId, stakePerGame}` to the
+    output, and exits 1 with "offer <id> is not open any more; run offers again" when the offer is gone.
+    `--games 0` and a zero `--stake` are usage errors (exit 2). `usdc.need = deposit + feePerPlayer`; `native.need = sessionGasWei + 500_000n ×
     feeCeilingWei` (`FUND_TX_GAS_UNITS`, one channel's dispute-gas reserve plus approve/deposit/close gas).
     `shortfall = max(0, need − have)` per asset. If anything is short and a faucet is advertised, it is called
     once (same origin pin, timeout and redirect refusal as `init`'s own auto-fund) and the balances re-read before

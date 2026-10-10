@@ -30,7 +30,13 @@ export function computeFundingNeed(i: FundingInput): FundingNeed {
   if (i.games <= 0n || i.stake <= 0n) throw new RangeError("games and stake must be positive");
   const max = i.games * i.stake;
   const deposit = i.deposit ?? (max < i.cap ? max : i.cap);
-  if (deposit < i.stake || deposit > i.cap) throw new RangeError(`deposit must be between the stake and the cap (${i.cap})`);
+  // Final fix wave (I2): every amount in this message is whole USDC, like `fund`'s flags and output -- the cap used to
+  // print in base units ("(100000000)"), which looked larger than the whole-USDC deposit it was compared with.
+  if (deposit < i.stake || deposit > i.cap) {
+    throw new RangeError(
+      `deposit must be between the stake and the cap: ${formatUsdc6(i.stake)} to ${formatUsdc6(i.cap)} USDC (asked for ${formatUsdc6(deposit)} USDC)`,
+    );
+  }
   return {
     deposit,
     feePerPlayer: i.feePerPlayer,
