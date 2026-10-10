@@ -78,6 +78,21 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 
 ### Plan 5.6
 - Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC and set feeCeilingWei for Arc in Plan 6.
+- **Before the first real publish** (owner's own steps, not automated — spec §6):
+  - choose the npm package name/scope and set `ARENA_CLI_PACKAGE`;
+  - choose a license, add a `LICENSE` file, and set `ARENA_CLI_LICENSE`;
+  - push the repo to GitHub and set `ARENA_CLI_REPOSITORY`; check npm's current provenance rules for the repo's
+    visibility (public vs. private) at that time — provenance attestation needs a public source, or an npm plan
+    that supports it for a private one;
+  - add the `NPM_TOKEN` secret the `release-cli` workflow publishes with.
+- **Host `cli` config set to a provenance-published version.** Only after a real `cli-v*` tag has gone through
+  `.github/workflows/release-cli.yml` (build → the clean-room test → `npm publish --provenance`) should the
+  host's `cli: {package, version, minVersion?}` point at that version — never at a version only built locally.
+- **Plan 6: Arc's USDC-as-gas reserve.** `fund`'s native line (`native.need = sessionGasWei + 500_000n ×
+  feeCeilingWei`) assumes native gas; on Arc, gas is paid in USDC, so this line needs its own Arc-specific
+  accounting. `withdraw --all`'s `withdrawReserve()` currently returns `0n` (correct on every chain this daemon
+  runs on today, whose gas is native) — Plan 6 must give it Arc's real reserve so `--all` never drains the USDC
+  a live channel's session key needs to keep paying its own gas.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 

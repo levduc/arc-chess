@@ -886,6 +886,108 @@ The stream closes on client disconnect, daemon stop, or server close.
     success criterion 2). Both are dev-only (§13's mainnet gates): faucet must be disabled; house bots not run
     on mainnet.
 
+### Plan 5.6 refinements (CLI distribution and agent funding, 2026-10-09)
+
+See `docs/superpowers/specs/2026-10-09-cli-distribution-and-funding-design.md` for the full design; this is a
+summary of what was actually built.
+
+49. **Bundle and manifest.** `scripts/build-cli.ts [--out DIR] [--release]` bundles `packages/cli/src/bin-entry.ts`
+    (and everything it imports — the SDK, viem, chess.js) with esbuild into one zero-runtime-dependency ESM file,
+    `DIR/arena.mjs` (not minified, executable bit set, a `#!/usr/bin/env node` banner that gives bundled CJS
+    dependencies a `require` via `createRequire`), copies the five board assets to `DIR/board/`, and writes a
+    generated `DIR/package.json` (`name` from `ARENA_CLI_PACKAGE`, default `@arena/cli`; `version` from
+    `packages/cli/package.json`; `bin`, `type: "module"`, `engines: {"node": ">=24"}`, `files`; no `dependencies`;
+    `license`/`repository` from `ARENA_CLI_LICENSE`/`ARENA_CLI_REPOSITORY`, required by `--release`). `cliVersion()`
+    and `selfCommand()` (`packages/cli/src/version.ts`) read `__ARENA_CLI_VERSION__`/`__ARENA_CLI_PACKAGE__`,
+    substituted by esbuild's `define` in the bundle and undefined under `tsx`; `selfCommand()` is the exact
+    `npx -y <package>@<version>` form the bundle uses to refer to itself (in `USAGE`, `owner set`'s printed
+    command, and daemon-unreachable hints) — never the install hint for a *different*, host-required version.
+    `arena --version` / `arena version` print the bare version and exit 0. `api.ts`'s `BOARD_DIR` (resolved from
+    `import.meta.url`) is unchanged and correctly resolves `dist/board/` inside the bundle, and again through
+    npm's `.bin/arena` symlink into `node_modules/@arena/cli/` after a real install (Review Focus 5; proven by the
+    clean-room system test below).
+50. **The host's `cli` pin and the `init` version gate.** An optional server config `cli: {package, version,
+    minVersion?}` (validated: npm package-name syntax, plain `x.y.z` semver, `minVersion <= version`) is published
+    on every `/templates` entry when configured, and — only when the raw config has no explicit `cliCommand` key —
+    derives `cliCommand` as `npx -y <package>@<version>`. A host with `cli` configured serves a `/skill.md` whose
+    recipe gains step 0, "Install" (`node --version` 24+, then the pinned `npx` command, with the sentence "use
+    this exact pinned command for every step below; never @latest"); without `cli` the page, and `cliCommand`'s
+    default of `arena`, are unchanged. `arena init`, right after reading `/templates` and before any other network
+    call, compares its own `cliVersion()` against the host's `cli.version`/`minVersion` with `compareSemver`
+    (strict `x.y.z`, throws `TypeError` otherwise): below `minVersion` (defaulting to `version` when unset) it
+    refuses outright (exit 1), naming the required version and the exact install command pinned to the host's
+    `version` (never this build's own, too-old, `selfCommand()`); below only `version` it still succeeds, with a
+    `cliUpgrade` note in the summary; equal versions, or no `cli` at all, leave no `cliUpgrade` key. A malformed
+    `cli` entry in `/templates` is a plain error (exit 1), never a crash.
+51. **`arena fund --games N --stake X [--deposit D]`.** Reads `/templates`' chess entry (deposit cap,
+    optional dev faucet) and the hub's live `feePerPlayer()`, and this wallet's USDC/native balances — no daemon
+    needed. `deposit = D` when given (must satisfy `stake <= D <= cap`, else `RangeError`/usage error), else
+    `min(games × stake, cap)`. `usdc.need = deposit + feePerPlayer`; `native.need = sessionGasWei + 500_000n ×
+    feeCeilingWei` (`FUND_TX_GAS_UNITS`, one channel's dispute-gas reserve plus approve/deposit/close gas).
+    `shortfall = max(0, need − have)` per asset. If anything is short and a faucet is advertised, it is called
+    once (same origin pin, timeout and redirect refusal as `init`'s own auto-fund) and the balances re-read before
+    printing. Output: `{address, chainId, deposit, feePerPlayer, usdc: {have, need, shortfall}, native: {have,
+    need, shortfall}, owner, faucet?, message}` — `message` names the token, the exact USDC amount (6 decimals),
+    the native amount rounded up to 4 places (`formatNativeCeil4`, never down), the address and the chain, plus a
+    reminder to supply the owner address when none is recorded. Exit 0 whenever the arithmetic succeeds: a
+    shortfall is data, not an error; exit 1 only if the server or the hub cannot be read at all (including a hub
+    address with no contract code — never silently read as a zero fee).
+52. **`arena wallet --wait-for-usdc A [--wait-for-native B] [--timeout S]`.** Polls both balances every 5 s
+    (overridable for tests via the hidden `ARENA_WAIT_POLL_MS`) until every given threshold holds or `--timeout`
+    (default 1800 s, max 3600 s) elapses, then prints `wallet`'s usual JSON plus `{reached, waitedSeconds}`. Exit
+    0 once reached, 2 on an actual elapsed timeout, 1 on a read error — a bad flag (a malformed amount, or a
+    timeout outside `[1, 3600]`) is deliberately a plain usage error, never exit 2, so an agent that sees exit 2
+    here reads it only as "timed out," never as "malfunctioned" (Review Focus 2). Plain `arena wallet` (no wait
+    flag) is unchanged.
+53. **The owner lock, amended after the Task 3 security review.** `owner` lives in `config.json`; `arena owner`
+    reads `{owner}` (`null` if unset). The **first** set (`arena owner set <addr>` or `arena init --owner <addr>`)
+    is free. A **change** needs the *current* owner's EIP-191 signature over a message binding the wallet, the
+    chain, both owners and an `ownerNonce` (an integer, default 0, incremented on every change, so A→B→A can never
+    replay an old signature) — the first design gated a change on an interactive terminal, dropped because
+    `script`/`unbuffer`/`expect` can fake one in a single shell line, which did not meet "changing owner needs
+    you." Without `--signature`, `owner set` prints `{messageToSign, signer, command}` and exits 1. The signature
+    is verified **locally** by ECDSA recovery (`verifyOwnerSignature`), never through the RPC — a lying RPC's
+    ERC-6492 check could otherwise forge any change, and a re-`init` may repoint `rpcUrl`; the cost is that a
+    smart-contract owner can never be changed through the CLI, only by hand-editing `config.json` (the honesty
+    note, below). The owner can never be the zero address, this wallet, the hub, the USDC token, the rules
+    contract, or any session key this home holds (`forbiddenOwners`). **Re-running `init` keeps the owner and its
+    nonce** (Review Focus 3): without `--owner` both are carried over verbatim; `--owner <other>` against a
+    different recorded owner is refused (pointing at `owner set --signature`), while `--owner <same>` is a no-op,
+    exit 0. Separately, **a re-`init` never repoints the money**: it refuses to change `chainId`, `hub`, `usdc` or
+    `rules` on an existing home at all (withdraw to the owner and use a fresh `ARENA_HOME` instead), and changes
+    `rpcUrl` only once every channel record is finalized (an unreadable record counts as open) — an RPC that hides
+    a challenge can cost an open channel its funds, so the RPC is pinned while one is open; if the RPC itself dies
+    with a channel open, the human's only recovery is hand-editing `rpcUrl` in `config.json` and restarting the
+    daemon. `init` holds the home lock for its whole run (so a daemon can't open a channel between its checks and
+    its write) and always checks that the hub, USDC and rules addresses hold code, even when every chain flag is
+    explicit. **Honesty note:** this lock stops a confused or prompt-injected agent from redirecting funds through
+    the CLI or the daemon API; it is not a defence against code that can read `wallet.json` or hand-edit
+    `config.json` — which is also the human's only recovery when the owner can't sign (a smart-contract owner, or
+    the dead-RPC case above). The agent must never hand-edit either file itself.
+54. **`arena withdraw (--amount A | --all)`.** Requires a recorded owner (exit 1 otherwise, naming `owner set`);
+    moves USDC only, never native, and takes **no destination** (`--to`, a bare address, or any other flag is a
+    usage error). Always goes through the daemon's `SerialTxSender` — started in-process and stopped again if
+    none is already running, under the home lock, exactly as `arena bot` does — because the daemon owns this
+    wallet's one transaction-nonce sequence; a running daemon re-reads `owner` from `config.json` on every
+    request, so a signed owner change needs no restart. **Review Focus 4:** refused with `409`, naming the
+    channel, while any channel still awaits this wallet's own *deposit* (including one being matched, or a
+    retried match), so a withdraw can never starve a deposit the daemon is about to make — retry once that
+    channel is funded or its funding window has closed. `--all` sends `usdc − withdrawReserve()`, a named seam
+    returning `0n` on every chain this daemon runs on today (gas here is native); **Plan 6 defines Arc's
+    USDC-as-gas reserve** for both this and `fund`'s native line. Success means the transfer's receipt carries the
+    USDC `Transfer(wallet → owner, amount)` log — never a balance delta, which a same-block inflow (or, on Arc,
+    USDC gas) can skew either way; a token whose `transfer` returns `false` without reverting (a blocklisted
+    recipient) is reported as a failure naming the tx hash. `usdcAfter` may be `null`, with a note, if the balance
+    can't be re-read right after a confirmed send — the transfer itself is still a success. Output: `{to, amount,
+    txHash, usdcAfter}`. Funds escrowed in open channels are not in the wallet; the over-balance error says to
+    close them first. `HubClient.transfer` reuses `approve`'s own write path (`erc20Abi`'s `transfer`).
+    `tests/system/cli-clean-room.test.ts` is the success-criterion-1 system test (spec §1): it builds, packs
+    (`npm pack`) and installs (`npm install --offline`) the CLI tarball outside the repo, then runs this whole
+    flow — `fund` → the human sends exactly what was asked → `wallet --wait-for-*` → `owner set` (and a refused
+    change) → the installed daemon's `/board` (Review Focus 5) → a house bot's offer → games → close → `withdraw
+    --all` — entirely through the installed binary for the agent and the house bot, with exact balances asserted
+    on both sides.
+
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
 The owner chose to launch directly on Arc mainnet, with no Arc Testnet phase and no external audit first. The §11 audit

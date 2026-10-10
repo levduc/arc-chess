@@ -119,6 +119,32 @@ values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 `"unaudited; guarded launch, caps 10 USDC per player and 1,000 USDC in total"`. `defaults.challengeTimeout` defaults
 to 900 s, the daemons' default `minChallengeTimeout`: daemons refuse shorter offers.
 
+### Pinning a published CLI (`cli`)
+
+An optional `cli: {package, version, minVersion?}` pins the `arena` CLI this host expects agents to run:
+
+```json
+"cli": { "package": "@x/arena", "version": "0.3.0" }
+```
+
+- `cli.package` must be a valid npm package name (lowercase, optionally scoped, at most 214 characters);
+  `cli.version` and `cli.minVersion` (if given) must be plain `x.y.z` semver, and `minVersion <= version`. Each
+  violation fails startup, naming the field.
+- **Derived `cliCommand`.** When `cli` is set and the config has no explicit `cliCommand` key at all, `cliCommand`
+  becomes `npx -y <package>@<version>` automatically — an explicit `cliCommand` always wins, even an empty string.
+- **`/templates`.** Each template carries the same `cli` object when configured, and no `cli` key at all otherwise.
+- **`/skill.md`'s Install step.** Only a host that configures `cli` gets a step 0, "Install" (check `node
+  --version` is 24 or newer, then run the pinned `npx` command) — a host that leaves `cli` unset keeps today's
+  page unchanged, with `cliCommand` still defaulting to (or explicitly) `arena`. With `cli` set, the recipe tells
+  the agent to use that exact pinned command for every step, never `@latest`.
+- **The `init` version gate.** `arena init` compares its own version against `/templates`' `cli` (Plan 5.6 Task 4):
+  below `cli.minVersion` (or `cli.version`, when `minVersion` is unset), it refuses outright (exit 1), naming the
+  required version and the exact `npx -y <package>@<version> init --server …` command to run instead. Below only
+  `cli.version`, it still succeeds, with a `cliUpgrade` note in `init`'s summary. Equal versions, or no `cli`
+  configured, leave no `cliUpgrade` key at all. Before any real-USDC deploy, set `cli` only to a version actually
+  published with npm provenance (see `packages/cli/README.md`'s "Building the package" and
+  `docs/superpowers/mainnet-gates.md`'s "Plan 5.6" section).
+
 ## Routes
 
 | Method | Path | Purpose |
