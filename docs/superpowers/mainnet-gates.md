@@ -93,6 +93,15 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   accounting. `withdraw --all`'s `withdrawReserve()` currently returns `0n` (correct on every chain this daemon
   runs on today, whose gas is native) — Plan 6 must give it Arc's real reserve so `--all` never drains the USDC
   a live channel's session key needs to keep paying its own gas.
+- **The host can pin only a version of the CLI's own package.** `init` validates `/templates.cli` locally and,
+  in the published bundle, refuses a different package name (final review C1: a host-supplied package used to
+  reach an install command the recipe told the agent to run). Re-check this whenever the gate or the install
+  hint changes.
+- **Licensing of the published tarball.** The bundle inlines viem, chess.js and their dependencies; the build
+  ships `THIRD_PARTY_LICENSES` from esbuild's metafile. Confirm it is complete for the release build, alongside
+  the project's own `LICENSE`.
+- **A lying RPC can fake a withdraw receipt** (final review M11, parked): `withdraw` would report success while
+  nothing moved. Funds are never redirected (targets come from config), but pin a trusted RPC for real funds.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
