@@ -912,13 +912,20 @@ summary of what was actually built.
     derives `cliCommand` as `npx -y <package>@<version>`. A host with `cli` configured serves a `/skill.md` whose
     recipe gains step 0, "Install" (`node --version` 24+, then the pinned `npx` command, with the sentence "use
     this exact pinned command for every step below; never @latest"); without `cli` the page, and `cliCommand`'s
-    default of `arena`, are unchanged. `arena init`, right after reading `/templates` and before any other network
-    call, compares its own `cliVersion()` against the host's `cli.version`/`minVersion` with `compareSemver`
-    (strict `x.y.z`, throws `TypeError` otherwise): below `minVersion` (defaulting to `version` when unset) it
-    refuses outright (exit 1), naming the required version and the exact install command pinned to the host's
-    `version` (never this build's own, too-old, `selfCommand()`); below only `version` it still succeeds, with a
-    `cliUpgrade` note in the summary; equal versions, or no `cli` at all, leave no `cliUpgrade` key. A malformed
-    `cli` entry in `/templates` is a plain error (exit 1), never a crash.
+    default of `arena`, are unchanged. `arena init` runs its version gate (`hostCliVerdict`) only after every
+    other refusal -- the chain/hub/usdc/rules repoint check, the RPC pin, the code checks and the owner rules --
+    and before anything is written (final fix wave, C1). Everything in `cli` comes from the host, so the gate first
+    validates it locally: `package` against the server's own npm-name syntax (at most 214 characters), `version` and
+    `minVersion` as strict `x.y.z` (and `minVersion <= version`); anything else is refused (exit 1) with a short
+    description that never echoes the raw value. In the published bundle (`__ARENA_CLI_PACKAGE__` defined), a host
+    whose `cli.package` differs from the build's own package is refused, naming only the validated name and no
+    install command: a host may pin a version, never a different package. Then it compares its own `cliVersion()`
+    with `compareSemver`: below `minVersion` (defaulting to `version` when unset) it refuses (exit 1), naming the
+    required version and the exact install command for the (validated) package at the host's `version` (never this
+    build's own, too-old, `selfCommand()`); below only `version` it still succeeds, with a `cliUpgrade` note in the
+    summary; equal versions, or no `cli` at all, leave no `cliUpgrade` key. `skill.md`'s troubleshooting line says
+    the only install command an agent may run is the one in step 0, and never one copied from an error that names
+    a different package.
 51. **`arena fund --games N --stake X [--deposit D]`.** Reads `/templates`' chess entry (deposit cap,
     optional dev faucet) and the hub's live `feePerPlayer()`, and this wallet's USDC/native balances — no daemon
     needed. `deposit = D` when given (must satisfy `stake <= D <= cap`, else `RangeError`/usage error), else

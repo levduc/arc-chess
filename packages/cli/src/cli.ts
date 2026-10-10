@@ -21,7 +21,7 @@ import { readJson } from "./jsonfile.js";
 import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecordedOwner, setOwner, UsageError } from "./owner.js";
 import { RecordStore } from "./records.js";
 import { startDaemonProcess } from "./run.js";
-import { cliVersion, compareSemver, selfCommand } from "./version.js";
+import { cliPackage, cliVersion, hostCliVerdict, selfCommand } from "./version.js";
 
 export type CliIo = {
   env: NodeJS.ProcessEnv;
@@ -392,61 +392,6 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             cli: chess.cli !== null && typeof chess.cli === "object" && !Array.isArray(chess.cli) ? (chess.cli as Record<string, unknown>) : undefined,
           };
         }
-        // Plan 5.6 Task 4 (spec §3): the version gate. Checked right after /templates, before any other network
-        // call (verifyChain, eth_gasPrice) -- a refusal here must cost nothing but the one /templates fetch.
-        // `cliUpgrade` (named in the summary below) is set only when this CLI is older than the host's published
-        // `cli.version` but not below its `minVersion` (otherwise init refuses outright, below). A malformed
-        // version anywhere in `cli` is a plain Error (exit 1, never a crash) -- `compareSemver` already throws a
-        // clear TypeError naming the bad value, which the usual catch-all below reports.
-        let cliUpgrade: string | undefined;
-        if (template.cli !== undefined) {
-          const cliRaw = template.cli;
-          const pkg = typeof cliRaw.package === "string" ? cliRaw.package : undefined;
-          const version = typeof cliRaw.version === "string" ? cliRaw.version : undefined;
-          const minVersionRaw = cliRaw.minVersion;
-          if (minVersionRaw !== undefined && typeof minVersionRaw !== "string") {
-            throw new Error(`server ${server} published a malformed cli.minVersion in /templates (not a string): ${JSON.stringify(minVersionRaw)?.slice(0, 80)}`);
-          }
-          const minVersion = minVersionRaw ?? version;
-          if (pkg === undefined || version === undefined || minVersion === undefined) {
-            throw new Error(
-              `server ${server} published a malformed cli entry in /templates (needs at least package and version strings): ` +
-                `${JSON.stringify(cliRaw).slice(0, 200)}`,
-            );
-          }
-          const current = cliVersion();
-          // `version` is validated first, regardless of whether `minVersion` was given explicitly or defaults to
-          // it, so a malformed cli.version is never misreported as cli.minVersion.
-          let cmpVersion: -1 | 0 | 1;
-          try {
-            cmpVersion = compareSemver(current, version);
-          } catch (err) {
-            throw new Error(`server ${server} published a malformed cli.version in /templates: ${err instanceof Error ? err.message : String(err)}`);
-          }
-          let cmpMinVersion: -1 | 0 | 1;
-          if (minVersionRaw === undefined) {
-            cmpMinVersion = cmpVersion; // defaulted to `version`, already validated above
-          } else {
-            try {
-              cmpMinVersion = compareSemver(current, minVersion);
-            } catch (err) {
-              throw new Error(`server ${server} published a malformed cli.minVersion in /templates: ${err instanceof Error ? err.message : String(err)}`);
-            }
-          }
-          if (cmpMinVersion < 0) {
-            // Never point the agent back at `CLI_COMMAND` here: in the published bundle that's `npx -y
-            // <pkg>@<this build's own, too-old, version>` -- exactly the command that just got refused. Name the
-            // full, explicit install command instead, pinned to the host's published `version` (the one skill.md's
-            // own Install step pins to), not the bare `minVersion` floor.
-            throw new Error(
-              `this host requires arena CLI version ${minVersion} or newer (you are running ${current} as ${CLI_COMMAND}): ` +
-                `install and run it with: npx -y ${pkg}@${version} init --server ${server}`,
-            );
-          }
-          if (cmpVersion < 0) {
-            cliUpgrade = `a newer CLI (${version}) is available; you are running ${current}`;
-          }
-        }
         const rpcUrl = flag("rpc") ?? template.rpcUrl;
         const chainIdRaw = flag("chain-id") ?? template.chainId;
         const hubRaw = flag("hub") ?? template.hub;
@@ -579,6 +524,18 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             );
           }
           owner = requested;
+        }
+
+        // Plan 5.6 Task 4 (spec §3) and the final fix wave (C1): the version gate, run only after every other refusal
+        // (the chain/hub/usdc/rules repoint check, the RPC pin, the code checks, the owner rules), so a host with other
+        // contracts is refused before any install hint can appear. `hostCliVerdict` validates the host's `cli` entry
+        // before anything derived from it is printed, never echoes a raw value, and -- in the bundle -- refuses a host
+        // that pins a package other than this build's own. Still before anything is written.
+        let cliUpgrade: string | undefined;
+        if (template.cli !== undefined) {
+          const verdict = hostCliVerdict(template.cli, { ownPackage: cliPackage(), current: cliVersion(), server });
+          if ("refusal" in verdict) throw new Error(verdict.refusal);
+          cliUpgrade = verdict.upgrade;
         }
 
         const cfg: ArenaConfig = {

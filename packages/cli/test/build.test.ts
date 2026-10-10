@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -37,6 +39,42 @@ function baseEnv(): NodeJS.ProcessEnv {
 
 function buildCli(out: string, extraEnv: NodeJS.ProcessEnv = {}, extraArgs: string[] = []): Promise<RunResult> {
   return run(TSX_BIN, [BUILD_SCRIPT, "--out", out, ...extraArgs], { cwd: REPO_ROOT, env: { ...baseEnv(), ...extraEnv } });
+}
+
+/** Final fix wave (C1): a stand-in arena host on 127.0.0.1 -- `GET /templates` publishes a chess template whose
+ *  `cli` entry is `cli`, and `POST /rpc` answers as chain 31337 on which every address holds code -- so the built
+ *  bundle's own `init` can be run against it end to end. */
+async function startStubHost(cli: Record<string, unknown>): Promise<{ url: string; server: Server }> {
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c: Buffer) => (body += c.toString("utf8")));
+    req.on("end", () => {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      res.setHeader("content-type", "application/json");
+      if (req.method === "GET" && req.url === "/templates") {
+        res.end(
+          JSON.stringify([
+            {
+              id: "chess",
+              version: "1",
+              chainId: 31337,
+              rpcUrl: `${url}/rpc`,
+              hub: `0x${"11".repeat(20)}`,
+              usdc: `0x${"22".repeat(20)}`,
+              rules: `0x${"33".repeat(20)}`,
+              cli,
+            },
+          ]),
+        );
+        return;
+      }
+      const rpc = JSON.parse(body || "{}") as { id?: number; method?: string };
+      const result = rpc.method === "eth_chainId" ? "0x7a69" : rpc.method === "eth_gasPrice" ? "0x3b9aca00" : "0x6080";
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id ?? 1, result }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, server };
 }
 
 describe("build-cli", () => {
@@ -154,4 +192,40 @@ describe("build-cli", () => {
     expect(pkg.license).toBe("MIT");
     expect(pkg.repository).toEqual({ type: "git", url: "git+https://github.com/example/arena.git" });
   }, 180_000);
+
+  it("Final fix wave (C1): the bundle's init refuses a host that pins a different package -- naming it, with no install command -- and writes nothing", async () => {
+    for (const [cli, expected, forbidden] of [
+      [
+        { package: "arena-cli-next", version: "9.9.9", minVersion: "9.9.9" },
+        "error: this server pins a different CLI package (arena-cli-next); refusing: this CLI is @arena/cli. Ask your human",
+        ["npx -y arena-cli-next"],
+      ],
+      [
+        { package: "arena-cli-next", version: "0.1.0" }, // even a version this build satisfies: never another package
+        "error: this server pins a different CLI package (arena-cli-next); refusing",
+        ["npx"],
+      ],
+      [
+        // The same package as this build, below minVersion: the install command names this build's own package.
+        { package: "@arena/cli", version: "9.9.9", minVersion: "9.9.9" },
+        "install and run it with: npx -y @arena/cli@9.9.9 init --server http://127.0.0.1:",
+        ["arena-cli-next"],
+      ],
+    ] as const) {
+      const host = await startStubHost(cli);
+      try {
+        const home = freshDir("arena-cli-gate-home-");
+        const result = await run(process.execPath, [join(outDir, "arena.mjs"), "init", "--server", host.url, "--no-faucet"], {
+          cwd: freshDir("arena-cli-gate-cwd-"),
+          env: { PATH: dirname(process.execPath), HOME: home },
+        });
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stderr).toContain(expected);
+        for (const f of forbidden) expect(result.stderr).not.toContain(f);
+        expect(existsSync(join(home, ".arena", "config.json"))).toBe(false);
+      } finally {
+        await new Promise<void>((r) => host.server.close(() => r()));
+      }
+    }
+  }, 60_000);
 });
