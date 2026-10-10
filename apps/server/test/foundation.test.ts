@@ -536,10 +536,11 @@ describe("http foundation", () => {
   it("Final fix wave I3: the units note is correct about channels/status (whole-USDC decimals, like wallet) -- not base units", async () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const text = await (await fetch(`${server.url}/skill.md`)).text();
-    // Plan 5.6 Task 4: the units note is now the tail of step 2 (`fund`), with step 3 (daemon start) -- which
-    // mentions `channels` itself -- sitting between it and step 4. Slice only up to step 3's own heading so
-    // the "channels" exclusion below is not tripped by step 3's own content.
-    const note = text.slice(text.indexOf("Note on units"), text.indexOf("3. Start the daemon"));
+    // Final fix wave (K1): the units note is now the tail of step 3 (pick an offer), right before step 4 (`fund
+    // --offer`) -- slice up to step 4's own heading so the "channels" exclusion below only sees the note itself.
+    const noteAt = text.indexOf("Note on units");
+    const note = text.slice(noteAt, text.indexOf("\n4. `", noteAt));
+    expect(note.length).toBeGreaterThan(100);
     // ChannelStatus (status/channels) carries no deposit/stake field at all; its only USDC amounts are
     // `balances.me`/`balances.opponent`, printed as whole-USDC decimals exactly like `wallet` -- confirmed by
     // dumping the real JSON output of a running stack (final fix wave I3).
@@ -550,8 +551,9 @@ describe("http foundation", () => {
     expect(baseUnitsClause).not.toMatch(/channels/);
     expect(note).toMatch(/offers.*\/templates.*base units/s);
     // Step 5's "cover another stake" decision names the field and its units explicitly.
-    const step5 = text.slice(text.indexOf("5. The play loop"), text.indexOf("6. Once"));
-    expect(step5).toMatch(/status.*balances.*whole-USDC decimals/s);
+    const playLoop = text.slice(text.indexOf("6. The play loop"), text.indexOf("7. Once"));
+    expect(playLoop.length).toBeGreaterThan(100);
+    expect(playLoop).toMatch(/status.*balances.*whole-USDC decimals/s);
   });
 
   it("Fix round 1, I2: session-gas-low is reworded to point at the native balance, not USDC", async () => {
@@ -655,6 +657,35 @@ describe("http foundation", () => {
       expect(text).toContain("A smart-contract owner can only be changed by **your human**");
       expect(text).toContain("You, the agent, must never edit `config.json` or `wallet.json` yourself.");
       expect(text).toMatch(/RPC died while a channel is open:.*so ask your\s+human to hand-edit `rpcUrl`/s);
+    });
+
+    it.each([
+      ["with cli", { cli: CLI, cliCommand: PINNED }, PINNED],
+      ["without cli", {}, "arena"],
+    ])("%s: final fix wave (K1, I2) -- the recipe order: daemon, pick an offer, fund --offer and wait, accept, play, report, withdraw", async (_label, override, cmd) => {
+      server = await startServer(testConfig(override), { chain: new FakeChain() });
+      const text = await (await fetch(`${server.url}/skill.md`)).text();
+      const recipe = text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("**Troubleshooting:**"));
+      const steps = ["1. `", "2. Start the daemon", "3. Pick an opponent's offer, but do not accept it yet", `4. \`${cmd} fund --offer <offerId>\``, `5. Run \`${cmd} offers\` again, then \`${cmd} accept <offerId>\``, "6. The play loop", "7. Once", "8. Ask your human whether to withdraw now"];
+      const at = steps.map((h) => recipe.indexOf(h));
+      for (const [i, h] of steps.entries()) expect(at[i], h).toBeGreaterThan(-1);
+      for (let i = 1; i < at.length; i++) expect(at[i], steps[i]).toBeGreaterThan(at[i - 1]);
+      const step = (i: number) => recipe.slice(at[i], at[i + 1] ?? recipe.length);
+      // Step 3: never accept before the money arrives.
+      expect(step(2)).toMatch(/Accept it only in step 5, once the money for it has\s+arrived/);
+      // Step 4: the wait (pinned text) and the starting balance, then the owner, then the no-offer-fits path.
+      expect(step(3)).toContain(`${cmd} wallet --wait-for-usdc <usdc.need> --wait-for-native <native.need> --timeout 100`);
+      expect(step(3)).toContain("reached: false` (exit 2) means it timed out.");
+      expect(step(3)).toMatch(/Note your starting USDC balance for step 7: the `usdc` the wait printed with `reached: true`, or `fund`'s\s+`usdc.have` if nothing was short/);
+      expect(step(3)).toContain(`${cmd} owner set <address>`);
+      expect(step(3)).toMatch(new RegExp(`No offer fits: run \`${cmd.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} fund --games N --stake X\` instead`));
+      expect(step(3)).toContain(`${cmd} offer --deposit <fund's deposit> --stake X`);
+      // Step 5: re-list, accept; if gone, another offer and fund --offer again.
+      expect(step(4)).toMatch(/If it is gone \(someone\s+else took it\), pick another the same way, and run/);
+      expect(step(4)).toContain(`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ`);
+      // Step 7: the profit and loss is measured against step 4's starting balance, not the balance before an offer.
+      expect(step(6)).toMatch(/minus the starting balance you noted in step 4/);
+      expect(step(7)).toContain(`${cmd} withdraw --all`);
     });
 
     it.each([

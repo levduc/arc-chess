@@ -1283,10 +1283,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       });
     } catch (err) {
       // M1: a bare "fetch failed" named neither the port nor what to do about it. Mirrors the board command's
-      // own wording (skill.md's recipe step 3 starts the daemon -- Plan 5.6 Task 4 moved it from step 2 when the
-      // fund/owner step was inserted ahead of it).
+      // own wording (skill.md's recipe step 2 starts the daemon -- the final fix wave moved it back ahead of
+      // picking an offer and `fund --offer`).
       throw new Error(
-        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon" (skill.md's recipe step 3), ` +
+        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon" (skill.md's recipe step 2), ` +
           `then retry: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
