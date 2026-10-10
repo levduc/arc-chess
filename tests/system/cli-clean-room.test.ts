@@ -20,7 +20,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPublicClient, createWalletClient, http, parseUnits, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -167,22 +167,30 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
     "builds, packs, installs offline, funds, plays 2 games against a house bot, and withdraws to the owner",
     async () => {
       tmp = mkdtempSync(join(tmpdir(), "cli-clean-room-"));
-      const distDir = join(tmp, "dist");
       const prefixDir = join(tmp, "prefix");
       const npmCacheDir = join(tmp, "npm-cache");
       const workDir = join(tmp, "work");
       mkdirSync(workDir, { recursive: true });
 
-      // A hermetic base env for the build itself (never the installed binary): the ambient shell must not change
-      // the default manifest (package name/license/repository) this test relies on.
-      const buildEnv = { ...process.env };
-      delete buildEnv.ARENA_CLI_PACKAGE;
-      delete buildEnv.ARENA_CLI_LICENSE;
-      delete buildEnv.ARENA_CLI_REPOSITORY;
-
-      // --- Step 1: build into <tmp>/dist ---
-      const buildRes = await run(TSX_BIN, [BUILD_SCRIPT, "--out", distDir], { cwd: REPO_ROOT, env: buildEnv });
-      if (buildRes.status !== 0) throw new Error(`build-cli failed (${buildRes.status}): ${buildRes.stderr}`);
+      // --- Step 1: the bundle under test. Final fix wave (M2): the release workflow passes the dist it just built
+      // with --release (ARENA_CLEAN_ROOM_DIST), so the artifact it publishes is the one installed and run here;
+      // without it, a dev build into <tmp>/dist. ---
+      const prebuilt = process.env.ARENA_CLEAN_ROOM_DIST;
+      let distDir: string;
+      if (prebuilt) {
+        distDir = resolve(REPO_ROOT, prebuilt);
+        console.log(`[cli-clean-room] installing the prebuilt bundle in ${distDir}`);
+      } else {
+        distDir = join(tmp, "dist");
+        // A hermetic base env for the build itself (never the installed binary): the ambient shell must not change
+        // the default manifest (package name/license/repository) this test relies on.
+        const buildEnv = { ...process.env };
+        delete buildEnv.ARENA_CLI_PACKAGE;
+        delete buildEnv.ARENA_CLI_LICENSE;
+        delete buildEnv.ARENA_CLI_REPOSITORY;
+        const buildRes = await run(TSX_BIN, [BUILD_SCRIPT, "--out", distDir], { cwd: REPO_ROOT, env: buildEnv });
+        if (buildRes.status !== 0) throw new Error(`build-cli failed (${buildRes.status}): ${buildRes.stderr}`);
+      }
 
       // --- Step 2: pack it ---
       const packRes = await run("npm", ["pack", distDir, "--pack-destination", tmp], { cwd: tmp, env: process.env });

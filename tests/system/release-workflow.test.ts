@@ -53,9 +53,42 @@ describe("release-cli workflow (written, never run)", () => {
     expect(publishIdx).toBeGreaterThan(cleanRoomIdx);
   });
 
-  it("never runs npm publish anywhere else in the repo's own workflows (this file is the only release path)", () => {
-    // Sanity: the one occurrence found above is this file's own `npm publish packages/cli/dist ...` line, not a
-    // dry-run or a different target package.
+  it("publishes exactly packages/cli/dist, publicly, with provenance (not a dry-run or another package)", () => {
+    // K2: this checks this one file's publish line only -- no other workflow is read here.
     expect(text).toContain("npm publish packages/cli/dist --provenance --access public");
+  });
+
+  it("I1: checks out the Foundry submodules (forge build needs contracts/lib before the clean-room test)", () => {
+    expect(text).toMatch(/- uses: actions\/checkout@v4\n\s+with:\n\s+submodules: recursive\n/);
+  });
+
+  it("K2: installs Foundry before the clean-room test (its global setup runs forge build)", () => {
+    const foundryIdx = text.indexOf("- uses: foundry-rs/foundry-toolchain@v1");
+    expect(foundryIdx).toBeGreaterThan(-1);
+    expect(foundryIdx).toBeLessThan(text.indexOf("cli-clean-room.test.ts"));
+  });
+
+  it("K2: build:cli --release gets the package name, license and repository from the three env lines", () => {
+    const buildIdx = text.indexOf("pnpm build:cli --release");
+    const block = text.slice(buildIdx, text.indexOf("- run:", buildIdx + 1));
+    expect(block).toContain("ARENA_CLI_PACKAGE: ${{ vars.ARENA_CLI_PACKAGE }}");
+    expect(block).toContain("ARENA_CLI_LICENSE: ${{ vars.ARENA_CLI_LICENSE }}");
+    expect(block).toContain("ARENA_CLI_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}");
+  });
+
+  it("M6: fails when the cli-v<version> tag differs from packages/cli/package.json's version, before installing or building", () => {
+    expect(text).toContain('tag="${GITHUB_REF_NAME#cli-v}"');
+    expect(text).toContain(`version="$(node -p "require('./packages/cli/package.json').version")"`);
+    expect(text).toMatch(/if \[ "\$tag" != "\$version" \]; then[\s\S]*?exit 1[\s\S]*?fi/);
+    const checkIdx = text.indexOf('tag="${GITHUB_REF_NAME#cli-v}"');
+    expect(checkIdx).toBeGreaterThan(text.indexOf("- uses: actions/setup-node@v4")); // node is on PATH by then
+    expect(checkIdx).toBeLessThan(text.indexOf("pnpm install --frozen-lockfile"));
+  });
+
+  it("M2: the clean-room test installs the release bundle the workflow just built, not a fresh dev build", () => {
+    const testIdx = text.indexOf("vitest run cli-clean-room.test.ts");
+    const block = text.slice(testIdx, text.indexOf("- run:", testIdx + 1));
+    expect(block).toContain("ARENA_CLEAN_ROOM_DIST: ${{ github.workspace }}/packages/cli/dist");
+    expect(text.indexOf("pnpm build:cli --release")).toBeLessThan(testIdx);
   });
 });
