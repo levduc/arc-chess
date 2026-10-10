@@ -34,6 +34,7 @@ const REPO_ROOT = join(import.meta.dirname, "../..");
 function recipeCommands(wrapper: string): string[] {
   return [
     `${wrapper} init --server`,
+    `${wrapper} fund --offer <offerId>`,
     `${wrapper} fund --games N --stake X`,
     `${wrapper} wallet --wait-for-usdc`,
     `${wrapper} owner set`,
@@ -179,9 +180,8 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
   }, 30_000);
 
   it(
-    "inits with auto-fund, accepts a house bot's offer, plays 3 games (resigning game 2), closes, and settles with exact accounting",
+    "inits with auto-fund, starts the daemon, funds for a house bot's offer with fund --offer, accepts it, plays 3 games (resigning game 2), closes, and settles with exact accounting against the starting balance",
     async () => {
-      // Moved up from the play loop below (Plan 5.6 Task 4) so the new fund step can size `--games` the same way.
       const GAMES_TO_PLAY = 3;
       dir = mkdtempSync(join(tmpdir(), "agent-recipe-"));
       const wrapperPath = writeArenaWrapper(dir, CLI_BIN);
@@ -219,17 +219,7 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       const balanceAfterInit = await usdcBalanceOf(stack, agentAddress);
       expect(balanceAfterInit).toBe(100_000_000n); // exactly the faucet's 100 USDC; the wallet started at 0
 
-      // --- Step 2: fund (already covered by init's own faucet) and record the human's owner address ---
-      const fundResult = await runWrapperJson(wrapperPath, ["fund", "--games", String(GAMES_TO_PLAY), "--stake", "1"], agentHome);
-      // init's faucet (100 USDC + 10 native) already covers 3 games at $1 plus the fee and the gas reserve.
-      expect(fundResult.usdc.shortfall).toBe("0.000000");
-      expect(fundResult.native.shortfall).toBe("0.0"); // native amounts are ether decimals, not 6-dp USDC
-      expect(fundResult.owner).toBeNull();
-      const humanAddress = privateKeyToAccount(generatePrivateKey()).address;
-      const ownerSetResult = await runWrapperJson(wrapperPath, ["owner", "set", humanAddress], agentHome);
-      expect(ownerSetResult.owner.toLowerCase()).toBe(humanAddress.toLowerCase());
-
-      // --- Step 3: start the daemon, keep it running ---
+      // --- Step 2: start the daemon, keep it running (final fix wave, K1: before picking an offer and funding) ---
       agentDaemon = spawn(wrapperPath, ["daemon"], {
         cwd: REPO_ROOT,
         env: { ...process.env, ARENA_HOME: agentHome },
@@ -254,19 +244,52 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       expect(walletBefore.usdc).toMatch(WHOLE_USDC);
       expect(walletBefore.usdc).toBe("100.000000");
 
-      // --- Step 4: find an opponent -- accept a house bot's standing offer ---
-      const offers = (await runWrapperJson(wrapperPath, ["offers"], agentHome)) as Array<{
-        offerId: Hex;
-        offer: { player: Address; deposit: string; stakePerGame: string };
-      }>;
+      // --- Step 3: pick a house bot's standing offer, but do not accept it yet ---
+      type OfferRow = { offerId: Hex; offer: { player: Address; deposit: string; stakePerGame: string } };
+      const offers = (await runWrapperJson(wrapperPath, ["offers"], agentHome)) as OfferRow[];
       expect(offers.length).toBeGreaterThanOrEqual(2);
       // Final review I3: offers reports USDC in base units (6 decimals), not whole-USDC decimals.
       for (const o of offers) {
         expect(o.offer.stakePerGame).toMatch(BASE_UNITS);
         expect(o.offer.deposit).toMatch(BASE_UNITS);
       }
-      const chosen = offers.find((o) => o.offer.stakePerGame === "1000000");
-      expect(chosen).toBeDefined();
+      const picked = offers.find((o) => o.offer.stakePerGame === "1000000");
+      expect(picked).toBeDefined();
+
+      // --- Step 4: fund --offer (the daemon is up), wait, note the starting balance, record the owner ---
+      const fundResult = await runWrapperJson(wrapperPath, ["fund", "--offer", picked!.offerId], agentHome);
+      expect(fundResult.offerId).toBe(picked!.offerId.toLowerCase());
+      expect(fundResult.stakePerGame).toBe("1.000000"); // the offer's own stake, in whole USDC
+      expect(fundResult.deposit).toBe("10.000000"); // the house bot's deposit, converted for the agent
+      // init's faucet (100 USDC + 10 native) already covers the offer's deposit plus the fee and the gas reserve.
+      expect(fundResult.usdc.shortfall).toBe("0.000000");
+      expect(fundResult.native.shortfall).toBe("0.0"); // native amounts are ether decimals, not 6-dp USDC
+      expect(fundResult.owner).toBeNull();
+      // Nothing is short, so the recipe needs no wait -- run it anyway, with the daemon up, as the agent would after
+      // a shortfall: it must return at once with reached:true and the same balance fund reported.
+      const waitResult = await runWrapperJson(
+        wrapperPath,
+        ["wallet", "--wait-for-usdc", fundResult.usdc.need, "--wait-for-native", fundResult.native.need, "--timeout", "100"],
+        agentHome,
+      );
+      expect(waitResult.reached).toBe(true);
+      expect(waitResult.usdc).toBe(fundResult.usdc.have);
+      // The starting balance for step 7's report: fund's usdc.have (nothing was short).
+      const startingUsdc = parseUnits(fundResult.usdc.have as string, 6);
+      expect(startingUsdc).toBe(balanceAfterInit);
+      const humanAddress = privateKeyToAccount(generatePrivateKey()).address;
+      const ownerSetResult = await runWrapperJson(wrapperPath, ["owner", "set", humanAddress], agentHome);
+      expect(ownerSetResult.owner.toLowerCase()).toBe(humanAddress.toLowerCase());
+
+      // --- Step 5: list the offers again, then accept (if the funded one is gone, another, funded again) ---
+      const relisted = (await runWrapperJson(wrapperPath, ["offers"], agentHome)) as OfferRow[];
+      let chosen = relisted.find((o) => o.offerId === picked!.offerId);
+      if (!chosen) {
+        chosen = relisted.find((o) => o.offer.stakePerGame === "1000000");
+        expect(chosen).toBeDefined();
+        const again = await runWrapperJson(wrapperPath, ["fund", "--offer", chosen!.offerId], agentHome);
+        expect(again.usdc.shortfall).toBe("0.000000");
+      }
       const houseBot = houseBots.find((b) => b.address.toLowerCase() === chosen!.offer.player.toLowerCase());
       expect(houseBot).toBeDefined();
       await runWrapperJson(wrapperPath, ["accept", chosen!.offerId], agentHome);
@@ -285,7 +308,7 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       expect(openedStatus.balances.opponent).toMatch(WHOLE_USDC);
       console.log(`[agent-recipe] channel ${channelId} open with house bot ${houseBot!.address}`);
 
-      // --- Step 5: the play loop -- 3 games at $1, always resigning game index 1 ("game 2") ---
+      // --- Step 6: the play loop -- 3 games at $1, always resigning game index 1 ("game 2") ---
       const RESIGN_GAME_INDEX = 1;
       const MAX_PLY_PER_GAME = 60;
       const rng = (() => {
@@ -354,7 +377,7 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
 
       console.log(`[agent-recipe] channel Finalized; results=${JSON.stringify(results)}`);
 
-      // --- Step 6: settled -- check the wallet again, and assert exact accounting ---
+      // --- Step 7: settled -- check the wallet again, and report against step 4's starting balance ---
       expect(results).toHaveLength(GAMES_TO_PLAY);
       expect(results[RESIGN_GAME_INDEX]).toBe(-1); // the forced resignation is always a loss
 
@@ -365,14 +388,16 @@ describe("agent-recipe: a scripted agent follows skill.md end to end", () => {
       const feePerPlayer = (await pub.readContract({ address: stack.hub, abi: channelHubAbi, functionName: "feePerPlayer" })) as bigint;
       const stakePerGame = 1_000_000n; // $1, matches the accepted offer's stakePerGame
       const expectedDelta = results.reduce((sum, r) => sum + BigInt(r) * stakePerGame, 0n) - feePerPlayer;
-      const actualDelta = balanceAfterClose - balanceAfterInit;
+      const actualDelta = balanceAfterClose - startingUsdc;
+      // The report's own number: the wallet's usdc now (as `wallet` prints it) minus the starting balance.
+      expect(parseUnits(walletAfter.usdc as string, 6) - startingUsdc).toBe(actualDelta);
       // Exact USDC accounting (Ruling 5): wallet delta = sum(game results * stake) - fee. Gas on this dev chain
       // is paid in native ETH, a separate token from USDC (unlike Arc, where gas is USDC too, per skill.md) --
       // it never touches this balance, so it needs no separate term here.
       expect(actualDelta).toBe(expectedDelta);
       expect(walletAfter.usdc).not.toBe(walletBefore.usdc); // sanity: the formatted wallet output moved too
 
-      // --- Step 7: ask to withdraw now; withdraw --all (the daemon is still running, so this goes through its
+      // --- Step 8: ask to withdraw now; withdraw --all (the daemon is still running, so this goes through its
       // API, not the in-process-daemon fallback) -- the owner's USDC delta must equal exactly what was withdrawn,
       // and the agent's own wallet must end at zero (the dev reserve is 0). ---
       const ownerBalanceBeforeWithdraw = await usdcBalanceOf(stack, humanAddress);

@@ -1,10 +1,13 @@
 /**
  * Plan 5.6 Task 5 (spec §1 success criterion 1; Review Focus 5): a clean-room install of the packed `arena` CLI
- * tarball, outside the repo, running the whole funded flow against a dev stack with the faucet off: build ->
- * pack -> offline install -> empty wallet -> `fund` reports the shortfall and a message -> the test, acting as
- * the human, sends exactly what was asked for -> `wallet --wait-for-usdc/--wait-for-native` returns -> `owner
- * set` (and a refused change) -> daemon -> `/board` served from the installed package -> accept a house bot's
- * offer -> 2 games -> close -> `withdraw --all` -> exact balances on both sides.
+ * tarball, outside the repo, running the whole funded flow against a dev stack with the faucet off, in skill.md's
+ * own order (final fix wave, K1): build (or, from the release workflow, the prebuilt `ARENA_CLEAN_ROOM_DIST`) ->
+ * pack -> offline install -> empty wallet -> daemon -> `/board` served from the installed package -> pick a house
+ * bot's offer -> `fund --offer` reports the shortfall and a message -> the test, acting as the human, sends exactly
+ * what was asked for -> `wallet --wait-for-usdc/--wait-for-native` returns (the starting balance) -> `owner set`
+ * (and a refused change) -> list the offers again and accept -> 2 games -> close -> the profit and loss against the
+ * starting balance -> stop the daemon -> `withdraw --amount 1` and `withdraw --all` with no daemon running (M12) ->
+ * exact balances on both sides.
  *
  * The agent and the house bot run ONLY the installed binary (`<prefix>/node_modules/.bin/arena`), under a
  * restricted environment that could not accidentally reach this repo, the live user daemon on :7070, or Anvil/
@@ -246,10 +249,40 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
       const agentInit = await runBinJson(BIN, ["init", "--server", stack.serverUrl, "--port", String(agentPort)], homeAgent, workDir);
       const agentAddress = agentInit.wallet as Address;
 
-      // The house bot's standing offer deposits 10 USDC per side (Params.deposit is one shared value): size this
-      // wallet's own ask to the deposit it will actually accept, not the (smaller) `min(games*stake, cap)` default
-      // -- a deviation from the brief's literal "fund --games 2 --stake 1" noted in the task report.
-      const fundResult = await runBinJson(BIN, ["fund", "--games", "2", "--stake", "1", "--deposit", "10"], homeAgent, workDir);
+      // --- Step 9: start the agent's daemon (skill.md step 2), before picking an offer and funding ---
+      agentDaemon = spawnBin(BIN, ["daemon"], homeAgent, workDir);
+      await waitFor("agent daemon health", 15_000, async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${agentPort}/health`, { signal: AbortSignal.timeout(1_000) });
+          return res.ok ? true : undefined;
+        } catch {
+          return undefined;
+        }
+      });
+
+      // Review Focus 5: /board served from the daemon of the INSTALLED package -- proves api.ts's
+      // import.meta.url-relative BOARD_DIR resolves correctly through npm's bin symlink into node_modules.
+      const boardRes = await fetch(`http://127.0.0.1:${agentPort}/board`, { signal: AbortSignal.timeout(5_000) });
+      expect(boardRes.status).toBe(200);
+      expect(boardRes.headers.get("content-type")).toContain("text/html");
+      const boardHtml = await boardRes.text();
+      expect(boardHtml.length).toBeGreaterThan(0);
+      expect(boardHtml).toContain("<html");
+
+      // --- Step 10: pick the house bot's standing offer (skill.md step 3), but do not accept it yet ---
+      type OfferRow = { offerId: Hex; offer: { player: Address; deposit: string; stakePerGame: string } };
+      const offers = await waitFor<OfferRow[]>("house bot's offer visible to the agent's own daemon", 30_000, async () => {
+        const list = (await runBinJson(BIN, ["offers"], homeAgent, workDir)) as OfferRow[];
+        return list.some((o) => o.offer.player.toLowerCase() === botAddress.toLowerCase()) ? list : undefined;
+      });
+      const picked = offers.find((o) => o.offer.player.toLowerCase() === botAddress.toLowerCase())!;
+      expect(picked.offer.deposit).toBe("10000000"); // base units, as `offers` prints them
+
+      // --- Step 11: fund --offer (skill.md step 4), with the daemon up: the offer's own deposit, in whole USDC ---
+      const fundResult = await runBinJson(BIN, ["fund", "--offer", picked.offerId], homeAgent, workDir);
+      expect(fundResult.offerId).toBe(picked.offerId.toLowerCase());
+      expect(fundResult.deposit).toBe("10.000000");
+      expect(fundResult.stakePerGame).toBe("1.000000");
       expect(Number(fundResult.usdc.shortfall)).toBeGreaterThan(0);
       expect(Number(fundResult.native.shortfall)).toBeGreaterThan(0);
       expect(fundResult.message).toContain(agentAddress);
@@ -272,15 +305,19 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
       const sendHash = await deployer.sendTransaction({ to: agentAddress, value: nativeNeed, chain: foundry, account: deployer.account });
       await pub.waitForTransactionReceipt({ hash: sendHash });
 
+      // The recipe's wait, in --timeout 100 chunks, while the daemon runs.
       const waitResult = await runBinJson(
         BIN,
-        ["wallet", "--wait-for-usdc", fundResult.usdc.need, "--wait-for-native", fundResult.native.need, "--timeout", "120"],
+        ["wallet", "--wait-for-usdc", fundResult.usdc.need, "--wait-for-native", fundResult.native.need, "--timeout", "100"],
         homeAgent,
         workDir,
       );
       expect(waitResult.reached).toBe(true);
+      // The starting balance for the report (skill.md step 4): the wallet's usdc when the wait reports reached:true.
+      const startingUsdc = parseUnits(waitResult.usdc as string, 6);
+      expect(startingUsdc).toBe(usdcNeed);
 
-      // --- Step 9: negative checks ---
+      // --- Step 12: negative checks, and the owner ---
       const withdrawNoOwner = await runBin(BIN, ["withdraw", "--all"], homeAgent, workDir);
       expect(withdrawNoOwner.status).toBe(1);
 
@@ -298,34 +335,11 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
       const ownerAfter = await runBinJson(BIN, ["owner"], homeAgent, workDir);
       expect((ownerAfter.owner as string).toLowerCase()).toBe(humanAddress.toLowerCase());
 
-      // --- Step 10: run the game ---
-      agentDaemon = spawnBin(BIN, ["daemon"], homeAgent, workDir);
-      await waitFor("agent daemon health", 15_000, async () => {
-        try {
-          const res = await fetch(`http://127.0.0.1:${agentPort}/health`, { signal: AbortSignal.timeout(1_000) });
-          return res.ok ? true : undefined;
-        } catch {
-          return undefined;
-        }
-      });
-
-      // Review Focus 5: /board served from the daemon of the INSTALLED package -- proves api.ts's
-      // import.meta.url-relative BOARD_DIR resolves correctly through npm's bin symlink into node_modules.
-      const boardRes = await fetch(`http://127.0.0.1:${agentPort}/board`, { signal: AbortSignal.timeout(5_000) });
-      expect(boardRes.status).toBe(200);
-      expect(boardRes.headers.get("content-type")).toContain("text/html");
-      const boardHtml = await boardRes.text();
-      expect(boardHtml.length).toBeGreaterThan(0);
-      expect(boardHtml).toContain("<html");
-
-      // --- accept the house bot's standing offer ---
-      type OfferRow = { offerId: Hex; offer: { player: Address } };
-      const offers = await waitFor<OfferRow[]>("house bot's offer visible to the agent's own daemon", 30_000, async () => {
-        const list = (await runBinJson(BIN, ["offers"], homeAgent, workDir)) as OfferRow[];
-        return list.some((o) => o.offer.player.toLowerCase() === botAddress.toLowerCase()) ? list : undefined;
-      });
-      const chosen = offers.find((o) => o.offer.player.toLowerCase() === botAddress.toLowerCase())!;
-      await runBinJson(BIN, ["accept", chosen.offerId], homeAgent, workDir);
+      // --- Step 13: list the offers again, then accept (skill.md step 5) ---
+      const relisted = (await runBinJson(BIN, ["offers"], homeAgent, workDir)) as OfferRow[];
+      const chosen = relisted.find((o) => o.offerId === picked.offerId);
+      expect(chosen).toBeDefined(); // the house bot reposts only once matched, and nothing else accepts here
+      await runBinJson(BIN, ["accept", chosen!.offerId], homeAgent, workDir);
 
       const channelId = await waitFor<Hex>("channel to appear after accept", 15_000, async () => {
         const list = (await runBinJson(BIN, ["channels"], homeAgent, workDir)) as Array<{ channelId?: Hex; degraded?: true }>;
@@ -345,7 +359,8 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
       const deadline = Date.now() + 6 * 60_000;
       let lastGameIndexSeen = -1;
       let plyInCurrentGame = 0;
-      let gamesFinished = 0;
+      // Each finished game's result for this agent (1 win, 0 draw, -1 loss), for the profit-and-loss check below.
+      const results: Array<-1 | 0 | 1> = [];
 
       while (true) {
         if (Date.now() > deadline) throw new Error("cli-clean-room's play loop exceeded its 6-minute budget");
@@ -368,8 +383,10 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
             break;
           }
           case "game-over": {
-            if (gamesFinished <= status.gameIndex) gamesFinished = status.gameIndex + 1;
-            if (gamesFinished < GAMES_TO_PLAY) {
+            if (results.length <= status.gameIndex) {
+              results.push(status.gameStatus === "draw" ? 0 : status.gameStatus === `${status.color}_won` ? 1 : -1);
+            }
+            if (results.length < GAMES_TO_PLAY) {
               await runBinJson(BIN, ["next-game", "--channel", channelId], homeAgent, workDir);
             } else {
               await runBinJson(BIN, ["close", "--channel", channelId], homeAgent, workDir);
@@ -386,20 +403,43 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
             break; // opponent-silent / session-gas-low / human-must-move / null: never expected on this happy path
         }
       }
-      expect(gamesFinished).toBe(GAMES_TO_PLAY);
-      console.log(`[cli-clean-room] channel Finalized after ${gamesFinished} games`);
+      expect(results).toHaveLength(GAMES_TO_PLAY);
+      expect(results[RESIGN_GAME_INDEX]).toBe(-1); // the forced resignation is always a loss
+      console.log(`[cli-clean-room] channel Finalized after ${results.length} games; results=${JSON.stringify(results)}`);
 
-      // --- Step 11: cash out ---
-      const agentUsdcBeforeWithdraw = await usdcBalanceOf(stack, agentAddress);
+      // --- Step 14: the report (skill.md step 7): the change against the starting balance from the wait ---
+      const walletAfterClose = await runBinJson(BIN, ["wallet"], homeAgent, workDir);
+      const agentUsdcAfterClose = await usdcBalanceOf(stack, agentAddress);
+      expect(parseUnits(walletAfterClose.usdc as string, 6)).toBe(agentUsdcAfterClose);
+      const feePerPlayer = parseUnits(fundResult.feePerPlayer as string, 6);
+      const stake = parseUnits(fundResult.stakePerGame as string, 6);
+      const expectedDelta = results.reduce((sum, r) => sum + BigInt(r) * stake, 0n) - feePerPlayer;
+      expect(agentUsdcAfterClose - startingUsdc).toBe(expectedDelta);
+
+      // --- Step 15: cash out with no daemon running (M12): stop the agent's daemon first, so withdraw runs the
+      // installed bundle's in-process daemon under the home lock -- after a close, the path an agent that has
+      // stopped its daemon takes. ---
+      const agentDaemonPid = agentDaemon.child.pid;
+      await stopTracked(agentDaemon);
+      await waitFor("the agent's daemon to exit", 15_000, async () => (!isAlive(agentDaemonPid) ? true : undefined));
+      expect(await isPortFree(agentPort)).toBe(true);
+
       const humanUsdcBeforeWithdraw = await usdcBalanceOf(stack, humanAddress);
-      const withdrawResult = await runBinJson(BIN, ["withdraw", "--all"], homeAgent, workDir);
-      expect((withdrawResult.to as string).toLowerCase()).toBe(humanAddress.toLowerCase());
-      const withdrawnAmount = parseUnits(withdrawResult.amount as string, 6);
-      expect(withdrawnAmount).toBe(agentUsdcBeforeWithdraw);
+      const withdrawOne = await runBinJson(BIN, ["withdraw", "--amount", "1"], homeAgent, workDir);
+      expect((withdrawOne.to as string).toLowerCase()).toBe(humanAddress.toLowerCase());
+      expect(withdrawOne.amount).toBe("1.000000");
+      expect(parseUnits(withdrawOne.usdcAfter as string, 6)).toBe(agentUsdcAfterClose - 1_000_000n);
+      const withdrawAll = await runBinJson(BIN, ["withdraw", "--all"], homeAgent, workDir);
+      expect((withdrawAll.to as string).toLowerCase()).toBe(humanAddress.toLowerCase());
+      const withdrawnRest = parseUnits(withdrawAll.amount as string, 6);
+      expect(withdrawnRest).toBe(agentUsdcAfterClose - 1_000_000n);
+      expect(withdrawAll.usdcAfter).toBe("0.000000");
       const humanUsdcAfterWithdraw = await usdcBalanceOf(stack, humanAddress);
-      expect(humanUsdcAfterWithdraw - humanUsdcBeforeWithdraw).toBe(agentUsdcBeforeWithdraw);
+      expect(humanUsdcAfterWithdraw - humanUsdcBeforeWithdraw).toBe(agentUsdcAfterClose); // 1 + the rest, exactly
       const walletAfterWithdraw = await runBinJson(BIN, ["wallet"], homeAgent, workDir);
       expect(walletAfterWithdraw.usdc).toBe("0.000000");
+      // Each in-process daemon stopped again, releasing the port it bound.
+      expect(await isPortFree(agentPort)).toBe(true);
 
       // --- the house bot's own daemon never got stuck (no lastError on this channel) ---
       const botStatus = await runBinJson(BIN, ["status", "--channel", channelId], homeBot, workDir);
@@ -409,7 +449,7 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
       // --- nothing left running (brief step 1): stop everything this test started right here (not just in
       // afterEach), then assert every pid is actually gone and every port is free. ---
       const pidsToConfirmDead: number[] = [];
-      if (agentDaemon.child.pid !== undefined) pidsToConfirmDead.push(agentDaemon.child.pid);
+      if (agentDaemonPid !== undefined) pidsToConfirmDead.push(agentDaemonPid); // stopped above, before the withdraws
       if (houseBot.child.pid !== undefined) pidsToConfirmDead.push(houseBot.child.pid);
       const serverPid = stack.server.pid;
       const anvilPid = stack.anvil.pid;
@@ -418,7 +458,7 @@ describe("cli-clean-room: installing the packed CLI tarball outside the repo run
       const anvilPort = Number(new URL(stack.rpcUrl).port);
       const serverPort = Number(new URL(stack.serverUrl).port);
 
-      await stopTracked(agentDaemon);
+      await stopTracked(agentDaemon); // a no-op: already stopped before the withdraws
       await stopTracked(houseBot);
       await stack.stop();
 

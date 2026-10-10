@@ -466,7 +466,9 @@ export async function startStack(
       dbPath: join(dir, "server.sqlite"),
       fundingWindow: "3600",
       offerMaxLifetime: "86400",
-      defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" },
+      // Final fix wave (M9): 900 s, as dev-up serves -- since c7ead3d this override takes effect, and every daemon
+      // refuses a challengeTimeout below its own 900 s minChallengeTimeout default.
+      defaults: { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "900" },
       cliCommand: "arena",
       audit: "unaudited (development build)",
       indexer: { pollMs: 200, chunkBlocks: 1000, startBlock: 0 },
