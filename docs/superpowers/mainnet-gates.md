@@ -80,7 +80,8 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC and set feeCeilingWei for Arc in Plan 6.
 - **Before the first real publish** (owner's own steps, not automated — spec §6):
   - choose the npm package name/scope and set `ARENA_CLI_PACKAGE`;
-  - choose a license, add a `LICENSE` file, and set `ARENA_CLI_LICENSE`;
+  - choose a license, add a `LICENSE` file, and set `ARENA_CLI_LICENSE`; make `scripts/build-cli.ts` copy that
+    `LICENSE` into `dist/` and its `files` (it ships only `THIRD_PARTY_LICENSES` today);
   - push the repo to GitHub and set `ARENA_CLI_REPOSITORY`; check npm's current provenance rules for the repo's
     visibility (public vs. private) at that time — provenance attestation needs a public source, or an npm plan
     that supports it for a private one;

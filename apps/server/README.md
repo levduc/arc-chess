@@ -137,13 +137,17 @@ An optional `cli: {package, version, minVersion?}` pins the `arena` CLI this hos
   --version` is 24 or newer, then run the pinned `npx` command) — a host that leaves `cli` unset keeps today's
   page unchanged, with `cliCommand` still defaulting to (or explicitly) `arena`. With `cli` set, the recipe tells
   the agent to use that exact pinned command for every step, never `@latest`.
-- **The `init` version gate.** `arena init` compares its own version against `/templates`' `cli` (Plan 5.6 Task 4):
-  below `cli.minVersion` (or `cli.version`, when `minVersion` is unset), it refuses outright (exit 1), naming the
-  required version and the exact `npx -y <package>@<version> init --server …` command to run instead. Below only
-  `cli.version`, it still succeeds, with a `cliUpgrade` note in `init`'s summary. Equal versions, or no `cli`
-  configured, leave no `cliUpgrade` key at all. Before any real-USDC deploy, set `cli` only to a version actually
-  published with npm provenance (see `packages/cli/README.md`'s "Building the package" and
-  `docs/superpowers/mainnet-gates.md`'s "Plan 5.6" section).
+- **The `init` version gate.** `arena init` checks `/templates`' `cli` only after every other refusal (a changed
+  chain/hub/USDC/rules, the RPC pin, the code checks). It validates the entry locally first: a `cli.package` that
+  is not a valid npm name, or a version that is not a plain `x.y.z`, is refused without echoing the raw value. In
+  the published bundle, a `cli.package` other than the bundle's own is refused outright, with no command to run:
+  **a host may pin a version of the CLI, never a different package** (so a fork or rename here makes every
+  published agent's `init` refuse). Below `cli.minVersion` (or `cli.version`, when `minVersion` is unset) it
+  refuses (exit 1) with the install command for this same package at the host's `version`. Below only
+  `cli.version`, it succeeds with a `cliUpgrade` note in `init`'s summary. Equal versions, or no `cli` configured,
+  leave no `cliUpgrade` key. Before any real-USDC deploy, set `cli` only to a version actually published with npm
+  provenance (see `packages/cli/README.md`'s "Building the package" and `docs/superpowers/mainnet-gates.md`'s
+  "Plan 5.6" section).
 
 ## Routes
 

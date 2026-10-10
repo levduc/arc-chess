@@ -310,17 +310,21 @@ to `DIR/board/`, and writes a generated `DIR/package.json` manifest (`bin`, `eng
 no `dependencies`). No `tsx` at runtime — the bundle calls `main()` directly. Environment variables control the
 generated manifest:
 
-- `ARENA_CLI_PACKAGE` — the published package name (default `@arena/cli`, a placeholder). Also baked into the
-  bundle itself, for `selfCommand()`'s `npx -y <package>@<version>` form (used in `USAGE`, in `owner set`'s
-  printed command, and in daemon-unreachable hints).
+- `ARENA_CLI_PACKAGE` — the published package name (default `@arena/cli`, a placeholder, for a dev build only).
+  Also baked into the bundle itself: for `selfCommand()`'s `npx -y <package>@<version>` form (used in `USAGE`, in
+  `owner set`'s printed command, and in daemon-unreachable hints), and for `init`'s own-package check, which
+  refuses a host whose `/templates` pins any other package.
 - `ARENA_CLI_LICENSE` — the manifest's `license` (default `UNLICENSED` for a dev build).
 - `ARENA_CLI_REPOSITORY` — the manifest's `repository` URL (omitted from a dev build).
 
 `--release` is for `.github/workflows/release-cli.yml` (written, never run by this repo's own tooling — see
 `mainnet-gates.md`'s "Plan 5.6" section for what the owner must set up by hand before the first real publish):
-it requires both `ARENA_CLI_LICENSE` and `ARENA_CLI_REPOSITORY` to be set and fails loudly otherwise. The
-clean-room system test (`tests/system/cli-clean-room.test.ts`) packs and installs a dev build of this bundle
-with `npm pack`/`npm install --offline` outside the repo, then runs the whole funded-agent flow through the
+it requires `ARENA_CLI_PACKAGE`, `ARENA_CLI_LICENSE` and `ARENA_CLI_REPOSITORY` to be set (an empty value is an
+error, never a fallback) and fails loudly otherwise. Every build also writes `DIR/THIRD_PARTY_LICENSES`, the
+license texts of every package the bundle inlines (from esbuild's metafile), listed in the manifest's `files`.
+The clean-room system test (`tests/system/cli-clean-room.test.ts`) packs and installs a build of this bundle (its
+own dev build, or the prebuilt one in `ARENA_CLEAN_ROOM_DIST`, which the release workflow points at the bundle it
+publishes) with `npm pack`/`npm install --offline` outside the repo, then runs the whole funded-agent flow through the
 installed binary only — proving the zero-dependency claim (an offline install succeeding is the proof) and that
 the board assets and `--version` resolve correctly from inside `node_modules`.
 
