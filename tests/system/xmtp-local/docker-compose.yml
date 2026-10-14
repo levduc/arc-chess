@@ -1,0 +1,68 @@
+# A pinned copy of https://github.com/xmtp/xmtp-local-node/blob/main/docker-compose.yml (fetched 2026-10-13), for
+# Plan 5.7 Task 3 and Task 5's system tests against XMTP's local node.
+#
+# Differences from upstream, both required by the plan:
+#   - Every image is pinned by @sha256: digest (never a mutable `:main`/`:13` tag). Each digest below was resolved
+#     on 2026-10-13 with `docker buildx imagetools inspect <image>:<tag>` and is the digest of the manifest that
+#     tag pointed to that day; record the tag it came from alongside it (per image, in the comment above the
+#     `image:` line) so a future re-pin knows what to re-resolve.
+#   - Host ports are parameterized (`${XMTP_GRPC_PORT:-5555}` etc.) instead of hardcoded, so a test run can pick
+#     free ports and run several fixtures at once without colliding. Values are quoted ("5555:5555") because an
+#     unquoted bare `5555:5555` is YAML's sexagesimal-looking "60-value" syntax trap for some parsers.
+#
+# Brought up with a unique `-p <project>` per test run (never the bare default project name) and always torn down
+# with `docker compose -p <project> down -v`, even on failure -- see tests/system/xmtp-local.test.ts. This file is
+# never used outside tests: the arena's own gateway operations live in deploy/xmtp-gateway/, which pays real XMTP
+# fees and is never run in CI or by any test.
+services:
+  node:
+    # ghcr.io/xmtp/node-go:main, resolved 2026-10-13 with `docker buildx imagetools inspect ghcr.io/xmtp/node-go:main`.
+    image: ghcr.io/xmtp/node-go:main@sha256:e61e0f030504af32da0eae969e27ea9140c154e805ed218efa92cfaf7d053132
+    platform: linux/amd64
+    environment:
+      # Upstream's own fixed dev-node key for this local-only Waku node, not a secret of ours -- copied verbatim
+      # from xmtp/xmtp-local-node's docker-compose.yml.
+      - GOWAKU-NODEKEY=8a30dcb604b0b53627a5adc054dbf434b446628d4bd1eccc681d223f0550ce67
+    command:
+      - --store.enable
+      - --store.db-connection-string=postgres://postgres:xmtp@db:5432/postgres?sslmode=disable
+      - --store.reader-db-connection-string=postgres://postgres:xmtp@db:5432/postgres?sslmode=disable
+      - --mls-store.db-connection-string=postgres://postgres:xmtp@mlsdb:5432/postgres?sslmode=disable
+      - --mls-validation.grpc-address=validation:50051
+      - --api.enable-mls
+      - --wait-for-db=30s
+    ports:
+      - "${XMTP_GRPC_PORT:-5555}:5555"
+      - "${XMTP_API_PORT:-5556}:5556"
+    depends_on:
+      - db
+      - mlsdb
+      - validation
+
+  validation:
+    # ghcr.io/xmtp/mls-validation-service:main, resolved 2026-10-13 with
+    # `docker buildx imagetools inspect ghcr.io/xmtp/mls-validation-service:main`.
+    image: ghcr.io/xmtp/mls-validation-service:main@sha256:ee64edfeaece2414ea29ca8e1cdbd336a62648ddca9111ed1bd6de774734856d
+    platform: linux/amd64
+
+  db:
+    # postgres:13, resolved 2026-10-13 with `docker buildx imagetools inspect postgres:13`. This is the multi-arch
+    # index digest (not a single-platform manifest digest) -- postgres ships multi-arch, and no `platform:` is set
+    # for this service upstream, so the index digest is pinned and the engine still picks the right platform.
+    image: postgres:13@sha256:4689940c683801b4ab839ab3b0a0a3555a5fe425371422310944e89eca7d8068
+    environment:
+      POSTGRES_PASSWORD: xmtp
+
+  mlsdb:
+    # Same image/digest as `db` above (postgres:13, resolved 2026-10-13).
+    image: postgres:13@sha256:4689940c683801b4ab839ab3b0a0a3555a5fe425371422310944e89eca7d8068
+    environment:
+      POSTGRES_PASSWORD: xmtp
+
+  history-server:
+    # ghcr.io/xmtp/message-history-server:main, resolved 2026-10-13 with
+    # `docker buildx imagetools inspect ghcr.io/xmtp/message-history-server:main`.
+    image: ghcr.io/xmtp/message-history-server:main@sha256:344725869ddc4ba0a86e4a3e7e68b2c39c1caff9de9a8ecb514e40346a8ac6be
+    platform: linux/amd64
+    ports:
+      - "${XMTP_HISTORY_PORT:-5558}:5558"
