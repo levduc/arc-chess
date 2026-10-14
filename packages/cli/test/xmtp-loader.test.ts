@@ -46,8 +46,8 @@ function fakeSdk(home: string, opts: { version?: string; source?: string; manife
 }
 
 describe("loadXmtpSdk (Review Focus 3: missing, broken or wrong-version SDK)", () => {
-  it("pins @xmtp/node-sdk 6.0.0", () => {
-    expect(XMTP_SDK_VERSION).toBe("6.0.0");
+  it("pins @xmtp/node-sdk 6.1.0", () => {
+    expect(XMTP_SDK_VERSION).toBe("6.1.0");
   });
 
   it("returns ok:false for a home with no SDK dir at all", async () => {
@@ -109,7 +109,7 @@ describe("loadXmtpSdk (Review Focus 3: missing, broken or wrong-version SDK)", (
     const r = await loadXmtpSdk(home);
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.version).toBe("6.0.0");
+      expect(r.version).toBe("6.1.0");
       expect((r.sdk as { IdentifierKind: { Ethereum: number } }).IdentifierKind.Ethereum).toBe(0);
     }
   });
@@ -142,7 +142,7 @@ describe("the XMTP signer adapter and DB key (I5: through RelaySigner only)", ()
 
 // ------------------------------------------------------------------------------------------------- opt-in smoke test
 
-/** Opt-in: point ARENA_XMTP_SDK_DIR at a `node_modules` holding `@xmtp/node-sdk` 6.0.0 to run this against XMTP's
+/** Opt-in: point ARENA_XMTP_SDK_DIR at a `node_modules` holding `@xmtp/node-sdk` 6.1.0 to run this against XMTP's
  *  public `dev` network. Skipped otherwise. */
 const SDK_DIR = process.env.ARENA_XMTP_SDK_DIR;
 const HAVE_SDK = SDK_DIR !== undefined && existsSync(join(SDK_DIR, "@xmtp", "node-sdk", "package.json"));

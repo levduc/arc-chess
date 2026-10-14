@@ -71,6 +71,10 @@ export class FakeXmtp implements XmtpTransport {
   readonly opened: Array<{ channelId: Hex; me: Address; peer: Address }> = [];
   readonly sent: Array<{ channelId: Hex; text: string }> = [];
   readonly closed: Hex[] = [];
+  /** The channels closed with `purge` (finalized: their DB deleted). */
+  readonly purged: Hex[] = [];
+  /** Every `catchUp(channelId, afterMs)` asked for (K1). */
+  readonly catchUps: Array<{ channelId: Hex; afterMs: number }> = [];
   stopped = false;
   openImpl: () => Promise<void> = async () => undefined;
   sendImpl: () => Promise<void> = async () => undefined;
@@ -88,8 +92,12 @@ export class FakeXmtp implements XmtpTransport {
     this.handlers.add(h);
     return () => this.handlers.delete(h);
   }
-  async close(channelId: Hex): Promise<void> {
+  async close(channelId: Hex, opts: { purge?: boolean } = {}): Promise<void> {
     this.closed.push(channelId);
+    if (opts.purge === true) this.purged.push(channelId);
+  }
+  catchUp(channelId: Hex, afterMs: number): void {
+    this.catchUps.push({ channelId, afterMs });
   }
   async stop(): Promise<void> {
     this.stopped = true;
@@ -245,12 +253,20 @@ export class FakeSdk {
   lookupMisses = 0;
   /** Makes the next N createDmWithIdentifier calls fail (a busy DB, or a slow network). */
   dmFailures = 0;
+  /** createDmWithIdentifier calls. */
+  dmCalls = 0;
   /** Send times for `msg`, increasing. */
   private clock = 1_000_000n;
   /** Groups B has been invited to (strangers' invites). */
   readonly groups: FakeConversation[] = [];
   /** Delays a getConversationById call: the test resolves it. */
   lookupGate: Promise<void> | null = null;
+  /** `Client.close()` calls (6.1.0). */
+  closes = 0;
+  /** Makes `Client.close()` hang (never settle) while set. */
+  closeHangs = false;
+  /** Delays `Client.create`: the test resolves it. */
+  createGate: Promise<void> | null = null;
   readonly sentTexts: string[] = [];
   readonly isText = (m: FakeMessage) => typeof m.content === "string";
   readonly Client: { create(signer: unknown, opts: Record<string, unknown>): Promise<unknown> };
@@ -284,6 +300,10 @@ export class FakeSdk {
     };
     const client = {
       inboxId: meInbox,
+      close: async () => {
+        sdk.closes++;
+        if (sdk.closeHangs) await new Promise<void>(() => undefined);
+      },
       fetchInboxIdByIdentifier: async (id: { identifier: string }) => {
         sdk.inboxLookups++;
         if (sdk.inboxLookupFailures > 0) {
@@ -309,6 +329,7 @@ export class FakeSdk {
       },
       conversations: {
         createDmWithIdentifier: async (id: { identifier: string }) => {
+          sdk.dmCalls++;
           if (sdk.dmFailures > 0) {
             sdk.dmFailures--;
             throw new Error("database is locked");
@@ -347,6 +368,8 @@ export class FakeSdk {
     this.Client = {
       create: async (_signer: unknown, opts: Record<string, unknown>) => {
         sdk.creates.push(opts);
+        const gate = sdk.createGate;
+        if (gate) await gate;
         return client;
       },
     };

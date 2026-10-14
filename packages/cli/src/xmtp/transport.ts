@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { hexToBytes, keccak256, toHex, type Address, type Hex } from "viem";
 import type { RelaySigner } from "@arena/sdk";
@@ -18,7 +18,14 @@ export interface XmtpTransport {
    *  A handler returns `false` when it did not take the text for now (the channel's rate limit): the transport then
    *  does not mark the message as delivered, so a later catch-up can deliver it again. */
   onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => boolean | void): () => void;
-  close(channelId: Hex): Promise<void>;
+  /** Stops the channel's client (`Client.close()`, bounded). With `purge` -- the channel is finalized, its inbox is
+   *  never used again -- its DB files are then deleted. */
+  close(channelId: Hex, opts?: { purge?: boolean }): Promise<void>;
+  /** K1: re-delivers the opponent DM's latest messages no sooner than `afterMs` from now, once: a message the
+   *  channel's rate limit turned away is then delivered without waiting for a stream restart. Never restarts the
+   *  stream; at most one is pending per channel. */
+  catchUp?(channelId: Hex, afterMs: number): void;
+  /** Stops every client. The DB files are kept: a restarted daemon resumes the same installations. */
   stop(): Promise<void>;
 }
 
@@ -62,7 +69,7 @@ export function xmtpSignerOf(signer: RelaySigner, ethereumKind: number) {
   };
 }
 
-// ------------------------------------------------------- the slice of @xmtp/node-sdk 6.0.0 this file uses
+// ------------------------------------------------------- the slice of @xmtp/node-sdk 6.1.0 this file uses
 // Structural types only: the SDK is never imported statically (it is loaded at runtime by loader.ts).
 
 type SdkIdentifier = { identifier: string; identifierKind: number };
@@ -88,6 +95,8 @@ type SdkStream = AsyncIterable<SdkMessage | undefined> & { end(): Promise<unknow
 type SdkInboxState = { identifiers?: SdkIdentifier[] };
 type SdkClient = {
   readonly inboxId: string;
+  /** 6.1.0: cancels the client's workers and streams, then releases its DB connection. Idempotent. */
+  close?(): Promise<void>;
   fetchInboxIdByIdentifier(identifier: SdkIdentifier): Promise<string | null>;
   preferences?: { getInboxStates(inboxIds: string[]): Promise<SdkInboxState[]> };
   conversations: {
@@ -128,9 +137,26 @@ type Entry = {
   lastPeerLookup: number;
   peerLookupRunning: boolean;
   opening: Promise<void>;
+  /** Settles once `Client.create` has returned or failed (`creating` is true until then). */
+  created: Promise<void>;
+  creating: boolean;
   closed: boolean;
+  /** Set by `close(…, {purge: true})`: a client whose `Client.create` returns after that is closed and its DB deleted
+   *  by `start` itself. */
+  purge: boolean;
   /** Cancels the restart back-off sleep, if one is running. */
   wake: (() => void) | null;
+  /** The channel's one inbound pipeline: stream deliveries and every catch-up run on it, one at a time (I3). */
+  inbound: Promise<void>;
+  /** K1: a message was turned away by the rate limit, and no catch-up has re-delivered it yet. Until one has, later
+   *  messages are delivered but not marked delivered, so the catch-up re-delivers them after it, in order. */
+  behind: boolean;
+  /** K1: the pending rate-limit catch-up, whether one is running, whether another was asked for meanwhile, and the
+   *  back-off between catch-ups that were turned away again. */
+  catchUpTimer: ReturnType<typeof setTimeout> | undefined;
+  catchingUp: boolean;
+  catchUpAgain: boolean;
+  catchUpBackoffMs: number;
   /** XMTP message ids already delivered, oldest first (bounded): the catch-up and the stream can overlap. */
   seen: Set<string>;
   /** conversationId -> the DM's peer inbox id (null: not a DM). Only definitive answers are cached: the opponent's
@@ -163,6 +189,13 @@ const SEEN_MAX = 512;
 const CACHE_MAX = 256;
 /** The network calls of the catch-up (the DM, its history) give up after this long. */
 const NETWORK_TIMEOUT_MS = 5_000;
+/** Closing a channel waits this long for a `Client.create` still running (one that returns later is closed by
+ *  `start` itself), then this long for `Client.close()`: both inside `run.ts`'s 5 s stop budget. */
+const CREATE_WAIT_MS = 1_500;
+const CLIENT_CLOSE_TIMEOUT_MS = 3_000;
+/** K1: a rate-limit catch-up runs no sooner than this, and one turned away again backs off, doubling up to the cap. */
+const RATE_CATCH_UP_MIN_MS = 1_000;
+const RATE_CATCH_UP_MAX_MS = 30_000;
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
 const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
@@ -194,15 +227,24 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 const monotonic = () => performance.now();
 
 /**
- * The `XmtpTransport` over `@xmtp/node-sdk` 6.0.0 (`sdk` is the module `loadXmtpSdk` returned). Each channel's DB is
+ * The `XmtpTransport` over `@xmtp/node-sdk` 6.1.0 (`sdk` is the module `loadXmtpSdk` returned). Each channel's DB is
  * `<dbDir>/<channelId>.db3`, encrypted with `xmtpDbKey`, so a restarted daemon resumes the same installation
- * (XMTP caps an inbox at 10).
+ * (XMTP caps an inbox at 10). Each client keeps one DB connection (`useSingleConnection`, 6.1.0: "intended for
+ * services running many clients in one process"): about 4 file descriptors and no pool threads per client, against
+ * about 12 and 3 with the default pool (measured on 6.1.0).
  *
  * Inbound, per channel, one serial pipeline: each (re)start of the DM stream first re-delivers the opponent DM's
  * latest `XMTP_CATCH_UP_MESSAGES`, then drains the stream with `for await`, one message at a time. So messages reach
  * `onText` in arrival order, and the SDK's stream buffer never grows: the SDK queues every streamed message until it
  * is read, which is why `onValue` is never used. The transport owns the restart loop (`retryOnFail: false`): a
  * stream that fails or ends is re-created with back-off for as long as the channel is open, and never after `close`.
+ *
+ * K1: a message the channel's rate limit turned away is not marked delivered, and `XmtpRelay` asks for a catch-up
+ * once its bucket has refilled (`catchUp`). That catch-up runs on the same pipeline, without restarting the stream,
+ * re-reads the opponent DM's latest messages and delivers the ones not yet delivered, in order: messages after the
+ * turned-away one are delivered when they arrive but marked delivered only by the catch-up, so none of them can stay
+ * ahead of it. A catch-up turned away again backs off (1 s doubling to 30 s), so a flood costs at most one local
+ * read of `XMTP_CATCH_UP_MESSAGES` per back-off, and never a stream restart.
  *
  * Acceptance (spec §3), per message, with no network call and no wait on the inbound path:
  * - **Fast path.** `open` creates (or finds) the DM to the opponent and caches its conversation id and those of its
@@ -229,8 +271,11 @@ const monotonic = () => performance.now();
  * (the new conversation), the messages it delivered before the deny (for a group: what the next restart's sync
  * fetched), and its inbox's identity record -- all in the channel's own encrypted DB.
  *
- * The SDK has no public way to close a client: `close`/`stop` end the channel's stream, stop its restart loop and drop
- * every reference; the native client releases its DB when it is garbage-collected. The DB file is never deleted.
+ * Closing (I-1): `close`/`stop` end the channel's stream, stop its restart loop and catch-ups, then `Client.close()`
+ * (6.1.0) the client, bounded by `CLIENT_CLOSE_TIMEOUT_MS`: that releases its DB connection and cancels its workers
+ * (the native threads idle out shortly after). A client whose `Client.create` returns after the close is closed as it
+ * returns. `close(…, {purge: true})` -- the channel is finalized -- then deletes the channel's DB files
+ * (`<channelId>.db3`, `-wal`, `-shm`); `stop` keeps them, so a restarted daemon resumes the same installation.
  */
 export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; config: XmtpConfig; log(l: string): void }): XmtpTransport {
   const sdk = opts.sdk as NodeSdk;
@@ -427,9 +472,19 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
   }
 
   /** Hands one message on, once (spec §3: dedupe by XMTP message id). It is marked delivered only once taken: one the
-   *  channel's rate limit turned away stays unmarked, so the next catch-up delivers it again (m-N10). */
+   *  channel's rate limit turned away stays unmarked, so a catch-up delivers it again (m-N10, K1) -- and so do the
+   *  ones after it until then (`behind`), so that the catch-up delivers them in order after it. */
   function pass(e: Entry, m: SdkMessage, from: Address, dm: Address): void {
-    if (emit(e.channelId, from, dm, m.content as string)) remember(e.seen, m.id, SEEN_MAX);
+    if (!emit(e.channelId, from, dm, m.content as string)) e.behind = true;
+    else if (!e.behind) remember(e.seen, m.id, SEEN_MAX);
+  }
+
+  /** Runs `fn` after everything already on the channel's inbound pipeline: stream deliveries and catch-ups take turns
+   *  on it, so they never interleave (I3). */
+  function serially(e: Entry, fn: () => Promise<void>): Promise<void> {
+    const turn = e.inbound.then(fn);
+    e.inbound = turn.catch(() => undefined);
+    return turn;
   }
 
   /** One inbound message, start to finish; called strictly one at a time per channel. It never waits on the network
@@ -499,12 +554,13 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     }
   }
 
-  /** Re-delivers the opponent DM's latest messages, oldest first, through `deliver`. The DM was found by the
-   *  opponent's address (`dmOf`), so its own messages take the fast path. No DM yet (the opponent has not registered,
-   *  or the network is out): nothing to catch up on now. */
+  /** Re-delivers the opponent DM's latest messages, oldest first, through `deliver`; run on the inbound pipeline. The
+   *  DM was found by the opponent's address (`dmOf`), so its own messages take the fast path. Anything the rate limit
+   *  turned away before is re-read here (K1): `behind` starts over, and is set again only if this catch-up's own
+   *  delivery is turned away. No DM yet (the opponent has not registered, or the network is out): nothing to catch
+   *  up on now. */
   async function catchUp(e: Entry, dm: SdkDm | null): Promise<void> {
-    if (!dm) return;
-    await rememberDuplicates(e, dm);
+    if (!dm || e.closed) return;
     let recent: SdkMessage[];
     try {
       recent = await withTimeout(
@@ -515,10 +571,52 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     } catch {
       return;
     }
+    e.behind = false;
     for (const m of recent.slice(0, XMTP_CATCH_UP_MESSAGES).reverse()) {
       if (e.closed) return;
       await deliver(e, m);
     }
+  }
+
+  /** K1: asks for a catch-up `afterMs` from now (at least `RATE_CATCH_UP_MIN_MS`, or the current back-off). One at a
+   *  time per channel: asked again while one is pending, it changes nothing; while one runs, another follows it. */
+  function scheduleCatchUp(e: Entry, afterMs: number): void {
+    if (e.closed || e.catchUpTimer !== undefined) return;
+    if (e.catchingUp) {
+      e.catchUpAgain = true;
+      return;
+    }
+    const delay = Math.max(afterMs, RATE_CATCH_UP_MIN_MS, e.catchUpBackoffMs);
+    e.catchUpTimer = setTimeout(() => {
+      e.catchUpTimer = undefined;
+      void rateCatchUp(e);
+    }, delay);
+    e.catchUpTimer.unref?.();
+  }
+
+  /** K1: one catch-up for messages the rate limit turned away, on the inbound pipeline (never a stream restart). The
+   *  DM is found first, off the pipeline. Turned away again (or the DM not found): it backs off and tries again. */
+  async function rateCatchUp(e: Entry): Promise<void> {
+    if (e.closed) return;
+    e.catchingUp = true;
+    e.catchUpAgain = false;
+    let done = false;
+    try {
+      const dm = await findDm(e);
+      if (dm && !e.closed) {
+        await serially(e, () => catchUp(e, dm));
+        done = !e.behind;
+      }
+    } finally {
+      e.catchingUp = false;
+    }
+    if (e.closed) return;
+    if (done && !e.catchUpAgain) {
+      e.catchUpBackoffMs = 0;
+      return;
+    }
+    e.catchUpBackoffMs = Math.min(RATE_CATCH_UP_MAX_MS, Math.max(2 * RATE_CATCH_UP_MIN_MS, 2 * e.catchUpBackoffMs));
+    scheduleCatchUp(e, 0);
   }
 
   /** Waits `ms`, or less if the channel is closed meanwhile. Never keeps the process alive. */
@@ -565,12 +663,15 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       if (stream && !e.closed) {
         e.stream = stream;
         denyStrangerGroups(e);
-        await catchUp(e, dm);
+        if (dm) await rememberDuplicates(e, dm);
+        await serially(e, () => catchUp(e, dm)).catch(() => undefined);
         if (first) ready();
         first = false;
         for await (const m of stream) {
           if (e.closed) break;
-          await deliver(e, m).catch((err: unknown) => log(`xmtp: channel ${e.channelId}: inbound message failed: ${errorText(err)}`));
+          await serially(e, () => deliver(e, m)).catch((err: unknown) =>
+            log(`xmtp: channel ${e.channelId}: inbound message failed: ${errorText(err)}`),
+          );
         }
         e.stream = null;
       }
@@ -584,20 +685,90 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     }
   }
 
+  /** `Client.close()`, bounded; true once it has resolved. A client without `close` (an SDK before 6.1.0, which the
+   *  loader refuses anyway) is only dropped. Never throws. */
+  async function closeClient(channelId: Hex, client: SdkClient): Promise<boolean> {
+    if (typeof client.close !== "function") return false;
+    try {
+      await withTimeout(Promise.resolve().then(() => client.close?.()), CLIENT_CLOSE_TIMEOUT_MS, "client close");
+      return true;
+    } catch (err) {
+      log(`xmtp: channel ${channelId}: client close failed: ${errorText(err)}`);
+      return false;
+    }
+  }
+
+  /** Deletes a finalized channel's DB files: `<channelId>.db3` and its `-wal`/`-shm` (or any other sidecar named after
+   *  it). Only ever called once no client of this channel is open in this process. Never throws. */
+  function purgeDb(channelId: Hex): void {
+    if (!/^0x[0-9a-f]{64}$/.test(channelId)) return; // a path component: canonical ids only
+    let names: string[];
+    try {
+      names = readdirSync(opts.dbDir);
+    } catch {
+      return; // no DB dir: nothing to delete
+    }
+    for (const name of names) {
+      if (!name.startsWith(`${channelId}.db3`)) continue;
+      try {
+        rmSync(join(opts.dbDir, name), { force: true });
+      } catch (err) {
+        log(`xmtp: channel ${channelId}: could not delete ${name}: ${errorText(err)}`);
+      }
+    }
+  }
+
+  /** Ends one channel's client: its stream, restart loop and catch-ups, then `Client.close()`; with `purge`, its DB
+   *  files are deleted once the client is closed. Bounded by `CREATE_WAIT_MS` + `CLIENT_CLOSE_TIMEOUT_MS`. */
+  async function shutdown(e: Entry, purge: boolean): Promise<void> {
+    e.closed = true;
+    if (purge) e.purge = true;
+    e.wake?.();
+    clearTimeout(e.catchUpTimer);
+    e.catchUpTimer = undefined;
+    await e.stream?.end().catch(() => undefined);
+    // A Client.create still running: give it a moment. If it returns later, `start` closes (and purges) it itself.
+    await withTimeout(e.created, CREATE_WAIT_MS, "client start").catch(() => undefined);
+    const client = e.client;
+    e.client = null;
+    e.stream = null;
+    e.dm = null;
+    if (e.creating) return;
+    const closed = client === null ? true : await closeClient(e.channelId, client);
+    if (purge && closed) purgeDb(e.channelId);
+    else if (purge) log(`xmtp: channel ${e.channelId}: its client did not close; its DB files are kept`);
+  }
+
   async function start(e: Entry): Promise<void> {
     mkdirSync(opts.dbDir, { recursive: true, mode: 0o700 });
     const dbEncryptionKey = hexToBytes(await xmtpDbKey(e.me, e.channelId));
     const network: Record<string, unknown> = { env: opts.config.env };
     if (opts.config.apiUrl !== undefined) network.apiUrl = opts.config.apiUrl;
     if (opts.config.gatewayHost !== undefined) network.gatewayHost = opts.config.gatewayHost;
-    const client = await sdk.Client.create(xmtpSignerOf(e.me, ethereum), {
-      ...network,
-      dbPath: join(opts.dbDir, `${e.channelId}.db3`),
-      dbEncryptionKey,
-      // One installation per channel, never synced to another device: no history-sync traffic.
-      disableDeviceSync: true,
-    });
-    if (e.closed) return;
+    if (e.closed) return; // closed before its client was created: none is
+    let created: () => void = () => undefined;
+    e.created = new Promise<void>((r) => (created = r));
+    e.creating = true;
+    let client: SdkClient;
+    try {
+      client = await sdk.Client.create(xmtpSignerOf(e.me, ethereum), {
+        ...network,
+        dbPath: join(opts.dbDir, `${e.channelId}.db3`),
+        dbEncryptionKey,
+        // One installation per channel, never synced to another device: no history-sync traffic.
+        disableDeviceSync: true,
+        // One DB connection per client, not a pool (6.1.0): a daemon may hold many clients (I-1).
+        useSingleConnection: true,
+      });
+    } finally {
+      e.creating = false;
+      created();
+    }
+    if (e.closed) {
+      // Closed while starting: this client was never handed out, so it is closed here (I-1).
+      if ((await closeClient(e.channelId, client)) && e.purge) purgeDb(e.channelId);
+      return;
+    }
     e.client = client;
     await new Promise<void>((ready) => {
       run(e, ready).catch((err: unknown) => log(`xmtp: channel ${e.channelId}: inbound loop failed: ${errorText(err)}`));
@@ -619,8 +790,17 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
         lastPeerLookup: Number.NEGATIVE_INFINITY,
         peerLookupRunning: false,
         opening: Promise.resolve(),
+        created: Promise.resolve(),
+        creating: false,
         closed: false,
+        purge: false,
         wake: null,
+        inbound: Promise.resolve(),
+        behind: false,
+        catchUpTimer: undefined,
+        catchingUp: false,
+        catchUpAgain: false,
+        catchUpBackoffMs: 0,
         seen: new Set(),
         convPeer: new Map(),
         lookupAgainAt: new Map(),
@@ -647,21 +827,25 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       handlers.add(handler);
       return () => handlers.delete(handler);
     },
-    async close(channelId: Hex): Promise<void> {
+    catchUp(channelId: Hex, afterMs: number): void {
       const e = entries.get(channelId);
-      if (!e) return;
+      if (e && e.client) scheduleCatchUp(e, afterMs);
+    },
+    async close(channelId: Hex, closeOpts: { purge?: boolean } = {}): Promise<void> {
+      const e = entries.get(channelId);
+      if (!e) {
+        // No client in this process (never opened here, or its start failed): a finalized channel's DB from an
+        // earlier run is still deleted.
+        if (closeOpts.purge === true) purgeDb(channelId);
+        return;
+      }
       entries.delete(channelId);
-      e.closed = true;
-      e.wake?.();
-      await e.stream?.end().catch(() => undefined);
-      await e.opening.catch(() => undefined);
-      await e.stream?.end().catch(() => undefined);
-      e.client = null;
-      e.stream = null;
-      e.dm = null;
+      await shutdown(e, closeOpts.purge === true);
     },
     async stop(): Promise<void> {
-      await Promise.all([...entries.keys()].map((id) => transport.close(id)));
+      const all = [...entries.values()];
+      entries.clear();
+      await Promise.all(all.map((e) => shutdown(e, false)));
       handlers.clear();
     },
   };

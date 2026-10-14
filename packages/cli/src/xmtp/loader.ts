@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 
 /** Plan 5.7 (spec §4): the one `@xmtp/node-sdk` version this CLI is written and tested against. `arena xmtp enable`
  *  installs exactly this version, and the loader refuses any other. */
-export const XMTP_SDK_VERSION = "6.0.0";
+export const XMTP_SDK_VERSION = "6.1.0";
 
 export type XmtpSdkLoad = { ok: true; sdk: unknown; version: string } | { ok: false; reason: string };
 

@@ -1,6 +1,6 @@
 import type { Address, Hex } from "viem";
 import { decodeWire, parseRelayMessage, toWire, type Params, type RelayMessage, type RelaySigner } from "@arena/sdk";
-import { UNDETERMINED, type XmtpTransport } from "./transport.js";
+import { UNDETERMINED, XMTP_CATCH_UP_MESSAGES, type XmtpTransport } from "./transport.js";
 
 /**
  * Plan 5.7 (spec §3): the per-channel inbound budget. These are the host relay's own numbers
@@ -49,7 +49,8 @@ const key = (id: Hex) => id.toLowerCase() as Hex;
  *    channel whose client received it.
  * Anything else is dropped and counted (`dropped`): a known stranger at 2 or 3, before it can spend the channel's
  * budget. The session still verifies every state and close signature. A text turned away at 4 is reported back to
- * the transport as not taken, so it is not marked delivered and a later catch-up can deliver it again.
+ * the transport as not taken, so it is not marked delivered, and the transport is asked for a catch-up once the
+ * bucket has refilled (K1: `XmtpTransport.catchUp`), which delivers it again without a stream restart.
  *
  * Spec §3: a message whose sender or conversation the transport could not determine passes on to the session like
  * any other; it is tagged, and when the session rejects it, `countRejected` counts it as dropped instead of the daemon
@@ -180,15 +181,17 @@ export class XmtpRelay {
     return true;
   }
 
-  /** Forgets the channel (its counters too) and stops its XMTP client. */
-  async close(channelId: Hex): Promise<void> {
+  /** Forgets the channel (its counters too) and stops its XMTP client. With `purge` (the channel is finalized), its
+   *  XMTP DB is deleted too -- even when this process never opened it (a DB from an earlier run). */
+  async close(channelId: Hex, opts: { purge?: boolean } = {}): Promise<void> {
     const id = key(channelId);
     const ch = this.channels.get(id);
     this.drops.delete(id);
-    if (!ch) return;
-    this.channels.delete(id);
-    clearTimeout(ch.retryTimer);
-    await this.xmtp.close(id);
+    if (ch) {
+      this.channels.delete(id);
+      clearTimeout(ch.retryTimer);
+    } else if (opts.purge !== true) return;
+    await this.xmtp.close(id, opts.purge === true ? { purge: true } : undefined);
   }
 
   async stop(): Promise<void> {
@@ -244,6 +247,10 @@ export class XmtpRelay {
     if (!dmUndetermined && (typeof dm !== "string" || !same(dm, ch.opponent))) return dropped("not in the DM with the opponent");
     if (!this.takeToken(ch)) {
       this.drop(id, "rate limited");
+      // K1: delivered again by a catch-up once the bucket holds a catch-up's worth of tokens (the transport keeps
+      // at most one pending per channel, at least a second apart), never by a stream restart.
+      const refillMs = (Math.max(0, XMTP_CATCH_UP_MESSAGES - ch.bucket.tokens) / this.perSec) * 1000;
+      this.xmtp.catchUp?.(id, Math.ceil(refillMs));
       return false;
     }
     let msg: RelayMessage;
