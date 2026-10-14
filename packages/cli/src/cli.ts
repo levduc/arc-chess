@@ -24,6 +24,7 @@ import {
   defaultSessionGasWei,
   knownDeploymentWarnings,
   parseXmtpConfig,
+  readConfig,
   type ArenaConfig,
   type XmtpConfig,
 } from "./config.js";
@@ -106,9 +107,11 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   xmtp enable | status | disable
        (Plan 5.7: the XMTP fallback transport's SDK -- opt-in, never bundled, loaded only once installed.
         enable installs the pinned @xmtp/node-sdk (about 700 MB, one-time) into <ARENA_HOME>/xmtp/sdk and prints
-        {enabled, version, sizeMB}; status prints {enabled, version|null, reason?, env|null} without installing
-        anything; disable removes the installed SDK only -- it never touches <ARENA_HOME>/xmtp/db, so a channel's
-        XMTP history survives a disable/enable cycle.
+        {enabled, version, sizeMB}; a running daemon loads it only when it starts, so restart the daemon after
+        enabling. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
+        installing anything: daemon is what the RUNNING daemon loaded ("xmtp" or "off") or "not running".
+        disable removes the installed SDK only -- it never touches <ARENA_HOME>/xmtp/db, so a channel's XMTP
+        history survives a disable/enable cycle.
         ARENA_XMTP_NPM overrides the npm binary "enable" installs with -- a test hook, never set this normally:
         a stale value left in a shell or CI environment silently swaps the installer)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
@@ -250,6 +253,40 @@ function runNpmInstall(npmBin: string, sdkDir: string, version: string, io: CliI
       }
     });
   });
+}
+
+/** Plan 5.7 (I-2): how long `arena xmtp status` waits for the running daemon's `GET /fallback`. */
+const DAEMON_FALLBACK_TIMEOUT_MS = 2_000;
+
+/**
+ * Plan 5.7 (I-2): whether this home's RUNNING daemon loaded the XMTP SDK, from its `GET /fallback` -- `"xmtp"` or
+ * `"off"` (with its reason) -- or `"not running"` when nothing answers on its port (no config or token yet counts as
+ * not running), or `"unknown"` when something answers but not with a fallback (with why). Never throws.
+ */
+async function runningDaemonFallback(home: string, io: CliIo): Promise<{ fallback: "xmtp" | "off" | "not running" | "unknown"; reason?: string }> {
+  let port: number;
+  let token: string;
+  try {
+    port = readConfig(home).config.port;
+    token = loadToken(home);
+  } catch {
+    return { fallback: "not running" };
+  }
+  let res: Response;
+  try {
+    res = await io.fetch(`http://127.0.0.1:${port}/fallback`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(DAEMON_FALLBACK_TIMEOUT_MS),
+    });
+  } catch {
+    return { fallback: "not running" };
+  }
+  const body = (await res.json().catch(() => null)) as { fallback?: unknown; reason?: unknown; error?: unknown } | null;
+  if (res.ok && (body?.fallback === "xmtp" || body?.fallback === "off")) {
+    return typeof body.reason === "string" ? { fallback: body.fallback, reason: body.reason } : { fallback: body.fallback };
+  }
+  const why = typeof body?.error === "string" ? body.error : res.statusText;
+  return { fallback: "unknown", reason: `the daemon on 127.0.0.1:${port} answered ${res.status}: ${why}` };
 }
 
 /**
@@ -793,7 +830,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // opens in its history (and omnibox autocomplete, and maybe cloud sync), which replaceState cannot undo.
       // The running daemon mints the code (POST /board/code, with the token read from disk); the board trades it
       // once for the token, which it keeps in memory only. The code expires 120 s after it is minted.
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const token = loadToken(home);
       let res: Response;
       try {
@@ -815,7 +852,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     if (cmd === "wallet") {
       // Plan 5.5 Task 1: reads the chain directly (no daemon, no token) -- useful whether or not one is running.
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
 
@@ -896,7 +933,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     if (cmd === "faucet") {
       // Plan 5.5 Task 1: calls the host server's dev faucet for this wallet explicitly (no daemon needed).
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
       const faucetUrl = `${cfg.serverUrl.replace(/\/$/, "")}/faucet`;
@@ -981,7 +1018,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         explicitDeposit = parseUnits(depositRaw, 6);
       }
 
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
 
@@ -1177,7 +1214,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (amount <= 0n) throw new Error("--amount must be greater than 0");
         req = { amount };
       }
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
 
       let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint | null; note?: string; openOffers?: string[] };
       if (livePidHoldingLock(home) !== null) {
@@ -1267,7 +1304,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (cmd === "bot") {
       // Plan 5.5 Task 2: house bots are dev tooling -- refuse any chain but 31337 up front, before the home lock
       // or any RPC call, unless the caller explicitly overrides it.
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       if (cfg.chainId !== 31337 && !flags.has("allow-real-chain")) {
         throw new UsageError(
           `refusing to run "${CLI_COMMAND} bot" against chain ${cfg.chainId}: house bots are dev tooling for chain 31337 ` +
@@ -1392,19 +1429,27 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         // The SDK's own install state (above) is independent of config.json -- `status` must still answer
         // before `init` has ever run, so a missing or unreadable config just means `env: null`, never a throw.
         let env: XmtpConfig["env"] | null = null;
+        let configProblem: string | null = null;
         if (existsSync(arenaPaths(home).config)) {
           try {
-            env = loadConfig(home).xmtp?.env ?? null;
+            const read = readConfig(home);
+            env = read.config.xmtp?.env ?? null;
+            configProblem = read.xmtpProblem;
           } catch {
             env = null;
           }
         }
+        // Plan 5.7 (I-2): what the RUNNING daemon loaded -- it loads the SDK once, at start, so an `enable` after it
+        // started needs a daemon restart. "not running" when no daemon of this home answers.
+        const daemon = await runningDaemonFallback(home, io);
         io.out(
-          JSON.stringify(
-            loaded.ok
-              ? { enabled: true, version: loaded.version, env }
-              : { enabled: false, version: null, reason: loaded.reason, env },
-          ),
+          JSON.stringify({
+            ...(loaded.ok ? { enabled: true, version: loaded.version } : { enabled: false, version: null, reason: loaded.reason }),
+            env,
+            ...(configProblem !== null ? { configProblem } : {}),
+            daemon: daemon.fallback,
+            ...(daemon.reason !== undefined ? { daemonReason: daemon.reason } : {}),
+          }),
         );
         return 0;
       }
@@ -1480,7 +1525,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         throw new UsageError(cmd ? `unknown command ${cmd}` : "no command given");
     }
 
-    const cfg = loadConfig(home);
+    const cfg = loadConfig(home, { warn: io.err });
     const token = loadToken(home);
     let res: Response;
     try {

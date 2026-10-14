@@ -122,7 +122,7 @@ describe("arena xmtp enable|status|disable", () => {
     expect(await runCli(["xmtp", "status"], t.io)).toBe(0);
     expect(t.out).toHaveLength(1);
     const payload = JSON.parse(t.out[0]) as Record<string, unknown>;
-    expect(payload).toMatchObject({ enabled: false, version: null, env: null });
+    expect(payload).toMatchObject({ enabled: false, version: null, env: null, daemon: "not running" });
     expect(payload.reason).toContain("not installed");
   });
 
@@ -140,7 +140,58 @@ describe("arena xmtp enable|status|disable", () => {
     // status now reports it installed, with no cached config (env: null).
     const t2 = io(home);
     expect(await runCli(["xmtp", "status"], t2.io)).toBe(0);
-    expect(JSON.parse(t2.out[0])).toEqual({ enabled: true, version: XMTP_SDK_VERSION, env: null });
+    expect(JSON.parse(t2.out[0])).toEqual({ enabled: true, version: XMTP_SDK_VERSION, env: null, daemon: "not running" });
+  });
+
+  it("I-2: status reports what the RUNNING daemon loaded (GET /fallback), or not running", async () => {
+    const home = freshDir("arena-xmtp-cli-");
+    expect(await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp: { env: "dev" } })) })).toBe(0);
+    const port = loadConfig(home).port;
+    const token = (JSON.parse(readFileSync(join(home, "token.json"), "utf8")) as { token: string }).token;
+    const daemonAnswering = (status: number, body: unknown, seen: string[]) =>
+      (async (url: string, init?: RequestInit) => {
+        seen.push(`${url} ${(init?.headers as Record<string, string>)?.authorization ?? ""}`);
+        return new Response(JSON.stringify(body), { status });
+      }) as unknown as typeof fetch;
+    const status = async (fetchImpl: typeof fetch) => {
+      const t = io(home);
+      expect(await runCli(["xmtp", "status"], { ...t.io, fetch: fetchImpl })).toBe(0);
+      return JSON.parse(t.out[0]) as Record<string, unknown>;
+    };
+    // A daemon that started before `xmtp enable`: it runs without the fallback until restarted.
+    const seen: string[] = [];
+    const off = await status(daemonAnswering(200, { fallback: "off", reason: "the XMTP SDK is not installed" }, seen));
+    expect(off).toMatchObject({ enabled: false, env: "dev", daemon: "off", daemonReason: "the XMTP SDK is not installed" });
+    expect(seen).toEqual([`http://127.0.0.1:${port}/fallback Bearer ${token}`]);
+    expect(await status(daemonAnswering(200, { fallback: "xmtp" }, []))).toMatchObject({ daemon: "xmtp" });
+    expect(await status(daemonAnswering(200, { fallback: "xmtp" }, []))).not.toHaveProperty("daemonReason");
+    // Nothing listening on the daemon's port.
+    expect(await status(io(home).io.fetch)).toMatchObject({ daemon: "not running" });
+    // Something else answers there (another home's daemon: wrong token).
+    const other = await status(daemonAnswering(401, { error: "missing or invalid token" }, []));
+    expect(other.daemon).toBe("unknown");
+    expect(other.daemonReason).toContain("answered 401");
+  });
+
+  it("m-7: an invalid xmtp in config.json is reported by status, and other commands still run (one warning)", async () => {
+    const home = freshDir("arena-xmtp-cli-");
+    expect(await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp: { env: "dev" } })) })).toBe(0);
+    const path = join(home, "config.json");
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify({ ...raw, xmtp: { env: "mainnet" } }));
+    const t = io(home);
+    expect(await runCli(["xmtp", "status"], t.io)).toBe(0);
+    const payload = JSON.parse(t.out[0]) as Record<string, unknown>;
+    expect(payload.env).toBeNull();
+    expect(payload.configProblem).toMatch(/^config\.json's xmtp is invalid \(xmtp\.env/);
+    // A daemon command: loads config, reaches the (stubbed) daemon, exits 0 -- with exactly one warning line.
+    const t2 = io(home);
+    const fetchChannels = (async () => new Response(JSON.stringify([]))) as unknown as typeof fetch;
+    expect(await runCli(["channels"], { ...t2.io, fetch: fetchChannels })).toBe(0);
+    expect(JSON.parse(t2.out.join("\n"))).toEqual([]);
+    expect(t2.err.filter((l) => l.includes("xmtp is invalid"))).toHaveLength(1);
+    // The file is left as it was (a newer CLI's value survives).
+    expect((JSON.parse(readFileSync(path, "utf8")) as { xmtp: unknown }).xmtp).toEqual({ env: "mainnet" });
   });
 
   it("enable surfaces npm's own failure clearly, naming its exit code and output", async () => {
@@ -251,10 +302,11 @@ describe("arena xmtp enable|status|disable", () => {
 });
 
 // Opt-in: the real install, against the real npm registry -- never run by plain `pnpm test:cli`. Downloads the
-// real ~725 MB @xmtp/node-sdk@6.0.0 (native binary included), so it is gated behind ARENA_XMTP_REAL_INSTALL=1 and
-// given a generous timeout; its temp HOME is removed in `afterEach` like every other test here.
+// real @xmtp/node-sdk@6.1.0 (native binaries included, about SIZE_MB on disk), so it is gated behind
+// ARENA_XMTP_REAL_INSTALL=1 and given a generous timeout; its temp HOME is removed in `afterEach` like every other
+// test here.
 describe.skipIf(process.env.ARENA_XMTP_REAL_INSTALL !== "1")("arena xmtp enable: the real install (opt-in: ARENA_XMTP_REAL_INSTALL=1)", () => {
-  it("installs the real @xmtp/node-sdk@6.0.0 from the npm registry and loads it", async () => {
+  it(`installs the real @xmtp/node-sdk@${XMTP_SDK_VERSION} from the npm registry and loads it`, async () => {
     const home = freshDir("arena-xmtp-real-install-");
     // No ARENA_XMTP_NPM override here: resolveNpmBinary finds the real npm (next to process.execPath, else PATH).
     const t = io(home);
@@ -263,12 +315,15 @@ describe.skipIf(process.env.ARENA_XMTP_REAL_INSTALL !== "1")("arena xmtp enable:
     const payload = JSON.parse(t.out.at(-1)!) as Record<string, unknown>;
     expect(payload.enabled).toBe(true);
     expect(payload.version).toBe(XMTP_SDK_VERSION);
-    // ~725 MB; loosely bounded so this isn't brittle against a minor packaging change.
+    // About SIZE_MB; loosely bounded so this isn't brittle against a minor packaging change.
+    // eslint-disable-next-line no-console
+    console.log(`arena xmtp enable (real install): sizeMB ${String(payload.sizeMB)}`);
     expect(payload.sizeMB as number).toBeGreaterThan(100);
+    expect(payload.sizeMB as number).toBeLessThan(1500);
 
     const t2 = io(home);
     expect(await runCli(["xmtp", "status"], t2.io)).toBe(0);
-    expect(JSON.parse(t2.out[0])).toEqual({ enabled: true, version: XMTP_SDK_VERSION, env: null });
+    expect(JSON.parse(t2.out[0])).toEqual({ enabled: true, version: XMTP_SDK_VERSION, env: null, daemon: "not running" });
   }, 600_000);
 });
 
