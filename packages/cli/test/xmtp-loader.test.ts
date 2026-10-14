@@ -179,4 +179,42 @@ describe.skipIf(!HAVE_SDK)("createNodeSdkTransport against XMTP's dev network (o
       await Promise.all([ta.stop(), tb.stop()]);
     }
   }, 180_000);
+
+  it("a stranger's group invite is denied at the next stream start (the real consent filter matches a fresh invite)", async () => {
+    const home = newHome();
+    mkdirSync(join(home, "xmtp", "sdk"), { recursive: true });
+    symlinkSync(SDK_DIR as string, xmtpSdkNodeModules(home), "dir");
+    const loaded = await loadXmtpSdk(home);
+    if (!loaded.ok) throw new Error(loaded.reason);
+    const sdk = loaded.sdk as {
+      Client: { create(s: unknown, o: Record<string, unknown>): Promise<any> }; // eslint-disable-line @typescript-eslint/no-explicit-any
+      IdentifierKind: { Ethereum: number };
+    };
+    const a = privateKeyToAccount(generatePrivateKey()); // the opponent: never registers here
+    const b = privateKeyToAccount(generatePrivateKey());
+    const stranger = privateKeyToAccount(generatePrivateKey());
+    const channelId = keccak256(toHex(`arena-smoke-group-${Date.now()}-${Math.random()}`)) as Hex;
+    const logs: string[] = [];
+    const make = () =>
+      createNodeSdkTransport({ sdk: loaded.sdk, dbDir: join(home, "xmtp", "db-b"), config: { env: "dev" }, log: (l) => logs.push(l) });
+    const first = make();
+    await first.open(channelId, b, a.address); // registers B's inbox
+    const c = await sdk.Client.create(xmtpSignerOf(stranger, sdk.IdentifierKind.Ethereum), {
+      env: "dev",
+      dbPath: null,
+      disableDeviceSync: true,
+    });
+    const group = await c.conversations.createGroupWithIdentifiers([
+      { identifier: b.address.toLowerCase(), identifierKind: sdk.IdentifierKind.Ethereum },
+    ]);
+    await group.sendText("join us");
+    await first.stop();
+    const second = make(); // B's daemon restarts: same DB, same installation
+    try {
+      await second.open(channelId, b, a.address);
+      expect(logs.filter((l) => l.includes("denied 1 group invite(s) from strangers"))).toHaveLength(1);
+    } finally {
+      await second.stop();
+    }
+  }, 180_000);
 });

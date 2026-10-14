@@ -53,7 +53,7 @@ export function xmtpSignerOf(signer: RelaySigner, ethereumKind: number) {
 // Structural types only: the SDK is never imported statically (it is loaded at runtime by loader.ts).
 
 type SdkIdentifier = { identifier: string; identifierKind: number };
-type SdkMessage = { id: string; content: unknown; conversationId: string; senderInboxId: string };
+type SdkMessage = { id: string; content: unknown; conversationId: string; senderInboxId: string; sentAtNs?: bigint };
 type SdkConversation = { readonly id: string; readonly peerInboxId?: string; updateConsentState?(state: number): void };
 type SdkDm = SdkConversation & {
   readonly peerInboxId: string;
@@ -112,8 +112,17 @@ type Entry = {
   notPeer: Set<string>;
   /** Strangers' conversations already denied (bounded). */
   denied: Set<string>;
-  /** Armed when an opponent message was passed on unresolved: restarts the stream after `UNRESOLVED_HOLD_MS`, so the
-   *  restart's catch-up (which finds the DM itself) delivers it. */
+  /** Set when an opponent message's conversation could not be resolved: from then on every opponent message is
+   *  held (in `held`, neither emitted nor `seen`), so none can overtake it, until a catch-up -- which finds the DM by
+   *  the opponent's address, the path that handles XMTP's DM stitching -- resolves them all, in order. */
+  gap: boolean;
+  /** The opponent's messages held while `gap` is set, in arrival order (bounded: `HELD_MAX`). */
+  held: SdkMessage[];
+  /** While `gap` is set: when (monotonic ms) the next catch-up may be tried, and the back-off after that. */
+  gapRetryAt: number;
+  gapBackoffMs: number;
+  /** While `gap` is set: restarts the stream when the next catch-up is due, so the gap closes even if no further
+   *  message arrives. One pending at a time. */
   refresh: ReturnType<typeof setTimeout> | undefined;
   /** The next restart is a deliberate one: no back-off. */
   refreshing: boolean;
@@ -137,6 +146,13 @@ const CACHE_MAX = 256;
 const UNRESOLVED_RETRY_MS = [100, 400, 1_500];
 /** After that, the same conversation is not looked up again for this long (a hot loop is impossible). */
 const UNRESOLVED_HOLD_MS = 5_000;
+/** While a gap is open: the first catch-up retry comes after this long, doubling up to the cap. */
+const GAP_RETRY_MIN_MS = 5_000;
+const GAP_RETRY_MAX_MS = 60_000;
+/** At most this many opponent messages are held while a gap is open, each at most `HELD_TEXT_MAX` characters (larger
+ *  ones are over XmtpRelay's 16 KiB anyway). A catch-up reads `XMTP_CATCH_UP_MESSAGES` plus the held count back. */
+const HELD_MAX = 64;
+const HELD_TEXT_MAX = 64 * 1024;
 /** The network calls on the inbound path (the opponent's inbox, the DM) give up after this long. */
 const NETWORK_TIMEOUT_MS = 5_000;
 
@@ -174,9 +190,12 @@ const monotonic = () => performance.now();
  * stream that fails or ends is re-created with back-off for as long as the channel is open, and never after `close`.
  *
  * Sender and conversation are resolved against the opponent's inbox only (see `NOT_THE_PEER`). A DM's peer is looked
- * up once per conversation and cached; a lookup that comes back empty is retried (bounded), never cached. A message
- * id is marked delivered only once it has gone out as the opponent's, in its DM, so a later catch-up can still
- * deliver one that was passed on as not the opponent's.
+ * up once per conversation and cached; a lookup that comes back empty is retried in place (bounded), never cached. If
+ * it stays empty, the channel opens a *gap*: that message and every later one from the opponent are held (bounded,
+ * never emitted or marked delivered), and a catch-up -- which finds the DM by the opponent's address, across XMTP's
+ * DM stitching, with no conversation lookup -- resolves them all and delivers them in send order. It is tried at once,
+ * then with back-off (a stream restart arms each retry, so the gap closes even if the opponent sends nothing more)
+ * until it succeeds. Only the opponent's own messages can open a gap; a stranger never can.
  *
  * Strangers: a stranger's DM is set to consent `Denied` on its first message -- once the opponent's inbox is known,
  * or earlier, when the sender's own inbox (read locally) is bound to addresses that do not include the opponent's.
@@ -347,52 +366,126 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     const { peer: peerInbox, stranger } = await peerInboxIdOf(e, m.senderInboxId);
     if (peerInbox === null || !same(m.senderInboxId, peerInbox)) {
       // A stranger: it cannot be in our DM with the opponent (a DM has two members), so neither field is the peer.
+      // Nothing here can open a gap, hold a message or restart the stream.
       if (stranger) await deny(e, m.conversationId, m.senderInboxId).catch(() => undefined);
       emit(e.channelId, NOT_THE_PEER, NOT_THE_PEER, m.content as string);
       return;
     }
+    if (e.gap) {
+      // An earlier opponent message is still unresolved: nothing of the opponent's may overtake it.
+      hold(e, m);
+      if (monotonic() >= e.gapRetryAt) await closeGap(e);
+      return;
+    }
     const { peer: dmPeer, conv, unresolved } = await convPeerOf(e, m.conversationId);
     if (e.closed) return;
+    if (unresolved) {
+      // Not resolvable by its conversation id: hold it, and resolve it at once the way the catch-up does.
+      e.gap = true;
+      e.gapBackoffMs = GAP_RETRY_MIN_MS;
+      e.gapRetryAt = 0;
+      log(`xmtp: channel ${e.channelId}: the opponent's message ${m.id} could not be placed; holding the opponent's messages until a catch-up resolves them`);
+      hold(e, m);
+      await closeGap(e);
+      return;
+    }
     const inTheDm = dmPeer !== null && same(dmPeer, peerInbox);
     if (inTheDm && conv) setConsent(conv, consent?.Allowed);
     if (inTheDm) remember(e.seen, m.id, SEEN_MAX); // delivered for good: a catch-up must not repeat it
-    else if (unresolved) {
-      log(`xmtp: channel ${e.channelId}: conversation of message ${m.id} not resolved; a catch-up will retry it`);
-      scheduleRefresh(e);
-    }
     emit(e.channelId, e.peer, inTheDm ? e.peer : NOT_THE_PEER, m.content as string);
   }
 
-  /** Restarts the channel's stream once `UNRESOLVED_HOLD_MS` has passed (one pending at a time), so its catch-up
-   *  re-delivers the messages left un-`seen`. */
-  function scheduleRefresh(e: Entry): void {
+  /** Keeps an opponent message for the gap's catch-up (bounded; never emitted or marked `seen` here). */
+  function hold(e: Entry, m: SdkMessage): void {
+    if (e.held.some((h) => h.id === m.id)) return;
+    if (e.held.length >= HELD_MAX || (m.content as string).length > HELD_TEXT_MAX) {
+      if (e.held.length === HELD_MAX) log(`xmtp: channel ${e.channelId}: ${HELD_MAX} opponent messages held; later ones are left to the catch-up`);
+      return;
+    }
+    e.held.push(m);
+  }
+
+  /** Emits one of the opponent's messages known to be in its DM, once. */
+  function emitOpponent(e: Entry, m: SdkMessage, peerInbox: string): void {
+    if (!isText(m) || e.seen.has(m.id) || !same(m.senderInboxId, peerInbox)) return;
+    remember(e.seen, m.id, SEEN_MAX);
+    emit(e.channelId, e.peer, e.peer, m.content as string);
+  }
+
+  /** Tries the catch-up that closes an open gap; on failure, schedules the next try (back-off) and a stream restart
+   *  for then, so the gap closes even if the opponent sends nothing more. */
+  async function closeGap(e: Entry): Promise<void> {
+    if (!e.gap || e.closed) return;
+    if (await catchUp(e)) return;
+    e.gapRetryAt = monotonic() + e.gapBackoffMs;
+    scheduleRefresh(e, e.gapBackoffMs);
+    log(`xmtp: channel ${e.channelId}: catch-up failed with ${e.held.length} message(s) held; retrying in ${e.gapBackoffMs / 1000}s`);
+    e.gapBackoffMs = Math.min(GAP_RETRY_MAX_MS, e.gapBackoffMs * 2);
+  }
+
+  /** Restarts the channel's stream after `ms` (one pending at a time): the restart runs a catch-up first. */
+  function scheduleRefresh(e: Entry, ms: number): void {
     if (e.refresh !== undefined || e.closed) return;
     e.refresh = setTimeout(() => {
       e.refresh = undefined;
-      if (e.closed || !e.stream) return;
+      if (e.closed || !e.gap || !e.stream) return;
       e.refreshing = true;
       void e.stream.end().catch(() => undefined);
-    }, UNRESOLVED_HOLD_MS);
+    }, ms);
     e.refresh.unref?.();
   }
 
-  /** Re-delivers the opponent DM's latest messages, oldest first, through `deliver`. */
-  async function catchUp(e: Entry): Promise<void> {
+  /**
+   * Re-delivers the opponent DM's latest messages, oldest first. The DM is found by the opponent's address (`dmOf`,
+   * which the SDK resolves across XMTP's duplicate-DM stitching), so no conversation lookup is involved, and every
+   * message it lists is the DM's. While a gap is open it also reads back as far as the held messages reach, merges
+   * them in (by send time), and on success closes the gap. Returns whether it ran to the end.
+   */
+  async function catchUp(e: Entry): Promise<boolean> {
     let dm: SdkDm;
     try {
       dm = await withTimeout(dmOf(e), NETWORK_TIMEOUT_MS, "DM lookup");
     } catch {
-      return; // the opponent has not registered yet (or the network is out): nothing to catch up on now
+      return false; // the opponent has not registered yet (or the network is out): nothing to catch up on now
     }
-    const recent = await withTimeout(
-      dm.messages({ limit: XMTP_CATCH_UP_MESSAGES, direction: sdk.SortDirection?.Descending }),
-      NETWORK_TIMEOUT_MS,
-      "catch-up",
-    ).catch(() => []);
-    for (const m of recent.slice(0, XMTP_CATCH_UP_MESSAGES).reverse()) {
-      if (e.closed) return;
-      await deliver(e, m).catch((err: unknown) => log(`xmtp: channel ${e.channelId}: catch-up message failed: ${errorText(err)}`));
+    const limit = XMTP_CATCH_UP_MESSAGES + (e.gap ? e.held.length : 0);
+    let recent: SdkMessage[];
+    try {
+      recent = await withTimeout(dm.messages({ limit, direction: sdk.SortDirection?.Descending }), NETWORK_TIMEOUT_MS, "catch-up");
+    } catch {
+      return false;
     }
+    if (e.closed) return false;
+    const peerInbox = dm.peerInboxId;
+    const ordered = recent.slice(0, limit).reverse(); // oldest first
+    const ids = new Set(ordered.map((m) => m.id));
+    let lost = 0;
+    if (e.gap) {
+      // Held messages the listing did not reach: still the DM's if they arrived in it (or a stitched duplicate of it).
+      for (const h of e.held) {
+        if (ids.has(h.id)) continue;
+        const cached = e.convPeer.get(h.conversationId);
+        if (h.conversationId === dm.id || (typeof cached === "string" && same(cached, peerInbox))) {
+          ordered.push(h);
+          ids.add(h.id);
+        } else lost++;
+      }
+    }
+    // By send time when every message carries one (a stable sort keeps arrival order among equals).
+    if (ordered.every((m) => typeof m.sentAtNs === "bigint")) {
+      ordered.sort((a, b) => ((a.sentAtNs as bigint) < (b.sentAtNs as bigint) ? -1 : (a.sentAtNs as bigint) > (b.sentAtNs as bigint) ? 1 : 0));
+    }
+    const wasGap = e.gap;
+    const heldCount = e.held.length;
+    e.gap = false;
+    e.held = [];
+    clearTimeout(e.refresh);
+    e.refresh = undefined;
+    for (const m of ordered) emitOpponent(e, m, peerInbox);
+    if (wasGap) {
+      log(`xmtp: channel ${e.channelId}: catch-up resolved ${heldCount} held message(s)` + (lost > 0 ? `; ${lost} could not be found in the DM` : ""));
+    }
+    return true;
   }
 
   /** Waits `ms`, or less if the channel is closed meanwhile. Never keeps the process alive. */
@@ -433,7 +526,8 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       if (stream && !e.closed) {
         e.stream = stream;
         denyStrangerGroups(e);
-        await catchUp(e);
+        if (e.gap) await closeGap(e);
+        else await catchUp(e);
         if (first) ready();
         first = false;
         for await (const m of stream) {
@@ -494,6 +588,10 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
         unresolvedUntil: new Map(),
         notPeer: new Set(),
         denied: new Set(),
+        gap: false,
+        held: [],
+        gapRetryAt: 0,
+        gapBackoffMs: GAP_RETRY_MIN_MS,
         refresh: undefined,
         refreshing: false,
       };

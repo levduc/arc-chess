@@ -135,7 +135,7 @@ export const settle = () => new Promise<void>((r) => setImmediate(r));
 
 // ------------------------------------------------------------------------------------------------- a fake node-sdk
 
-export type FakeMessage = { id: string; content: unknown; conversationId: string; senderInboxId: string };
+export type FakeMessage = { id: string; content: unknown; conversationId: string; senderInboxId: string; sentAtNs?: bigint };
 
 /** The SDK's AsyncStream, as far as the transport can see it: a buffer that grows while nobody reads it. Like the
  *  real one, `push` also calls `onValue` when the consumer passed one. */
@@ -206,6 +206,10 @@ export class FakeSdk {
   failStarts = 0;
   /** Makes the next N getConversationById calls come back `undefined` (the SDK turns any error into that). */
   lookupMisses = 0;
+  /** Makes the next N createDmWithIdentifier calls fail (a busy DB, or a slow network). */
+  dmFailures = 0;
+  /** Send times for `msg`, increasing. */
+  private clock = 1_000_000n;
   /** Groups B has been invited to (strangers' invites). */
   readonly groups: FakeConversation[] = [];
   /** Delays a getConversationById call: the test resolves it. */
@@ -249,6 +253,10 @@ export class FakeSdk {
       },
       conversations: {
         createDmWithIdentifier: async (id: { identifier: string }) => {
+          if (sdk.dmFailures > 0) {
+            sdk.dmFailures--;
+            throw new Error("database is locked");
+          }
           if (!sdk.peerRegistered || id.identifier.toLowerCase() !== peer.toLowerCase()) throw new Error("peer not registered");
           return dm();
         },
@@ -311,7 +319,16 @@ export class FakeSdk {
 
   /** A text from `from` in `conversationId`. */
   msg(id: string, from: Address, text: string, conversationId = "dm-ab"): FakeMessage {
-    return { id, content: text, conversationId, senderInboxId: FakeSdk.inboxOf(from) };
+    this.clock += 1_000n;
+    return { id, content: text, conversationId, senderInboxId: FakeSdk.inboxOf(from), sentAtNs: this.clock };
+  }
+
+  /** The opponent sends `text` into the DM: it is in the DM's history, and arrives on the live stream. */
+  arrive(id: string, from: Address, text: string): FakeMessage {
+    const m = this.msg(id, from, text);
+    this.history.push(m);
+    this.stream.push(m);
+    return m;
   }
 
   get stream(): FakeStream {

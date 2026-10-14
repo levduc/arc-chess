@@ -176,35 +176,113 @@ describe("createNodeSdkTransport: the inbound stream", () => {
     expect(sdk.lookups).toBe(2); // the real answer was
   });
 
-  it("lookups that keep coming back empty: passed on unresolved, never seen, then delivered in order by a catch-up", async () => {
-    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
-    sdk.peerRegistered = false;
-    await t.open(channelId, b, a.address);
-    sdk.peerRegistered = true;
-    sdk.lookupMisses = 4; // the first lookup and its three retries
-    for (const [id, text] of [["a-1", "move-1"], ["a-2", "move-2"]] as const) {
-      sdk.history.push(sdk.msg(id, a.address, text));
-      sdk.stream.push(sdk.msg(id, a.address, text));
-    }
+  /** B's transport whose opponent DM was unknown at open (B opened before A registered), so A's first message needs a
+   *  conversation lookup -- and every lookup comes back empty for a while. */
+  async function lookupsFailing(misses: number) {
+    const tb = await bTransport({ open: false });
+    tb.sdk.peerRegistered = false;
+    await tb.t.open(tb.channelId, tb.b, tb.a.address);
+    tb.sdk.peerRegistered = true;
+    tb.sdk.lookupMisses = misses;
+    return tb;
+  }
+
+  /** The 100/400/1500 ms in-place retries of a conversation lookup. */
+  async function retries(): Promise<void> {
     await settle();
     await advance(100);
     await advance(400);
     await advance(1_500);
-    // Both passed on as not in the DM (XmtpRelay drops and counts them); the second one without any lookup.
-    expect(got.map((g) => [g.text, g.dm])).toEqual([
-      ["move-1", NOT_THE_PEER],
-      ["move-2", NOT_THE_PEER],
-    ]);
-    expect(sdk.lookups).toBe(4);
-    for (let i = 0; i < 100; i++) sdk.stream.push(sdk.msg(`s-${i}`, a.address, "flood"));
-    await settle();
-    expect(sdk.lookups).toBe(4); // held: no lookup per message
-    // After the hold, the stream is restarted; its catch-up finds the DM itself and delivers what was left un-seen.
+  }
+
+  const texts = (got: Got[]) => got.map((g) => [g.text, g.dm]);
+
+  it("lookups that keep coming back empty: resolved in place through the DM lookup, in order, no restart (I-N2)", async () => {
+    const { a, sdk, got } = await lookupsFailing(1_000);
     const streams = sdk.streams.length;
+    sdk.arrive("a-1", a.address, "M1");
+    sdk.arrive("a-2", a.address, "M2");
+    await retries();
+    expect(texts(got)).toEqual([
+      ["M1", a.address],
+      ["M2", a.address],
+    ]);
+    expect(sdk.streams.length).toBe(streams); // no restart was needed
+    expect(sdk.lookups).toBe(4); // M2 needed none: its conversation is the DM the catch-up found
+  });
+
+  it("P1: our own send fills the DM cache during a gap -- a later opponent message still waits for the first (I-N2)", async () => {
+    const { a, sdk, got, t, channelId } = await lookupsFailing(1_000);
+    sdk.dmFailures = 1; // the in-place catch-up cannot get the DM
+    sdk.arrive("a-1", a.address, "M1");
+    await retries();
+    expect(got).toEqual([]); // held, not passed on as a stranger's
+    await t.send(channelId, "our reply"); // finds the DM: the cache now knows it
+    sdk.arrive("a-2", a.address, "M2");
+    await settle();
+    expect(got).toEqual([]); // M2 must not overtake M1
+    await advance(5_000); // the gap's retry: the stream restarts...
+    await advance(1_000); // ...and its catch-up closes the gap
+    expect(texts(got)).toEqual([
+      ["M1", a.address],
+      ["M2", a.address],
+    ]);
+    sdk.arrive("a-3", a.address, "M3"); // the gap is closed: straight through again
+    await settle();
+    expect(got.at(-1)?.text).toBe("M3");
+  });
+
+  it("P3: the gap's catch-up fails too -- it is retried with back-off until it works, and nothing overtakes (I-N2)", async () => {
+    const { a, sdk, got } = await lookupsFailing(1_000);
+    sdk.dmFailures = 2; // the in-place catch-up and the first retry both fail
+    sdk.arrive("a-1", a.address, "M1");
+    await retries();
+    sdk.arrive("a-3", a.address, "M3");
+    await settle(); // held behind M1
+    await advance(5_000);
+    await advance(1_000); // the first retry's restart: its catch-up fails as well
+    expect(got).toEqual([]);
+    expect(logs.some((l) => l.includes("retrying in 10s"))).toBe(true); // re-armed, with back-off
+    await advance(10_000);
+    await advance(1_000);
+    expect(texts(got)).toEqual([
+      ["M1", a.address],
+      ["M3", a.address],
+    ]);
+  });
+
+  it("P2: more opponent messages than the usual catch-up window during a gap are all delivered, in order", async () => {
+    const { a, sdk, got } = await lookupsFailing(1_000);
+    sdk.dmFailures = 1;
+    sdk.arrive("a-0", a.address, "M1");
+    await retries();
+    for (let i = 0; i < XMTP_CATCH_UP_MESSAGES + 4; i++) sdk.arrive(`r-${i}`, a.address, `R${i}`);
+    await settle();
+    expect(got).toEqual([]);
     await advance(5_000);
     await advance(1_000);
-    expect(sdk.streams.length).toBe(streams + 1);
-    expect(got.filter((g) => g.dm === a.address).map((g) => g.text)).toEqual(["move-1", "move-2"]);
+    expect(got.map((g) => g.text)).toEqual(["M1", ...Array.from({ length: XMTP_CATCH_UP_MESSAGES + 4 }, (_, i) => `R${i}`)]);
+    expect(got.every((g) => g.dm === a.address)).toBe(true);
+    // One line when the gap opens, one per failed try, one when it closes: none per held message (m-N5).
+    expect(logs.filter((l) => l.includes("could not be placed"))).toHaveLength(1);
+    expect(logs.filter((l) => l.includes("catch-up resolved"))).toHaveLength(1);
+  });
+
+  it("strangers can never open a gap or restart the stream, even with every lookup failing", async () => {
+    const { sdk, got } = await bTransport();
+    sdk.lookupMisses = 1_000_000;
+    const streams = sdk.streams.length;
+    for (let c = 0; c < 50; c++) {
+      const stranger = privateKeyToAccount(generatePrivateKey()).address;
+      const conv = sdk.strangerDm(stranger);
+      for (let i = 0; i < 3; i++) sdk.stream.push(sdk.msg(`x-${c}-${i}`, stranger, "spam", conv));
+    }
+    await settle();
+    for (let i = 0; i < 12; i++) await advance(5_000);
+    expect(sdk.streams.length).toBe(streams); // 0 restarts
+    expect(got).toHaveLength(150); // all passed on (and dropped by XmtpRelay as strangers'), none held
+    expect(sdk.lookups).toBeLessThanOrEqual(50 * 2); // one per conversation, then held
+    expect(logs.some((l) => l.includes("could not be placed"))).toBe(false);
   });
 
   it("denies a stranger's DM even before the opponent's inbox is known, when the sender's inbox lacks the opponent's address", async () => {
