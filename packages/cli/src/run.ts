@@ -52,6 +52,7 @@ export async function startDaemonProcess(
     let relay: RelayClient = hostRelay;
     let transportOf = (id: Hex): ChannelTransport => (hostRelay.isJoined(id) ? "relay" : "none");
     let relayRejected: ((msg: RelayMessage) => boolean) | undefined;
+    let relayUndetermined: ((msg: RelayMessage) => boolean) | undefined;
     // Plan 5.7 (spec §4): the XMTP fallback, only when the host published `xmtp` (cached by init) and the SDK
     // loads. Otherwise the daemon gets the host relay itself, exactly as before.
     if (config.xmtp) {
@@ -69,6 +70,7 @@ export async function startDaemonProcess(
         relay = fb;
         transportOf = (id) => fb.transportOf(id);
         relayRejected = (msg) => fb.countRejected(msg);
+        relayUndetermined = (msg) => fb.isUndetermined(msg);
         log(`xmtp: fallback on (env ${config.xmtp.env}, node-sdk ${loaded.version})`);
       } else {
         log(`xmtp: fallback off: ${loaded.reason}`);
@@ -84,6 +86,7 @@ export async function startDaemonProcess(
       transportOf,
       fallback: fallback ? "xmtp" : "off",
       relayRejected,
+      relayUndetermined,
     });
     await daemon.start();
 

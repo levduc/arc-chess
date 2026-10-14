@@ -41,7 +41,9 @@ async function bTransport(opts: { open?: boolean } = {}) {
   const t = createNodeSdkTransport({ sdk, dbDir: dir, config: { env: "dev" }, log: (l) => logs.push(l) });
   transports.push(t);
   const got: Got[] = [];
-  t.onText((id, from, dm, text) => got.push({ id, from, dm, text }));
+  t.onText((id, from, dm, text) => {
+    got.push({ id, from, dm, text });
+  });
   const channelId = `0x${"ab".repeat(32)}` as Hex;
   if (opts.open !== false) await t.open(channelId, b, a.address);
   return { a, b, sdk, t, got, channelId };
@@ -359,6 +361,99 @@ describe("createNodeSdkTransport: the inbound stream", () => {
     expect(sdk.conversations.get(conv)?.consent).toEqual([FakeSdk.ConsentState.Denied]);
   });
 
+  it("C-N1: its DM, found by the opponent's address, replaces a wrong opponent inbox (here a stale network answer)", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.peerRegistered = false; // B opened before A registered
+    await t.open(channelId, b, a.address);
+    sdk.inboxAnswers.push("inbox-stale"); // the network's lookup of A's inbox answers someone else's
+    sdk.inboxStateFailures = 1; // so the first message is undetermined
+    sdk.arrive("a-1", a.address, "M1");
+    await settle();
+    expect(got.map((g) => [g.text, g.from, g.dm])).toEqual([["M1", UNDETERMINED, UNDETERMINED]]);
+    expect(sdk.inboxLookups).toBe(1); // the opponent's inbox is now stored as "inbox-stale"
+    sdk.peerRegistered = true;
+    await t.send(channelId, "our reply"); // dmOf: the DM found by A's address names A's inbox, and replaces the stale one
+    const lookups = sdk.lookups;
+    sdk.arrive("a-2", a.address, "M2");
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    sdk.stream.push(sdk.msg("x-1", stranger, "spam", sdk.strangerDm(stranger)));
+    await settle();
+    expect(got.slice(1).map((g) => [g.text, g.from, g.dm])).toEqual([
+      ["M2", a.address, a.address], // the fast path
+      ["spam", NOT_THE_PEER, NOT_THE_PEER],
+    ]);
+    expect(sdk.lookups - lookups).toBe(1); // the stranger's DM, to deny it; none for A's message
+    expect(sdk.conversations.get("dm-ab")?.consent).not.toContain(FakeSdk.ConsentState.Denied);
+  });
+
+  it("C-N1: the opponent's DM denied by an earlier wrong classification is allowed again once found by address; its message is recovered", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.peerRegistered = false;
+    await t.open(channelId, b, a.address);
+    sdk.inboxAnswers.push("inbox-stale");
+    sdk.inboxStateFailures = 1;
+    sdk.arrive("a-1", a.address, "M1"); // undetermined; the network's stale answer is stored
+    await settle();
+    sdk.arrive("a-2", a.address, "M2"); // A is not "inbox-stale": taken for a stranger, and dm-ab denied
+    await settle();
+    expect(got.map((g) => [g.text, g.from, g.dm])).toEqual([
+      ["M1", UNDETERMINED, UNDETERMINED],
+      ["M2", NOT_THE_PEER, NOT_THE_PEER],
+    ]);
+    expect(sdk.conversations.get("dm-ab")?.consent).toEqual([FakeSdk.ConsentState.Denied]);
+    const streams = sdk.streams.length;
+    sdk.peerRegistered = true;
+    await t.send(channelId, "our reply"); // dmOf: A's inbox replaces the stale one, and dm-ab is allowed again
+    await settle();
+    expect(sdk.conversations.get("dm-ab")?.consent).toEqual([FakeSdk.ConsentState.Denied, FakeSdk.ConsentState.Allowed]);
+    expect(logs.filter((l) => l.includes("the opponent's conversation dm-ab was denied; allowed again"))).toHaveLength(1);
+    // The stream is restarted (a stream carries only the conversations allowed when it starts), and its catch-up
+    // re-reads dm-ab: M2 was never marked delivered, M1 was.
+    await advance(1_000);
+    expect(sdk.streams.length).toBe(streams + 1);
+    expect(got.slice(2).map((g) => [g.text, g.from, g.dm])).toEqual([["M2", a.address, a.address]]);
+    sdk.arrive("a-3", a.address, "M3");
+    await settle();
+    expect(got.at(-1)).toMatchObject({ text: "M3", from: a.address, dm: a.address });
+    expect(sdk.conversations.get("dm-ab")?.consent).toEqual([FakeSdk.ConsentState.Denied, FakeSdk.ConsentState.Allowed]);
+  });
+
+  it("C-N1: the opponent's DM left denied in the DB is allowed again at open, before the stream starts", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.conversations.get("dm-ab")?.updateConsentState(FakeSdk.ConsentState.Denied); // by an earlier run
+    sdk.history.push(sdk.msg("a-1", a.address, "M1"));
+    await t.open(channelId, b, a.address);
+    expect(sdk.conversations.get("dm-ab")?.consent).toEqual([FakeSdk.ConsentState.Denied, FakeSdk.ConsentState.Allowed]);
+    expect(sdk.streams).toHaveLength(1); // allowed before the stream was created: no restart needed
+    expect(got.map((g) => [g.text, g.from, g.dm])).toEqual([["M1", a.address, a.address]]);
+  });
+
+  it("C-N1: deny never denies the opponent's DM once found by address, even for a message classified before that", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.peerRegistered = false;
+    await t.open(channelId, b, a.address);
+    // B's local copy of A's inbox is wrong (it lacks A's address), and the network lookup fails: A's message is taken
+    // for a stranger's, and its DM is about to be denied.
+    const aInbox = FakeSdk.inboxOf(a.address);
+    sdk.inboxStateOf = (inbox) => (inbox === aInbox ? { identifiers: [{ identifier: `0x${"0b".repeat(20)}`, identifierKind: 0 }] } : null);
+    sdk.inboxLookupFailures = 1_000;
+    let release: () => void = () => undefined;
+    sdk.lookupGate = new Promise<void>((r) => (release = r)); // deny's conversation lookup is slow
+    sdk.arrive("a-1", a.address, "M1");
+    await settle();
+    sdk.peerRegistered = true;
+    await t.send(channelId, "our reply"); // meanwhile, dmOf finds dm-ab by A's address
+    release();
+    await settle();
+    expect(got.map((g) => [g.text, g.from])).toEqual([["M1", NOT_THE_PEER]]);
+    expect(sdk.conversations.get("dm-ab")?.consent).toEqual([]); // never denied
+    // M1 was never marked delivered: the next catch-up delivers it, as A's.
+    sdk.stream.fail();
+    await settle();
+    await advance(1_000);
+    expect(got.at(-1)).toMatchObject({ text: "M1", from: a.address, dm: a.address });
+  });
+
   it("denies strangers' group invites at every stream (re)start (m5)", async () => {
     const { sdk, t, a, b, channelId } = await bTransport({ open: false });
     const g1 = sdk.strangerGroup("group-1");
@@ -397,8 +492,9 @@ describe("createNodeSdkTransport: the inbound stream", () => {
 
 describe("FallbackRelay over the node-sdk transport: what reaches the session (I3 scenarios, spec §3)", () => {
   /** B's FallbackRelay over a fake host that is down and the fake-SDK transport, feeding B's real session. A
-   *  rejection is handed back to `countRejected`, as the daemon does. `dmKnown`: A registered before B opened. */
-  async function bOverXmtp(opts: { dmKnown?: boolean } = {}) {
+   *  rejection is handed back to `countRejected`, as the daemon does. `dmKnown`: A registered before B opened.
+   *  `registerLater`: A registers only when the test says so (`sdk.peerRegistered = true`). */
+  async function bOverXmtp(opts: { dmKnown?: boolean; registerLater?: boolean } = {}) {
     const pair = await sessionPair();
     const [aSigner, bSigner] = pair.signers;
     const sdk = new FakeSdk(bSigner.address, aSigner.address);
@@ -426,12 +522,57 @@ describe("FallbackRelay over the node-sdk transport: what reaches the session (I
     });
     await relay.join(pair.id, pair.params, bSigner);
     await settle();
-    sdk.peerRegistered = true;
+    if (opts.registerLater !== true) sdk.peerRegistered = true;
     let n = 0;
     const push = (m: RelayMessage, from: Address = aSigner.address, conv = "dm-ab") =>
       sdk.stream.push(sdk.msg(`a-${++n}`, from, toWire({ arena: 1, msg: m }), conv));
-    return { ...pair, sdk, relay, push, results, drained: () => chain };
+    return { ...pair, sdk, transport, relay, push, results, drained: () => chain };
   }
+
+  it("C-N1: a stranger that names the opponent's address as its inbox's recovery identifier stays a known stranger", async () => {
+    const { a, b, id, signers, sdk, transport, relay, push, results, drained } = await bOverXmtp({ registerLater: true });
+    const [aSigner, bSigner] = signers;
+    const eve = privateKeyToAccount(generatePrivateKey()).address;
+    const eveInbox = FakeSdk.inboxOf(eve);
+    // B's local copy of Eve's inbox: Eve's own address its only member, A's session address its recovery identifier.
+    // XMTP's ChangeRecoveryIdentity is signed by the current recovery identity alone: A never signed anything.
+    sdk.inboxStateOf = (inbox) =>
+      inbox === eveInbox
+        ? {
+            identifiers: [{ identifier: eve.toLowerCase(), identifierKind: 0 }],
+            recoveryIdentifier: { identifier: aSigner.address.toLowerCase(), identifierKind: 0 },
+          }
+        : null;
+    const eveDm = sdk.strangerDm(eve);
+    const genuine = await a.move("e2e4");
+    const forged = { ...genuine, sigA: await bSigner.signMessage({ message: "eve" }) };
+
+    // B opened before A registered: neither A's inbox nor its DM is known yet.
+    push({ type: "state", channelId: id, signed: forged }, eve, eveDm);
+    await settle();
+    await drained();
+    expect(results).toEqual([]); // dropped before the session, as a known stranger's
+    expect(relay.dropped(id)).toBe(1);
+    expect(sdk.conversations.get(eveDm)?.consent).toEqual([FakeSdk.ConsentState.Denied]);
+
+    // A registers; B sends over XMTP (its DM lookup finds dm-ab); A's genuine move arrives in it.
+    sdk.peerRegistered = true;
+    await transport.send(id, "b's reply");
+    push({ type: "state", channelId: id, signed: genuine });
+    await settle();
+    await drained();
+    expect(results).toEqual(["move"]);
+    expect(b.latest.state.turnNum).toBe(1n);
+    expect(sdk.conversations.get("dm-ab")?.consent).not.toContain(FakeSdk.ConsentState.Denied);
+
+    // Eve floods: every message a known stranger's, dropped before the session (no lastError, no line per message).
+    for (let i = 0; i < 300; i++) push({ type: "state", channelId: id, signed: forged }, eve, eveDm);
+    await settle();
+    await drained();
+    expect(results).toEqual(["move"]);
+    expect(relay.dropped(id)).toBe(301);
+    expect(sdk.conversations.get("dm-ab")?.consent).not.toContain(FakeSdk.ConsentState.Denied);
+  });
 
   it("the opponent resigns, then signs Close: both arrive together, the slow first one still goes first", async () => {
     const { a, b, id, sdk, push, results, drained } = await bOverXmtp();
@@ -472,6 +613,39 @@ describe("FallbackRelay over the node-sdk transport: what reaches the session (I
     await drained();
     expect(results).toEqual(["move"]);
     expect(relay.dropped(id)).toBe(XMTP_INBOUND_BURST + 100);
+  });
+
+  it("m-N10: an opponent message the rate limit turned away is not marked delivered: the next catch-up delivers it", async () => {
+    const { a, id, signers, sdk, relay, results, drained } = await bOverXmtp({ registerLater: true });
+    sdk.inboxStateFailures = 1_000_000; // a lookup outage: every sender is undetermined
+    sdk.inboxLookupFailures = 1_000_000;
+    // Undetermined junk spends the channel's whole burst (dropped after the bucket, before the session).
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    const conv = sdk.strangerDm(stranger);
+    for (let i = 0; i < XMTP_INBOUND_BURST; i++) sdk.stream.push(sdk.msg(`x-${i}`, stranger, "junk", conv));
+    const genuine = await a.move("e2e4");
+    sdk.arrive("a-move", signers[0].address, toWire({ arena: 1, msg: { type: "state", channelId: id, signed: genuine } }));
+    await settle();
+    await drained();
+    expect(results).toEqual([]);
+    expect(relay.dropped(id)).toBe(XMTP_INBOUND_BURST + 1); // the move too: rate limited
+    // The outage heals and the bucket refills; the stream restarts, and its catch-up re-reads the DM.
+    sdk.inboxStateFailures = 0;
+    sdk.inboxLookupFailures = 0;
+    sdk.peerRegistered = true;
+    await advance(10_000);
+    sdk.stream.fail();
+    await settle();
+    await advance(1_000);
+    await drained();
+    expect(results).toEqual(["move"]);
+    // Delivered now, so marked: the next restart does not deliver it again.
+    sdk.stream.fail();
+    await settle();
+    await advance(2_000);
+    await drained();
+    expect(results).toEqual(["move"]);
+    expect(sdk.messagesCalls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("an undetermined sender with the opponent's valid signatures is delivered, in order", async () => {

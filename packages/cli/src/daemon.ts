@@ -287,6 +287,9 @@ export type DaemonOptions = {
    *  dropped -- an XMTP message whose sender could not be determined, a stranger's as likely as not -- so it sets no
    *  `lastError` and logs nothing. `run.ts` passes `FallbackRelay`'s; without it every rejection is reported. */
   relayRejected?: (msg: RelayMessage) => boolean;
+  /** Plan 5.7 (spec §3): whether a relayed message is such an XMTP message. A stale or duplicate one then leaves
+   *  `lastError` as it was. `run.ts` passes `FallbackRelay`'s; without it nothing changes. */
+  relayUndetermined?: (msg: RelayMessage) => boolean;
 };
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
@@ -2229,6 +2232,7 @@ export class ArenaDaemon {
     if (!l) return;
     let closeReceived = false;
     let accepted = false;
+    let keepError = false;
     try {
       if (msg.type === "state") {
         // A re-send after a reconnect (§7) can land as "duplicate" (we already hold it) or "stale" (we've moved
@@ -2237,15 +2241,18 @@ export class ArenaDaemon {
         accepted = true;
         if (this.stopped) return;
         if (result !== "duplicate" && result !== "stale") await this.autoPlay(l);
+        // Plan 5.7 (spec §3): a repeat from an undetermined XMTP sender, a stranger's replay as likely as not.
+        else keepError = this.opts.relayUndetermined?.(msg) === true;
       } else {
         await l.session.receiveClose(msg.close);
         accepted = true;
         closeReceived = true;
       }
-      l.lastError = null;
+      if (!keepError) l.lastError = null;
     } catch (err) {
       // Plan 5.7 (spec §3): the relay counts a rejected message whose sender it could not determine; nothing changed.
-      if (!accepted && this.opts.relayRejected?.(msg) === true) return;
+      // Only a protocol rejection: any other failure (a failed store.save, say) is reported as before.
+      if (!accepted && err instanceof ArenaProtocolError && this.opts.relayRejected?.(msg) === true) return;
       l.lastError = errorText(err);
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }

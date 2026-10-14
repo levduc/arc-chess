@@ -12,7 +12,7 @@ import { connectHost, type HostRelay } from "../src/host.js";
 import { startDaemonProcess } from "../src/run.js";
 import { buildStatus } from "../src/status.js";
 import { FallbackRelay, HOST_DOWN_GRACE_MS, XMTP_MAX_PAYLOAD_BYTES, XMTP_SEND_WAIT_MS } from "../src/xmtp/fallback.js";
-import { XMTP_INBOUND_BURST, XMTP_INBOUND_PER_SEC } from "../src/xmtp/relay.js";
+import { XMTP_DROP_LOG_INTERVAL_MS, XMTP_INBOUND_BURST, XMTP_INBOUND_PER_SEC } from "../src/xmtp/relay.js";
 import { NOT_THE_PEER, UNDETERMINED } from "../src/xmtp/transport.js";
 import { ANVIL_KEYS, RPC, deployArena, mintUsdc, now } from "../../sdk/test/helpers/chain.js";
 import { waitFor } from "./helpers/harness.js";
@@ -495,11 +495,37 @@ describe("FallbackRelay: XMTP acceptance (spec §3)", () => {
     for (let i = 0; i < 250; i++) xmtp.deliver(id, UNDETERMINED, UNDETERMINED, text);
     for (const g of got.splice(0)) relay.countRejected(g);
     expect(relay.dropped(id)).toBe(250);
-    // No line per message: the drop summary's first and every 100th.
-    expect(logs.filter((l) => l.includes("dropped an inbound message"))).toHaveLength(3);
+    // No line per message: the drop summary, at most one per channel per XMTP_DROP_LOG_INTERVAL_MS.
+    expect(logs.filter((l) => l.includes("dropped an inbound message"))).toHaveLength(1);
     for (let i = 0; i < XMTP_INBOUND_BURST - 250; i++) xmtp.deliver(id, UNDETERMINED, UNDETERMINED, text);
     xmtp.deliver(id, opponent, opponent, text);
     expect(got).toHaveLength(XMTP_INBOUND_BURST - 250); // the opponent's was rate-limited
+  });
+
+  it("the drop summary is throttled by time: the first at once, then at most one line per channel per 10 s, with the count (m-N13)", async () => {
+    const { a, id, xmtp, relay } = await bSide({ joined: true });
+    const other = await bSide({ joined: true });
+    expect(XMTP_DROP_LOG_INTERVAL_MS).toBe(10_000);
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    const text = frame(stateMsg(id, await a.move("e2e4")));
+    const lines = (cid: Hex) => logs.filter((l) => l.includes(cid.toLowerCase()) && l.includes("dropped an inbound message"));
+    xmtp.deliver(id, stranger, stranger, text);
+    expect(lines(id)).toHaveLength(1);
+    expect(lines(id)[0]).toMatch(/\(not from the opponent\); 1 dropped so far$/);
+    for (let i = 0; i < 500; i++) xmtp.deliver(id, stranger, stranger, text); // a flood at one instant
+    clock += XMTP_DROP_LOG_INTERVAL_MS - 1;
+    xmtp.deliver(id, stranger, stranger, text);
+    expect(lines(id)).toHaveLength(1); // still within the interval
+    other.xmtp.deliver(other.id, stranger, stranger, text); // another channel has its own interval
+    expect(lines(other.id)).toHaveLength(1);
+    clock += 1;
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, "not json");
+    expect(lines(id)).toHaveLength(2);
+    expect(lines(id)[1]).toMatch(/\(malformed: .*\); 503 dropped so far \(502 since the last line\)$/);
+    expect(relay.dropped(id)).toBe(503);
+    clock += 60_000;
+    xmtp.deliver(id, stranger, stranger, text);
+    expect(lines(id)[2]).toMatch(/; 504 dropped so far$/); // a lone drop after a quiet spell: no "since" count
   });
 
   it("rate-limits inbound per channel with the host relay's budget; strangers never spend it", async () => {
@@ -740,6 +766,7 @@ describe("startDaemonProcess: choosing the relay", () => {
       expect(proc.fallback).toBe("off");
       expect(proc.daemon.fallback).toBe("off");
       expect(optsOf(proc.daemon).relayRejected).toBeUndefined(); // every rejection is reported, as before
+      expect(optsOf(proc.daemon).relayUndetermined).toBeUndefined(); // and every success clears lastError
       expect(load).not.toHaveBeenCalled();
       expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual([]);
     } finally {
@@ -784,6 +811,7 @@ describe("startDaemonProcess: choosing the relay", () => {
       // The daemon hands session rejections to FallbackRelay.countRejected (a host relay message is never one).
       const host = { type: "close", channelId: keccak256(toHex("c")), close: { stateHash: keccak256("0x01"), by: 0, sig: "0x" } };
       expect(optsOf(proc.daemon).relayRejected?.(host as RelayMessage)).toBe(false);
+      expect(optsOf(proc.daemon).relayUndetermined?.(host as RelayMessage)).toBe(false);
       expect(seen).toEqual([{ dbDir: join(dir, "xmtp", "db"), env: "dev" }]);
       expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual(["xmtp: fallback on (env dev, node-sdk 6.0.0)"]);
     } finally {
@@ -888,7 +916,12 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
       const fb = new FallbackRelay({ host: h, xmtp, log: (l) => bobLogs.push(l) });
       host = h;
       fallback = fb;
-      return { relay: fb, relayRejected: (m) => fb.countRejected(m), log: (l) => bobLogs.push(l) };
+      return {
+        relay: fb,
+        relayRejected: (m) => fb.countRejected(m),
+        relayUndetermined: (m) => fb.isUndetermined(m),
+        log: (l) => bobLogs.push(l),
+      };
     });
     cleanup = async () => {
       await alice.daemon.stop();
@@ -921,7 +954,10 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
     expect(bob.daemon.handle(id).lastError).toBeNull();
     expect(bob.daemon.handle(id).session.latest.state.turnNum).toBe(0n);
     expect(bobLogs.filter((l) => l.includes("signature"))).toEqual([]); // no daemon line per message
-    expect(bobLogs.filter((l) => l.includes("dropped an inbound message"))).toHaveLength(2); // the 1st and the 100th
+    // The time-throttled drop summary: the first at once, then at most one per 10 s (the run takes about a second).
+    const summaries = bobLogs.filter((l) => l.includes("dropped an inbound message")).length;
+    expect(summaries).toBeGreaterThanOrEqual(1);
+    expect(summaries).toBeLessThanOrEqual(2);
 
     // The same forgery from the host relay is reported exactly as before.
     host.inject(stateMsg(id, forged));
@@ -939,6 +975,30 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
     await new Promise((r) => setTimeout(r, 300));
     expect(bob.daemon.handle(id).session.snapshot()).toEqual(before);
     expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(fallback.dropped(id)).toBe(150);
+
+    // m-N12: a repeat from an undetermined sender (here a duplicate, and a stale state nobody signed) leaves a
+    // lastError as it was. The host relay's repeat still clears it, exactly as before.
+    host.inject(stateMsg(id, { ...forged, state: { ...genuine.state, turnNum: 2n } })); // a forged next state
+    await waitFor(() => bob.daemon.handle(id).lastError !== null, 10_000, "host rejection reported again");
+    const shown = bob.daemon.handle(id).lastError;
+    const stale: SignedState = { ...forged, state: { ...genuine.state, turnNum: 0n } };
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, genuine)));
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, stale)));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(bob.daemon.handle(id).lastError).toBe(shown);
+    expect(bob.daemon.handle(id).session.snapshot()).toEqual(before);
+    expect(fallback.dropped(id)).toBe(150);
+    host.inject(stateMsg(id, genuine));
+    await waitFor(() => bob.daemon.handle(id).lastError === null, 10_000, "host repeat clears lastError");
+
+    // m-N11: an undetermined message whose receive fails for any other reason than a protocol rejection (a failed
+    // store.save, say) is reported as before: lastError and one line, not counted as dropped.
+    vi.spyOn(bob.daemon.handle(id).session, "receive").mockRejectedValueOnce(new Error("disk full"));
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, genuine)));
+    await waitFor(() => bob.daemon.handle(id).lastError !== null, 10_000, "non-protocol failure reported");
+    expect(bob.daemon.handle(id).lastError).toBe("disk full");
+    expect(bobLogs.filter((l) => l.includes("disk full"))).toHaveLength(1);
     expect(fallback.dropped(id)).toBe(150);
   });
 });

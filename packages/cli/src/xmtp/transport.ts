@@ -14,8 +14,10 @@ export interface XmtpTransport {
   send(channelId: Hex, text: string): Promise<void>;
   /** `from` is the XMTP sender's Ethereum address; `dm` is the peer address of the conversation it arrived in.
    *  Either is `NOT_THE_PEER` when it is known not to be the opponent, and `UNDETERMINED` when it could not be
-   *  determined (spec §3: such a message still reaches the session, which checks every signature). */
-  onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => void): () => void;
+   *  determined (spec §3: such a message still reaches the session, which checks every signature).
+   *  A handler returns `false` when it did not take the text for now (the channel's rate limit): the transport then
+   *  does not mark the message as delivered, so a later catch-up can deliver it again. */
+  onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => boolean | void): () => void;
   close(channelId: Hex): Promise<void>;
   stop(): Promise<void>;
 }
@@ -65,7 +67,12 @@ export function xmtpSignerOf(signer: RelaySigner, ethereumKind: number) {
 
 type SdkIdentifier = { identifier: string; identifierKind: number };
 type SdkMessage = { id: string; content: unknown; conversationId: string; senderInboxId: string; sentAtNs?: bigint };
-type SdkConversation = { readonly id: string; readonly peerInboxId?: string; updateConsentState?(state: number): void };
+type SdkConversation = {
+  readonly id: string;
+  readonly peerInboxId?: string;
+  consentState?(): number;
+  updateConsentState?(state: number): void;
+};
 type SdkDm = SdkConversation & {
   readonly peerInboxId: string;
   sendText(text: string): Promise<string>;
@@ -75,7 +82,10 @@ type SdkDm = SdkConversation & {
 };
 /** The SDK's AsyncStreamProxy: async-iterable, ended by `end()`. */
 type SdkStream = AsyncIterable<SdkMessage | undefined> & { end(): Promise<unknown> };
-type SdkInboxState = { identifiers?: SdkIdentifier[]; recoveryIdentifier?: SdkIdentifier };
+/** `identifiers` are the inbox's members: each was added with its own signature (libxmtp `AddAssociation`). The
+ *  recovery identifier is not: any inbox can name any address as its recovery identifier without that address's
+ *  signature (libxmtp `ChangeRecoveryIdentity`), so it is never read here (C-N1). */
+type SdkInboxState = { identifiers?: SdkIdentifier[] };
 type SdkClient = {
   readonly inboxId: string;
   fetchInboxIdByIdentifier(identifier: SdkIdentifier): Promise<string | null>;
@@ -111,6 +121,8 @@ type Entry = {
   client: SdkClient | null;
   stream: SdkStream | null;
   dm: SdkDm | null;
+  /** The opponent's inbox id. Only an answer keyed by the opponent's own address sets it -- its DM (`dmOf`) or the
+   *  network's inbox lookup -- and each such answer replaces what was stored (`setPeerInbox`). */
   peerInboxId: string | null;
   /** When (monotonic ms) the opponent's inbox was last looked up on the network, and whether a lookup is running. */
   lastPeerLookup: number;
@@ -130,8 +142,9 @@ type Entry = {
   lookupAgainAt: Map<string, number>;
   /** Sender inbox ids found not to be the opponent's while its inbox was still unknown (bounded). */
   notPeer: Set<string>;
-  /** Strangers' conversations already denied (bounded). */
-  denied: Set<string>;
+  /** Strangers' conversations already denied -> their peer's inbox id (bounded), so that one later found to be the
+   *  opponent's is allowed again. */
+  denied: Map<string, string>;
 };
 
 /** A failed or ended stream is re-created after this back-off, doubling up to the cap, for as long as the channel is
@@ -196,8 +209,13 @@ const monotonic = () => performance.now();
  *   stitched duplicates. A message in one of them is the opponent's: a DM has two members, and our own echoes are
  *   skipped. No lookup.
  * - **Otherwise the sender is looked up**, locally: against the opponent's inbox id once known, else in the sender's
- *   own inbox state (it lists the identifiers bound to that inbox). The opponent's message is then checked to be in
- *   a DM with the opponent, by one conversation lookup, cached.
+ *   own inbox state, by its member identifiers only (each added with its own signature; never the recovery
+ *   identifier, which any inbox can set to any address). The opponent's message is then checked to be in a DM with
+ *   the opponent, by one conversation lookup, cached.
+ * - **The opponent's inbox id** is set only by answers keyed by the opponent's own address -- its DM, found by
+ *   address (`dmOf`), and the network's inbox lookup -- and each replaces what was stored. A sender's own inbox state
+ *   classifies that one message; it never sets the opponent's inbox. A conversation of the opponent's that was
+ *   denied earlier is allowed again once such an answer names it, and the stream restarted to carry it.
  * - **A known stranger** -- the lookup succeeded and the sender is not the opponent, or the conversation is not a DM
  *   with the opponent -- is passed on as `NOT_THE_PEER`, for `XmtpRelay` to drop and count before its rate limit,
  *   and its DM is set to consent `Denied`.
@@ -219,27 +237,62 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
   const log = opts.log;
   const ethereum = sdk.IdentifierKind.Ethereum;
   const entries = new Map<Hex, Entry>();
-  const handlers = new Set<(channelId: Hex, from: Address, dm: Address, text: string) => void>();
+  const handlers = new Set<(channelId: Hex, from: Address, dm: Address, text: string) => boolean | void>();
   const identifierOf = (address: Address): SdkIdentifier => ({ identifier: address.toLowerCase(), identifierKind: ethereum });
   const isText = (m: SdkMessage) => (typeof sdk.isText === "function" ? sdk.isText(m) : true) && typeof m.content === "string";
   const consent = sdk.ConsentState;
   const wantedConsent =
     consent?.Allowed !== undefined && consent.Unknown !== undefined ? [consent.Allowed, consent.Unknown] : undefined;
 
-  function emit(channelId: Hex, from: Address, dm: Address, text: string): void {
+  /** Hands a text to every handler; false when one did not take it for now (the channel's rate limit). */
+  function emit(channelId: Hex, from: Address, dm: Address, text: string): boolean {
+    let taken = true;
     for (const h of handlers) {
       try {
-        h(channelId, from, dm, text);
+        if (h(channelId, from, dm, text) === false) taken = false;
       } catch (err) {
         log(`xmtp: onText handler threw: ${errorText(err)}`);
       }
     }
+    return taken;
   }
 
-  /** The opponent's inbox id, once known (from its DM, its own messages, or the network). */
+  /** The opponent's inbox id, once an answer keyed by its address has come in (its DM, or the network's lookup). */
   function peerInboxOf(e: Entry): string | null {
-    if (e.peerInboxId === null && e.dm) e.peerInboxId = e.dm.peerInboxId;
     return e.peerInboxId;
+  }
+
+  /** The only writer of `e.peerInboxId` (C-N1): an answer keyed by the opponent's own address, which replaces whatever
+   *  was stored. A conversation with that inbox that was denied earlier is allowed again. */
+  function setPeerInbox(e: Entry, inbox: string): void {
+    e.peerInboxId = inbox;
+    for (const s of e.notPeer) if (same(s, inbox)) e.notPeer.delete(s);
+    for (const [conversationId, peer] of [...e.denied]) {
+      if (!same(peer, inbox)) continue;
+      void lookUp(e, conversationId).then((conv) => {
+        if (conv && !e.closed) allowAgain(e, conv);
+      });
+    }
+  }
+
+  function isDenied(conv: SdkConversation): boolean {
+    if (consent?.Denied === undefined || typeof conv.consentState !== "function") return false;
+    try {
+      return conv.consentState() === consent.Denied;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Allows one of the opponent's conversations again if it was denied (by an earlier wrong classification, or in the
+   *  DB from an earlier run), and ends the stream, so that the restarted stream carries it and its catch-up re-reads
+   *  it: a stream asks only for the conversations allowed when it starts. */
+  function allowAgain(e: Entry, conv: SdkConversation): void {
+    if (!e.denied.has(conv.id) && !isDenied(conv)) return;
+    if (!setConsent(conv, consent?.Allowed)) return;
+    e.denied.delete(conv.id);
+    log(`xmtp: channel ${e.channelId}: the opponent's conversation ${conv.id} was denied; allowed again`);
+    void e.stream?.end().catch(() => undefined);
   }
 
   /** Whether a conversation is cached as our DM with the opponent: the fast path. */
@@ -260,7 +313,7 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     withTimeout(lookup, NETWORK_TIMEOUT_MS, "inbox lookup")
       .then(
         (id) => {
-          if (id && e.peerInboxId === null) e.peerInboxId = id;
+          if (id && !e.closed) setPeerInbox(e, id); // keyed by the opponent's address: it has the last word
         },
         () => undefined,
       )
@@ -270,28 +323,28 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
   }
 
   /** Who sent a message. Known only on a definitive answer: the opponent's inbox id compared, or the sender's own
-   *  inbox state (read locally) listing identifiers -- the opponent's address among them or not. A failed or empty
-   *  read leaves the sender undetermined. */
+   *  inbox state (read locally) listing member identifiers -- the opponent's address among them or not. A failed or
+   *  empty read leaves the sender undetermined. Never the recovery identifier (C-N1), and a sender found to be the
+   *  opponent this way is not stored as the opponent's inbox: only an answer keyed by its address is. */
   async function senderOf(e: Entry, sender: string): Promise<Sender> {
     const peerInbox = peerInboxOf(e);
     if (peerInbox !== null) return same(sender, peerInbox) ? "opponent" : "stranger";
     if (e.notPeer.has(sender)) return "stranger";
+    lookUpPeerInbox(e); // the opponent's inbox, from the network, for later messages (throttled; never waited for)
     let state: SdkInboxState | undefined;
     try {
       state = (await e.client?.preferences?.getInboxStates([sender]))?.[0];
     } catch {
       state = undefined; // a native error: undetermined, below
     }
-    const ids = [...(state?.identifiers ?? []), ...(state?.recoveryIdentifier ? [state.recoveryIdentifier] : [])];
-    if (ids.some((i) => i.identifierKind === ethereum && same(i.identifier, e.peer))) {
-      e.peerInboxId = sender; // the opponent's inbox: its creating address, the session key, is bound to it
-      return "opponent";
-    }
-    if (ids.length > 0) {
-      remember(e.notPeer, sender, CACHE_MAX); // bound to other identifiers only: definitely not the opponent
+    const members = Array.isArray(state?.identifiers) ? state.identifiers : [];
+    // The opponent's creating address, its session key, is a member of its inbox; a member was added by its own
+    // signature, so no other inbox can list it.
+    if (members.some((i) => i.identifierKind === ethereum && same(i.identifier, e.peer))) return "opponent";
+    if (members.length > 0) {
+      remember(e.notPeer, sender, CACHE_MAX); // other members only: definitely not the opponent
       return "stranger";
     }
-    lookUpPeerInbox(e);
     return "undetermined";
   }
 
@@ -322,29 +375,40 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     }
   }
 
-  /** Whether the opponent's message arrived in a DM with the opponent, by one lookup per conversation (cached);
-   *  undetermined while the lookup comes back empty. */
-  async function inOpponentDm(e: Entry, conversationId: string): Promise<boolean | "undetermined"> {
+  /** Whether the opponent's message (from `senderInbox`, found to be the opponent's) arrived in a DM with that inbox,
+   *  by one lookup per conversation (cached); undetermined while the lookup comes back empty. */
+  async function inOpponentDm(e: Entry, conversationId: string, senderInbox: string): Promise<boolean | "undetermined"> {
     if (!e.convPeer.has(conversationId)) {
       const conv = await lookUp(e, conversationId);
       if (!conv) return "undetermined";
       const peer = typeof conv.peerInboxId === "string" ? conv.peerInboxId : null;
       cache(e.convPeer, conversationId, peer, CACHE_MAX);
-      if (isOpponentDm(e, conversationId)) setConsent(conv, consent?.Allowed);
+      if (peer !== null && same(peer, senderInbox)) setConsent(conv, consent?.Allowed);
     }
-    return isOpponentDm(e, conversationId);
+    const peer = e.convPeer.get(conversationId);
+    return typeof peer === "string" && same(peer, senderInbox);
+  }
+
+  /** Whether a conversation is the opponent's by the answers keyed by its address: our DM found by its address, or a
+   *  conversation whose peer is its inbox. `deny` never touches one. */
+  function isTheOpponents(e: Entry, conversationId: string, peer: string): boolean {
+    if (e.dm && conversationId === e.dm.id) return true;
+    const peerInbox = peerInboxOf(e);
+    if (peerInbox === null) return false;
+    const cached = e.convPeer.get(conversationId);
+    return same(peer, peerInbox) || (typeof cached === "string" && same(cached, peerInbox));
   }
 
   /** Stops a known stranger's DM from being streamed or synced again (spec §3: it has been dropped and counted). */
   async function deny(e: Entry, conversationId: string, sender: string): Promise<void> {
     if (consent?.Denied === undefined || e.denied.has(conversationId)) return;
     const conv = await lookUp(e, conversationId);
-    if (!conv) return; // tried again on a later message, no sooner than LOOKUP_RETRY_MS
-    // Only ever a DM whose peer is this stranger: never the opponent's.
+    if (!conv || e.closed) return; // tried again on a later message, no sooner than LOOKUP_RETRY_MS
+    // Only ever a DM whose peer is this stranger, and never the opponent's (checked after the lookup: an answer keyed
+    // by the opponent's address may have come in meanwhile).
     if (typeof conv.peerInboxId !== "string" || !same(conv.peerInboxId, sender)) return;
-    const peerInbox = peerInboxOf(e);
-    if (peerInbox !== null && same(conv.peerInboxId, peerInbox)) return;
-    if (setConsent(conv, consent.Denied)) remember(e.denied, conversationId, CACHE_MAX);
+    if (isTheOpponents(e, conversationId, conv.peerInboxId)) return;
+    if (setConsent(conv, consent.Denied)) cache(e.denied, conversationId, conv.peerInboxId, CACHE_MAX);
   }
 
   /** Denies every group still in `Unknown` consent: an arena channel never uses groups, so any group is a stranger's
@@ -362,10 +426,10 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     if (n > 0) log(`xmtp: channel ${e.channelId}: denied ${n} group invite(s) from strangers`);
   }
 
-  /** Hands one message on, once (spec §3: dedupe by XMTP message id). */
+  /** Hands one message on, once (spec §3: dedupe by XMTP message id). It is marked delivered only once taken: one the
+   *  channel's rate limit turned away stays unmarked, so the next catch-up delivers it again (m-N10). */
   function pass(e: Entry, m: SdkMessage, from: Address, dm: Address): void {
-    remember(e.seen, m.id, SEEN_MAX);
-    emit(e.channelId, from, dm, m.content as string);
+    if (emit(e.channelId, from, dm, m.content as string)) remember(e.seen, m.id, SEEN_MAX);
   }
 
   /** One inbound message, start to finish; called strictly one at a time per channel. It never waits on the network
@@ -384,7 +448,7 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       return;
     }
     if (sender === "undetermined") return pass(e, m, UNDETERMINED, UNDETERMINED);
-    const inDm = await inOpponentDm(e, m.conversationId);
+    const inDm = await inOpponentDm(e, m.conversationId, m.senderInboxId);
     if (e.closed) return;
     if (inDm === false) {
       emit(e.channelId, e.peer, NOT_THE_PEER, m.content as string); // the opponent, but not in its DM with us
@@ -393,17 +457,29 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     pass(e, m, e.peer, inDm === true ? e.peer : UNDETERMINED);
   }
 
-  /** The DM to the opponent, created (or found: the SDK returns an existing DM) on first use. It fails until the
-   *  opponent's client has registered, so it is retried on every `send` and stream (re)start. */
+  /** The DM to the opponent, created (or found: the SDK returns an existing DM) on first use, by the opponent's
+   *  address: its peer is the opponent's inbox, whatever was stored before, and it is allowed again if it was denied.
+   *  It fails until the opponent's client has registered, so it is retried on every `send` and stream (re)start. */
   async function dmOf(e: Entry): Promise<SdkDm> {
     if (e.dm) return e.dm;
     if (!e.client) throw new Error("xmtp: client not started");
     const dm = await e.client.conversations.createDmWithIdentifier(identifierOf(e.peer));
+    if (e.closed) return dm;
     e.dm = dm;
-    if (e.peerInboxId === null) e.peerInboxId = dm.peerInboxId;
     cache(e.convPeer, dm.id, dm.peerInboxId, CACHE_MAX);
     e.lookupAgainAt.delete(dm.id);
+    setPeerInbox(e, dm.peerInboxId);
+    allowAgain(e, dm);
     return dm;
+  }
+
+  /** `dmOf` within `NETWORK_TIMEOUT_MS`; null until the opponent has registered (or while the network is out). */
+  async function findDm(e: Entry): Promise<SdkDm | null> {
+    try {
+      return await withTimeout(dmOf(e), NETWORK_TIMEOUT_MS, "DM lookup");
+    } catch {
+      return null;
+    }
   }
 
   /** Caches the conversation ids of the opponent DM's stitched duplicates (both sides created a DM at once), so
@@ -417,19 +493,17 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       return;
     }
     for (const d of dups) {
-      if (typeof d.peerInboxId === "string" && same(d.peerInboxId, dm.peerInboxId)) cache(e.convPeer, d.id, d.peerInboxId, CACHE_MAX);
+      if (typeof d.peerInboxId !== "string" || !same(d.peerInboxId, dm.peerInboxId)) continue;
+      cache(e.convPeer, d.id, d.peerInboxId, CACHE_MAX);
+      allowAgain(e, d);
     }
   }
 
-  /** Re-delivers the opponent DM's latest messages, oldest first, through `deliver`. The DM is found by the
-   *  opponent's address (`dmOf`), so its own messages take the fast path. */
-  async function catchUp(e: Entry): Promise<void> {
-    let dm: SdkDm;
-    try {
-      dm = await withTimeout(dmOf(e), NETWORK_TIMEOUT_MS, "DM lookup");
-    } catch {
-      return; // the opponent has not registered yet (or the network is out): nothing to catch up on now
-    }
+  /** Re-delivers the opponent DM's latest messages, oldest first, through `deliver`. The DM was found by the
+   *  opponent's address (`dmOf`), so its own messages take the fast path. No DM yet (the opponent has not registered,
+   *  or the network is out): nothing to catch up on now. */
+  async function catchUp(e: Entry, dm: SdkDm | null): Promise<void> {
+    if (!dm) return;
     await rememberDuplicates(e, dm);
     let recent: SdkMessage[];
     try {
@@ -470,22 +544,28 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     let first = true;
     while (!e.closed && e.client) {
       const startedAt = monotonic();
+      // The DM first: a stream carries only the conversations allowed when it starts, and `dmOf` allows the
+      // opponent's again if it was denied.
+      const dm = await findDm(e);
       let stream: SdkStream | null = null;
-      try {
-        stream = await e.client.conversations.streamAllMessages({
-          conversationType: sdk.ConversationType?.Dm,
-          consentStates: wantedConsent,
-          retryOnFail: false,
-          onError: (err) => log(`xmtp: channel ${e.channelId}: stream error: ${errorText(err)}`),
-        });
-      } catch (err) {
-        log(`xmtp: channel ${e.channelId}: stream failed to start: ${errorText(err)}`);
+      const client = e.client; // null once closed meanwhile: no stream then, and `ready` below still runs
+      if (client && !e.closed) {
+        try {
+          stream = await client.conversations.streamAllMessages({
+            conversationType: sdk.ConversationType?.Dm,
+            consentStates: wantedConsent,
+            retryOnFail: false,
+            onError: (err) => log(`xmtp: channel ${e.channelId}: stream error: ${errorText(err)}`),
+          });
+        } catch (err) {
+          log(`xmtp: channel ${e.channelId}: stream failed to start: ${errorText(err)}`);
+        }
       }
       if (stream && e.closed) await stream.end().catch(() => undefined);
       if (stream && !e.closed) {
         e.stream = stream;
         denyStrangerGroups(e);
-        await catchUp(e);
+        await catchUp(e, dm);
         if (first) ready();
         first = false;
         for await (const m of stream) {
@@ -545,7 +625,7 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
         convPeer: new Map(),
         lookupAgainAt: new Map(),
         notPeer: new Set(),
-        denied: new Set(),
+        denied: new Map(),
       };
       e.opening = start(e).catch((err: unknown) => {
         // Forgotten, so the next `open` starts over (XmtpRelay retries it).
@@ -563,7 +643,7 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       if (e.closed || !e.client) throw new Error(`xmtp: channel ${channelId} is closed`);
       await (await dmOf(e)).sendText(text);
     },
-    onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => void): () => void {
+    onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => boolean | void): () => void {
       handlers.add(handler);
       return () => handlers.delete(handler);
     },

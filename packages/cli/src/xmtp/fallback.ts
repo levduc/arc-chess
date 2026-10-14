@@ -179,6 +179,13 @@ export class FallbackRelay implements RelayClient {
     return this.xmtp.countRejected(msg);
   }
 
+  /** Spec §3: whether `msg` came over XMTP with its sender undetermined (it counts nothing). The daemon leaves
+   *  `lastError` as it was on a repeat of such a message, a stranger's replay as likely as not; a host relay message
+   *  is never one. */
+  isUndetermined(msg: RelayMessage): boolean {
+    return this.xmtp.isUndetermined(msg);
+  }
+
   /** Stops every channel's XMTP client. The host connection is the caller's to close. */
   async stop(): Promise<void> {
     for (const u of this.unsubscribers.splice(0)) u();

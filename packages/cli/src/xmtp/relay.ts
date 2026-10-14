@@ -12,6 +12,9 @@ import { UNDETERMINED, type XmtpTransport } from "./transport.js";
 export const XMTP_INBOUND_BURST = 4000;
 export const XMTP_INBOUND_PER_SEC = 400;
 
+/** The drop summary is logged at most this often per channel (the first drop at once), with the running count. */
+export const XMTP_DROP_LOG_INTERVAL_MS = 10_000;
+
 /** A failed `open` (the XMTP network unreachable, say) is retried after this long, doubling up to the cap. */
 const OPEN_RETRY_MIN_MS = 1_000;
 const OPEN_RETRY_MAX_MS = 60_000;
@@ -26,6 +29,9 @@ type Channel = {
   retryTimer: ReturnType<typeof setTimeout> | undefined;
   bucket: { tokens: number; last: number };
 };
+
+/** A channel's drop count, and when (this relay's clock) and at what count the summary was last logged. */
+type Drops = { n: number; loggedAt: number; loggedN: number };
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
 const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
@@ -42,7 +48,8 @@ const key = (id: Hex) => id.toLowerCase() as Hex;
  * 5. it decodes as wire JSON with `arena === 1`, its `msg` passes `parseRelayMessage`, and `msg.channelId` is the
  *    channel whose client received it.
  * Anything else is dropped and counted (`dropped`): a known stranger at 2 or 3, before it can spend the channel's
- * budget. The session still verifies every state and close signature.
+ * budget. The session still verifies every state and close signature. A text turned away at 4 is reported back to
+ * the transport as not taken, so it is not marked delivered and a later catch-up can deliver it again.
  *
  * Spec §3: a message whose sender or conversation the transport could not determine passes on to the session like
  * any other; it is tagged, and when the session rejects it, `countRejected` counts it as dropped instead of the daemon
@@ -56,7 +63,7 @@ export class XmtpRelay {
   private readonly burst: number;
   private readonly perSec: number;
   private readonly channels = new Map<Hex, Channel>();
-  private readonly drops = new Map<Hex, number>();
+  private readonly drops = new Map<Hex, Drops>();
   private readonly handlers = new Set<(msg: RelayMessage) => void>();
   /** Accepted messages whose sender or conversation was `UNDETERMINED` (held weakly: gone with the message). */
   private readonly undetermined = new WeakSet<RelayMessage>();
@@ -76,6 +83,8 @@ export class XmtpRelay {
     this.log = opts.log ?? (() => undefined);
     this.burst = opts.rate?.burst ?? XMTP_INBOUND_BURST;
     this.perSec = opts.rate?.perSec ?? XMTP_INBOUND_PER_SEC;
+    // The transport marks a message delivered only when it is taken: one turned away by the rate limit is not, so
+    // a later catch-up can deliver it again.
     this.unsubscribe = this.xmtp.onText((channelId, from, dm, text) => this.receive(channelId, from, dm, text));
   }
 
@@ -152,7 +161,13 @@ export class XmtpRelay {
 
   /** Messages dropped by the acceptance checks for this channel since it was opened. */
   dropped(channelId: Hex): number {
-    return this.drops.get(key(channelId)) ?? 0;
+    return this.drops.get(key(channelId))?.n ?? 0;
+  }
+
+  /** Whether `msg` came from XMTP with its sender or conversation undetermined. Unlike `countRejected`, it counts
+   *  nothing and can be asked again. */
+  isUndetermined(msg: RelayMessage): boolean {
+    return this.undetermined.has(msg);
   }
 
   /** Spec §3: the session rejected `msg`. True when it came from XMTP with its sender undetermined: it is then counted
@@ -186,11 +201,19 @@ export class XmtpRelay {
     await this.xmtp.stop();
   }
 
+  /** Counts a drop. The summary line is throttled by time, at most one per channel per `XMTP_DROP_LOG_INTERVAL_MS`
+   *  (the first at once), so a flood never becomes a log flood. */
   private drop(id: Hex, reason: string): void {
-    const n = (this.drops.get(id) ?? 0) + 1;
-    this.drops.set(id, n);
-    // The first drop and every 100th after it: a flood must not become a log flood.
-    if (n === 1 || n % 100 === 0) this.log(`xmtp: channel ${id}: dropped an inbound message (${reason}); ${n} dropped so far`);
+    const d = this.drops.get(id) ?? { n: 0, loggedAt: Number.NEGATIVE_INFINITY, loggedN: 0 };
+    this.drops.set(id, d);
+    d.n += 1;
+    const t = this.now();
+    if (t - d.loggedAt < XMTP_DROP_LOG_INTERVAL_MS) return;
+    const since = d.n - d.loggedN;
+    const tail = since > 1 ? ` (${since} since the last line)` : "";
+    this.log(`xmtp: channel ${id}: dropped an inbound message (${reason}); ${d.n} dropped so far${tail}`);
+    d.loggedAt = t;
+    d.loggedN = d.n;
   }
 
   private takeToken(ch: Channel): boolean {
@@ -203,28 +226,37 @@ export class XmtpRelay {
     return true;
   }
 
-  private receive(channelId: Hex, from: Address, dm: Address, text: string): void {
+  /** One inbound text. False only when the rate limit turned it away (it may be delivered again later); true when it
+   *  was handed on or dropped for good. */
+  private receive(channelId: Hex, from: Address, dm: Address, text: string): boolean {
     const id = key(channelId);
     const ch = this.channels.get(id);
-    if (!ch) return; // not (or no longer) one of ours: nothing to count it against
-    if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > this.maxPayloadBytes) return this.drop(id, "oversized");
+    if (!ch) return true; // not (or no longer) one of ours: nothing to count it against
+    const dropped = (reason: string) => {
+      this.drop(id, reason);
+      return true;
+    };
+    if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > this.maxPayloadBytes) return dropped("oversized");
     // A known stranger is dropped here, before the bucket; an undetermined sender or conversation goes on.
     const fromUndetermined = typeof from === "string" && same(from, UNDETERMINED);
     const dmUndetermined = typeof dm === "string" && same(dm, UNDETERMINED);
-    if (!fromUndetermined && (typeof from !== "string" || !same(from, ch.opponent))) return this.drop(id, "not from the opponent");
-    if (!dmUndetermined && (typeof dm !== "string" || !same(dm, ch.opponent))) return this.drop(id, "not in the DM with the opponent");
-    if (!this.takeToken(ch)) return this.drop(id, "rate limited");
+    if (!fromUndetermined && (typeof from !== "string" || !same(from, ch.opponent))) return dropped("not from the opponent");
+    if (!dmUndetermined && (typeof dm !== "string" || !same(dm, ch.opponent))) return dropped("not in the DM with the opponent");
+    if (!this.takeToken(ch)) {
+      this.drop(id, "rate limited");
+      return false;
+    }
     let msg: RelayMessage;
     try {
       const outer = decodeWire(text) as { arena?: unknown; msg?: unknown } | null;
       if (typeof outer !== "object" || outer === null || Array.isArray(outer) || outer.arena !== 1) {
-        return this.drop(id, "not an arena v1 message");
+        return dropped("not an arena v1 message");
       }
       msg = parseRelayMessage(outer.msg);
     } catch (err) {
-      return this.drop(id, `malformed: ${errorText(err)}`);
+      return dropped(`malformed: ${errorText(err)}`);
     }
-    if (!same(msg.channelId, id)) return this.drop(id, "for another channel");
+    if (!same(msg.channelId, id)) return dropped("for another channel");
     if (fromUndetermined || dmUndetermined) this.undetermined.add(msg);
     for (const h of this.handlers) {
       try {
@@ -233,5 +265,6 @@ export class XmtpRelay {
         this.log(`xmtp: onMessage handler threw: ${errorText(err)}`);
       }
     }
+    return true;
   }
 }

@@ -6,7 +6,14 @@ import { keccak256, recoverMessageAddress, toHex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { XMTP_SDK_VERSION, loadXmtpSdk, xmtpSdkNodeModules } from "../src/xmtp/loader.js";
-import { createNodeSdkTransport, xmtpDbKey, xmtpSignerOf, type XmtpTransport } from "../src/xmtp/transport.js";
+import {
+  NOT_THE_PEER,
+  UNDETERMINED,
+  createNodeSdkTransport,
+  xmtpDbKey,
+  xmtpSignerOf,
+  type XmtpTransport,
+} from "../src/xmtp/transport.js";
 
 const homes: string[] = [];
 afterEach(() => {
@@ -215,6 +222,59 @@ describe.skipIf(!HAVE_SDK)("createNodeSdkTransport against XMTP's dev network (o
       expect(logs.filter((l) => l.includes("denied 1 group invite(s) from strangers"))).toHaveLength(1);
     } finally {
       await second.stop();
+    }
+  }, 180_000);
+
+  it("C-N1: members are in InboxState.identifiers (what the transport reads); a stranger can name any address as its recovery identifier, and is never taken for that address", async () => {
+    const home = newHome();
+    mkdirSync(join(home, "xmtp", "sdk"), { recursive: true });
+    symlinkSync(SDK_DIR as string, xmtpSdkNodeModules(home), "dir");
+    const loaded = await loadXmtpSdk(home);
+    if (!loaded.ok) throw new Error(loaded.reason);
+    const sdk = loaded.sdk as {
+      Client: { create(s: unknown, o: Record<string, unknown>): Promise<any> }; // eslint-disable-line @typescript-eslint/no-explicit-any
+      IdentifierKind: { Ethereum: number };
+    };
+    const kind = sdk.IdentifierKind.Ethereum;
+    const a = privateKeyToAccount(generatePrivateKey()); // the opponent: never registers, so B classifies by inbox state
+    const b = privateKeyToAccount(generatePrivateKey());
+    const eve = privateKeyToAccount(generatePrivateKey());
+    const channelId = keccak256(toHex(`arena-smoke-recovery-${Date.now()}-${Math.random()}`)) as Hex;
+    const logs: string[] = [];
+    const tb = createNodeSdkTransport({ sdk: loaded.sdk, dbDir: join(home, "xmtp", "db-b"), config: { env: "dev" }, log: (l) => logs.push(l) });
+    try {
+      await tb.open(channelId, b, a.address);
+      const got = new Promise<{ from: Address; dm: Address; text: string }>((resolve) =>
+        tb.onText((_id, from, dm, text) => resolve({ from, dm, text })),
+      );
+      const c = await sdk.Client.create(xmtpSignerOf(eve, kind), { env: "dev", dbPath: null, disableDeviceSync: true });
+      // Signed by Eve alone (her inbox's current recovery identity): A signs nothing.
+      await c.changeRecoveryIdentifier({ identifier: a.address.toLowerCase(), identifierKind: kind });
+      const state = (await c.preferences.fetchInboxState()) as {
+        identifiers: Array<{ identifier: string; identifierKind: number }>;
+        recoveryIdentifier: { identifier: string; identifierKind: number };
+      };
+      // The field the transport relies on: the members, each added by its own signature -- Eve's creating address.
+      expect(state.identifiers.map((i) => i.identifier.toLowerCase())).toEqual([eve.address.toLowerCase()]);
+      // The field it never reads: now A's address, with no signature of A's.
+      expect(state.recoveryIdentifier.identifier.toLowerCase()).toBe(a.address.toLowerCase());
+      const dm = await c.conversations.createDmWithIdentifier({ identifier: b.address.toLowerCase(), identifierKind: kind });
+      await dm.sendText('{"arena":1,"msg":"eve"}');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const r = await Promise.race([
+        got,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`no message within 60 s; logs: ${logs.join(" | ")}`)), 60_000);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      // eslint-disable-next-line no-console
+      console.log(`xmtp smoke (C-N1): Eve's message arrived as from=${r.from === NOT_THE_PEER ? "NOT_THE_PEER" : r.from === UNDETERMINED ? "UNDETERMINED" : r.from}`);
+      expect(r.text).toBe('{"arena":1,"msg":"eve"}');
+      expect(r.from).not.toBe(a.address);
+      expect(r.dm).not.toBe(a.address);
+      expect([NOT_THE_PEER, UNDETERMINED]).toContain(r.from);
+    } finally {
+      await tb.stop();
     }
   }, 180_000);
 });

@@ -74,7 +74,7 @@ export class FakeXmtp implements XmtpTransport {
   stopped = false;
   openImpl: () => Promise<void> = async () => undefined;
   sendImpl: () => Promise<void> = async () => undefined;
-  private readonly handlers = new Set<(channelId: Hex, from: Address, dm: Address, text: string) => void>();
+  private readonly handlers = new Set<(channelId: Hex, from: Address, dm: Address, text: string) => boolean | void>();
 
   async open(channelId: Hex, me: RelaySigner, peer: Address): Promise<void> {
     this.opened.push({ channelId, me: me.address, peer });
@@ -84,7 +84,7 @@ export class FakeXmtp implements XmtpTransport {
     await this.sendImpl();
     this.sent.push({ channelId, text });
   }
-  onText(h: (channelId: Hex, from: Address, dm: Address, text: string) => void): () => void {
+  onText(h: (channelId: Hex, from: Address, dm: Address, text: string) => boolean | void): () => void {
     this.handlers.add(h);
     return () => this.handlers.delete(h);
   }
@@ -176,9 +176,30 @@ export class FakeStream {
 export type FakeConversation = {
   id: string;
   peerInboxId?: string;
+  /** Every consent state set on it, in order (the current one is the last; none set: `Unknown`). */
   consent: number[];
+  consentState(): number;
   updateConsentState(state: number): void;
 };
+
+/** A fake conversation (a DM when `peerInboxId` is given), with its consent history. */
+function conversation(id: string, peerInboxId?: string): FakeConversation {
+  return {
+    id,
+    ...(peerInboxId !== undefined ? { peerInboxId } : {}),
+    consent: [],
+    consentState() {
+      return this.consent.at(-1) ?? FakeSdk.ConsentState.Unknown;
+    },
+    updateConsentState(s) {
+      this.consent.push(s);
+    },
+  };
+}
+
+type FakeIdentifier = { identifier: string; identifierKind: number };
+/** An inbox's state as `getInboxStates` returns it: its member identifiers, and its recovery identifier. */
+export type FakeInboxState = { identifiers: FakeIdentifier[]; recoveryIdentifier?: FakeIdentifier };
 
 /**
  * A fake `@xmtp/node-sdk` for one client (B, the transport under test) talking to the opponent A and to strangers.
@@ -207,8 +228,12 @@ export class FakeSdk {
   inboxStateFailures = 0;
   /** Makes the next N network inbox lookups throw (the network is out). */
   inboxLookupFailures = 0;
-  /** Overrides the local inbox state of an inbox (default: bound to the address its id is made of). */
-  inboxStateOf: ((inboxId: string) => { identifiers: Array<{ identifier: string; identifierKind: number }> }) | null = null;
+  /** Overrides the local inbox state of an inbox; null (or no override) is the default: the address its id is made
+   *  of is its only member and its recovery identifier, as for an inbox its creating address has not changed. */
+  inboxStateOf: ((inboxId: string) => FakeInboxState | null) | null = null;
+  /** Answers the next network inbox lookups (`fetchInboxIdByIdentifier`) give for the opponent, oldest first, before
+   *  the default (its inbox once registered): a stale or wrong answer. */
+  readonly inboxAnswers: Array<string | null> = [];
   /** Conversation ids of the opponent's stitched duplicate DMs (`dm.duplicateDms()`). */
   readonly duplicates: string[] = [];
   /** Whether the opponent has registered (`fetchInboxIdByIdentifier` finds it). */
@@ -237,13 +262,14 @@ export class FakeSdk {
     const sdk = this;
     const meInbox = FakeSdk.inboxOf(me);
     const peerInbox = FakeSdk.inboxOf(peer);
-    this.conversations.set("dm-ab", { id: "dm-ab", peerInboxId: peerInbox, consent: [], updateConsentState(s) { this.consent.push(s); } });
+    this.conversations.set("dm-ab", conversation("dm-ab", peerInbox));
     const dm = () => {
       const c = sdk.conversations.get("dm-ab")!;
       return {
         id: c.id,
         peerInboxId: peerInbox,
-        updateConsentState: (s: number) => c.consent.push(s),
+        consentState: () => c.consentState(),
+        updateConsentState: (s: number) => c.updateConsentState(s),
         sendText: async (text: string) => {
           sdk.sentTexts.push(text);
           return `sent-${sdk.sentTexts.length}`;
@@ -264,7 +290,9 @@ export class FakeSdk {
           sdk.inboxLookupFailures--;
           throw new Error("network unreachable");
         }
-        return sdk.peerRegistered && id.identifier.toLowerCase() === peer.toLowerCase() ? peerInbox : null;
+        if (id.identifier.toLowerCase() !== peer.toLowerCase()) return null;
+        if (sdk.inboxAnswers.length > 0) return sdk.inboxAnswers.shift() as string | null;
+        return sdk.peerRegistered ? peerInbox : null;
       },
       preferences: {
         getInboxStates: async (ids: string[]) => {
@@ -273,7 +301,10 @@ export class FakeSdk {
             sdk.inboxStateFailures--;
             throw new Error("database is locked");
           }
-          return ids.map((i) => sdk.inboxStateOf?.(i) ?? { identifiers: [{ identifier: i.replace(/^inbox-/, ""), identifierKind: 0 }] });
+          return ids.map((i) => {
+            const own = { identifier: i.replace(/^inbox-/, ""), identifierKind: 0 };
+            return sdk.inboxStateOf?.(i) ?? { identifiers: [own], recoveryIdentifier: own };
+          });
         },
       },
       conversations: {
@@ -327,7 +358,7 @@ export class FakeSdk {
 
   /** A stranger's group invite to B. */
   strangerGroup(id: string): FakeConversation {
-    const g: FakeConversation = { id, consent: [], updateConsentState(s) { this.consent.push(s); } };
+    const g = conversation(id);
     this.groups.push(g);
     this.conversations.set(id, g);
     return g;
@@ -337,7 +368,7 @@ export class FakeSdk {
   strangerDm(stranger: Address): string {
     const id = `dm-${stranger.toLowerCase()}`;
     if (!this.conversations.has(id)) {
-      this.conversations.set(id, { id, peerInboxId: FakeSdk.inboxOf(stranger), consent: [], updateConsentState(s) { this.consent.push(s); } });
+      this.conversations.set(id, conversation(id, FakeSdk.inboxOf(stranger)));
     }
     return id;
   }
@@ -345,7 +376,7 @@ export class FakeSdk {
   /** The opponent's stitched duplicate DM with B (as when both sides created a DM at once). */
   duplicateDm(id: string): string {
     this.duplicates.push(id);
-    this.conversations.set(id, { id, peerInboxId: FakeSdk.inboxOf(this.peer), consent: [], updateConsentState(s) { this.consent.push(s); } });
+    this.conversations.set(id, conversation(id, FakeSdk.inboxOf(this.peer)));
     return id;
   }
 
