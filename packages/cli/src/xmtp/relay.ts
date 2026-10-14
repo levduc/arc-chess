@@ -1,4 +1,3 @@
-import { performance } from "node:perf_hooks";
 import type { Address, Hex } from "viem";
 import { decodeWire, parseRelayMessage, toWire, type Params, type RelayMessage, type RelaySigner } from "@arena/sdk";
 import type { XmtpTransport } from "./transport.js";

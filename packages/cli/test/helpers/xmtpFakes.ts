@@ -201,8 +201,13 @@ export class FakeSdk {
   lookups = 0;
   /** Whether the opponent has registered (`fetchInboxIdByIdentifier` finds it). */
   peerRegistered = true;
-  /** Makes the next N streamAllMessages calls throw (a `syncAll` failure while offline). */
+  /** Makes the next N streamAllMessages calls fail to start (a `syncAll` failure while offline): like the real
+   *  `createStream` with `retryOnFail: false`, the call reports `onError` and returns an already-ended stream. */
   failStarts = 0;
+  /** Makes the next N getConversationById calls come back `undefined` (the SDK turns any error into that). */
+  lookupMisses = 0;
+  /** Groups B has been invited to (strangers' invites). */
+  readonly groups: FakeConversation[] = [];
   /** Delays a getConversationById call: the test resolves it. */
   lookupGate: Promise<void> | null = null;
   readonly sentTexts: string[] = [];
@@ -247,8 +252,14 @@ export class FakeSdk {
           if (!sdk.peerRegistered || id.identifier.toLowerCase() !== peer.toLowerCase()) throw new Error("peer not registered");
           return dm();
         },
+        listGroups: (opts: { consentStates?: number[] } = {}) =>
+          sdk.groups.filter((g) => !opts.consentStates || opts.consentStates.includes(g.consent.at(-1) ?? FakeSdk.ConsentState.Unknown)),
         getConversationById: async (id: string) => {
           sdk.lookups++;
+          if (sdk.lookupMisses > 0) {
+            sdk.lookupMisses--;
+            return undefined;
+          }
           const gate = sdk.lookupGate;
           if (gate) {
             sdk.lookupGate = null;
@@ -258,11 +269,12 @@ export class FakeSdk {
         },
         streamAllMessages: async (opts: Record<string, unknown>) => {
           sdk.streamCalls.push(opts);
+          const s = new FakeStream(opts);
           if (sdk.failStarts > 0) {
             sdk.failStarts--;
-            throw new Error("syncAll failed: offline");
+            (opts.onError as ((err: Error) => void) | undefined)?.(new Error("syncAll failed: offline"));
+            void s.end();
           }
-          const s = new FakeStream(opts);
           sdk.streams.push(s);
           return s;
         },
@@ -278,6 +290,14 @@ export class FakeSdk {
 
   static inboxOf(a: Address): string {
     return `inbox-${a.toLowerCase()}`;
+  }
+
+  /** A stranger's group invite to B. */
+  strangerGroup(id: string): FakeConversation {
+    const g: FakeConversation = { id, consent: [], updateConsentState(s) { this.consent.push(s); } };
+    this.groups.push(g);
+    this.conversations.set(id, g);
+    return g;
   }
 
   /** A stranger's DM with B. */

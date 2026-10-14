@@ -20,7 +20,8 @@ let logs: string[] = [];
 
 beforeEach(() => {
   logs = [];
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  // The transport's holds and back-offs run on performance.now(): faked too, so they follow the fake timers.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
 });
 
 afterEach(async () => {
@@ -123,11 +124,18 @@ describe("createNodeSdkTransport: the inbound stream", () => {
     expect(sdk.streams).toHaveLength(2);
     expect(got.map((g) => g.text)).toEqual(["before", "gap-1", "gap-2"]); // "before" not twice: same message id
     expect(sdk.messagesCalls.at(-1)?.limit).toBe(XMTP_CATCH_UP_MESSAGES);
-    // Far past the SDK's own 10 attempts: starts that keep failing are retried with a capped back-off.
+    // Far past the SDK's own 10 attempts: starts that keep failing (the SDK returns an already-ended stream and reports
+    // onError) are retried with a capped back-off, and each one still runs its catch-up.
+    const catchUpsBefore = sdk.messagesCalls.length;
     sdk.stream.fail();
     sdk.failStarts = 20;
+    await settle();
+    expect(logs.some((l) => l.includes("restarting in 2s"))).toBe(true); // the back-off doubled
     for (let i = 0; i < 25; i++) await advance(30_000);
     expect(sdk.streamCalls.length).toBeGreaterThanOrEqual(2 + 20 + 1);
+    expect(sdk.messagesCalls.length - catchUpsBefore).toBeGreaterThanOrEqual(20 + 1);
+    expect(logs.some((l) => l.includes("stream error: syncAll failed: offline"))).toBe(true);
+    expect(logs.some((l) => l.includes("restarting in 30s"))).toBe(true); // capped
     expect(sdk.stream.isDone).toBe(false); // a live stream again
     sdk.stream.push(sdk.msg("a-4", a.address, "after"));
     await settle();
@@ -144,6 +152,102 @@ describe("createNodeSdkTransport: the inbound stream", () => {
     await settle();
     expect(got.map((g) => g.text).slice(-2)).toEqual(["h19", "new"]);
     expect(got).toHaveLength(XMTP_CATCH_UP_MESSAGES + 1);
+  });
+
+  it("a conversation lookup that comes back empty once is retried in place: the opponent's messages arrive in order (I-N1)", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.peerRegistered = false; // A's DM unknown at open: its first message needs a lookup
+    await t.open(channelId, b, a.address);
+    sdk.peerRegistered = true;
+    sdk.lookupMisses = 1; // a transient native error
+    sdk.stream.push(sdk.msg("a-1", a.address, "move-1"));
+    sdk.stream.push(sdk.msg("a-2", a.address, "move-2"));
+    await settle();
+    expect(got).toEqual([]); // waiting on the retry, in order
+    await advance(100);
+    expect(got.map((g) => [g.text, g.dm])).toEqual([
+      ["move-1", a.address],
+      ["move-2", a.address],
+    ]);
+    expect(sdk.lookups).toBe(2); // the empty answer was not cached
+    sdk.stream.push(sdk.msg("a-3", a.address, "move-3"));
+    await settle();
+    expect(got.at(-1)).toMatchObject({ text: "move-3", dm: a.address });
+    expect(sdk.lookups).toBe(2); // the real answer was
+  });
+
+  it("lookups that keep coming back empty: passed on unresolved, never seen, then delivered in order by a catch-up", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.peerRegistered = false;
+    await t.open(channelId, b, a.address);
+    sdk.peerRegistered = true;
+    sdk.lookupMisses = 4; // the first lookup and its three retries
+    for (const [id, text] of [["a-1", "move-1"], ["a-2", "move-2"]] as const) {
+      sdk.history.push(sdk.msg(id, a.address, text));
+      sdk.stream.push(sdk.msg(id, a.address, text));
+    }
+    await settle();
+    await advance(100);
+    await advance(400);
+    await advance(1_500);
+    // Both passed on as not in the DM (XmtpRelay drops and counts them); the second one without any lookup.
+    expect(got.map((g) => [g.text, g.dm])).toEqual([
+      ["move-1", NOT_THE_PEER],
+      ["move-2", NOT_THE_PEER],
+    ]);
+    expect(sdk.lookups).toBe(4);
+    for (let i = 0; i < 100; i++) sdk.stream.push(sdk.msg(`s-${i}`, a.address, "flood"));
+    await settle();
+    expect(sdk.lookups).toBe(4); // held: no lookup per message
+    // After the hold, the stream is restarted; its catch-up finds the DM itself and delivers what was left un-seen.
+    const streams = sdk.streams.length;
+    await advance(5_000);
+    await advance(1_000);
+    expect(sdk.streams.length).toBe(streams + 1);
+    expect(got.filter((g) => g.dm === a.address).map((g) => g.text)).toEqual(["move-1", "move-2"]);
+  });
+
+  it("denies a stranger's DM even before the opponent's inbox is known, when the sender's inbox lacks the opponent's address", async () => {
+    const { a, sdk, got, t, b, channelId } = await bTransport({ open: false });
+    sdk.peerRegistered = false; // the opponent never registers (it runs without XMTP)
+    await t.open(channelId, b, a.address);
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    const conv = sdk.strangerDm(stranger);
+    for (let i = 0; i < 10; i++) sdk.stream.push(sdk.msg(`x-${i}`, stranger, "spam", conv));
+    await settle();
+    expect(got).toHaveLength(10);
+    expect(sdk.conversations.get(conv)?.consent).toEqual([FakeSdk.ConsentState.Denied]);
+  });
+
+  it("a stranger's DM whose lookup comes back empty is denied on a later message, not marked denied meanwhile", async () => {
+    const { sdk } = await bTransport();
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    const conv = sdk.strangerDm(stranger);
+    sdk.lookupMisses = 1;
+    sdk.stream.push(sdk.msg("x-1", stranger, "spam", conv));
+    await settle();
+    expect(sdk.conversations.get(conv)?.consent).toEqual([]);
+    sdk.stream.push(sdk.msg("x-2", stranger, "spam", conv)); // within the hold: no lookup
+    await settle();
+    expect(sdk.lookups).toBe(1);
+    await advance(5_000);
+    sdk.stream.push(sdk.msg("x-3", stranger, "spam", conv));
+    await settle();
+    expect(sdk.conversations.get(conv)?.consent).toEqual([FakeSdk.ConsentState.Denied]);
+  });
+
+  it("denies strangers' group invites at every stream (re)start (m5)", async () => {
+    const { sdk, t, a, b, channelId } = await bTransport({ open: false });
+    const g1 = sdk.strangerGroup("group-1");
+    await t.open(channelId, b, a.address);
+    expect(g1.consent).toEqual([FakeSdk.ConsentState.Denied]);
+    const g2 = sdk.strangerGroup("group-2"); // invited mid-stream
+    sdk.stream.fail();
+    await settle();
+    await advance(1_000);
+    expect(g2.consent).toEqual([FakeSdk.ConsentState.Denied]);
+    expect(g1.consent).toEqual([FakeSdk.ConsentState.Denied]); // not denied twice
+    expect(logs.filter((l) => l.includes("denied 1 group invite(s) from strangers"))).toHaveLength(2);
   });
 
   it("stop ends the restart loop: no stream is created after it (m4)", async () => {

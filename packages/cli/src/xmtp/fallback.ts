@@ -1,4 +1,3 @@
-import { performance } from "node:perf_hooks";
 import type { Hex } from "viem";
 import type { Params, RelayClient, RelayMessage, RelaySigner } from "@arena/sdk";
 import type { HostRelay } from "../host.js";
