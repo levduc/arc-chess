@@ -104,6 +104,30 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **A lying RPC can fake a withdraw receipt** (final review M11, parked): `withdraw` would report success while
   nothing moved. Funds are never redirected (targets come from config), but pin a trusted RPC for real funds.
 
+### Plan 5.7
+
+See `docs/superpowers/specs/2026-10-13-xmtp-fallback-design.md` (§6, §8) for the full design. The XMTP fallback
+transport ships in Plan 5.7; these are the gates before it carries real money or real games on mainnet:
+- **The gateway must be funded and running on separate infrastructure once XMTP fees are enforced.** While XMTP's
+  fees are not enforced, no gateway is needed at all (`deploy/xmtp-gateway/`'s README notes that, as of
+  2026-10-13, whether mainnet fee enforcement is already live or still pending is not clearly stated in XMTP's
+  own docs — verify current status before launch). Once enforced, the gateway must be running, funded to its
+  payer cap, monitored (`deploy/xmtp-gateway/README.md`), and on infrastructure separate from the website; the
+  server must publish `gatewayHost` in its `xmtp` config.
+- **Gateway authentication once XMTP ships client auth tokens.** XMTP's `gatewayAuthTokenFetcher` is marked
+  "coming soon" as of 2026-10-13; until then, the gateway's only gate is an IP-based `WithAuthorizers` rate limit
+  (`deploy/xmtp-gateway/README.md`). Once XMTP ships client auth tokens, the gateway must authorize only session
+  keys of currently open channels — not every client that happens to present a token.
+- **XMTP production verified end to end before launch.** The system tests run only against XMTP's local node
+  (Docker); nothing in this repo exercises XMTP's real `dev` or production network. Before mainnet, run the
+  manual smoke script (spec §7) against XMTP's public `dev` network, and confirm the fallback actually works
+  against production XMTP, not just the local-node fixture.
+- **Supply-chain note for the pinned native SDK.** `@xmtp/node-sdk@6.0.0` is installed at runtime (`arena xmtp
+  enable`), never bundled into the published CLI, and pinned by exact version (`--save-exact`). It is a native
+  module (not pure JS) fetched from npm outside the workspace's own lockfile/audit surface — confirm its
+  provenance and integrity (npm's own signature/provenance checks, or a manual hash pin) before relying on it for
+  real-money games, the same way Plan 5.6's gates treat the CLI's own published tarball.
+
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
 1. **Arc chain facts verified and written down.**
