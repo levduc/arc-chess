@@ -132,6 +132,9 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 - **The XMTP SDK runs inside the process that holds the wallet key.** `@xmtp/node-sdk` and its native bindings
   run in the daemon's own process, with the wallet key and every session key in memory: a supply-chain risk (and
   a native crash there stops the watchtower too). Isolate the SDK in its own process before real funds.
+- **XMTP resource bound.** A daemon runs at most 64 XMTP clients (`XMTP_MAX_CLIENTS`), each one opened only once its
+  channel is Open on-chain and closed (`Client.close()`, node-sdk 6.1.0) when the channel settles. Before launch,
+  measure fds, threads and RSS on a long-running house bot across many channels and confirm they stay flat.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
