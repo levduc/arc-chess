@@ -43,9 +43,16 @@ function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Prom
 let child: ChildProcess | undefined;
 let deploymentSnapshot: string | null | undefined;
 let devDir: string | undefined;
-/** Plan 5.7 Task 5: the compose project a `--xmtp-local` run reported, taken down here if the test did not get to
- *  (a SIGKILLed dev-up never runs its own teardown). */
+/** Plan 5.7 Task 5: the compose project of a `--xmtp-local` run, taken down here if the test did not get to (a
+ *  SIGKILLed dev-up never runs its own teardown). Final fix wave (K4): named by the test before dev-up starts
+ *  (`ARENA_DEV_XMTP_PROJECT`), so it is known even when dev-up hangs before its ready line. */
 let xmtpProject: string | undefined;
+
+/** K4: a fresh compose project name for one `--xmtp-local` run, set as `xmtpProject` before dev-up is spawned. */
+function nameXmtpProject(): string {
+  xmtpProject = `arena-dev-xmtp-test-${process.pid}-${Date.now()}`;
+  return xmtpProject;
+}
 
 /** Plan 5.7 Task 5: the containers (any state) of one compose project, by its label: only ever this test's own. */
 function composeContainers(project: string): string[] {
@@ -374,19 +381,19 @@ describe("pnpm dev:up", () => {
       devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
       const anvilPort = await freeTcpPort();
       const serverPort = await freeTcpPort();
+      const project = nameXmtpProject(); // known before dev-up starts: torn down in afterEach whatever happens
       child = spawn(
         TSX_BIN,
         [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--xmtp-local",
           "--players", "0", "--house-bots", "0", "--dir", devDir],
-        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, ARENA_DEV_XMTP_PROJECT: project } },
       );
       // A cold machine pulls the fixture's five pinned images first.
       const ready = await waitForJsonLine(child, (o) => o.ready === true, 600_000);
       const xmtp = ready.xmtp as { env: string; apiUrl: string; project: string };
-      xmtpProject = xmtp.project;
+      expect(xmtp.project).toBe(project);
       expect(xmtp.env).toBe("local");
       expect(xmtp.apiUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
-      expect(xmtp.project).toMatch(/^arena-dev-xmtp-/);
       expect(composeContainers(xmtp.project).length).toBeGreaterThan(0);
 
       const serverUrl = `http://127.0.0.1:${serverPort}`;
@@ -418,15 +425,21 @@ describe("pnpm dev:up", () => {
       devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
       const anvilPort = await freeTcpPort();
       const serverPort = await freeTcpPort();
+      const project = nameXmtpProject();
       child = spawn(
         TSX_BIN,
         [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--xmtp-local",
           "--players", "0", "--house-bots", "2", "--dir", devDir],
         // npm's cache shared with the rest of the suite (harness.ts), so a warm machine installs offline.
-        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, npm_config_cache: XMTP_NPM_CACHE } },
+        {
+          cwd: REPO_ROOT,
+          detached: true,
+          stdio: ["ignore", "pipe", "inherit"],
+          env: { ...process.env, npm_config_cache: XMTP_NPM_CACHE, ARENA_DEV_XMTP_PROJECT: project },
+        },
       );
       const ready = await waitForJsonLine(child, (o) => o.ready === true, 900_000);
-      xmtpProject = (ready.xmtp as { project: string }).project;
+      expect((ready.xmtp as { project: string }).project).toBe(project);
       const house = (i: number) => join(devDir!, "house-bots", `house-${i}`);
       expect(lstatSync(join(house(1), "xmtp", "sdk")).isDirectory()).toBe(true);
       expect(lstatSync(join(house(2), "xmtp", "sdk")).isSymbolicLink()).toBe(true);
@@ -441,7 +454,7 @@ describe("pnpm dev:up", () => {
       const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
       process.kill(-child.pid!, "SIGINT");
       await withDeadline(exited, 90_000, "dev-up did not exit within 90s of SIGINT");
-      expect(composeContainers(xmtpProject)).toEqual([]);
+      expect(composeContainers(project)).toEqual([]);
       xmtpProject = undefined;
     },
     1_020_000,

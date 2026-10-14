@@ -7,10 +7,13 @@
  *    cooperatively (exactly one successful `closeCooperative` on chain) and settle exact USDC; after a server restart
  *    a new channel is back on the relay.
  * 2. A flapping host (down, up, down) mid-game: the game completes.
- * 3. A third party's XMTP client DMs a daemon's session key a valid-looking message: it is dropped (read from the
- *    daemon's own log line, before the channel finalizes) and the game is unaffected.
+ * 3. A third party's XMTP client DMs a daemon's session key a valid-looking message: it is dropped (its status's
+ *    `xmtpDropped`, read before the channel finalizes) and the game is unaffected.
  * 4. A daemon restarted while its channel is on XMTP: it exits promptly on stop, resumes over XMTP from its DB --
  *    the opponent's move made while it was down included -- and its inbox still has one installation.
+ * Scenarios 1-4 also assert, on chain, that no challenge, respond or timeout was sent at all (the outage was carried
+ * by XMTP alone), and scenario 1 that a finalized channel's XMTP DB is deleted (I-1, m-1). A channel's XMTP client
+ * starts only once the daemon sees it Open on chain (I-1), which `waitRegistered` waits for.
  * 5. XMTP off: a pair without `xmtp` behaves as today -- `fallback: "off"`, never `transport: "xmtp"` -- and with the
  *    host down the chain path (challenge, respond) still carries the game.
  *
@@ -20,7 +23,7 @@
  * When Docker is unavailable the suite is skipped, with the reason in its title (and a tagged console line).
  */
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -34,6 +37,7 @@ import {
   dockerUnavailableReason,
   hasLockFile,
   installXmtpSdk,
+  runCli,
   startStack,
   startXmtpLocal,
   usdcBalanceOf,
@@ -216,8 +220,8 @@ async function waitPhase(hub: HubClient, id: Hex, phase: string, ms = 30_000): P
   await waitFor(async () => (await hub.channelInfo(id)).phase === phase, ms, `on-chain phase ${phase}`);
 }
 
-async function status(p: Player, id: Hex): Promise<Status & { transport: string; lastError: string | null }> {
-  return (await p.api("GET", `/status?channel=${id}`)) as Status & { transport: string; lastError: string | null };
+async function status(p: Player, id: Hex): Promise<Status & { transport: string; lastError: string | null; xmtpDropped: number }> {
+  return (await p.api("GET", `/status?channel=${id}`)) as Status & { transport: string; lastError: string | null; xmtpDropped: number };
 }
 
 /** A stack whose server publishes `xmtp` (env local, the fixture's apiUrl), and two players whose daemons run with
@@ -295,6 +299,19 @@ async function signersOf(p: Player, id: Hex): Promise<readonly [Address, Address
   return [record.params.signers[0], record.params.signers[1]];
 }
 
+/** K5: a player's own session signer for the channel, by its own seat in its own record (never by position). */
+async function ownSignerOf(p: Player, id: Hex): Promise<Address> {
+  const record = await waitFor(() => readJson<ChannelRecord>(join(p.home, "channels", id, "record.json")), 20_000, `${p.name}'s record`);
+  return record.params.signers[record.me];
+}
+
+/** I-1, m-1: once finalized, a channel's XMTP DB files are deleted from the player's home. */
+async function expectXmtpDbPurged(p: Player, id: Hex): Promise<void> {
+  const dbDir = join(p.home, "xmtp", "db");
+  const left = () => (existsSync(dbDir) ? readdirSync(dbDir).filter((n) => n.startsWith(`${id.toLowerCase()}.db3`)) : []);
+  await waitFor(() => left().length === 0, 20_000, `${p.name}'s XMTP DB for ${id} deleted (left: ${left().join(", ")})`);
+}
+
 /** One move by whoever is on move (white's view), then waits until the other side holds it. Returns the latency. */
 async function move(white: Player, black: Player, id: Hex, m: string, ms = XMTP_MOVE_MS): Promise<number> {
   const w = await status(white, id);
@@ -328,7 +345,9 @@ async function closeBoth(alice: Player, bob: Player, id: Hex, hub: HubClient, ms
 }
 
 /** Ruling 3: exactly one successful `closeCooperative` -- one `Finalized` event for the channel, emitted by a
- *  successful `closeCooperative` transaction, and no other successful `closeCooperative` on the hub in this stack. */
+ *  successful `closeCooperative` transaction, and no other successful `closeCooperative` on the hub in this stack.
+ *  K2: and not one `challenge`, `respond` or `timeout` transaction on the hub in this stack, successful or not: the
+ *  outage was carried off-chain, over XMTP, never by the chain path. */
 async function expectOneCloseCooperative(s: Stack, id: Hex): Promise<void> {
   const { pub } = hubOf(s);
   const logs = await pub.getContractEvents({ address: s.hub, abi: channelHubAbi, eventName: "Finalized", args: { channelId: id }, fromBlock: 0n });
@@ -336,6 +355,7 @@ async function expectOneCloseCooperative(s: Stack, id: Hex): Promise<void> {
   const finalTx = await pub.getTransaction({ hash: logs[0].transactionHash });
   expect(decodeFunctionData({ abi: channelHubAbi, data: finalTx.input }).functionName).toBe("closeCooperative");
   let ok = 0;
+  const disputes: string[] = [];
   const latest = await pub.getBlockNumber();
   for (let n = 0n; n <= latest; n++) {
     const block = await pub.getBlock({ blockNumber: n, includeTransactions: true });
@@ -347,11 +367,13 @@ async function expectOneCloseCooperative(s: Stack, id: Hex): Promise<void> {
       } catch {
         continue;
       }
+      if (fn === "challenge" || fn === "respond" || fn === "timeout") disputes.push(`${fn} ${tx.hash}`);
       if (fn !== "closeCooperative") continue;
       if ((await pub.getTransactionReceipt({ hash: tx.hash })).status === "success") ok++;
     }
   }
   expect(ok, "successful closeCooperative transactions").toBe(1);
+  expect(disputes, "challenge/respond/timeout transactions on the hub (the outage must not reach the chain)").toEqual([]);
 }
 
 async function expectSettled(s: Stack, alice: Player, bob: Player): Promise<void> {
@@ -405,6 +427,10 @@ suite(skipReason ? `XMTP fallback (SKIPPED: ${skipReason})` : "XMTP fallback ove
       const name = "1 kill the host";
       const { s, alice, bob } = await xmtpStack();
       const { hub } = hubOf(s);
+      // I-2: `arena xmtp status` reports what the RUNNING daemon loaded.
+      const st = await runCli(["xmtp", "status"], alice.home, { timeoutMs: 60_000 });
+      expect(st.status, st.stderr).toBe(0);
+      expect(JSON.parse(st.stdout.trim().split("\n").at(-1) as string)).toMatchObject({ enabled: true, env: "local", daemon: "xmtp" });
       const id = await matchAndOpen(alice, bob);
       expect(await waitRegistered(await signersOf(bob, id))).toEqual([1, 1]);
 
@@ -417,6 +443,8 @@ suite(skipReason ? `XMTP fallback (SKIPPED: ${skipReason})` : "XMTP fallback ove
       await expectOneCloseCooperative(s, id);
       await expectSettled(s, alice, bob);
       await expectNoErrors(alice, bob);
+      // I-1, m-1: the finalized channel's XMTP client is closed and its DB deleted, on both sides.
+      for (const p of [alice, bob]) await expectXmtpDbPurged(p, id);
 
       // The site is back: a new match is made through it, and its channel sends via the relay.
       await s.restartServer();
@@ -462,6 +490,7 @@ suite(skipReason ? `XMTP fallback (SKIPPED: ${skipReason})` : "XMTP fallback ove
       const id = await matchAndOpen(alice, bob);
       const signers = await signersOf(bob, id);
       await waitRegistered(signers);
+      const bobSigner = await ownSignerOf(bob, id); // K5: Bob's own seat, from his record
 
       await playMoves(name, "the relay", alice, bob, id, SCHOLARS_MATE.slice(0, 2));
       await hostDown(s, [alice, bob], id);
@@ -475,15 +504,15 @@ suite(skipReason ? `XMTP fallback (SKIPPED: ${skipReason})` : "XMTP fallback ove
       const text = toWire({ arena: 1, msg: { type: "state", channelId: id, signed: snapshot!.latest } });
       const textFile = join(helperDir!, `stranger-${id}.txt`);
       writeFileSync(textFile, text);
-      const dropLine = new RegExp(`xmtp: channel ${id.toLowerCase()}: dropped an inbound message \\(not (from the opponent|in the DM with the opponent)\\); (\\d+) dropped so far`);
       const strangerDb = mkdtempSync(join(helperDir!, "stranger-db-"));
+      expect((await status(bob, id)).xmtpDropped).toBe(0);
       const t0 = Date.now();
-      const sent = await helper(["stranger", strangerDb, signers[1], textFile], 90_000);
+      const sent = await helper(["stranger", strangerDb, bobSigner, textFile], 90_000);
       expect(sent.sent).toBe(true);
-      // Read before the channel finalizes (the XMTP side forgets a channel's counters on close).
-      const line = await waitFor(() => bob.logs().split("\n").find((l) => dropLine.test(l)), 30_000, "bob's XMTP drop line");
-      measure(name, "stranger's message sent to its drop logged", Date.now() - t0);
-      expect(Number(dropLine.exec(line)![2])).toBeGreaterThan(0);
+      // K3: the drop, from Bob's status (read before the channel finalizes).
+      const dropped = await waitFor(async () => (await status(bob, id)).xmtpDropped, 30_000, "bob's xmtpDropped");
+      measure(name, "stranger's message sent to its drop counted", Date.now() - t0);
+      expect(dropped).toBeGreaterThan(0);
       expect((await status(bob, id)).lastError).toBeNull();
 
       await playMoves(name, "XMTP", alice, bob, id, SCHOLARS_MATE.slice(4));
@@ -510,7 +539,7 @@ suite(skipReason ? `XMTP fallback (SKIPPED: ${skipReason})` : "XMTP fallback ove
       await hostDown(s, [alice, bob], id);
       await playMoves(name, "XMTP", alice, bob, id, SCHOLARS_MATE.slice(2, 4));
 
-      // Bob stops mid-fallback (ruling 3: node-sdk 6.0.0 has no client close, so the exit itself is the check).
+      // Bob stops mid-fallback: node-sdk 6.1.0's Client.close() runs on stop (bounded), and the exit is the check.
       const t0 = Date.now();
       await bob.kill("SIGTERM");
       const exitMs = Date.now() - t0;

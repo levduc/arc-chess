@@ -890,7 +890,7 @@ export type XmtpSdkInstall = {
   sdkDir: string;
   /** How long the install took, in milliseconds. */
   ms: number;
-  /** Deletes the install (about 437 MB). */
+  /** Deletes the install (about 480 MB). */
   remove(): void;
 };
 

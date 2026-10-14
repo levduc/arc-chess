@@ -19,9 +19,11 @@
  * `--xmtp-local` (Plan 5.7): also starts XMTP's local node in Docker (the pinned fixture
  * `tests/system/xmtp-local/docker-compose.yml`, under a unique compose project, on free ports) and has the server
  * publish `xmtp: {env: "local", apiUrl}` in `/templates`, so every `arena init` against this stack caches it. House
- * bots get the XMTP fallback too: dev-up runs `arena xmtp enable` (a real npm install of the SDK, about 437 MB) in the
+ * bots get the XMTP fallback too: dev-up runs `arena xmtp enable` (a real npm install of the SDK, about 480 MB) in the
  * first house bot's home and symlinks every other house bot's `xmtp/sdk` to it. Teardown takes the fixture down
- * with `docker compose down -v`. Without the flag nothing about XMTP is started or published.
+ * with `docker compose down -v`. Without the flag nothing about XMTP is started or published. The compose project is
+ * `arena-dev-xmtp-<pid>-<time>`, or `ARENA_DEV_XMTP_PROJECT` when set (it must start with `arena-dev-xmtp-`): a
+ * caller that names it up front can take the fixture down itself even if dev-up dies before its ready line.
  *
  * `--dir` is refused if it already exists, is non-empty, and has no `.arena-dev-marker` file (written on a
  * successful run) -- so a caller who points `--dir` at something unrelated never has it silently wiped. An
@@ -245,6 +247,19 @@ async function stopChild(label: string, child: ChildProcess | undefined, graceMs
 let anvil: ChildProcess | undefined;
 let server: ChildProcess | undefined;
 const bots: Array<{ label: string; child: ChildProcess }> = [];
+/** Plan 5.7 (`--xmtp-local`, final fix wave K4): the fixture's compose project -- `ARENA_DEV_XMTP_PROJECT` when set
+ *  (dev-up.test.ts names it up front, so it can `down -v` the fixture even if dev-up hangs or is killed before its
+ *  ready line), else unique per run. A given name must carry the `arena-dev-xmtp-` prefix, so nothing else is
+ *  ever taken down under it. */
+function xmtpProjectName(): string {
+  const given = process.env.ARENA_DEV_XMTP_PROJECT;
+  if (given === undefined || given === "") return `arena-dev-xmtp-${process.pid}-${Date.now()}`;
+  if (!/^arena-dev-xmtp-[a-z0-9][a-z0-9_-]*$/.test(given)) {
+    throw new Error(`ARENA_DEV_XMTP_PROJECT must be "arena-dev-xmtp-" followed by lowercase letters, digits, "_" or "-" (got ${JSON.stringify(given)})`);
+  }
+  return given;
+}
+
 /** Plan 5.7 (`--xmtp-local`): XMTP's local node, once it is up. A Ctrl-C that lands while it is still starting is
  *  covered by harness.ts's own `exit` backstop, which takes down any fixture it started and has not stopped. */
 let xmtpLocal: XmtpLocal | undefined;
@@ -393,7 +408,7 @@ async function main(): Promise<void> {
   // Plan 5.7 (`--xmtp-local`): XMTP's local node, before the server, whose /templates then publishes it.
   if (withXmtpLocal) {
     process.stderr.write("dev-up: starting XMTP's local node (docker compose; a first run pulls its images)\n");
-    xmtpLocal = await startXmtpLocal({ project: `arena-dev-xmtp-${process.pid}-${Date.now()}` });
+    xmtpLocal = await startXmtpLocal({ project: xmtpProjectName() });
     process.stderr.write(`dev-up: XMTP's local node is up at ${xmtpLocal.apiUrl} (compose project ${xmtpLocal.project})\n`);
   }
 
@@ -526,7 +541,7 @@ async function main(): Promise<void> {
     }
     // Plan 5.7 (`--xmtp-local`): house bots play with the fallback on. `arena bot` itself only hints when the SDK is
     // missing, so dev-up enables it: one real install in the first house bot's home, and a symlink to it in every
-    // other one (the SDK is about 437 MB).
+    // other one (the SDK is about 480 MB).
     if (xmtpLocal) {
       if (sharedXmtpSdk === undefined) {
         const enableLog = join(logsDir, "xmtp-enable.log");
@@ -587,7 +602,7 @@ async function main(): Promise<void> {
   }
   if (xmtpLocal) {
     process.stderr.write(`  XMTP fallback: XMTP's local node is at ${xmtpLocal.apiUrl}, published in /templates (env local).\n`);
-    process.stderr.write("  A player's daemon uses it once that home has run `arena xmtp enable` (one-time, about 437 MB).\n\n");
+    process.stderr.write("  A player's daemon uses it once that home has run `arena xmtp enable` (one-time, about 480 MB).\n\n");
   }
   if (commands.length > 0) {
     process.stderr.write("  start each player's daemon in its own terminal:\n\n");
