@@ -18,12 +18,16 @@
  * `XMTP_GRPC_PORT`-mapped port) and "serving grpc" on its container port 5556 (the `XMTP_API_PORT`-mapped port)
  * -- i.e. the port named "grpc" is the one a plain HTTP GET actually gets a response from, and the port named
  * "api" never answers HTTP at all (confirmed over 40s of polling: consistently no response). The env var names
- * are kept exactly as specified (they're just upstream's own 5555/5556 numbers); this test checks HTTP against
- * `ports.grpc` and falls back to a raw TCP connect against `ports.api` accordingly, so the HTTP check is a real
- * readiness signal rather than one that can never succeed. A bare TCP connect-success is a weak signal on its
- * own here -- Docker's userland proxy accepts the TCP handshake on a published port immediately on `up -d`,
- * before the containerized process has bound anything -- which is exactly why the HTTP check (a real response,
- * not just a completed handshake) is tried first and given the whole 120s budget before falling back to it.
+ * are kept exactly as specified (they're just upstream's own 5555/5556 numbers).
+ *
+ * Readiness is the real HTTP response on `ports.grpc`, *and nothing else*. A fix-round review caught that an
+ * earlier version of this test also accepted a bare TCP connect-success on `ports.api` as a pass, checked on
+ * every loop iteration -- but Docker's userland proxy accepts a TCP handshake on a published host port the
+ * instant `up -d` returns, before node-go has bound anything inside the container, so that branch could (and,
+ * per the review, plausibly did) pass the test in well under a second without node-go ever answering anything.
+ * There is no TCP fallback in the pass path any more: the test polls HTTP alone for the full 120s budget, and a
+ * TCP connect is attempted only once that budget is exhausted, purely to make the failure message more useful
+ * (did the container come up at all?) -- it is never treated as success.
  */
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { connect } from "node:net";
@@ -82,27 +86,35 @@ suite(skipReason ? `XMTP local-node fixture (SKIPPED: ${skipReason})` : "XMTP lo
   }, 120_000);
 
   it(
-    "answers HTTP on the port node-go actually serves it on, or accepts a TCP connection on the gRPC port, within 120s",
+    "answers HTTP on the port node-go actually serves it on, within 120s",
     async () => {
       const deadline = Date.now() + 120_000;
       let reachable = false;
       let lastHttpErr: unknown;
       while (Date.now() < deadline && !reachable) {
         try {
-          // See the suite-level comment: node-go's real HTTP response is on the `grpc`-named port.
+          // See the suite-level comment: node-go's real HTTP response is on the `grpc`-named port. This is the
+          // *only* signal this test accepts as readiness -- no TCP fallback in this path (fix round 1).
           const res = await fetch(`http://127.0.0.1:${ports.grpc}/`, { signal: AbortSignal.timeout(2_000) });
           await res.body?.cancel().catch(() => undefined);
           reachable = true; // an actual HTTP response (even a 404) means node-go itself answered, not just the proxy.
         } catch (err) {
           lastHttpErr = err;
+          await sleep(1_000);
         }
-        // Weak fallback only: a successful TCP connect on the grpc-only port can be Docker's userland proxy
-        // accepting the handshake before node-go has bound anything (see suite comment) -- it's checked only
-        // because the HTTP probe above already has the whole 120s budget to find the real signal first.
-        if (!reachable) reachable = await tcpConnects(ports.api, 2_000);
-        if (!reachable) await sleep(1_000);
       }
-      expect(reachable, `fixture never became reachable within 120s (last HTTP error: ${String(lastHttpErr)})`).toBe(true);
+      if (!reachable) {
+        // Diagnostic only, consulted only after the full 120s HTTP budget is exhausted, and never a pass: a
+        // TCP connect succeeding here would only prove Docker's proxy accepted a handshake, not that node-go is
+        // up (see suite comment) -- it just makes the failure message distinguish "container never came up"
+        // from "container is up but node-go itself never answered".
+        const apiPortAcceptsTcp = await tcpConnects(ports.api, 2_000);
+        throw new Error(
+          `fixture never answered real HTTP within 120s (last HTTP error: ${String(lastHttpErr)}); ` +
+            `api-port TCP connect ${apiPortAcceptsTcp ? "succeeded" : "failed"} -- diagnostic only, not a readiness signal`,
+        );
+      }
+      expect(reachable).toBe(true);
     },
     150_000,
   );

@@ -1021,18 +1021,28 @@ verified-after-the-fact account of what shipped — re-check it against the actu
     `transport: "relay" | "xmtp" | "none"`; the daemon start line gains `fallback: "xmtp" | "off"`. With
     `config.xmtp` absent, or the XMTP SDK failing to load, `run.ts` uses the host relay directly and behaviour is
     byte-for-byte identical to pre-Plan-5.7 (Global Constraint: every existing test passes unmodified).
-56. **XMTP identity is the channel's own session key; acceptance is strict.** Each channel's session key
-    (`params.signers[me]`) is its XMTP identity, and the opponent's session key (`params.signers[other]`) is the
-    only sender ever accepted — no discovery, and the raw session key never reaches XMTP code (I5): the client
-    signs through the same `RelaySigner` the relay join already uses, and the per-channel XMTP database key is
+56. **XMTP identity is the channel's own session key; acceptance drops known strangers and verifies everything
+    else by signature, never by a lookup that can fail.** Each channel's session key (`params.signers[me]`) is
+    its XMTP identity, and the opponent's session key (`params.signers[other]`) is who it expects to hear from —
+    no discovery, and the raw session key never reaches XMTP code (I5): the client signs through the same
+    `RelaySigner` the relay join already uses, and the per-channel XMTP database key is
     `keccak256(await signer.signMessage({ message: { raw: toHex("arena-xmtp-db/v1:" + channelId) } }))`, 32
     bytes, RFC-6979-deterministic so there is no new secret to store. The wire format is one XMTP text message
     per `RelayMessage`: `{"arena": 1, "msg": <RelayMessage wire JSON>}`, at most `XMTP_MAX_PAYLOAD_BYTES` (16
-    KiB). A message is accepted only when the sender's address equals the opponent's signer for that channel,
-    the conversation is a DM with that address, `arena` is `1`, and the payload parses and validates with the
-    existing wire validators; anything else is dropped and counted (`dropped(channelId)`), with the same
-    per-channel inbound rate limit the host relay already enforces (success criterion 3: a message from anyone
-    but the opponent's session key never reaches the session).
+    KiB). Acceptance (amended 2026-10-14, commit `61d0246`, after three review rounds found liveness bugs in
+    identity lookups that can fail): `open()` remembers the known opponent DM's conversation id(s) as a **fast
+    path**, needing no lookup. Otherwise the sender is looked up. A **known stranger** (lookup succeeded, and
+    the address or DM is definitely not the opponent's) is dropped and counted (`dropped(channelId)`) before it
+    consumes any rate-limit budget. An **undetermined** sender (the lookup itself failed or timed out) is *not*
+    held back — it is delivered to the session in arrival order, which verifies every state and close signature
+    (`session.receive`/`session.receiveClose`) exactly as it already does for host-relay traffic, so a flaky
+    lookup can never cost liveness. Every message, on every path, still passes the 16 KiB cap, `arena === 1`,
+    the existing wire validators, XMTP-message-id dedupe, and the same per-channel inbound rate limit the host
+    relay already enforces. A session rejection of an undetermined-sender message is also counted in
+    `dropped(channelId)`, but never sets `lastError` and is never logged per message, so a stranger flood during
+    a lookup outage can't spam `status` (success criterion 3: a message from a sender **known** not to be the
+    opponent is dropped before it reaches the session; a message whose sender **can't be determined** reaches
+    the session, where nothing changes without the channel's own session-key signatures).
 57. **Packaging keeps the SDK out of the published bundle.** The published CLI bundle stays zero-runtime-
     dependency; `@xmtp/node-sdk@6.0.0` (about 725 MB) is never bundled, only installed at runtime into
     `<home>/xmtp/sdk/node_modules/@xmtp/node-sdk` by `arena xmtp enable`
@@ -1044,8 +1054,8 @@ verified-after-the-fact account of what shipped — re-check it against the actu
     never in the pnpm workspace (Global Constraints).
 58. **Configuration flows from the server to `config.json`, never fetched at fallback time.** The server config
     gains optional `xmtp: {env: "local"|"dev"|"production", apiUrl?, gatewayHost?}` (the same shape as the CLI's
-    `XmtpConfig`), published in `/templates` only when configured; `gatewayHost` is accepted only with
-    `env: "production"`. `init` copies it into `config.json` as `xmtp`, re-init updates it, and a server without
+    `XmtpConfig`), published in `/templates` only when configured; `gatewayHost` is accepted with `env: "dev"` or
+    `env: "production"`, refused with `env: "local"`. `init` copies it into `config.json` as `xmtp`, re-init updates it, and a server without
     `xmtp` removes it — because the site may be down exactly when the daemon needs this config, the daemon reads
     it from its own `config.json`, never from a live fetch. `dev:up --xmtp-local` publishes `xmtp: {env:"local",
     apiUrl}` backed by the pinned local-node fixture below.

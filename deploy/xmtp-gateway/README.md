@@ -53,6 +53,20 @@ Every `XMTPD_*` variable XMTP's docs document for this service, verbatim:
 refuses to start if any required variable is unset or empty), so a misconfigured deploy fails loudly instead of
 starting half-configured.
 
+### Host-side port mapping (not upstream config)
+
+Three more variables appear in `docker-compose.yml`'s `ports:` block, but they are **not** part of XMTP's
+`XMTPD_*` config surface -- they only choose which host port each container port is published on, and are never
+passed into the container's environment. They deliberately don't carry the `XMTPD_` prefix, so a reader grepping
+for that prefix to find real upstream config isn't misled into thinking these configure the gateway process
+itself:
+
+| Variable | Default | Publishes host port for container port |
+| --- | --- | --- |
+| `GATEWAY_PORT` | `5050` | `5050` (message traffic) |
+| `GATEWAY_PORT_2` | `5055` | `5055` (message traffic) |
+| `GATEWAY_METRICS_PORT` | `8008` | `8008` (Prometheus metrics) |
+
 ## Funding the payer (USDC on Base)
 
 1. Create or designate the payer's Ethereum account; its private key becomes `XMTPD_PAYER_PRIVATE_KEY`.
@@ -129,7 +143,8 @@ notices (see monitoring, below).
   there periodically, or via whatever account/API access the portal offers.
 - **The payer's on-chain USDC balance on Base** is the ground truth and can be read directly from any Base RPC,
   independent of the portal.
-- **Prometheus metrics on port 8008** (`XMTPD_METRICS_PORT`, default 8008) are exposed by the gateway process
+- **Prometheus metrics on port 8008** (the container's own metrics port; published on the host via
+  `GATEWAY_METRICS_PORT`, default 8008 -- see "Host-side port mapping" above) are exposed by the gateway process
   itself; wire them into whatever metrics stack the host already runs. XMTP's docs do not publish a specific
   metric name for the payer balance as of 2026-10-13 -- confirm what the `/metrics` endpoint actually exposes
   before building an alert on a named series, and in the meantime alert on the on-chain balance and the Funding

@@ -31,6 +31,12 @@ services:
       - --mls-validation.grpc-address=validation:50051
       - --api.enable-mls
       - --wait-for-db=30s
+    # Named as upstream xmtp/xmtp-local-node names them (5555/5556) -- but the names are a trap. Verified
+    # empirically against this container's own startup log (2026-10-13): node-go logs "serving grpc" on
+    # container port 5556 and "serving http" on container port 5555. So an XMTP SDK's `apiUrl` (a gRPC/HTTP2
+    # endpoint) must target `XMTP_API_PORT` (container 5556), not `XMTP_GRPC_PORT` -- and `XMTP_GRPC_PORT`
+    # (container 5555) is the one that happens to answer a plain HTTP GET, which is why it's the one
+    # tests/system/xmtp-local.test.ts polls for readiness.
     ports:
       - "${XMTP_GRPC_PORT:-5555}:5555"
       - "${XMTP_API_PORT:-5556}:5556"
