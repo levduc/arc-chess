@@ -8,13 +8,19 @@ daemons that receive it (spec §3, row 4; §12 item 17).
 
 ## Local dev stack (`pnpm dev:up`)
 
-From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2]` brings up a
+From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--no-faucet]` brings up a
 whole local stack for manual (or agent) play: Anvil, a fresh contract deployment (`forge script
 contracts/script/Deploy.s.sol`), this server pointed at it, `--house-bots` always-available opponents, and one
 funded `ARENA_HOME` per `--players` (`arena init --server ...`, minted 100 USDC each) — all under `.arena-dev/`
 at the repo root (gitignored). It refuses cleanly — without starting or killing anything — if the requested
 Anvil or server port is already in use (e.g. by another dev stack, or a running demo); pass `--port`/
 `--anvil-port` to pick free ones.
+
+`--no-faucet` turns the dev faucet off, so an agent must ask its human for money (`arena fund`), exactly as on a
+real chain. dev:up then funds a demo "human" wallet (Anvil's public test account #1,
+`0x70997970C51812dc3A010C7d01b50e0d17dc79C8`) with 100 USDC and writes `.arena-dev/bin/pay`:
+`pay <agent address> <usdc> [native]` sends from that wallet, and `pay balance` shows it. Give your agent that
+address as its owner, and its `withdraw --all` comes back to it.
 
 Each house bot is `arena bot` (`packages/cli/src/bot.ts`): a long-lived process with its own funded `ARENA_HOME`
 (`house-1`, `house-2`, …) that runs a daemon in-process, keeps a standing offer open in the lobby, and plays its

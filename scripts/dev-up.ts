@@ -1,5 +1,5 @@
 /**
- * `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--dir PATH]`
+ * `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--no-faucet] [--dir PATH]`
  *
  * Brings up a local Agent Chess Arena stack for manual play: Anvil, a contract deployment (via `forge script`),
  * the host server, `--house-bots` always-available opponents (each one `arena bot`, started and funded by
@@ -22,7 +22,7 @@
  * pass a fresh `--dir`, and later runs will carry their own marker from then on.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
@@ -49,10 +49,22 @@ const PLAYER_NAMES = ["alice", "bob", "carol", "dave", "erin", "frank", "grace",
 // written on a run's first successful use of a directory, is the only thing that makes wiping it safe next time.
 const DEV_DIR_MARKER = ".arena-dev-marker";
 
-function parseArgs(argv: string[]): { port: number; anvilPort: number; players: number; houseBots: number; dir: string } {
+function parseArgs(argv: string[]): {
+  port: number;
+  anvilPort: number;
+  players: number;
+  houseBots: number;
+  dir: string;
+  noFaucet: boolean;
+} {
   const flags = new Map<string, string>();
+  let noFaucet = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === "--no-faucet") {
+      noFaucet = true; // a boolean flag: takes no value
+      continue;
+    }
     if (a?.startsWith("--")) {
       const v = argv[i + 1];
       if (v !== undefined) flags.set(a.slice(2), v);
@@ -70,7 +82,53 @@ function parseArgs(argv: string[]): { port: number; anvilPort: number; players: 
     // Final review m12: a caller (the dev-up test) passes its own temporary directory, so running the test suite
     // never wipes the repo's .arena-dev.
     dir: resolve(flags.get("dir") ?? DEFAULT_DEV_DIR),
+    // Faucet off: agents must ask their human for money (`arena fund`), as on a real chain. dev-up then funds a
+    // demo "human" wallet and writes `<dir>/bin/pay` for paying an agent from it.
+    noFaucet,
   };
+}
+
+/** Anvil's well-known test account #1 (public key material, local dev only): the demo "human" wallet that
+ *  `--no-faucet` funds and that `<dir>/bin/pay` sends from. Give an agent this address as its owner, so its
+ *  `withdraw --all` comes back here. */
+const DEMO_HUMAN = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as const;
+const DEMO_HUMAN_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as const;
+
+/** Writes `<dir>/bin/pay`: `pay <agent address> <usdc> [native]` sends from the demo human wallet with Foundry's
+ *  `cast`; `pay balance` prints that wallet's balances. Values are interpolated single-quoted. */
+function writePayScript(dir: string, rpcUrl: string, usdc: string): string {
+  const path = join(dir, "bin", "pay");
+  const sq = (v: string) => `'${v.replace(/'/g, "'\\''")}'`;
+  writeFileSync(
+    path,
+    [
+      "#!/usr/bin/env bash",
+      "# dev:up --no-faucet demo only (local Anvil, fake money): you, the human, pay your agent.",
+      "#   pay <agent address> <usdc, e.g. 10.005> [native gas, e.g. 0.89]   send from your demo wallet",
+      "#   pay balance                                                        show your demo wallet's balances",
+      "set -euo pipefail",
+      'export PATH="$HOME/.foundry/bin:$PATH"',
+      `RPC=${sq(rpcUrl)}`,
+      `USDC=${sq(usdc)}`,
+      `ME=${sq(DEMO_HUMAN)}`,
+      `KEY=${sq(DEMO_HUMAN_KEY)}`,
+      'if [ "${1:-}" = "balance" ]; then',
+      '  raw=$(cast call --rpc-url "$RPC" "$USDC" "balanceOf(address)(uint256)" "$ME" | awk \'{print $1}\')',
+      '  usdc=$(python3 -c "from decimal import Decimal; print(f\'{Decimal($raw)/Decimal(10**6):.6f}\')")',
+      '  echo "your wallet $ME: $usdc USDC, $(cast balance --rpc-url "$RPC" --ether "$ME") native"',
+      "  exit 0",
+      "fi",
+      'if [ $# -lt 2 ]; then sed -n "2,4p" "$0"; exit 1; fi',
+      'TO=$1; AMOUNT=$2; GAS=${3:-0}',
+      'UNITS=$(python3 -c "import sys; from decimal import Decimal; print(int(Decimal(sys.argv[1]) * 10**6))" "$AMOUNT")',
+      'cast send --rpc-url "$RPC" --private-key "$KEY" "$USDC" "transfer(address,uint256)" "$TO" "$UNITS" >/dev/null',
+      'if [ "$GAS" != "0" ]; then cast send --rpc-url "$RPC" --private-key "$KEY" "$TO" --value "${GAS}ether" >/dev/null; fi',
+      'echo "sent $AMOUNT USDC and $GAS native gas from your wallet to $TO"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(path, 0o755);
+  return path;
 }
 
 async function isPortFree(port: number): Promise<boolean> {
@@ -190,7 +248,14 @@ async function shutdown(signal: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const { port: serverPort, anvilPort, players: numPlayers, houseBots: numHouseBots, dir: DEV_DIR } = parseArgs(process.argv.slice(2));
+  const {
+    port: serverPort,
+    anvilPort,
+    players: numPlayers,
+    houseBots: numHouseBots,
+    dir: DEV_DIR,
+    noFaucet,
+  } = parseArgs(process.argv.slice(2));
 
   // Fix round (minor): --dir existing as a plain file (not a directory) is a clear, distinct refusal --
   // readdirSync below would otherwise throw a raw ENOTDIR with a Node stack trace.
@@ -307,7 +372,7 @@ async function main(): Promise<void> {
     trustProxy: false,
     // Plan 5.5 Task 1: dev-up always runs a local Anvil at chainId 31337, so the three-way faucet guard's other
     // two checks (chainId, Anvil's web3_clientVersion) are satisfied too -- /faucet comes up enabled.
-    devFaucet: true,
+    devFaucet: !noFaucet,
   };
   writeFileSync(serverConfigPath, JSON.stringify(serverConfig, null, 2));
 
@@ -421,6 +486,12 @@ async function main(): Promise<void> {
     await waitForOffer(serverUrl, address);
   }
 
+  let payPath: string | null = null;
+  if (noFaucet) {
+    await fundAccount(DEMO_HUMAN);
+    payPath = writePayScript(DEV_DIR, rpcUrl, deployment.token);
+  }
+
   process.stderr.write("\ndev-up: ready.\n\n");
   process.stderr.write(`  owner/deployer private key (LOCAL DEV ONLY, never use for real funds): ${OWNER_KEY}\n`);
   process.stderr.write(`  anvil:  ${rpcUrl}\n`);
@@ -434,6 +505,12 @@ async function main(): Promise<void> {
     );
     process.stderr.write("  (a fresh Claude Code session, pointed at that one sentence, can run this end to end.)\n\n");
   }
+  if (payPath) {
+    process.stderr.write("  Faucet OFF: an agent asks its human for money (arena fund). You are the human:\n");
+    process.stderr.write(`    your demo wallet (give it to your agent as its owner): ${DEMO_HUMAN}\n`);
+    process.stderr.write(`    pay your agent:  ${payPath} <agent address> <usdc> <native>\n`);
+    process.stderr.write(`    your balance:    ${payPath} balance\n\n`);
+  }
   if (commands.length > 0) {
     process.stderr.write("  start each player's daemon in its own terminal:\n\n");
     for (const cmd of commands) process.stderr.write(`    ${cmd}\n`);
@@ -443,7 +520,18 @@ async function main(): Promise<void> {
 
   // One machine-readable line, last, so tooling (and this task's own dev-up test) can wait for it deterministically.
   console.log(
-    JSON.stringify({ ready: true, anvilPort, serverPort, rpcUrl, serverUrl, players: numPlayers, houseBots: numHouseBots, dir: DEV_DIR }),
+    JSON.stringify({
+      ready: true,
+      anvilPort,
+      serverPort,
+      rpcUrl,
+      serverUrl,
+      players: numPlayers,
+      houseBots: numHouseBots,
+      dir: DEV_DIR,
+      faucet: !noFaucet,
+      ...(payPath ? { pay: payPath, demoHuman: DEMO_HUMAN } : {}),
+    }),
   );
 
   await new Promise<void>(() => {}); // keep running until Ctrl-C

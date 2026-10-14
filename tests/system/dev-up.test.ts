@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -298,6 +298,49 @@ describe("pnpm dev:up", () => {
       expect(botAlive()).toBe(false);
       expect(anvilFree).toBe(true);
       expect(serverFree).toBe(true);
+    },
+    120_000,
+  );
+
+  it(
+    "--no-faucet: no /faucet, a funded demo human wallet, and <dir>/bin/pay sends from it",
+    async () => {
+      deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+      child = spawn(
+        TSX_BIN,
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--no-faucet",
+          "--players", "0", "--house-bots", "0", "--dir", devDir],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
+      );
+      const ready = await waitForJsonLine(child, (o) => o.ready === true, 60_000);
+      expect(ready.faucet).toBe(false);
+      expect(ready.demoHuman).toBe("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+      const pay = ready.pay as string;
+      expect(pay).toBe(join(devDir, "bin", "pay"));
+
+      const serverUrl = `http://127.0.0.1:${serverPort}`;
+      const templates = (await (await fetch(`${serverUrl}/templates`)).json()) as Array<Record<string, unknown>>;
+      expect(templates[0]).not.toHaveProperty("faucet");
+      const faucet = await fetch(`${serverUrl}/faucet`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ address: "0x00000000000000000000000000000000000000Aa" }),
+      });
+      expect(faucet.status).toBe(404);
+
+      const run = (args: string[]) => spawnSync(pay, args, { encoding: "utf8", timeout: 60_000 });
+      expect(run(["balance"]).stdout).toContain("100.000000 USDC");
+      const sent = run(["0x00000000000000000000000000000000000000Aa", "1.5", "0.01"]);
+      expect(sent.status).toBe(0);
+      expect(sent.stdout).toContain("sent 1.5 USDC and 0.01 native gas");
+      expect(run(["balance"]).stdout).toContain("98.500000 USDC");
+
+      const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      process.kill(-child.pid!, "SIGINT");
+      await withDeadline(exited, 20_000, "dev-up did not exit within 20s of SIGINT");
     },
     120_000,
   );
