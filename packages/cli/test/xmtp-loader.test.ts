@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import type { Address, Hex } from "viem";
 import { keccak256, recoverMessageAddress, toHex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -215,6 +217,7 @@ describe.skipIf(!HAVE_SDK)("createNodeSdkTransport against XMTP's dev network (o
       { identifier: b.address.toLowerCase(), identifierKind: sdk.IdentifierKind.Ethereum },
     ]);
     await group.sendText("join us");
+    await c.close(); // 6.1.0: the stranger's client releases its resources
     await first.stop();
     const second = make(); // B's daemon restarts: same DB, same installation
     try {
@@ -260,6 +263,7 @@ describe.skipIf(!HAVE_SDK)("createNodeSdkTransport against XMTP's dev network (o
       expect(state.recoveryIdentifier.identifier.toLowerCase()).toBe(a.address.toLowerCase());
       const dm = await c.conversations.createDmWithIdentifier({ identifier: b.address.toLowerCase(), identifierKind: kind });
       await dm.sendText('{"arena":1,"msg":"eve"}');
+      await c.close(); // 6.1.0: Eve's client releases its resources
       let timer: ReturnType<typeof setTimeout> | undefined;
       const r = await Promise.race([
         got,
@@ -277,4 +281,72 @@ describe.skipIf(!HAVE_SDK)("createNodeSdkTransport against XMTP's dev network (o
       await tb.stop();
     }
   }, 180_000);
+  it("I-1: clients opened then closed through the transport release their resources: fds back to the baseline, RSS flat across rounds", async () => {
+    if (!existsSync("/proc/self/fd")) return; // Linux only: the counts come from /proc
+    const home = newHome();
+    mkdirSync(join(home, "xmtp", "sdk"), { recursive: true });
+    symlinkSync(SDK_DIR as string, xmtpSdkNodeModules(home), "dir");
+    const loaded = await loadXmtpSdk(home);
+    if (!loaded.ok) throw new Error(loaded.reason);
+    setFlagsFromString("--expose-gc");
+    const gc = runInNewContext("gc") as () => void;
+    const dbDir = join(home, "xmtp", "db");
+    const fds = () => readdirSync("/proc/self/fd").length;
+    const dbFds = () =>
+      readdirSync("/proc/self/fd").filter((f) => {
+        try {
+          return readlinkSync(`/proc/self/fd/${f}`).startsWith(dbDir);
+        } catch {
+          return false;
+        }
+      }).length;
+    const threads = () => readdirSync("/proc/self/task").length;
+    const rssMB = () => Math.round(process.memoryUsage().rss / 1e6);
+    const settleDown = async () => {
+      for (let i = 0; i < 6; i++) {
+        gc();
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    };
+    const N = 6;
+    const logs: string[] = [];
+    const t = createNodeSdkTransport({ sdk: loaded.sdk, dbDir, config: { env: "dev" }, log: (l) => logs.push(l) });
+    const round = async (r: number) => {
+      const ids: Hex[] = [];
+      for (let i = 0; i < N; i++) {
+        const id = keccak256(toHex(`arena-fd-${r}-${i}-${Date.now()}-${Math.random()}`)) as Hex;
+        ids.push(id);
+        // A peer that never registers: the client starts and streams; its DM is simply never found.
+        await t.open(id, privateKeyToAccount(generatePrivateKey()), privateKeyToAccount(generatePrivateKey()).address);
+      }
+      const open = { fds: fds(), dbFds: dbFds(), threads: threads(), rssMB: rssMB() };
+      // Half finalized (closed and purged), half closed as on a daemon stop.
+      for (const [i, id] of ids.entries()) await t.close(id, i % 2 === 0 ? { purge: true } : undefined);
+      await settleDown();
+      const closed = { fds: fds(), dbFds: dbFds(), threads: threads(), rssMB: rssMB() };
+      for (const [i, id] of ids.entries()) expect(existsSync(join(dbDir, `${id}.db3`))).toBe(i % 2 !== 0);
+      return { open, closed };
+    };
+    try {
+      await round(0); // warm-up: the SDK's process-wide state (runtime, TLS) is created once, then kept
+      await settleDown();
+      const baseline = { fds: fds(), threads: threads(), rssMB: rssMB() };
+      const r1 = await round(1);
+      const r2 = await round(2);
+      const r3 = await round(3);
+      // eslint-disable-next-line no-console
+      console.log(`xmtp fd/RSS (N=${N} per round): baseline ${JSON.stringify(baseline)}; ` +
+        [r1, r2, r3].map((r, i) => `round ${i + 1} open ${JSON.stringify(r.open)} closed ${JSON.stringify(r.closed)}`).join("; "));
+      for (const r of [r1, r2, r3]) {
+        expect(r.open.dbFds).toBeGreaterThan(0); // the clients really held their DBs
+        expect(r.closed.dbFds).toBe(0); // and released every DB file descriptor
+        expect(r.closed.fds).toBeLessThanOrEqual(baseline.fds + 3);
+      }
+      // RSS does not keep growing: three more rounds of N clients end where the first one did, give or take.
+      expect(r3.closed.rssMB).toBeLessThanOrEqual(r1.closed.rssMB + 40);
+      expect(logs.filter((l) => l.includes("client close failed"))).toEqual([]);
+    } finally {
+      await t.stop();
+    }
+  }, 600_000);
 });
