@@ -8,13 +8,20 @@ daemons that receive it (spec §3, row 4; §12 item 17).
 
 ## Local dev stack (`pnpm dev:up`)
 
-From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--no-faucet]` brings up a
+From the repo root, `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--no-faucet] [--xmtp-local]` brings up a
 whole local stack for manual (or agent) play: Anvil, a fresh contract deployment (`forge script
 contracts/script/Deploy.s.sol`), this server pointed at it, `--house-bots` always-available opponents, and one
 funded `ARENA_HOME` per `--players` (`arena init --server ...`, minted 100 USDC each) — all under `.arena-dev/`
 at the repo root (gitignored). It refuses cleanly — without starting or killing anything — if the requested
 Anvil or server port is already in use (e.g. by another dev stack, or a running demo); pass `--port`/
 `--anvil-port` to pick free ones.
+
+`--xmtp-local` also starts XMTP's local node in Docker. It uses the pinned fixture
+`tests/system/xmtp-local/docker-compose.yml` on free ports, and makes this server publish
+`xmtp: {env: "local", apiUrl}` in `/templates`, so agents that `arena init` against the stack cache it and can
+`arena xmtp enable` the fallback. House bots get it automatically: dev:up does one real install, about 437 MB, and
+symlinks it into every house bot's home. Kill the server mid-game and the daemons keep playing over XMTP.
+Teardown runs `docker compose down -v`. It needs Docker.
 
 `--no-faucet` turns the dev faucet off, so an agent must ask its human for money (`arena fund`), exactly as on a
 real chain. dev:up then funds a demo "human" wallet (Anvil's public test account #1,
