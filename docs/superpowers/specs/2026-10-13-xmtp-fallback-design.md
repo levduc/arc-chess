@@ -20,7 +20,10 @@ remains the last resort, as today.
    mid-game, finishes the game over XMTP, closes cooperatively, and settles on-chain. It then restarts the server and
    shows the daemons back on the relay.
 2. With XMTP not enabled, behaviour is byte-for-byte today's: every existing test passes unchanged.
-3. An XMTP message from anyone except the channel's opponent session key is dropped before it reaches the session.
+3. An XMTP message from a sender **known** not to be the opponent is dropped before it reaches the session. A
+   message whose sender cannot be determined (a lookup error, timeout or unresolved conversation) reaches the
+   session. There, as with every relayed message, nothing changes without the channel's own session-key
+   signatures. *(Amended 2026-10-14 after three review rounds: a lookup that can fail must never cost liveness.)*
 
 ### Non-goals
 - XMTP as the primary transport.
@@ -45,42 +48,80 @@ remains the last resort, as today.
   never throws to the daemon for a transport reason; failures are logged and retried by the daemon's existing paths.
 - **Switch back:** when the host relay rejoins the channel, the existing `onJoined` re-send runs, and later sends go
   via the host again.
-- **Status:** `ChannelStatus` gains `transport: "relay" | "xmtp" | "none"`, the side currently used to send. The
-  daemon start line gains `fallback: "xmtp" | "off"`.
+- **Status:** `ChannelStatus` gains `transport: "relay" | "xmtp" | "none"`, the side currently used to send, and
+  `xmtpDropped`, the channel's count of dropped inbound XMTP messages (0 with XMTP off). The daemon start line gains
+  `fallback: "xmtp" | "off"`, and the daemon's API a read-only `GET /fallback` returning `{fallback, reason?}`.
 
 ## 3. XMTP identity and messages
 
 - **Identity.** Each channel's own session key (`params.signers[me]`) is its XMTP identity, and the opponent's is
   `params.signers[other]`, so no discovery is needed. The XMTP client signs with the session key through the same
   signer object the relay join already uses. The private key never leaves the daemon (I5).
-- **Client lifecycle.** The client is created when the channel is opened and joined, ahead of need. It is stopped
-  when the channel is finalized or the daemon stops.
-- **Storage.** The database is `<home>/xmtp/db/<channelId>.db3`. The encryption key is
+- **Client lifecycle.** *(Amended 2026-10-14, final fix wave I-1.)* The client is created once the channel is
+  **Open on chain** -- both deposits in -- not when it is matched and joined: an accept costs its sender nothing, so
+  a client per match would let anyone grow a daemon by accepting its offers. The daemon arms it from its chain
+  refresh (phase `Open` or `Challenged`), still ahead of need; the host relay join at match time is unchanged, and
+  until armed a channel is the host relay's alone. A daemon holds at most `XMTP_MAX_CLIENTS = 64` clients at once
+  (a client counts until its close has finished); a channel past the cap runs without the fallback, logged once,
+  its `transport` `"relay"` or `"none"` as without XMTP. The client is closed with `Client.close()` (bounded) when
+  the channel is finalized -- its database files are then deleted, since its inbox is never used again -- or when
+  the daemon stops (the files are kept, so a restart resumes the same installation).
+- **Storage.** The database is `<home>/xmtp/db/<channelId>.db3` (with its `-wal`/`-shm`), one connection per client
+  (`useSingleConnection`). The encryption key is
   `keccak256(signer.signMessage("arena-xmtp-db/v1:" + channelId))`, 32 bytes. Signing is RFC 6979-deterministic,
   so the key is stable, there is no new secret to store, and the raw session key never reaches the XMTP code (I5).
   A persisted database avoids re-registering an installation. XMTP caps an inbox at 10 installations.
 - **Wire format.** One XMTP text message per `RelayMessage`: `{"arena": 1, "msg": <RelayMessage wire JSON>}`. It
   uses the same encoding the host relay uses (`wire.ts`), at most 16 KiB.
-- **Acceptance.** A message is accepted only when all of the following hold:
-  - the XMTP sender's address equals the opponent's signer for `msg.channelId`;
-  - the conversation is a DM with that address;
-  - the payload parses and validates with the existing wire validators.
-
-  Anything else is dropped and counted (`xmtpDropped`). Inbound messages are rate-limited per channel, with the
-  same budget the host relay enforces. As today, every state and close signature is then verified by the session.
+- **Acceptance.**
+  - **Fast path.** `open()` creates the DM to the peer and remembers its conversation id(s). A message in a known
+    opponent DM needs no lookup.
+  - **Otherwise**, the sender is looked up. A **known stranger** (lookup succeeded, address != the opponent's
+    signer, or a DM with someone else) is dropped and counted (`xmtpDropped`), before it consumes any rate-limit
+    budget. An **undetermined** sender (lookup failed or timed out) is delivered in arrival order to the session,
+    which verifies every state and close signature (`session.receive`, `session.receiveClose`) exactly as it does
+    for host-relay traffic. There is no holding or "gap" machinery.
+  - **Who the opponent is (C-N1).** The opponent is identified only by verified member addresses, never by the
+    recovery identifier:
+    - a sender's inbox state is matched by its member identifiers (Ethereum kind) alone -- each was added with its
+      own signature -- never by its recovery identifier, which any inbox can set to any address unsigned;
+    - the opponent's inbox id is set only by answers keyed by the opponent's own address (its DM, found with
+      `createDmWithIdentifier`, and the network's `fetchInboxIdByIdentifier`), and each such answer replaces the
+      stored one; a sender's own inbox state classifies that one message and never sets it;
+    - a stranger's DM is denied, but never the DM found by the opponent's address, nor any conversation whose
+      peer is the opponent's inbox; one of the opponent's denied earlier is allowed again.
+  - **Every message also passes:** the 16 KiB cap; `arena === 1`; the existing wire validators; per-channel rate
+    limiting with the host relay's budget; dedupe by XMTP message id.
+  - **Rejections.** A session rejection of an undetermined-sender message is counted in `xmtpDropped`. It never
+    sets `lastError` and is never logged per message, so a stranger flood during a lookup outage cannot spam
+    `status`.
+  - **Rate limit (K1).** A message the channel's budget turns away is not marked delivered; once the bucket has
+    refilled, a catch-up re-reads the opponent DM's latest messages and delivers it, in order, without restarting
+    the stream (a catch-up turned away again backs off, 1 s doubling to 30 s).
+  - **Accepted residual.** During a lookup outage, strangers' messages share the channel's inbound budget with the
+    opponent's; an opponent message they push out is re-delivered by the catch-up once the flood ends, if it is
+    still among the DM's latest `XMTP_CATCH_UP_MESSAGES`. The chain fallback covers a resulting stall. What the SDK
+    stores regardless, in the channel's own encrypted DB until the channel is finalized: each stranger's welcome
+    (the new conversation), the messages it delivered before its deny, and its inbox's identity record.
 - **Environment.** `xmtp.env` is one of `"local" | "dev" | "production"`, plus optional `apiUrl` (tests, local
-  node) and optional `gatewayHost` (production, once fees are enforced).
+  node) and optional `gatewayHost` (dev or production, once fees are enforced).
 
-## 4. Packaging (the SDK is about 725 MB)
+## 4. Packaging (the SDK is about 480 MB installed)
 
 - The published CLI bundle stays zero-dependency, and the XMTP SDK is never bundled.
-- `arena xmtp enable` installs the pinned `@xmtp/node-sdk@6.0.0` into `<home>/xmtp/sdk/` with
+- `arena xmtp enable` installs the pinned `@xmtp/node-sdk@6.1.0` into `<home>/xmtp/sdk/` with
   `npm install --prefix <home>/xmtp/sdk --no-audit --no-fund --save-exact`. It then verifies the installed version.
-  `arena xmtp status` reports `{enabled, version, env}`. `arena xmtp disable` removes the directory.
+  *(6.0.0 until the final fix wave: 6.1.0 adds `Client.close()`, without which a client was never released.)*
+  `arena xmtp status` reports `{enabled, version, env}`, plus `daemon`: what the **running** daemon loaded
+  (`"xmtp"` or `"off"` with `daemonReason`, from its `GET /fallback`), or `"not running"`. `arena xmtp disable`
+  removes the directory.
 - The daemon loads the SDK with a dynamic import from that path, and only when it is present and `config.xmtp` is
-  set. A load failure is logged once, and the daemon runs with `fallback: "off"`.
-- The recipe (`skill.md`) gains one recommended step: enable the fallback before playing for real money. House bots
-  enable it when the server publishes `xmtp`.
+  set -- once, at start: an `xmtp enable` after that needs a daemon restart. A load failure is logged once, and the
+  daemon runs with `fallback: "off"`. An invalid `xmtp` in `config.json` does the same (one warning; every command
+  still runs); only `init` refuses one.
+- The recipe (`skill.md`) gains one recommended step, before the daemon is started: enable the fallback before
+  playing for real money, then check `xmtp status` shows `"daemon": "xmtp"`. House bots enable it when the server
+  publishes `xmtp`.
 
 ## 5. Configuration
 
@@ -117,7 +158,8 @@ remains the last resort, as today.
   - `transport` and `fallback` in status;
   - no behaviour change when XMTP is disabled.
 - **Packaging.** `xmtp enable`, `status` and `disable` against a local npm-registry stub, or a pre-populated
-  directory, so tests never download 725 MB. Plus one opt-in real install check.
+  directory, so tests never download the SDK. Plus one opt-in real install check, and an opt-in real-SDK check that
+  clients opened and closed release their file descriptors.
 - **System**, against XMTP's local node (`tests/system/xmtp-local/docker-compose.yml`, a copy of
   `xmtp/xmtp-local-node` pinned by image digest, with ports chosen per run through `apiUrl`):
   - the kill-the-host scenario of success criterion 1;

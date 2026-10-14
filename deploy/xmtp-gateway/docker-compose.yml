@@ -1,0 +1,46 @@
+# The arena's host-paid XMTP Gateway Service. Run on infrastructure separate from the website (see README.md) --
+# never co-located with apps/server, so a website outage doesn't also take down the gateway that lets in-progress
+# games keep moving over XMTP.
+#
+# This file is never run in tests or CI (Global Constraints): it needs a real Base RPC and a payer wallet funded
+# with real or testnet USDC. tests/system/xmtp-local/docker-compose.yml is the only compose file any test touches.
+#
+# Image: XMTP's own docs (https://docs.xmtp.org/fund-agents-apps/run-gateway, fetched 2026-10-13) name the
+# prebuilt image `xmtp/xmtpd-gateway:main`, but that repository was not pullable on Docker Hub as of 2026-10-13
+# (`pull access denied: repository does not exist or may require authorization`). The same tag resolves on GHCR:
+# ghcr.io/xmtp/xmtpd-gateway:main, resolved 2026-10-13 with
+# `docker buildx imagetools inspect ghcr.io/xmtp/xmtpd-gateway:main`. Re-check both registries before re-pinning.
+#
+# IMPORTANT: XMTP's docs state this prebuilt image "authorizes all requests without authentication" and say
+# "Never use it in production." See README.md's "Rate-limiting and client authentication" section before pointing
+# this at mainnet -- running it as-is, open to the internet, lets anyone spend the payer's funds.
+services:
+  gateway:
+    image: ghcr.io/xmtp/xmtpd-gateway:main@sha256:03fdbe3cba629746df13bd52138475c8f9d1b530d134ddf63b92611ae5efd968
+    restart: unless-stopped
+    environment:
+      # Every required XMTPD_* variable (verbatim names from XMTP's docs) must be set in the environment this
+      # compose file is run with (e.g. a .env file next to it, or the host's secret manager) -- `:?` makes compose
+      # refuse to start with any of them unset or empty, rather than silently booting a half-configured gateway.
+      - XMTPD_PAYER_PRIVATE_KEY=${XMTPD_PAYER_PRIVATE_KEY:?set the funded payer's secp256k1 private key}
+      - XMTPD_APP_CHAIN_RPC_URL=${XMTPD_APP_CHAIN_RPC_URL:?set the XMTP app chain RPC URL}
+      - XMTPD_SETTLEMENT_CHAIN_RPC_URL=${XMTPD_SETTLEMENT_CHAIN_RPC_URL:?set the Base (settlement chain) RPC URL}
+      - XMTPD_APP_CHAIN_WSS_URL=${XMTPD_APP_CHAIN_WSS_URL:?set the XMTP app chain WebSocket URL}
+      - XMTPD_SETTLEMENT_CHAIN_WSS_URL=${XMTPD_SETTLEMENT_CHAIN_WSS_URL:?set the Base (settlement chain) WebSocket URL}
+      # One of: anvil | testnet | mainnet.
+      - XMTPD_CONTRACTS_ENVIRONMENT=${XMTPD_CONTRACTS_ENVIRONMENT:?set anvil, testnet, or mainnet}
+      # Optional: a Redis instance for nonce management (and, per XMTP's docs, rate-limiting support). Bare name,
+      # no `=value`/`:-` default, so this is genuinely absent from the container's environment when unset, rather
+      # than set to an empty string -- if the gateway's own config loader treats an empty string as "a connection
+      # string was given", `XMTPD_REDIS_CONNECTION_STRING=${...:-}` would wrongly try to dial "".
+      - XMTPD_REDIS_CONNECTION_STRING
+    ports:
+      # 5050/5055: message traffic. 8008: Prometheus metrics. These variables are host-side port-mapping
+      # conveniences for this compose file only -- they are never passed into the container's `environment:`
+      # block above, so they deliberately do NOT carry the `XMTPD_` prefix (that prefix is reserved for real
+      # upstream config; see README.md's "Environment variables" table for the ones that actually are).
+      # Loopback only by default: the prebuilt image authorizes every request, so its ports are never published on
+      # a public interface unless the operator chooses to (README.md, "Exposing the gateway").
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT:-5050}:5050"
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT_2:-5055}:5055"
+      - "${GATEWAY_METRICS_BIND:-127.0.0.1}:${GATEWAY_METRICS_PORT:-8008}:8008"

@@ -181,6 +181,9 @@ export type ChannelHandle = {
    *  drives `SWEEP_ABANDON_ATTEMPTS`. Passed by reference to `runSweepAttempt`, shared with the sweep queue's
    *  identically-shaped per-entry state (see `SweepQueueEntry`). */
   sweep: SweepBackoff;
+  /** Plan 5.7 (K3): the highest XMTP drop count seen for this channel, so its status keeps it once the relay has
+   *  forgotten the channel (at finalization). */
+  xmtpDropped?: number;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -278,6 +281,27 @@ export type DaemonOptions = {
   lobby: LobbyClient;
   relay: RelayClient;
   log?: (line: string) => void;
+  /** Plan 5.7: where `relay` sends this channel's messages now (`ChannelStatus.transport`). `run.ts` passes the
+   *  host relay's or `FallbackRelay`'s; without it, a live channel reports `"relay"`. */
+  transportOf?: (channelId: Hex) => ChannelStatus["transport"];
+  /** Plan 5.7: whether `relay` falls back to XMTP (the daemon's start line). Default `"off"`. */
+  fallback?: "xmtp" | "off";
+  /** Plan 5.7 (spec §3): called when the session rejects a relayed message. True means the relay has counted it as
+   *  dropped -- an XMTP message whose sender could not be determined, a stranger's as likely as not -- so it sets no
+   *  `lastError` and logs nothing. `run.ts` passes `FallbackRelay`'s; without it every rejection is reported. */
+  relayRejected?: (msg: RelayMessage) => boolean;
+  /** Plan 5.7 (spec §3): whether a relayed message is such an XMTP message. A stale or duplicate one then leaves
+   *  `lastError` as it was. `run.ts` passes `FallbackRelay`'s; without it nothing changes. */
+  relayUndetermined?: (msg: RelayMessage) => boolean;
+  /** Plan 5.7 (spec §3, I-1): called on every chain refresh of a channel that is Open (or Challenged) on chain --
+   *  both deposits in -- and not finalized: the relay starts the channel's XMTP client then, never at match time.
+   *  Idempotent. `run.ts` passes `FallbackRelay.arm`; without it nothing happens. */
+  armFallback?: (channelId: Hex) => void;
+  /** Plan 5.7 (K3): the channel's XMTP drop count (`ChannelStatus.xmtpDropped`). Without it, 0. */
+  xmtpDroppedOf?: (channelId: Hex) => number;
+  /** Plan 5.7 (I-2): why `fallback` is `"off"` -- not configured, the SDK failed to load, or an invalid `xmtp` in
+   *  config.json -- for `GET /fallback`. */
+  fallbackReason?: string;
 };
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
@@ -511,6 +535,18 @@ export class ArenaDaemon {
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
+  }
+
+  /** Plan 5.7 (spec §2): whether this daemon's relay falls back to XMTP -- the start line's `fallback`. */
+  get fallback(): "xmtp" | "off" {
+    return this.opts.fallback ?? "off";
+  }
+
+  /** Plan 5.7 (I-2): what this running daemon loaded, for `GET /fallback` (and so `arena xmtp status`): `"xmtp"`, or
+   *  `"off"` with the reason. The SDK is loaded once, at start: an `xmtp enable` after that needs a daemon restart. */
+  fallbackInfo(): { fallback: "xmtp" | "off"; reason?: string } {
+    if (this.fallback === "xmtp") return { fallback: "xmtp" };
+    return { fallback: "off", reason: this.opts.fallbackReason ?? "the XMTP fallback is not configured (config.json has no xmtp)" };
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -2214,19 +2250,28 @@ export class ArenaDaemon {
     const l = this.live.get(msg.channelId);
     if (!l) return;
     let closeReceived = false;
+    let accepted = false;
+    let keepError = false;
     try {
       if (msg.type === "state") {
         // A re-send after a reconnect (§7) can land as "duplicate" (we already hold it) or "stale" (we've moved
         // past it): both are success, not an error, and neither needs an autoPlay pass.
         const result = await l.session.receive(msg.signed);
+        accepted = true;
         if (this.stopped) return;
         if (result !== "duplicate" && result !== "stale") await this.autoPlay(l);
+        // Plan 5.7 (spec §3): a repeat from an undetermined XMTP sender, a stranger's replay as likely as not.
+        else keepError = this.opts.relayUndetermined?.(msg) === true;
       } else {
         await l.session.receiveClose(msg.close);
+        accepted = true;
         closeReceived = true;
       }
-      l.lastError = null;
+      if (!keepError) l.lastError = null;
     } catch (err) {
+      // Plan 5.7 (spec §3): the relay counts a rejected message whose sender it could not determine; nothing changed.
+      // Only a protocol rejection: any other failure (a failed store.save, say) is reported as before.
+      if (!accepted && err instanceof ArenaProtocolError && this.opts.relayRejected?.(msg) === true) return;
       l.lastError = errorText(err);
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }
@@ -3028,6 +3073,13 @@ export class ArenaDaemon {
     }
   }
 
+  /** Plan 5.7 (K3): the channel's XMTP drop count (0 without the fallback), kept at its highest. */
+  private xmtpDroppedOf(l: ChannelHandle): number {
+    const now = this.opts.xmtpDroppedOf?.(l.record.channelId) ?? 0;
+    l.xmtpDropped = Math.max(l.xmtpDropped ?? 0, now);
+    return l.xmtpDropped;
+  }
+
   private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean } = {}): ChannelStatus {
     return buildStatus({
       record: l.record,
@@ -3041,6 +3093,8 @@ export class ArenaDaemon {
       settled: l.settledWake,
       autoReturnSeconds: autoReturnOnChallengeOf(this.opts.config) ? autoReturnSecondsOf(l.record.params.challengeTimeout) : null,
       ignoreHumanMustMove: opts.ignoreHumanMustMove,
+      transport: l.record.finalized ? "none" : (this.opts.transportOf?.(l.record.channelId) ?? "relay"),
+      xmtpDropped: this.xmtpDroppedOf(l),
     });
   }
 
@@ -3073,6 +3127,9 @@ export class ArenaDaemon {
       cooldownUntil: info.cooldownUntil,
       now: blockNow,
     };
+    // Plan 5.7 (spec §3, I-1): the XMTP fallback is armed only once the channel is Open on chain -- both deposits in --
+    // never at match time, so an accept that costs nothing never starts an XMTP client here. Idempotent.
+    if (!l.record.finalized && (info.phase === "Open" || info.phase === "Challenged")) this.opts.armFallback?.(id);
     // I2: progress is any change to the states and signatures held (our move, a received move, a checkpoint
     // proposed or completed, a Close signature either way, an on-chain adoption) or to the phase (the channel
     // opening, a challenge being answered). Observed here — every tick and every status call — on chain time.

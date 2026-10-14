@@ -1,4 +1,6 @@
-import { existsSync, mkdirSync, rmdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, lstatSync, readdirSync, renameSync, rmdirSync, rmSync, type Dirent } from "node:fs";
+import { dirname, join } from "node:path";
 import { encodeFunctionData, formatUnits, parseUnits, type Address, type Hex } from "viem";
 import {
   channelHubAbi,
@@ -21,7 +23,10 @@ import {
   DEFAULT_LOG_CHUNK_BLOCKS,
   defaultSessionGasWei,
   knownDeploymentWarnings,
+  parseXmtpConfig,
+  readConfig,
   type ArenaConfig,
+  type XmtpConfig,
 } from "./config.js";
 import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
 import { readJson } from "./jsonfile.js";
@@ -29,6 +34,7 @@ import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecor
 import { RecordStore } from "./records.js";
 import { startDaemonProcess } from "./run.js";
 import { cliPackage, cliVersion, hostCliVerdict, selfCommand } from "./version.js";
+import { loadXmtpSdk, loadXmtpSdkFrom, XMTP_SDK_VERSION } from "./xmtp/loader.js";
 
 export type CliIo = {
   env: NodeJS.ProcessEnv;
@@ -98,6 +104,16 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
        sometimes a check or a capture, else a random move. Refuses any chain but 31337 unless --allow-real-chain.)
+  xmtp enable | status | disable
+       (Plan 5.7: the XMTP fallback transport's SDK -- opt-in, never bundled, loaded only once installed.
+        enable installs the pinned @xmtp/node-sdk (about 480 MB, one-time) into <ARENA_HOME>/xmtp/sdk and prints
+        {enabled, version, sizeMB}; a running daemon loads it only when it starts, so restart the daemon after
+        enabling. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
+        installing anything: daemon is what the RUNNING daemon loaded ("xmtp" or "off") or "not running".
+        disable removes the installed SDK only -- it never touches <ARENA_HOME>/xmtp/db, so a channel's XMTP
+        history survives a disable/enable cycle.
+        ARENA_XMTP_NPM overrides the npm binary "enable" installs with -- a test hook, never set this normally:
+        a stale value left in a shell or CI environment silently swaps the installer)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
@@ -153,7 +169,7 @@ function formatNativeBalance(wei: bigint): string {
  * single-use, short-lived code, never the token itself (Plan 5 final fix M1).
  * A pure function so a test can check its shape without actually starting a daemon.
  */
-export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: string }): Record<string, unknown> {
+export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: string; fallback: "xmtp" | "off" }): Record<string, unknown> {
   return {
     api: proc.apiUrl,
     pid: proc.pid,
@@ -161,7 +177,128 @@ export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: str
     board: `${proc.apiUrl}/board`,
     // Final fix wave (M5): the pinned npx form in the bundle, which an agent can run as is.
     boardHint: `run: ${CLI_COMMAND} board`,
+    // Plan 5.7 (spec §2): "xmtp" once config.xmtp is set and the SDK loaded, else "off" -- mirrors ArenaDaemon's
+    // own `fallback` getter (daemon.ts), so a human or agent reading the start line sees it immediately rather
+    // than having to ask `status`.
+    fallback: proc.fallback,
   };
+}
+
+/** Plan 5.7 Task 4: the npm binary `arena xmtp enable` installs with. Next to this build's own `process.execPath`
+ *  when present (the same Node install's own npm, e.g. nvm/Volta), else the bare name -- resolved from PATH by
+ *  the shell-less `spawn` itself. `ARENA_XMTP_NPM` overrides it outright: the one seam tests use to point at a
+ *  fake installer script that copies a fixture package, instead of ever reaching the real ~480 MB npm download. */
+export function resolveNpmBinary(io: CliIo): string {
+  const override = io.env.ARENA_XMTP_NPM;
+  if (override) return override;
+  const name = process.platform === "win32" ? "npm.cmd" : "npm";
+  const candidate = join(dirname(process.execPath), name);
+  return existsSync(candidate) ? candidate : "npm";
+}
+
+/** The total size (bytes) of every regular file under `dir`, recursively. A symlink counts its own link size,
+ *  never the target's (so a cycle can never recurse forever); a `dir` that does not exist (or a raced-away file)
+ *  counts as 0 rather than throwing. */
+function dirSizeBytes(dir: string): number {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) total += dirSizeBytes(full);
+    else {
+      try {
+        total += lstatSync(full).size;
+      } catch {
+        // raced away between readdir and stat: not this process's problem to report
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Plan 5.7 Task 4 (spec §4): runs `npm install --prefix <sdkDir> --no-audit --no-fund --save-exact
+ * @xmtp/node-sdk@<version>` with `npmBin`, with no shell (an argv array, never a shell string -- `sdkDir` is a
+ * path this process built itself, but there is no reason to open a shell-injection surface for it anyway).
+ * Collects npm's combined stdout/stderr only to report on failure; prints nothing on success.
+ */
+function runNpmInstall(npmBin: string, sdkDir: string, version: string, io: CliIo): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const args = ["install", "--prefix", sdkDir, "--no-audit", "--no-fund", "--save-exact", `@xmtp/node-sdk@${version}`];
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(npmBin, args, { env: io.env, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      reject(new Error(`xmtp enable: failed to start ${npmBin}: ${err instanceof Error ? err.message : String(err)}`));
+      return;
+    }
+    let output = "";
+    child.stdout?.on("data", (c: Buffer) => (output += c.toString("utf8")));
+    child.stderr?.on("data", (c: Buffer) => (output += c.toString("utf8")));
+    child.once("error", (err) => reject(new Error(`xmtp enable: failed to run ${npmBin}: ${err.message}`)));
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else {
+        // Fix round 1 (Minor 1): the generic top-level handler prints only an Error's first line
+        // (err.message.split("\n")[0]), which would bury npm's actually-useful line (its second line, routinely
+        // -- "npm error code E404" then "npm error 404 Not Found - ..."). Write the captured output straight to
+        // stderr instead, so the real reason survives that truncation; the rejection itself stays one line.
+        if (output.trim()) io.err(output.trim().slice(-4000));
+        reject(new Error(`xmtp enable: "${npmBin} install … @xmtp/node-sdk@${version}" exited ${code}`));
+      }
+    });
+  });
+}
+
+/** Plan 5.7 (I-2): how long `arena xmtp status` waits for the running daemon's `GET /fallback`. */
+const DAEMON_FALLBACK_TIMEOUT_MS = 2_000;
+
+/**
+ * Plan 5.7 (I-2): whether this home's RUNNING daemon loaded the XMTP SDK, from its `GET /fallback` -- `"xmtp"` or
+ * `"off"` (with its reason) -- or `"not running"` when nothing answers on its port (no config or token yet counts as
+ * not running), or `"unknown"` when something answers but not with a fallback (with why). Never throws.
+ */
+async function runningDaemonFallback(home: string, io: CliIo): Promise<{ fallback: "xmtp" | "off" | "not running" | "unknown"; reason?: string }> {
+  let port: number;
+  let token: string;
+  try {
+    port = readConfig(home).config.port;
+    token = loadToken(home);
+  } catch {
+    return { fallback: "not running" };
+  }
+  let res: Response;
+  try {
+    res = await io.fetch(`http://127.0.0.1:${port}/fallback`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(DAEMON_FALLBACK_TIMEOUT_MS),
+    });
+  } catch {
+    return { fallback: "not running" };
+  }
+  const body = (await res.json().catch(() => null)) as { fallback?: unknown; reason?: unknown; error?: unknown } | null;
+  if (res.ok && (body?.fallback === "xmtp" || body?.fallback === "off")) {
+    return typeof body.reason === "string" ? { fallback: body.fallback, reason: body.reason } : { fallback: body.fallback };
+  }
+  const why = typeof body?.error === "string" ? body.error : res.statusText;
+  return { fallback: "unknown", reason: `the daemon on 127.0.0.1:${port} answered ${res.status}: ${why}` };
+}
+
+/**
+ * Plan 5.7 Task 4: the one line `arena bot` logs, once, when the host configured XMTP (`config.xmtp`) but this
+ * daemon ended up without the fallback -- the SDK missing, a wrong version, or a broken install
+ * (`DaemonProcess.fallback` stays `"off"` exactly when `startDaemonProcess`'s own `loadXmtpSdk` failed, Task 1).
+ * `null` when xmtp is not configured, or the fallback is already on -- `arena bot` never re-checks the SDK
+ * itself; it only reads what the daemon already decided.
+ */
+export function xmtpBotHint(xmtpConfigured: boolean, fallback: "xmtp" | "off"): string | null {
+  if (!xmtpConfigured || fallback === "xmtp") return null;
+  return `xmtp is configured but not enabled on this machine: run "${CLI_COMMAND} xmtp enable" (about 480 MB, one-time)`;
 }
 
 /**
@@ -379,6 +516,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           rules?: string;
           faucet?: string;
           cli?: Record<string, unknown>;
+          xmtp?: unknown;
         } = {};
         if (!haveAllExplicit) {
           const templatesUrl = `${server.replace(/\/$/, "")}/templates`;
@@ -404,6 +542,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             faucet: typeof chess.faucet === "string" ? chess.faucet : undefined,
             // Plan 5.6 Task 4 (spec §3): only ever set by a host that has pinned a published CLI version.
             cli: chess.cli !== null && typeof chess.cli === "object" && !Array.isArray(chess.cli) ? (chess.cli as Record<string, unknown>) : undefined,
+            // Plan 5.7 Task 4 (spec §5): only ever set by a host that configures the XMTP fallback -- left as raw
+            // `unknown` here (not shape-checked) so a malformed value still reaches `parseXmtpConfig` below and
+            // fails with that function's own, specific message, instead of being silently dropped. Fix round 1
+            // (Minor 5): an explicit JSON `null` (as opposed to the key being omitted) is normalized to
+            // `undefined` here -- "the key is absent" and "the key is null" are the same thing to every reader
+            // of `template.xmtp` below, matching spec §5's "a server without xmtp removes it" rather than
+            // refusing the whole init over a host's harmless `"xmtp": null`.
+            xmtp: chess.xmtp ?? undefined,
           };
         }
         const rpcUrl = flag("rpc") ?? template.rpcUrl;
@@ -523,7 +669,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const walletKey: Hex =
           readJson<{ key: Hex }>(paths.wallet)?.key ?? (flag("wallet-key") as Hex | undefined) ?? generatePrivateKey();
         const walletAddress = privateKeyToAccount(walletKey).address;
-        const existingCfg = readJson<{ owner?: unknown; ownerNonce?: unknown }>(paths.config);
+        const existingCfg = readJson<{ owner?: unknown; ownerNonce?: unknown; xmtp?: unknown }>(paths.config);
         let owner: unknown = existingCfg?.owner ?? undefined; // kept verbatim
         // Fix round 1 (I2): a re-init must never reset the nonce either -- back at 0, a signature from an earlier
         // change (A→B at nonce 0, after B→A) would verify again.
@@ -552,6 +698,31 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           cliUpgrade = verdict.upgrade;
         }
 
+        // Plan 5.7 Task 4 (spec §5), fix round 1 (Important 1 / Ruling 1): the host's `xmtp` config, copied
+        // verbatim from /templates when a template was actually fetched this run. Re-init against an updated
+        // template updates it; re-init against a server that stopped publishing it drops it (spec §5: "a server
+        // without xmtp removes it") -- both correct because `cfg` below is built fresh either way. But when
+        // every chain flag was given explicitly, /templates is never fetched at all (haveAllExplicit, above) --
+        // that run says nothing whatsoever about xmtp one way or the other, so it must carry forward whatever is
+        // already cached, exactly like `owner`/`ownerNonce` just above, rather than silently dropping it (the
+        // ruling this fixes: "a re-init must never silently turn the fallback off"). Validation is always
+        // `loadConfig`'s own (`parseXmtpConfig`): a host -- or a config.json -- that holds something invalid
+        // refuses the whole init, before anything is written.
+        let xmtp: XmtpConfig | undefined;
+        if (template.xmtp !== undefined) {
+          try {
+            xmtp = parseXmtpConfig(template.xmtp);
+          } catch (err) {
+            throw new Error(`server ${server} published an invalid xmtp config: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else if (haveAllExplicit && existingCfg?.xmtp !== undefined) {
+          try {
+            xmtp = parseXmtpConfig(existingCfg.xmtp);
+          } catch (err) {
+            throw new Error(`the cached xmtp config in ${paths.config} is invalid: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
         const cfg: ArenaConfig = {
           rpcUrl,
           chainId,
@@ -570,6 +741,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           ...(autoReturn !== undefined ? { autoReturnOnChallenge: autoReturn } : {}),
           ...(owner !== undefined && owner !== null ? { owner: owner as Address } : {}),
           ...(ownerNonce !== 0 ? { ownerNonce } : {}),
+          ...(xmtp !== undefined ? { xmtp } : {}),
         };
         initHome(home, cfg, walletKey);
         const summary: Record<string, unknown> = {
@@ -638,7 +810,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const proc = await startDaemonProcess(home, { log: io.err });
       // Plan 5 Task 2 fix round, CRITICAL 1: no token anywhere in this line -- see daemonStartLine's own
       // docstring. Run `arena board` for a board link with a one-time code.
-      io.out(JSON.stringify(daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address })));
+      io.out(JSON.stringify(daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address, fallback: proc.fallback })));
       await new Promise<void>((resolve) => {
         const stop = () => {
           // Only one of SIGINT/SIGTERM fires; `process.once` alone would leave the other one's listener
@@ -658,7 +830,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // opens in its history (and omnibox autocomplete, and maybe cloud sync), which replaceState cannot undo.
       // The running daemon mints the code (POST /board/code, with the token read from disk); the board trades it
       // once for the token, which it keeps in memory only. The code expires 120 s after it is minted.
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const token = loadToken(home);
       let res: Response;
       try {
@@ -680,7 +852,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     if (cmd === "wallet") {
       // Plan 5.5 Task 1: reads the chain directly (no daemon, no token) -- useful whether or not one is running.
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
 
@@ -761,7 +933,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     if (cmd === "faucet") {
       // Plan 5.5 Task 1: calls the host server's dev faucet for this wallet explicitly (no daemon needed).
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
       const faucetUrl = `${cfg.serverUrl.replace(/\/$/, "")}/faucet`;
@@ -846,7 +1018,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         explicitDeposit = parseUnits(depositRaw, 6);
       }
 
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
 
@@ -1042,7 +1214,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (amount <= 0n) throw new Error("--amount must be greater than 0");
         req = { amount };
       }
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
 
       let result: { to: string; amount: bigint; txHash: string; usdcAfter: bigint | null; note?: string; openOffers?: string[] };
       if (livePidHoldingLock(home) !== null) {
@@ -1132,7 +1304,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (cmd === "bot") {
       // Plan 5.5 Task 2: house bots are dev tooling -- refuse any chain but 31337 up front, before the home lock
       // or any RPC call, unless the caller explicitly overrides it.
-      const cfg = loadConfig(home);
+      const cfg = loadConfig(home, { warn: io.err });
       if (cfg.chainId !== 31337 && !flags.has("allow-real-chain")) {
         throw new UsageError(
           `refusing to run "${CLI_COMMAND} bot" against chain ${cfg.chainId}: house bots are dev tooling for chain 31337 ` +
@@ -1177,10 +1349,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       io.out(
         JSON.stringify({
-          ...daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address }),
+          ...daemonStartLine({ apiUrl: proc.apiUrl, pid: process.pid, wallet: proc.daemon.wallet.address, fallback: proc.fallback }),
           bot: true,
         }),
       );
+      // Plan 5.7 Task 4: xmtp configured (config.xmtp) but this daemon ended up without the fallback -- logged
+      // once, here, rather than re-checking the SDK itself; `startDaemonProcess` (Task 1) already decided.
+      const xmtpHint = xmtpBotHint(cfg.xmtp !== undefined, proc.fallback);
 
       const controller = new AbortController();
       // Plan 5.5 Task 2: `process.on` (not `once`), and idempotent -- a process group signal (a terminal Ctrl-C,
@@ -1206,6 +1381,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         idleCloseMs: idleCloseSeconds * 1000,
         log: io.err,
         signal: controller.signal,
+        ...(xmtpHint ? { xmtpEnableHint: `bot: ${xmtpHint}` } : {}),
       }).catch((err) => io.err(`bot: ${err instanceof Error ? err.message : String(err)}`));
 
       await proc.stop();
@@ -1215,6 +1391,77 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // this the process would otherwise linger for that long after a clean shutdown -- this command is the only
       // one with such a loop, so forcing the exit here (after every bit of cleanup above has already run) is safe.
       process.exit(0);
+    }
+
+    if (cmd === "xmtp") {
+      // Plan 5.7 Task 4 (spec §4): none of enable/status/disable needs the home lock or even an existing
+      // config.json -- the SDK install is independent of ARENA_HOME's own config, and every CLI invocation here
+      // uses a temp HOME/ARENA_HOME anyway (Global Constraints).
+      if (arg === "enable") {
+        mkdirSync(home, { recursive: true, mode: 0o700 });
+        const xmtpDir = join(home, "xmtp");
+        mkdirSync(xmtpDir, { recursive: true });
+        const sdkDir = join(xmtpDir, "sdk");
+        // Fix round 1 (Minor 4): install into a throwaway sibling dir first, and move it into place only once
+        // npm *and* the loader both succeed -- a failed install (npm exits non-zero, or the installed SDK fails
+        // to load) then never leaves a half-populated <home>/xmtp/sdk behind; a concurrent `status`, or a retried
+        // `enable`, still sees only the last good install (or none at all), never a corrupt partial one.
+        const tmpDir = join(xmtpDir, `.sdk-tmp-${process.pid}-${Date.now()}`);
+        mkdirSync(tmpDir, { recursive: true });
+        try {
+          const npmBin = resolveNpmBinary(io);
+          io.err(`xmtp enable: installing @xmtp/node-sdk@${XMTP_SDK_VERSION} into ${sdkDir} (about 480 MB; this can take a while)...`);
+          await runNpmInstall(npmBin, tmpDir, XMTP_SDK_VERSION, io);
+          const loaded = await loadXmtpSdkFrom(join(tmpDir, "node_modules"));
+          if (!loaded.ok) throw new Error(`xmtp enable: installed, but the SDK failed to load: ${loaded.reason}`);
+          rmSync(sdkDir, { recursive: true, force: true });
+          renameSync(tmpDir, sdkDir);
+          const sizeMB = Math.round(dirSizeBytes(sdkDir) / (1024 * 1024));
+          io.out(JSON.stringify({ enabled: true, version: loaded.version, sizeMB }));
+          return 0;
+        } catch (err) {
+          rmSync(tmpDir, { recursive: true, force: true });
+          throw err;
+        }
+      }
+      if (arg === "status") {
+        const loaded = await loadXmtpSdk(home);
+        // The SDK's own install state (above) is independent of config.json -- `status` must still answer
+        // before `init` has ever run, so a missing or unreadable config just means `env: null`, never a throw.
+        let env: XmtpConfig["env"] | null = null;
+        let configProblem: string | null = null;
+        if (existsSync(arenaPaths(home).config)) {
+          try {
+            const read = readConfig(home);
+            env = read.config.xmtp?.env ?? null;
+            configProblem = read.xmtpProblem;
+          } catch {
+            env = null;
+          }
+        }
+        // Plan 5.7 (I-2): what the RUNNING daemon loaded -- it loads the SDK once, at start, so an `enable` after it
+        // started needs a daemon restart. "not running" when no daemon of this home answers.
+        const daemon = await runningDaemonFallback(home, io);
+        io.out(
+          JSON.stringify({
+            ...(loaded.ok ? { enabled: true, version: loaded.version } : { enabled: false, version: null, reason: loaded.reason }),
+            env,
+            ...(configProblem !== null ? { configProblem } : {}),
+            daemon: daemon.fallback,
+            ...(daemon.reason !== undefined ? { daemonReason: daemon.reason } : {}),
+          }),
+        );
+        return 0;
+      }
+      if (arg === "disable") {
+        // Plan 5.7 Task 4: removes only the installed SDK -- `<home>/xmtp/db` (every channel's XMTP message
+        // history and installation state) is a sibling directory, never touched here, so a later `xmtp enable`
+        // resumes instead of re-registering a fresh installation.
+        rmSync(join(home, "xmtp", "sdk"), { recursive: true, force: true });
+        io.out(JSON.stringify({ enabled: false }));
+        return 0;
+      }
+      throw new UsageError(`unknown xmtp subcommand ${arg ?? "(none)"}: use enable, status or disable`);
     }
 
     const channel = flag("channel");
@@ -1278,7 +1525,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         throw new UsageError(cmd ? `unknown command ${cmd}` : "no command given");
     }
 
-    const cfg = loadConfig(home);
+    const cfg = loadConfig(home, { warn: io.err });
     const token = loadToken(home);
     let res: Response;
     try {

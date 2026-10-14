@@ -198,7 +198,7 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
   const path = arenaPaths(home).config;
   if (kind === "same") return;
   if (kind === "first") {
-    writeJsonAtomic(path, { ...cfg, owner });
+    writeJsonAtomic(path, { ...rawConfig(path), ...cfg, owner });
     return;
   }
   // A change. `current` is non-null here; if it is not an address at all, nobody can sign for it.
@@ -234,5 +234,11 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
   if (readRecordedOwner(home) !== current || ownerNonceOf(now) !== nonce) {
     throw new Error("the owner changed while this command was running: run it again");
   }
-  writeJsonAtomic(path, { ...now, owner, ownerNonce: nonce + 1 });
+  writeJsonAtomic(path, { ...rawConfig(path), ...now, owner, ownerNonce: nonce + 1 });
+}
+
+/** Plan 5.7 (m-7): config.json as it is on disk, so a write-back keeps a field `loadConfig` dropped as invalid (an
+ *  `xmtp` from a newer CLI, say) instead of deleting it. */
+function rawConfig(path: string): Record<string, unknown> {
+  return readJson<Record<string, unknown>>(path) ?? {};
 }

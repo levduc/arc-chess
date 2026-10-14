@@ -12,7 +12,7 @@
 - The host pays fees through an XMTP Gateway on separate infrastructure. This plan covers only its operations docs.
 - System tests run against XMTP's local node in Docker.
 
-**Tech Stack:** TypeScript on Node ≥ 24; viem 2.56.8; vitest 5.0.1; `@xmtp/node-sdk` 6.0.0, never bundled and installed at runtime; Docker for the XMTP local node.
+**Tech Stack:** TypeScript on Node ≥ 24; viem 2.56.8; vitest 5.0.1; `@xmtp/node-sdk` 6.1.0 (6.0.0 until the final fix wave: 6.1.0 adds `Client.close()`), never bundled and installed at runtime; Docker for the XMTP local node.
 
 **Spec:** `docs/superpowers/specs/2026-10-13-xmtp-fallback-design.md`. The parent spec is `docs/superpowers/specs/2026-09-24-agent-chess-arena-design.md`.
 
@@ -72,18 +72,25 @@ export interface XmtpTransport {
   send(channelId: Hex, text: string): Promise<void>;
   /** `from` is the XMTP sender's Ethereum address; `dm` is the peer address of the conversation it arrived in. */
   onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => void): () => void;
-  close(channelId: Hex): Promise<void>;
+  // Final fix wave (I-1, m-1, K1): close is Client.close() (6.1.0), bounded; `purge` (the channel is finalized) then
+  // deletes its DB files. catchUp re-delivers a rate-limited message without a stream restart.
+  close(channelId: Hex, opts?: { purge?: boolean }): Promise<void>;
+  catchUp?(channelId: Hex, afterMs: number): void;
   stop(): Promise<void>;
 }
 export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; config: XmtpConfig; log(l: string): void }): XmtpTransport;
 // xmtp/loader.ts
 export async function loadXmtpSdk(home: string): Promise<{ ok: true; sdk: unknown; version: string } | { ok: false; reason: string }>;
-export const XMTP_SDK_VERSION = "6.0.0";
+export const XMTP_SDK_VERSION = "6.1.0"; // 6.0.0 until the final fix wave
 // xmtp/fallback.ts
 export const HOST_DOWN_GRACE_MS = 3000;
 export const XMTP_MAX_PAYLOAD_BYTES = 16 * 1024;
 export class FallbackRelay implements RelayClient {
-  constructor(opts: { host: HostRelay; xmtp: XmtpTransport; graceMs?: number; now?: () => number; log?(l: string): void });
+  constructor(opts: { host: HostRelay; xmtp: XmtpTransport; graceMs?: number; now?: () => number; log?(l: string): void; maxClients?: number });
+  // Final fix wave (I-1, amends the join rule below and spec §3 "Client lifecycle"): `join` only registers the
+  // channel; the daemon calls `arm` once the channel is Open on chain (both deposits in), and only then is
+  // `xmtp.open(...)` called. At most XMTP_MAX_CLIENTS = 64 channels are armed at once.
+  arm(channelId: Hex): void;
   transportOf(channelId: Hex): "relay" | "xmtp" | "none";
   /** Messages dropped by the XMTP acceptance checks, per channel (spec §3). */
   dropped(channelId: Hex): number;
@@ -93,7 +100,7 @@ export type HostRelay = RelayClient & { isJoined(channelId: Hex): boolean; onLin
 ```
 
 **Requirements:** spec §2 and §3, verbatim:
-- `join` joins the host relay as today. It also calls `xmtp.open(channelId, signer, params.signers[other])` and does not await it for the host path, so a slow XMTP never delays the host join.
+- `join` joins the host relay as today. It also calls `xmtp.open(channelId, signer, params.signers[other])` and does not await it for the host path, so a slow XMTP never delays the host join. *(Amended in the final fix wave, I-1: `xmtp.open` is called by `arm`, once the channel is Open on chain, not by `join`.)*
 - `send`:
   - when `host.isJoined(id)`, send via the host;
   - else, if the channel has not been joined for `graceMs`, send via XMTP as `{"arena":1,"msg":<wire JSON>}`;
@@ -136,6 +143,8 @@ export type HostRelay = RelayClient & { isJoined(channelId: Hex): boolean; onLin
 - Validate `env` against the three values. `apiUrl` and `gatewayHost` must be `http(s)` URLs with no credentials. `gatewayHost` is allowed only with `env: "production"`.
 - In `skill.md`, only when `xmtp` is configured, add to the recipe right after the daemon step:
   > Recommended before playing for real money: `<cmd> xmtp enable` (one-time, about 700 MB). If this site goes down mid-game, your daemon keeps playing over XMTP; `status` shows `transport`.
+
+  *(Amended in the final fix wave, I-2/m-3/m-4: the step moved before the daemon step, as a continuation of step 1, says the daemon must be restarted if XMTP is enabled later, keeps playing over XMTP "when your opponent has it enabled too; otherwise the chain path takes over as before", says about 480 MB, and step 2 gains a check that `<cmd> xmtp status` shows `"daemon": "xmtp"`.)*
 - Troubleshooting gains: "`transport: \"xmtp\"` means this site is unreachable and your game continues over XMTP; new matches need the site."
 - Tests:
   - config validation, one test per rule;
@@ -199,7 +208,7 @@ export type HostRelay = RelayClient & { isJoined(channelId: Hex): boolean; onLin
   - `tests/system/dev-up.test.ts`.
 
 **Requirements:**
-- **SDK fixture.** Install the real `@xmtp/node-sdk@6.0.0` once per test run into a temp `HOME`'s `<home>/xmtp/sdk` with `arena xmtp enable`, using a shared cache dir under the system-test temp root. Each further home symlinks to it, so the 725 MB is installed once per run.
+- **SDK fixture.** Install the real `@xmtp/node-sdk` (6.1.0 since the final fix wave) once per test run into a temp `HOME`'s `<home>/xmtp/sdk` with `arena xmtp enable`, using a shared cache dir under the system-test temp root. Each further home symlinks to it, so the SDK (about 480 MB installed) is installed once per run.
 - **Scenarios** (each bounded, with cleanup in `afterEach`):
   1. **Kill the host mid-game** (success criterion 1).
      1. Two daemons with XMTP play.

@@ -1000,6 +1000,91 @@ summary of what was actually built.
     --all` — entirely through the installed binary for the agent and the house bot, with exact balances asserted
     on both sides.
 
+### Plan 5.7 refinements (XMTP fallback transport, 2026-10-13)
+
+See `docs/superpowers/specs/2026-10-13-xmtp-fallback-design.md` for the full design and
+`docs/superpowers/plans/2026-10-13-xmtp-fallback.md` for the task breakdown. Items 55–59 were brought in line
+with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch review.
+
+55. **`FallbackRelay` composes the host relay with XMTP; the chain stays the last resort.** A new `FallbackRelay`
+    (`packages/cli/src/xmtp/fallback.ts`) implements the existing `RelayClient` (`join`/`send`/`onMessage`/
+    `onJoined`/`leave`) by composing the host relay (`connectHost(...).relay`, which gains `isJoined(channelId)`
+    and `onLinkChange(handler)`) with an `XmtpRelay` built on an `XmtpTransport` interface
+    (`packages/cli/src/xmtp/transport.ts`). Daemon game logic is unchanged: messages from both transports are
+    always accepted and fed to the same handlers, and duplicates are harmless (an exact duplicate of `latest` is
+    already a no-op; the close-signature path is already idempotent). `send` goes via the host relay while it is
+    up for that channel (socket open and channel joined); once the channel has not been up for
+    `HOST_DOWN_GRACE_MS = 3000`, sends go via XMTP instead, holding briefly and retrying on `onLinkChange` or a
+    timer otherwise; a send never throws to the daemon for a transport reason. A channel's XMTP side exists only
+    once the daemon has seen it Open on chain (both deposits in) and armed it (`FallbackRelay.arm`, from the
+    chain refresh) -- never at match time, since an accept costs nothing -- and at most `XMTP_MAX_CLIENTS = 64`
+    channels per daemon are armed at once; until armed (or past the cap) a channel is the host relay's alone.
+    `ChannelStatus` gains `transport: "relay" | "xmtp" | "none"` and `xmtpDropped`; the daemon start line gains
+    `fallback: "xmtp" | "off"`, and its API `GET /fallback` (`{fallback, reason?}`). With
+    `config.xmtp` absent, or the XMTP SDK failing to load, `run.ts` uses the host relay directly and behaviour is
+    byte-for-byte identical to pre-Plan-5.7 (Global Constraint: every existing test passes unmodified).
+56. **XMTP identity is the channel's own session key; acceptance drops known strangers and verifies everything
+    else by signature, never by a lookup that can fail.** Each channel's session key (`params.signers[me]`) is
+    its XMTP identity, and the opponent's session key (`params.signers[other]`) is who it expects to hear from —
+    no discovery, and the raw session key never reaches XMTP code (I5): the client signs through the same
+    `RelaySigner` the relay join already uses, and the per-channel XMTP database key is
+    `keccak256(await signer.signMessage({ message: { raw: toHex("arena-xmtp-db/v1:" + channelId) } }))`, 32
+    bytes, RFC-6979-deterministic so there is no new secret to store. The wire format is one XMTP text message
+    per `RelayMessage`: `{"arena": 1, "msg": <RelayMessage wire JSON>}`, at most `XMTP_MAX_PAYLOAD_BYTES` (16
+    KiB). Acceptance (amended 2026-10-14, commit `61d0246`, after three review rounds found liveness bugs in
+    identity lookups that can fail): `open()` remembers the known opponent DM's conversation id(s) as a **fast
+    path**, needing no lookup. Otherwise the sender is looked up. A **known stranger** (lookup succeeded, and
+    the address or DM is definitely not the opponent's) is dropped and counted (`dropped(channelId)`) before it
+    consumes any rate-limit budget. The opponent is identified only by verified member addresses, never by the
+    recovery identifier (C-N1, fix round 5): a sender's inbox state is matched by its member identifiers alone
+    (each added with its own signature), never by its recovery identifier, which any inbox can point at any
+    address unsigned; the opponent's inbox id is set only by answers keyed by the opponent's own address (its
+    DM found by address, and the network's inbox lookup), each replacing the stored one; and the DM found by
+    the opponent's address, or any conversation whose peer is the opponent's inbox, is never denied. An **undetermined** sender (the lookup itself failed or timed out) is *not*
+    held back — it is delivered to the session in arrival order, which verifies every state and close signature
+    (`session.receive`/`session.receiveClose`) exactly as it already does for host-relay traffic, so a flaky
+    lookup can never cost liveness. Every message, on every path, still passes the 16 KiB cap, `arena === 1`,
+    the existing wire validators, XMTP-message-id dedupe, and the same per-channel inbound rate limit the host
+    relay already enforces; a message that limit turns away is re-delivered by a catch-up of the opponent DM once
+    the bucket refills, never by a stream restart. A session rejection of an undetermined-sender message is also counted in
+    `dropped(channelId)`, but never sets `lastError` and is never logged per message, so a stranger flood during
+    a lookup outage can't spam `status` (success criterion 3: a message from a sender **known** not to be the
+    opponent is dropped before it reaches the session; a message whose sender **can't be determined** reaches
+    the session, where nothing changes without the channel's own session-key signatures).
+57. **Packaging keeps the SDK out of the published bundle.** The published CLI bundle stays zero-runtime-
+    dependency; `@xmtp/node-sdk@6.1.0` (about 480 MB installed) is never bundled, only installed at runtime into
+    `<home>/xmtp/sdk/node_modules/@xmtp/node-sdk` by `arena xmtp enable`
+    (`npm install --prefix <home>/xmtp/sdk --no-audit --no-fund --save-exact @xmtp/node-sdk@6.1.0`), and loaded
+    with a dynamic `import()` only when the directory is present and `config.xmtp` is set, once, at daemon start.
+    6.1.0 (not 6.0.0) because its `Client.close()` releases a client: each is closed when its channel is finalized
+    (its DB files then deleted) or the daemon stops. A missing, broken, or wrong-version SDK, or an invalid `xmtp`
+    in `config.json`, is not a crash: the daemon logs once and runs with `fallback: "off"`, and
+    `arena xmtp status` (which also reports what the running daemon loaded) and `arena bot` report and work around
+    it respectively. This
+    plan adds no new workspace dependency — the SDK lives only in a runtime home directory or a test fixture,
+    never in the pnpm workspace (Global Constraints).
+58. **Configuration flows from the server to `config.json`, never fetched at fallback time.** The server config
+    gains optional `xmtp: {env: "local"|"dev"|"production", apiUrl?, gatewayHost?}` (the same shape as the CLI's
+    `XmtpConfig`), published in `/templates` only when configured; `gatewayHost` is accepted with `env: "dev"` or
+    `env: "production"`, refused with `env: "local"`. `init` copies it into `config.json` as `xmtp`, re-init updates it, and a server without
+    `xmtp` removes it — because the site may be down exactly when the daemon needs this config, the daemon reads
+    it from its own `config.json`, never from a live fetch. `dev:up --xmtp-local` publishes `xmtp: {env:"local",
+    apiUrl}` backed by the pinned local-node fixture below.
+59. **The host-paid gateway runs on separate infrastructure and is never exercised by tests.** The XMTP Gateway
+    Service (`github.com/xmtp/xmtpd/pkg/gateway`, image pinned in `deploy/xmtp-gateway/docker-compose.yml`) holds
+    a hot payer key, funded with USDC on Base through XMTP's Funding Portal, and pays XMTP's per-message fee on
+    every agent's behalf so no agent needs its own funded wallet just to send messages. It must run on
+    infrastructure separate from the website (an outage of `apps/server` must never also take down the
+    fallback it's paying for). `deploy/xmtp-gateway/README.md` documents every `XMTPD_*` variable, the funding
+    steps, the `WithAuthorizers` IP rate-limit hook (the prebuilt image ships with none), a ~$20 payer cap
+    (≈400,000 messages at XMTP's published ~$5/100k-messages, 1 KB/90-day assumption), monitoring the payer
+    balance, and the upgrade path to XMTP's (not-yet-shipped) client auth tokens. No test or CI job ever runs the
+    gateway — it needs a real Base RPC and real funds — and the arena never runs it in tests. System tests
+    instead run against `tests/system/xmtp-local/docker-compose.yml`, a copy of `xmtp/xmtp-local-node`'s compose
+    file with every image pinned by `@sha256:` digest and host ports parameterized
+    (`${XMTP_GRPC_PORT:-5555}`/`${XMTP_API_PORT:-5556}`/`${XMTP_HISTORY_PORT:-5558}`), brought up under a unique
+    compose project name per run and always torn down with `down -v`, even on failure.
+
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
 The owner chose to launch directly on Arc mainnet, with no Arc Testnet phase and no external audit first. The §11 audit

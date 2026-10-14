@@ -168,6 +168,9 @@ async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader,
     // Plan 5.6 Task 4 (spec §3): the pinned CLI version, when this host configures one -- same undefined-key
     // omission as `faucet` above when it does not.
     ...(cfg.cli !== undefined ? { cli: cfg.cli } : {}),
+    // Plan 5.7 Task 2 (spec §5): the XMTP fallback config, when this host publishes one -- same undefined-key
+    // omission as `cli`/`faucet` above when it does not. `init` copies this into the daemon's `config.json`.
+    ...(cfg.xmtp !== undefined ? { xmtp: cfg.xmtp } : {}),
   };
 }
 

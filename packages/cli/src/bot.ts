@@ -85,6 +85,12 @@ export type BotOptions = {
   log?: (line: string) => void;
   /** Aborting stops the loop (and any in-flight `sleep`/`wait`) promptly; see `runBot`'s own docstring. */
   signal?: AbortSignal;
+  /** Plan 5.7 Task 4: logged once, before the loop starts, when the host configured XMTP but this daemon ended
+   *  up without the fallback (the SDK missing, a wrong version, or a broken install) -- computed by the caller
+   *  (`cli.ts`'s `bot` command, which already knows `config.xmtp` and the daemon's own `fallback`), since
+   *  `runBot` has no `home` directory to check this itself. `undefined` logs nothing; the bot runs exactly as it
+   *  would with no xmtp at all either way (the daemon already fell back to the host relay alone). */
+  xmtpEnableHint?: string;
 };
 
 /** Resolves once `signal` aborts (immediately if it already has); never, if there is no signal. */
@@ -359,6 +365,9 @@ export async function runBot(daemon: ArenaDaemon, opts: BotOptions): Promise<voi
   const challengeBackoffMaxMs = opts.challengeBackoffMaxMs ?? CHALLENGE_BACKOFF_MAX_MS;
   const offerBlockBackoffMs = opts.offerBlockBackoffMs ?? OFFER_BLOCK_BACKOFF_MS;
   const signal = opts.signal;
+
+  // Plan 5.7 Task 4: once, at startup -- the bot still runs its normal loop below either way.
+  if (opts.xmtpEnableHint) log(opts.xmtpEnableHint);
 
   const ctx: ActCtx = {
     rng,

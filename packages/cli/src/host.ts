@@ -29,9 +29,17 @@ export type HostOptions = {
   idleTimeoutMs?: number;
 };
 
+/**
+ * Plan 5.7 (spec §2): the host relay plus its up-signal, which `FallbackRelay` (xmtp/fallback.ts) reads to decide
+ * where a message goes. `isJoined(id)` is true exactly while `send` for that channel would go out: the socket is
+ * open and the server has confirmed the channel's join on it. `onLinkChange` fires after every change to that
+ * condition (a `joined` frame, a new `hello`, the socket closing or being abandoned, a `leave`).
+ */
+export type HostRelay = RelayClient & { isJoined(channelId: Hex): boolean; onLinkChange(handler: () => void): () => void };
+
 export type HostConnection = {
   lobby: LobbyClient;
-  relay: RelayClient;
+  relay: HostRelay;
   connected(): boolean;
   close(): void;
 };
@@ -138,6 +146,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   const relayHandlers = new Set<(m: RelayMessage) => void>();
   const joinedHandlers = new Set<(id: Hex) => void>();
   const watchRefusedHandlers = new Set<(message: string) => void>();
+  const linkHandlers = new Set<() => void>();
   const joinWaiters = new Map<Hex, JoinWaiter[]>();
 
   function safeCall<A extends unknown[]>(fn: (...args: A) => void, args: A, what: string): void {
@@ -146,6 +155,11 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     } catch (err) {
       log(`host: ${what} handler threw: ${errorText(err)}`);
     }
+  }
+
+  /** Plan 5.7: tells `onLinkChange` subscribers that some channel's `isJoined` may have changed. */
+  function linkChanged(): void {
+    for (const h of linkHandlers) safeCall(h, [], "onLinkChange");
   }
 
   function sendFrame(frame: ClientFrame): void {
@@ -192,6 +206,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
   function onHello(n: Hex): void {
     nonce = n;
     joinedOnSocket.clear();
+    linkChanged();
     // Only a connection that stays up resets the backoff: a server that accepts and then drops us right away
     // (rate limit, overload) must keep seeing a growing delay, not a reconnect at minimum backoff forever.
     clearTimeout(stableTimer);
@@ -234,6 +249,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
         const id = frame.channelId as Hex;
         joinedOnSocket.add(id);
         settleJoinWaiters(id);
+        linkChanged();
         for (const h of joinedHandlers) safeCall(h, [id], "onJoined");
         return;
       }
@@ -300,6 +316,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     clearTimeout(stableTimer);
     nonce = null;
     joinedOnSocket.clear();
+    linkChanged();
     try {
       socket.close();
     } catch {
@@ -336,6 +353,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
       clearTimeout(stableTimer);
       nonce = null;
       joinedOnSocket.clear();
+      linkChanged();
       scheduleReconnect();
     });
     socket.addEventListener("error", () => {
@@ -404,7 +422,7 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     },
   };
 
-  const relay: RelayClient = {
+  const relay: HostRelay = {
     async join(channelId: Hex, params: Params, signer: RelaySigner): Promise<void> {
       joins.set(channelId, { params, signer });
       if (!nonce || !ws || ws.readyState !== WebSocket.OPEN) return; // sent on the next hello
@@ -450,9 +468,18 @@ export function connectHost(serverUrl: string, opts: HostOptions = {}): HostConn
     },
     leave(channelId: Hex): void {
       const registered = joins.delete(channelId);
-      joinedOnSocket.delete(channelId);
+      const wasJoined = joinedOnSocket.delete(channelId);
       settleJoinWaiters(channelId, new Error(`left ${channelId}`));
       if (registered && nonce) sendFrame({ type: "leave", channelId });
+      if (wasJoined) linkChanged();
+    },
+    isJoined(channelId: Hex): boolean {
+      // Exactly the negation of `send`'s "relay not connected" condition.
+      return ws !== null && ws.readyState === WebSocket.OPEN && joinedOnSocket.has(channelId);
+    },
+    onLinkChange(handler: () => void): () => void {
+      linkHandlers.add(handler);
+      return () => linkHandlers.delete(handler);
     },
   };
 

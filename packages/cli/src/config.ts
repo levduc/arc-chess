@@ -7,6 +7,11 @@ import { generatePrivateKey } from "viem/accounts";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import { selfCommand } from "./version.js";
 
+/** Plan 5.7 (spec §3, §5): the XMTP network the fallback transport uses, copied by `init` from the host's
+ *  `/templates` (`xmtp`). `apiUrl` overrides the env's endpoint (tests, a local node); `gatewayHost` is the host's
+ *  XMTP Gateway once network fees are enforced. */
+export type XmtpConfig = { env: "local" | "dev" | "production"; apiUrl?: string; gatewayHost?: string };
+
 export type ArenaConfig = {
   rpcUrl: string;
   chainId: number;
@@ -44,7 +49,49 @@ export type ArenaConfig = {
   /** Task 3 fix round 1 (I2): goes up by one on every owner change and is part of the message the current owner
    *  signs, so an old signature can never be replayed (A→B→A). Absent = 0. Kept by a re-`init`. */
   ownerNonce?: number;
+  /** Plan 5.7: the XMTP fallback transport's network. Absent = no fallback: the daemon uses the host relay alone,
+   *  exactly as before. Validated by `loadConfig` (`parseXmtpConfig`). */
+  xmtp?: XmtpConfig;
 };
+
+const XMTP_ENVS: ReadonlyArray<XmtpConfig["env"]> = ["local", "dev", "production"];
+
+/** An http(s) URL with no embedded credentials, or a throw naming `field`. */
+function xmtpUrl(v: unknown, field: string): string {
+  if (typeof v !== "string") throw new Error(`${field}: must be a string`);
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new Error(`${field}: must be a valid URL`);
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error(`${field}: must be an http(s) URL`);
+  if (u.username !== "" || u.password !== "") throw new Error(`${field}: must not contain credentials`);
+  return v;
+}
+
+/**
+ * Plan 5.7: validates an `xmtp` config value (from `config.json`, or from the host's `/templates` when `init` caches
+ * it) and returns a clean copy with only the known fields (an unknown key is dropped, so a host that publishes a
+ * newer field does not break an older CLI). The rules are the server's own (`apps/server/src/config.ts`
+ * `parseXmtp`), so whatever a host publishes, the CLI accepts: `env` is one of the three; `apiUrl` and
+ * `gatewayHost` are http(s) URLs without credentials; a gateway is refused with `env: "local"` (the SDK accepts one
+ * only for `dev` and `production`).
+ */
+export function parseXmtpConfig(x: unknown): XmtpConfig {
+  if (typeof x !== "object" || x === null || Array.isArray(x)) throw new Error("xmtp: must be an object");
+  const o = x as Record<string, unknown>;
+  if (typeof o.env !== "string" || !(XMTP_ENVS as readonly string[]).includes(o.env)) {
+    throw new Error(`xmtp.env: must be one of ${XMTP_ENVS.join(", ")}`);
+  }
+  const out: XmtpConfig = { env: o.env as XmtpConfig["env"] };
+  if (o.apiUrl !== undefined) out.apiUrl = xmtpUrl(o.apiUrl, "xmtp.apiUrl");
+  if (o.gatewayHost !== undefined) {
+    out.gatewayHost = xmtpUrl(o.gatewayHost, "xmtp.gatewayHost");
+    if (out.env === "local") throw new Error('xmtp.gatewayHost: is not allowed with env: "local"');
+  }
+  return out;
+}
 
 /** A canonical arena deployment on one chain (final review I2). */
 export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc?: Address };
@@ -179,8 +226,41 @@ function required<T>(value: T | null, what: string): T {
   return value;
 }
 
-export function loadConfig(home: string): ArenaConfig {
-  return required(readJson<ArenaConfig>(arenaPaths(home).config), "config");
+/**
+ * Plan 5.7 (m-7): `config.json` as `loadConfig` returns it, plus what was wrong with its `xmtp`, if anything. Only
+ * `xmtp` is validated here, and only when present -- every other field loads exactly as before. An invalid `xmtp` (a
+ * hand edit, or a value a newer CLI wrote) is dropped from the returned config rather than refused: the XMTP fallback
+ * is optional, and refusing would stop every command, `arena daemon` and its watchtower included. `init` stays strict
+ * (it validates with `parseXmtpConfig` itself). The file is not rewritten.
+ */
+export function readConfig(home: string): { config: ArenaConfig; xmtpProblem: string | null } {
+  const cfg = required(readJson<ArenaConfig>(arenaPaths(home).config), "config");
+  if (cfg.xmtp === undefined) return { config: cfg, xmtpProblem: null };
+  try {
+    cfg.xmtp = parseXmtpConfig(cfg.xmtp);
+    return { config: cfg, xmtpProblem: null };
+  } catch (err) {
+    delete cfg.xmtp;
+    const why = err instanceof Error ? err.message : String(err);
+    return { config: cfg, xmtpProblem: `config.json's xmtp is invalid (${why}), so the XMTP fallback is off; re-run init to refresh it` };
+  }
+}
+
+/** Problems `loadConfig` has already warned about with its default sink: once per process each. */
+const warnedConfigProblems = new Set<string>();
+
+/** Loads `config.json` (see `readConfig`). An invalid `xmtp` is dropped with one warning: to `opts.warn` when given,
+ *  else to stderr, once per process. */
+export function loadConfig(home: string, opts: { warn?: (line: string) => void } = {}): ArenaConfig {
+  const { config, xmtpProblem } = readConfig(home);
+  if (xmtpProblem !== null) {
+    if (opts.warn) opts.warn(`warning: ${xmtpProblem}`);
+    else if (!warnedConfigProblems.has(xmtpProblem)) {
+      warnedConfigProblems.add(xmtpProblem);
+      process.stderr.write(`warning: ${xmtpProblem}\n`);
+    }
+  }
+  return config;
 }
 
 export function loadWalletKey(home: string): Hex {

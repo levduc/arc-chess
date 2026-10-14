@@ -116,6 +116,67 @@ describe("config", () => {
       expect(parseServerConfig(base).cliCommand).toBe("arena");
     });
   });
+
+  describe("Plan 5.7 Task 2 (spec §5): the xmtp config", () => {
+    it("is absent (no xmtp key at all) when the config has none", () => {
+      expect(parseServerConfig(validBase()).xmtp).toBeUndefined();
+    });
+    it("accepts a minimal local config and a full production one", () => {
+      const base = validBase();
+      expect(parseServerConfig({ ...base, xmtp: { env: "local" } }).xmtp).toEqual({ env: "local" });
+      const full = parseServerConfig({
+        ...base,
+        xmtp: { env: "production", apiUrl: "https://xmtp.example.com:5555", gatewayHost: "https://gateway.example.com" },
+      }).xmtp;
+      expect(full).toEqual({ env: "production", apiUrl: "https://xmtp.example.com:5555", gatewayHost: "https://gateway.example.com" });
+    });
+    it("rejects a non-object xmtp, naming the field", () => {
+      const base = validBase();
+      expect(() => parseServerConfig({ ...base, xmtp: "local" })).toThrow(/^xmtp:/);
+      expect(() => parseServerConfig({ ...base, xmtp: [] })).toThrow(/^xmtp:/);
+    });
+    it("rejects a missing or unrecognised env, naming the field", () => {
+      const base = validBase();
+      expect(() => parseServerConfig({ ...base, xmtp: {} })).toThrow(/xmtp\.env/);
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "mainnet" } })).toThrow(/xmtp\.env/);
+    });
+    it("rejects an apiUrl that is not an http(s) URL, naming the field", () => {
+      const base = validBase();
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "local", apiUrl: "not a url" } })).toThrow(/xmtp\.apiUrl/);
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "local", apiUrl: "ftp://host" } })).toThrow(/xmtp\.apiUrl/);
+    });
+    it("rejects an apiUrl carrying credentials, naming the field", () => {
+      const base = validBase();
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "local", apiUrl: "http://user:pass@host" } })).toThrow(/xmtp\.apiUrl/);
+    });
+    it("rejects a gatewayHost that is not an http(s) URL, naming the field", () => {
+      const base = validBase();
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "production", gatewayHost: "not a url" } })).toThrow(/xmtp\.gatewayHost/);
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "production", gatewayHost: "ftp://host" } })).toThrow(/xmtp\.gatewayHost/);
+    });
+    it("rejects a gatewayHost carrying credentials, naming the field", () => {
+      const base = validBase();
+      expect(() =>
+        parseServerConfig({ ...base, xmtp: { env: "production", gatewayHost: "https://user:pass@host" } }),
+      ).toThrow(/xmtp\.gatewayHost/);
+    });
+    it("rejects gatewayHost with env: \"local\", but allows it with \"dev\" and \"production\"", () => {
+      const base = validBase();
+      expect(() => parseServerConfig({ ...base, xmtp: { env: "local", gatewayHost: "https://host" } })).toThrow(/xmtp\.gatewayHost/);
+      expect(parseServerConfig({ ...base, xmtp: { env: "dev", gatewayHost: "https://host" } }).xmtp).toEqual({
+        env: "dev",
+        gatewayHost: "https://host",
+      });
+      expect(parseServerConfig({ ...base, xmtp: { env: "production", gatewayHost: "https://host" } }).xmtp).toEqual({
+        env: "production",
+        gatewayHost: "https://host",
+      });
+    });
+    it("drops unknown xmtp keys rather than passing them through", () => {
+      const base = validBase();
+      expect(parseServerConfig({ ...base, xmtp: { env: "local", foo: 1 } }).xmtp).toEqual({ env: "local" });
+    });
+  });
 });
 
 function validBase() {
@@ -713,6 +774,62 @@ describe("http foundation", () => {
     });
   });
 
+  describe("Plan 5.7 Task 2 (spec §5): skill.md's xmtp recommendation and troubleshooting entry", () => {
+    const XMTP = { env: "local" as const };
+    const CMD = "my-arena";
+    // Final fix wave (I-2, m-3, m-4): enabled before the daemon starts (it loads the SDK only then), what the
+    // fallback actually guarantees, the measured size, and a check of what the RUNNING daemon loaded.
+    const RECIPE_SENTENCE = [
+      `   Recommended before playing for real money, and before step 2: \`${CMD} xmtp enable\` (one-time, about`,
+      "   480 MB). The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
+      "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
+      "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
+    ].join("\n");
+    const CHECK_SENTENCE = [
+      `   If you ran \`xmtp enable\`, check that \`${CMD} xmtp status\` shows \`"daemon": "xmtp"\`: \`"off"\` means the`,
+      "   daemon started before the install (or could not load it: see `daemonReason`) -- restart the daemon.",
+    ].join("\n");
+    const TROUBLESHOOTING_SENTENCE =
+      '- `transport: "xmtp"` means this site is unreachable and your game continues over XMTP; new matches need the site.';
+
+    it('with xmtp configured: the recipe enables XMTP before the daemon step, checks the running daemon after it, and troubleshooting names transport: "xmtp"', async () => {
+      server = await startServer(testConfig({ xmtp: XMTP, cliCommand: CMD }), { chain: new FakeChain() });
+      const text = await (await fetch(`${server.url}/skill.md`)).text();
+      // Pinned verbatim (uses cfg.cliCommand, not a hardcoded "arena").
+      expect(text).toContain(RECIPE_SENTENCE);
+      expect(text).toContain(CHECK_SENTENCE);
+      expect(text).toContain(TROUBLESHOOTING_SENTENCE);
+      expect(text).not.toContain("700 MB");
+
+      // Step 1's continuation, before the daemon step (2); the check right after step 2's own lines, before step 3
+      // -- the numbered recipe itself is unaffected.
+      const recipe = text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("**Troubleshooting:**"));
+      const initAt = recipe.indexOf("1. `my-arena init");
+      const recommendAt = recipe.indexOf(RECIPE_SENTENCE);
+      const daemonAt = recipe.indexOf("2. Start the daemon");
+      const upAt = recipe.indexOf("means the daemon is not running or not reachable yet).");
+      const checkAt = recipe.indexOf(CHECK_SENTENCE);
+      const step3At = recipe.indexOf("3. Pick an opponent's offer");
+      expect(initAt).toBeGreaterThan(-1);
+      expect(recommendAt).toBeGreaterThan(initAt);
+      expect(daemonAt).toBeGreaterThan(recommendAt);
+      expect(checkAt).toBeGreaterThan(upAt);
+      expect(upAt).toBeGreaterThan(daemonAt);
+      expect(step3At).toBeGreaterThan(checkAt);
+
+      // Appended after the existing RPC-died entry, so the C1 test's own slice stays untouched.
+      expect(text.indexOf(TROUBLESHOOTING_SENTENCE)).toBeGreaterThan(text.indexOf("- The RPC died while a channel is open"));
+    });
+
+    it("without xmtp: none of the sentences appears", async () => {
+      server = await startServer(testConfig(), { chain: new FakeChain() });
+      const text = await (await fetch(`${server.url}/skill.md`)).text();
+      expect(text).not.toContain("xmtp enable");
+      expect(text).not.toContain("xmtp status");
+      expect(text).not.toContain("transport:");
+    });
+  });
+
   it("Plan 5.5 Task 3 (ruling 1): the index page addresses an agent above the table, and llms.txt does on its first line", async () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const html = await (await fetch(`${server.url}/`)).text();
@@ -760,6 +877,18 @@ describe("http foundation", () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const templatesNoCli = (await (await fetch(`${server.url}/templates`)).json()) as Array<Record<string, unknown>>;
     expect(Object.prototype.hasOwnProperty.call(templatesNoCli[0], "cli")).toBe(false);
+  });
+
+  it("Plan 5.7 Task 2 (spec §5): /templates carries xmtp when configured, and has no xmtp key otherwise", async () => {
+    const xmtp = { env: "local" as const, apiUrl: "http://127.0.0.1:5555" };
+    server = await startServer(testConfig({ xmtp }), { chain: new FakeChain() });
+    const templates = (await (await fetch(`${server.url}/templates`)).json()) as Array<Record<string, unknown>>;
+    expect(templates[0].xmtp).toEqual(xmtp);
+    await server.close();
+
+    server = await startServer(testConfig(), { chain: new FakeChain() });
+    const templatesNoXmtp = (await (await fetch(`${server.url}/templates`)).json()) as Array<Record<string, unknown>>;
+    expect(Object.prototype.hasOwnProperty.call(templatesNoXmtp[0], "xmtp")).toBe(false);
   });
   it("rate-limits GETs per IP with 429", async () => {
     server = await startServer({ ...testConfig(), limits: { ...DEFAULT_LIMITS, httpGetBurst: 2, httpGetPerSec: 0.001 } }, { chain: new FakeChain() });

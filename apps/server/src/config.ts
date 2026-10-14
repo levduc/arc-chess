@@ -24,6 +24,13 @@ export const DEFAULT_LIMITS: Limits = {
  *  refuses below; `version` is the one the derived `cliCommand` and skill.md's Install step actually pin to. */
 export type CliConfig = { package: string; version: string; minVersion?: string };
 
+/** Plan 5.7 Task 2 (spec §5): the same shape as the CLI's own `XmtpConfig` (packages/cli/src/config.ts), but
+ *  defined locally -- `@arena/cli` is only a devDependency of `@arena/server` (used in tests), so the server's
+ *  runtime has no dependency on the CLI package. `apiUrl` (tests, local node) and `gatewayHost` (dev and
+ *  production, once fees are enforced -- the XMTP SDK accepts a gateway only for those two environments, which
+ *  also lets the paid gateway be tested on XMTP's `dev` testnet) are both optional. */
+export type XmtpConfig = { env: "local" | "dev" | "production"; apiUrl?: string; gatewayHost?: string };
+
 export type ServerConfig = {
   host: string;
   port: number;
@@ -39,6 +46,9 @@ export type ServerConfig = {
   cliCommand: string;
   /** Set only when this host pins a published CLI (see `CliConfig`); published in `/templates` the same way. */
   cli?: CliConfig;
+  /** Plan 5.7 Task 2 (spec §5): set only when this host publishes the XMTP fallback transport; published in
+   *  `/templates` the same way. `init` copies it into the daemon's own `config.json`. */
+  xmtp?: XmtpConfig;
   audit: string;
   indexer: { pollMs: number; chunkBlocks: number; startBlock: bigint };
   limits: Limits;
@@ -198,6 +208,53 @@ function parseCli(obj: Record<string, unknown>): CliConfig | undefined {
   return { package: pkg, version, minVersion };
 }
 
+const XMTP_ENVS = ["local", "dev", "production"] as const;
+type XmtpEnv = (typeof XMTP_ENVS)[number];
+
+function isXmtpEnv(v: unknown): v is XmtpEnv {
+  return typeof v === "string" && (XMTP_ENVS as readonly string[]).includes(v);
+}
+
+/** Validates an `http(s)` URL carrying no embedded credentials (`user:pass@host`), naming `displayName` (defaulting
+ *  to `field`) on failure -- same `field`-vs-`displayName` split as `num()`/`bigint()` above, since `obj` here is
+ *  already the unwrapped `xmtp` sub-object. */
+function httpUrl(obj: Record<string, unknown>, field: string, displayName: string = field): string {
+  const v = obj[field];
+  if (typeof v !== "string") fail(displayName, "must be a string");
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    fail(displayName, "must be a valid URL");
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") fail(displayName, "must be an http(s) URL");
+  if (u.username !== "" || u.password !== "") fail(displayName, "must not contain credentials");
+  return v;
+}
+
+/** Plan 5.7 Task 2 (spec §5): `xmtp`, or `undefined` when the config carries none. Each violation names the
+ *  offending field (`xmtp.env`/`xmtp.apiUrl`/`xmtp.gatewayHost`). */
+function parseXmtp(obj: Record<string, unknown>): XmtpConfig | undefined {
+  const raw = obj.xmtp;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail("xmtp", "must be an object");
+  const r = raw as Record<string, unknown>;
+
+  const envRaw = r.env;
+  if (!isXmtpEnv(envRaw)) fail("xmtp.env", `must be one of "local", "dev", "production"`);
+  const env = envRaw;
+
+  const apiUrl = r.apiUrl === undefined ? undefined : httpUrl(r, "apiUrl", "xmtp.apiUrl");
+  const gatewayHost = r.gatewayHost === undefined ? undefined : httpUrl(r, "gatewayHost", "xmtp.gatewayHost");
+  // Controller ruling (fix round 1): the XMTP SDK accepts a gateway only for "dev" and "production" -- "local"
+  // is the only environment that refuses one, which also lets the paid gateway be tested on XMTP's dev testnet.
+  if (gatewayHost !== undefined && env === "local") {
+    fail("xmtp.gatewayHost", 'is not allowed with env: "local"');
+  }
+
+  return { env, ...(apiUrl !== undefined ? { apiUrl } : {}), ...(gatewayHost !== undefined ? { gatewayHost } : {}) };
+}
+
 /** Plain-JSON config (bigints as decimal strings, optional fields defaulted); throws with the offending field name. */
 export function parseServerConfig(raw: unknown): ServerConfig {
   const obj = asRecord(raw);
@@ -234,6 +291,7 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   };
 
   const cli = parseCli(obj);
+  const xmtp = parseXmtp(obj);
   // Plan 5.6 Task 4 (spec §3): derived only when the raw config has no `cliCommand` key at all -- an explicit
   // `cliCommand` always wins over a configured `cli`, even an empty string (`obj.cliCommand !== undefined`, not
   // `str`'s own fallback, so this distinguishes "not given" from "given but falsy").
@@ -258,6 +316,7 @@ export function parseServerConfig(raw: unknown): ServerConfig {
 
   return {
     host, port, publicUrl, rpcUrl, publicRpcUrl, chainId, hub, usdc, rules, dbPath,
-    fundingWindow, offerMaxLifetime, defaults, cliCommand, ...(cli !== undefined ? { cli } : {}), audit, indexer, limits, trustProxy, devFaucet,
+    fundingWindow, offerMaxLifetime, defaults, cliCommand, ...(cli !== undefined ? { cli } : {}),
+    ...(xmtp !== undefined ? { xmtp } : {}), audit, indexer, limits, trustProxy, devFaucet,
   };
 }

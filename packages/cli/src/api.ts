@@ -371,6 +371,9 @@ export async function startApi(
           }
           case "GET /offers":
             return send(res, 200, await daemon.listOffers());
+          case "GET /fallback":
+            // Plan 5.7 (I-2): read-only -- whether this running daemon loaded the XMTP SDK (`arena xmtp status`).
+            return send(res, 200, daemon.fallbackInfo());
           case "POST /offers":
             return send(
               res,
