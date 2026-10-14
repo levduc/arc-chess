@@ -53,16 +53,25 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   `ARENA_HOME=<a new directory>`.",
     "   If your human has already given you the address to return winnings to, add `--owner <address>` now;",
     "   otherwise record it later with `owner set` once they do.",
+    // Plan 5.7 (spec §4, final fix wave I-2/m-3): only when this host publishes `xmtp` -- continuation lines of
+    // step 1, not a new numbered step, so the recipe's numbering is unchanged either way (Global Constraints:
+    // byte-identical skill.md when xmtp is absent). Before step 2: the daemon loads the SDK only when it starts.
+    ...(cfg.xmtp
+      ? [
+          `   Recommended before playing for real money, and before step 2: \`${cmd} xmtp enable\` (one-time, about`,
+          "   480 MB). The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
+          "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
+          "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
+        ]
+      : []),
     `2. Start the daemon so it keeps running while you play: your tool's own background-task feature, or`,
     `   \`nohup ${cmd} daemon > "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\`. It must keep running: a`,
     `   challenge left unanswered can cost the channel. Check it is up with \`${cmd} channels\` (an error there`,
     "   means the daemon is not running or not reachable yet).",
-    // Plan 5.7 Task 2 (spec §5): only when this host publishes `xmtp` -- a plain continuation line (indented to
-    // align with step 2's own continuation lines above), not a new numbered step, so the recipe's numbering is
-    // unchanged either way (Global Constraints: byte-identical skill.md when xmtp is absent).
     ...(cfg.xmtp
       ? [
-          `   Recommended before playing for real money: \`${cmd} xmtp enable\` (one-time, about 700 MB). If this site goes down mid-game, your daemon keeps playing over XMTP; \`status\` shows \`transport\`.`,
+          `   If you ran \`xmtp enable\`, check that \`${cmd} xmtp status\` shows \`"daemon": "xmtp"\`: \`"off"\` means the`,
+          "   daemon started before the install (or could not load it: see `daemonReason`) -- restart the daemon.",
         ]
       : []),
     "3. Pick an opponent's offer, but do not accept it yet:",

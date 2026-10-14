@@ -777,35 +777,55 @@ describe("http foundation", () => {
   describe("Plan 5.7 Task 2 (spec §5): skill.md's xmtp recommendation and troubleshooting entry", () => {
     const XMTP = { env: "local" as const };
     const CMD = "my-arena";
-    const RECIPE_SENTENCE =
-      `Recommended before playing for real money: \`${CMD} xmtp enable\` (one-time, about 700 MB). If this site goes down mid-game, your daemon keeps playing over XMTP; \`status\` shows \`transport\`.`;
+    // Final fix wave (I-2, m-3, m-4): enabled before the daemon starts (it loads the SDK only then), what the
+    // fallback actually guarantees, the measured size, and a check of what the RUNNING daemon loaded.
+    const RECIPE_SENTENCE = [
+      `   Recommended before playing for real money, and before step 2: \`${CMD} xmtp enable\` (one-time, about`,
+      "   480 MB). The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
+      "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
+      "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
+    ].join("\n");
+    const CHECK_SENTENCE = [
+      `   If you ran \`xmtp enable\`, check that \`${CMD} xmtp status\` shows \`"daemon": "xmtp"\`: \`"off"\` means the`,
+      "   daemon started before the install (or could not load it: see `daemonReason`) -- restart the daemon.",
+    ].join("\n");
     const TROUBLESHOOTING_SENTENCE =
       '- `transport: "xmtp"` means this site is unreachable and your game continues over XMTP; new matches need the site.';
 
-    it('with xmtp configured: the recipe recommends xmtp enable right after the daemon step, and troubleshooting names transport: "xmtp"', async () => {
+    it('with xmtp configured: the recipe enables XMTP before the daemon step, checks the running daemon after it, and troubleshooting names transport: "xmtp"', async () => {
       server = await startServer(testConfig({ xmtp: XMTP, cliCommand: CMD }), { chain: new FakeChain() });
       const text = await (await fetch(`${server.url}/skill.md`)).text();
       // Pinned verbatim (uses cfg.cliCommand, not a hardcoded "arena").
       expect(text).toContain(RECIPE_SENTENCE);
+      expect(text).toContain(CHECK_SENTENCE);
       expect(text).toContain(TROUBLESHOOTING_SENTENCE);
+      expect(text).not.toContain("700 MB");
 
-      // Right after the daemon step (2), before step 3 -- the numbered recipe itself is unaffected.
+      // Step 1's continuation, before the daemon step (2); the check right after step 2's own lines, before step 3
+      // -- the numbered recipe itself is unaffected.
       const recipe = text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("**Troubleshooting:**"));
-      const daemonAt = recipe.indexOf("2. Start the daemon");
+      const initAt = recipe.indexOf("1. `my-arena init");
       const recommendAt = recipe.indexOf(RECIPE_SENTENCE);
+      const daemonAt = recipe.indexOf("2. Start the daemon");
+      const upAt = recipe.indexOf("means the daemon is not running or not reachable yet).");
+      const checkAt = recipe.indexOf(CHECK_SENTENCE);
       const step3At = recipe.indexOf("3. Pick an opponent's offer");
-      expect(daemonAt).toBeGreaterThan(-1);
-      expect(recommendAt).toBeGreaterThan(daemonAt);
-      expect(step3At).toBeGreaterThan(recommendAt);
+      expect(initAt).toBeGreaterThan(-1);
+      expect(recommendAt).toBeGreaterThan(initAt);
+      expect(daemonAt).toBeGreaterThan(recommendAt);
+      expect(checkAt).toBeGreaterThan(upAt);
+      expect(upAt).toBeGreaterThan(daemonAt);
+      expect(step3At).toBeGreaterThan(checkAt);
 
       // Appended after the existing RPC-died entry, so the C1 test's own slice stays untouched.
       expect(text.indexOf(TROUBLESHOOTING_SENTENCE)).toBeGreaterThan(text.indexOf("- The RPC died while a channel is open"));
     });
 
-    it("without xmtp: neither sentence appears", async () => {
+    it("without xmtp: none of the sentences appears", async () => {
       server = await startServer(testConfig(), { chain: new FakeChain() });
       const text = await (await fetch(`${server.url}/skill.md`)).text();
       expect(text).not.toContain("xmtp enable");
+      expect(text).not.toContain("xmtp status");
       expect(text).not.toContain("transport:");
     });
   });
