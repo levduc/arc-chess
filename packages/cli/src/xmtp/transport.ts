@@ -189,9 +189,11 @@ const SEEN_MAX = 512;
 const CACHE_MAX = 256;
 /** The network calls of the catch-up (the DM, its history) give up after this long. */
 const NETWORK_TIMEOUT_MS = 5_000;
-/** Closing a channel waits this long for a `Client.create` still running (one that returns later is closed by
- *  `start` itself), then this long for `Client.close()`: both inside `run.ts`'s 5 s stop budget. */
-const CREATE_WAIT_MS = 1_500;
+/** Closing a channel waits at most this long for its stream to end, then this long for a `Client.create` still
+ *  running (one that returns later is closed by `start` itself), then this long for `Client.close()`: 4.5 s in all,
+ *  inside `run.ts`'s 5 s stop budget. */
+const STREAM_END_WAIT_MS = 500;
+const CREATE_WAIT_MS = 1_000;
 const CLIENT_CLOSE_TIMEOUT_MS = 3_000;
 /** K1: a rate-limit catch-up runs no sooner than this, and one turned away again backs off, doubling up to the cap. */
 const RATE_CATCH_UP_MIN_MS = 1_000;
@@ -719,14 +721,15 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
   }
 
   /** Ends one channel's client: its stream, restart loop and catch-ups, then `Client.close()`; with `purge`, its DB
-   *  files are deleted once the client is closed. Bounded by `CREATE_WAIT_MS` + `CLIENT_CLOSE_TIMEOUT_MS`. */
+   *  files are deleted once the client is closed. Bounded: `STREAM_END_WAIT_MS` + `CREATE_WAIT_MS` +
+   *  `CLIENT_CLOSE_TIMEOUT_MS`. */
   async function shutdown(e: Entry, purge: boolean): Promise<void> {
     e.closed = true;
     if (purge) e.purge = true;
     e.wake?.();
     clearTimeout(e.catchUpTimer);
     e.catchUpTimer = undefined;
-    await e.stream?.end().catch(() => undefined);
+    if (e.stream) await withTimeout(e.stream.end(), STREAM_END_WAIT_MS, "stream end").catch(() => undefined);
     // A Client.create still running: give it a moment. If it returns later, `start` closes (and purges) it itself.
     await withTimeout(e.created, CREATE_WAIT_MS, "client start").catch(() => undefined);
     const client = e.client;
