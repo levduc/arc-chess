@@ -1,5 +1,5 @@
 /**
- * `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--no-faucet] [--dir PATH]`
+ * `pnpm dev:up [--port 8080] [--anvil-port 8545] [--players 0] [--house-bots 2] [--no-faucet] [--xmtp-local] [--dir PATH]`
  *
  * Brings up a local Agent Chess Arena stack for manual play: Anvil, a contract deployment (via `forge script`),
  * the host server, `--house-bots` always-available opponents (each one `arena bot`, started and funded by
@@ -16,19 +16,27 @@
  * :8545/:8080) -- it never kills another process to make room. Ctrl-C tears down everything it started,
  * including every house bot.
  *
+ * `--xmtp-local` (Plan 5.7): also starts XMTP's local node in Docker (the pinned fixture
+ * `tests/system/xmtp-local/docker-compose.yml`, under a unique compose project, on free ports) and has the server
+ * publish `xmtp: {env: "local", apiUrl}` in `/templates`, so every `arena init` against this stack caches it. House
+ * bots get the XMTP fallback too: dev-up runs `arena xmtp enable` (a real npm install of the SDK, about 437 MB) in the
+ * first house bot's home and symlinks every other house bot's `xmtp/sdk` to it. Teardown takes the fixture down
+ * with `docker compose down -v`. Without the flag nothing about XMTP is started or published.
+ *
  * `--dir` is refused if it already exists, is non-empty, and has no `.arena-dev-marker` file (written on a
  * successful run) -- so a caller who points `--dir` at something unrelated never has it silently wiped. An
  * existing `.arena-dev/` from before this guard existed has no marker: remove it once (`rm -rf .arena-dev`), or
  * pass a fresh `--dir`, and later runs will carry their own marker from then on.
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { createPublicClient, createTestClient, createWalletClient, http } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
 import { writeArenaWrapper } from "../tests/system/claude-sandbox.js";
+import { startXmtpLocal, type XmtpLocal } from "../tests/system/harness.js";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const CONTRACTS_DIR = join(REPO_ROOT, "contracts");
@@ -56,13 +64,19 @@ function parseArgs(argv: string[]): {
   houseBots: number;
   dir: string;
   noFaucet: boolean;
+  xmtpLocal: boolean;
 } {
   const flags = new Map<string, string>();
   let noFaucet = false;
+  let xmtpLocal = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--no-faucet") {
       noFaucet = true; // a boolean flag: takes no value
+      continue;
+    }
+    if (a === "--xmtp-local") {
+      xmtpLocal = true; // Plan 5.7: a boolean flag too
       continue;
     }
     if (a?.startsWith("--")) {
@@ -85,6 +99,8 @@ function parseArgs(argv: string[]): {
     // Faucet off: agents must ask their human for money (`arena fund`), as on a real chain. dev-up then funds a
     // demo "human" wallet and writes `<dir>/bin/pay` for paying an agent from it.
     noFaucet,
+    // Plan 5.7: XMTP's local node (Docker) and `xmtp` published in /templates; house bots get the fallback.
+    xmtpLocal,
   };
 }
 
@@ -229,13 +245,44 @@ async function stopChild(label: string, child: ChildProcess | undefined, graceMs
 let anvil: ChildProcess | undefined;
 let server: ChildProcess | undefined;
 const bots: Array<{ label: string; child: ChildProcess }> = [];
+/** Plan 5.7 (`--xmtp-local`): XMTP's local node, once it is up. A Ctrl-C that lands while it is still starting is
+ *  covered by harness.ts's own `exit` backstop, which takes down any fixture it started and has not stopped. */
+let xmtpLocal: XmtpLocal | undefined;
+/** Plan 5.7: an `arena xmtp enable` still running (a long npm install), stopped by teardown. */
+let xmtpEnable: ChildProcess | undefined;
 let shuttingDown = false;
 
 async function teardown(): Promise<void> {
-  // House bots depend on the server and anvil, so they come down first.
+  // House bots depend on the server and anvil (and on XMTP's local node), so they come down first.
+  await stopChild("arena xmtp enable", xmtpEnable);
   await Promise.all(bots.map((b) => stopChild(b.label, b.child)));
   await stopChild("server", server);
   await stopChild("anvil", anvil);
+  if (xmtpLocal) {
+    process.stderr.write(`dev-up: stopping XMTP's local node (docker compose -p ${xmtpLocal.project} down -v)...\n`);
+    const err = await xmtpLocal.stop();
+    if (err) process.stderr.write(`dev-up: ${err}\n`);
+  }
+}
+
+/** Plan 5.7: runs `arena xmtp enable` in `home` (a real npm install of the pinned SDK) without blocking the event
+ *  loop, so a Ctrl-C during the install still tears everything down. */
+function xmtpEnableIn(home: string, logPath: string): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const logFd = openSync(logPath, "a");
+    const child = spawn("node", [CLI_BIN, "xmtp", "enable"], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, ARENA_HOME: home },
+      stdio: ["ignore", logFd, logFd],
+    });
+    xmtpEnable = child;
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      xmtpEnable = undefined;
+      if (code === 0) resolvePromise();
+      else reject(new Error(`arena xmtp enable failed (code=${code} signal=${signal}); see ${logPath}`));
+    });
+  });
 }
 
 async function shutdown(signal: string): Promise<void> {
@@ -255,6 +302,7 @@ async function main(): Promise<void> {
     houseBots: numHouseBots,
     dir: DEV_DIR,
     noFaucet,
+    xmtpLocal: withXmtpLocal,
   } = parseArgs(process.argv.slice(2));
 
   // Fix round (minor): --dir existing as a plain file (not a directory) is a clear, distinct refusal --
@@ -342,6 +390,13 @@ async function main(): Promise<void> {
     channelHub: string;
   };
 
+  // Plan 5.7 (`--xmtp-local`): XMTP's local node, before the server, whose /templates then publishes it.
+  if (withXmtpLocal) {
+    process.stderr.write("dev-up: starting XMTP's local node (docker compose; a first run pulls its images)\n");
+    xmtpLocal = await startXmtpLocal({ project: `arena-dev-xmtp-${process.pid}-${Date.now()}` });
+    process.stderr.write(`dev-up: XMTP's local node is up at ${xmtpLocal.apiUrl} (compose project ${xmtpLocal.project})\n`);
+  }
+
   const serverConfigPath = join(DEV_DIR, "server.json");
   const serverConfig = {
     host: "127.0.0.1",
@@ -373,6 +428,8 @@ async function main(): Promise<void> {
     // Plan 5.5 Task 1: dev-up always runs a local Anvil at chainId 31337, so the three-way faucet guard's other
     // two checks (chainId, Anvil's web3_clientVersion) are satisfied too -- /faucet comes up enabled.
     devFaucet: !noFaucet,
+    // Plan 5.7 (spec §5): published only with --xmtp-local.
+    ...(xmtpLocal ? { xmtp: { env: "local", apiUrl: xmtpLocal.apiUrl } } : {}),
   };
   writeFileSync(serverConfigPath, JSON.stringify(serverConfig, null, 2));
 
@@ -443,6 +500,8 @@ async function main(): Promise<void> {
   mkdirSync(houseBotsDir, { recursive: true });
   const logsDir = join(DEV_DIR, "logs");
   mkdirSync(logsDir, { recursive: true });
+  /** Plan 5.7: the one SDK install every house bot shares (`<house-1>/xmtp/sdk`), once made. */
+  let sharedXmtpSdk: string | undefined;
   for (let i = 1; i <= numHouseBots; i++) {
     // M4: a Ctrl-C that lands mid-startup runs shutdown()/teardown() against whatever `bots` holds *right now*;
     // main() itself just keeps looping through this for-loop regardless, since nothing here was awaiting the
@@ -464,6 +523,21 @@ async function main(): Promise<void> {
     );
     if (init.status !== 0) {
       throw new Error(`arena init failed for ${name}:\n${init.stderr}`);
+    }
+    // Plan 5.7 (`--xmtp-local`): house bots play with the fallback on. `arena bot` itself only hints when the SDK is
+    // missing, so dev-up enables it: one real install in the first house bot's home, and a symlink to it in every
+    // other one (the SDK is about 437 MB).
+    if (xmtpLocal) {
+      if (sharedXmtpSdk === undefined) {
+        const enableLog = join(logsDir, "xmtp-enable.log");
+        process.stderr.write(`dev-up: arena xmtp enable for the house bots (a one-time npm install; logging to ${enableLog})\n`);
+        await xmtpEnableIn(home, enableLog);
+        if (shuttingDown) break;
+        sharedXmtpSdk = join(home, "xmtp", "sdk");
+      } else {
+        mkdirSync(join(home, "xmtp"), { recursive: true });
+        symlinkSync(sharedXmtpSdk, join(home, "xmtp", "sdk"), "dir");
+      }
     }
 
     process.stderr.write(`dev-up: starting house bot ${name} (logging to ${join(logsDir, `${name}.log`)})\n`);
@@ -511,12 +585,18 @@ async function main(): Promise<void> {
     process.stderr.write(`    pay your agent:  ${payPath} <agent address> <usdc> <native>\n`);
     process.stderr.write(`    your balance:    ${payPath} balance\n\n`);
   }
+  if (xmtpLocal) {
+    process.stderr.write(`  XMTP fallback: XMTP's local node is at ${xmtpLocal.apiUrl}, published in /templates (env local).\n`);
+    process.stderr.write("  A player's daemon uses it once that home has run `arena xmtp enable` (one-time, about 437 MB).\n\n");
+  }
   if (commands.length > 0) {
     process.stderr.write("  start each player's daemon in its own terminal:\n\n");
     for (const cmd of commands) process.stderr.write(`    ${cmd}\n`);
     process.stderr.write("\n");
   }
-  process.stderr.write("  Ctrl-C here tears down anvil, the server and every house bot.\n\n");
+  process.stderr.write(
+    `  Ctrl-C here tears down anvil, the server and every house bot${xmtpLocal ? ", and XMTP's local node" : ""}.\n\n`,
+  );
 
   // One machine-readable line, last, so tooling (and this task's own dev-up test) can wait for it deterministically.
   console.log(
@@ -531,6 +611,7 @@ async function main(): Promise<void> {
       dir: DEV_DIR,
       faucet: !noFaucet,
       ...(payPath ? { pay: payPath, demoHuman: DEMO_HUMAN } : {}),
+      ...(xmtpLocal ? { xmtp: { env: "local", apiUrl: xmtpLocal.apiUrl, project: xmtpLocal.project } } : {}),
     }),
   );
 

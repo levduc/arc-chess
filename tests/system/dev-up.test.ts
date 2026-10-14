@@ -1,9 +1,9 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { freeTcpPort, isPortFree } from "./harness.js";
+import { XMTP_NPM_CACHE, dockerUnavailableReason, freeTcpPort, isPortFree } from "./harness.js";
 
 const REPO_ROOT = join(import.meta.dirname, "../..");
 const TSX_BIN = join(REPO_ROOT, "node_modules/.bin/tsx");
@@ -43,6 +43,16 @@ function withDeadline<T>(promise: Promise<T>, ms: number, message: string): Prom
 let child: ChildProcess | undefined;
 let deploymentSnapshot: string | null | undefined;
 let devDir: string | undefined;
+/** Plan 5.7 Task 5: the compose project a `--xmtp-local` run reported, taken down here if the test did not get to
+ *  (a SIGKILLed dev-up never runs its own teardown). */
+let xmtpProject: string | undefined;
+
+/** Plan 5.7 Task 5: the containers (any state) of one compose project, by its label: only ever this test's own. */
+function composeContainers(project: string): string[] {
+  const ps = spawnSync("docker", ["ps", "-a", "-q", "--filter", `label=com.docker.compose.project=${project}`], { encoding: "utf8" });
+  if (ps.status !== 0) throw new Error(`docker ps failed: ${ps.stderr}`);
+  return ps.stdout.split("\n").filter((l) => l.trim() !== "");
+}
 
 afterEach(async () => {
   if (child && child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
@@ -53,6 +63,16 @@ afterEach(async () => {
     }
   }
   child = undefined;
+  if (xmtpProject) {
+    // `down -v` by project name alone: the compose file's port variables have defaults, and no port is needed to
+    // remove this project's own containers and volumes. Never prune, never touch anything else.
+    spawnSync(
+      "docker",
+      ["compose", "-p", xmtpProject, "-f", join(REPO_ROOT, "tests/system/xmtp-local/docker-compose.yml"), "down", "-v", "--timeout", "5"],
+      { stdio: "ignore", timeout: 120_000 },
+    );
+    xmtpProject = undefined;
+  }
   if (devDir) rmSync(devDir, { recursive: true, force: true });
   devDir = undefined;
   if (deploymentSnapshot !== undefined) {
@@ -60,7 +80,7 @@ afterEach(async () => {
     else writeFileSync(DEPLOYMENT_31337, deploymentSnapshot);
     deploymentSnapshot = undefined;
   }
-}, 20_000);
+}, 150_000);
 
 /** Reads lines from `child`'s stdout until `predicate` matches a parsed JSON line, or `ms` elapses. */
 async function waitForJsonLine(target: ChildProcess, predicate: (o: Record<string, unknown>) => boolean, ms: number): Promise<Record<string, unknown>> {
@@ -343,5 +363,87 @@ describe("pnpm dev:up", () => {
       await withDeadline(exited, 20_000, "dev-up did not exit within 20s of SIGINT");
     },
     120_000,
+  );
+  // Plan 5.7 Task 5: `--xmtp-local` starts XMTP's local node (Docker), publishes it in /templates, and teardown
+  // removes its containers. Skipped, with the reason in the title, when Docker is unavailable.
+  const dockerSkip = dockerUnavailableReason();
+  it.skipIf(dockerSkip !== null)(
+    `Plan 5.7: --xmtp-local publishes xmtp {env: "local", apiUrl} in /templates, and teardown removes its containers${dockerSkip ? ` (SKIPPED: ${dockerSkip})` : ""}`,
+    async () => {
+      deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+      child = spawn(
+        TSX_BIN,
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--xmtp-local",
+          "--players", "0", "--house-bots", "0", "--dir", devDir],
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] },
+      );
+      // A cold machine pulls the fixture's five pinned images first.
+      const ready = await waitForJsonLine(child, (o) => o.ready === true, 600_000);
+      const xmtp = ready.xmtp as { env: string; apiUrl: string; project: string };
+      xmtpProject = xmtp.project;
+      expect(xmtp.env).toBe("local");
+      expect(xmtp.apiUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(xmtp.project).toMatch(/^arena-dev-xmtp-/);
+      expect(composeContainers(xmtp.project).length).toBeGreaterThan(0);
+
+      const serverUrl = `http://127.0.0.1:${serverPort}`;
+      const templates = (await (await fetch(`${serverUrl}/templates`)).json()) as Array<Record<string, unknown>>;
+      expect(templates[0].xmtp).toEqual({ env: "local", apiUrl: xmtp.apiUrl });
+      // skill.md's recipe gains its XMTP step only when the host publishes `xmtp` (Plan 5.7 Task 2).
+      const skillText = await (await fetch(`${serverUrl}/skill.md`)).text();
+      expect(skillText).toContain("xmtp enable");
+
+      const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      process.kill(-child.pid!, "SIGINT");
+      // `down -v` of five containers comes after the bots, server and Anvil are down.
+      await withDeadline(exited, 90_000, "dev-up did not exit within 90s of SIGINT");
+      expect(composeContainers(xmtp.project)).toEqual([]);
+      xmtpProject = undefined;
+      await isPortFree(anvilPort).then((free) => expect(free).toBe(true));
+      await isPortFree(serverPort).then((free) => expect(free).toBe(true));
+    },
+    720_000,
+  );
+
+  // Plan 5.7 Task 5 (ruling 2): house bots under `--xmtp-local` run with the fallback on -- one real `arena xmtp
+  // enable` in house-1's home, a symlink to it in house-2's. Opt-in (ARENA_XMTP_REAL_INSTALL=1, Task 4's gate for a
+  // real SDK install): ruling 1 allows one real install per run, and xmtp-fallback.test.ts makes it.
+  it.skipIf(dockerSkip !== null || process.env.ARENA_XMTP_REAL_INSTALL !== "1")(
+    "Plan 5.7: --xmtp-local --house-bots 2 enables XMTP for every house bot through one shared install (opt-in: ARENA_XMTP_REAL_INSTALL=1)",
+    async () => {
+      deploymentSnapshot = existsSync(DEPLOYMENT_31337) ? readFileSync(DEPLOYMENT_31337, "utf8") : null;
+      devDir = mkdtempSync(join(tmpdir(), "arena-dev-up-"));
+      const anvilPort = await freeTcpPort();
+      const serverPort = await freeTcpPort();
+      child = spawn(
+        TSX_BIN,
+        [DEV_UP_SCRIPT, "--anvil-port", String(anvilPort), "--port", String(serverPort), "--xmtp-local",
+          "--players", "0", "--house-bots", "2", "--dir", devDir],
+        // npm's cache shared with the rest of the suite (harness.ts), so a warm machine installs offline.
+        { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, npm_config_cache: XMTP_NPM_CACHE } },
+      );
+      const ready = await waitForJsonLine(child, (o) => o.ready === true, 900_000);
+      xmtpProject = (ready.xmtp as { project: string }).project;
+      const house = (i: number) => join(devDir!, "house-bots", `house-${i}`);
+      expect(lstatSync(join(house(1), "xmtp", "sdk")).isDirectory()).toBe(true);
+      expect(lstatSync(join(house(2), "xmtp", "sdk")).isSymbolicLink()).toBe(true);
+      for (const i of [1, 2]) {
+        const startLine = readFileSync(join(devDir, "logs", `house-${i}.log`), "utf8")
+          .split("\n")
+          .find((l) => l.startsWith("{") && l.includes('"bot":true'));
+        expect(startLine, `house-${i}'s start line`).toBeDefined();
+        expect(JSON.parse(startLine!).fallback, `house-${i}'s start line`).toBe("xmtp");
+      }
+
+      const exited = new Promise<void>((resolvePromise) => child!.once("exit", () => resolvePromise()));
+      process.kill(-child.pid!, "SIGINT");
+      await withDeadline(exited, 90_000, "dev-up did not exit within 90s of SIGINT");
+      expect(composeContainers(xmtpProject)).toEqual([]);
+      xmtpProject = undefined;
+    },
+    1_020_000,
   );
 });
