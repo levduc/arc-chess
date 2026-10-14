@@ -20,7 +20,10 @@ remains the last resort, as today.
    mid-game, finishes the game over XMTP, closes cooperatively, and settles on-chain. It then restarts the server and
    shows the daemons back on the relay.
 2. With XMTP not enabled, behaviour is byte-for-byte today's: every existing test passes unchanged.
-3. An XMTP message from anyone except the channel's opponent session key is dropped before it reaches the session.
+3. An XMTP message from a sender **known** not to be the opponent is dropped before it reaches the session. A
+   message whose sender cannot be determined (a lookup error, timeout or unresolved conversation) reaches the
+   session. There, as with every relayed message, nothing changes without the channel's own session-key
+   signatures. *(Amended 2026-10-14 after three review rounds: a lookup that can fail must never cost liveness.)*
 
 ### Non-goals
 - XMTP as the primary transport.
@@ -61,13 +64,21 @@ remains the last resort, as today.
   A persisted database avoids re-registering an installation. XMTP caps an inbox at 10 installations.
 - **Wire format.** One XMTP text message per `RelayMessage`: `{"arena": 1, "msg": <RelayMessage wire JSON>}`. It
   uses the same encoding the host relay uses (`wire.ts`), at most 16 KiB.
-- **Acceptance.** A message is accepted only when all of the following hold:
-  - the XMTP sender's address equals the opponent's signer for `msg.channelId`;
-  - the conversation is a DM with that address;
-  - the payload parses and validates with the existing wire validators.
-
-  Anything else is dropped and counted (`xmtpDropped`). Inbound messages are rate-limited per channel, with the
-  same budget the host relay enforces. As today, every state and close signature is then verified by the session.
+- **Acceptance.**
+  - **Fast path.** `open()` creates the DM to the peer and remembers its conversation id(s). A message in a known
+    opponent DM needs no lookup.
+  - **Otherwise**, the sender is looked up. A **known stranger** (lookup succeeded, address != the opponent's
+    signer, or a DM with someone else) is dropped and counted (`xmtpDropped`), before it consumes any rate-limit
+    budget. An **undetermined** sender (lookup failed or timed out) is delivered in arrival order to the session,
+    which verifies every state and close signature (`session.receive`, `session.receiveClose`) exactly as it does
+    for host-relay traffic. There is no holding or "gap" machinery.
+  - **Every message also passes:** the 16 KiB cap; `arena === 1`; the existing wire validators; per-channel rate
+    limiting with the host relay's budget; dedupe by XMTP message id.
+  - **Rejections.** A session rejection of an undetermined-sender message is counted in `xmtpDropped`. It never
+    sets `lastError` and is never logged per message, so a stranger flood during a lookup outage cannot spam
+    `status`.
+  - **Accepted residual.** During a lookup outage, strangers' messages share the channel's inbound budget with the
+    opponent's. The chain fallback covers a resulting stall.
 - **Environment.** `xmtp.env` is one of `"local" | "dev" | "production"`, plus optional `apiUrl` (tests, local
   node) and optional `gatewayHost` (production, once fees are enforced).
 
