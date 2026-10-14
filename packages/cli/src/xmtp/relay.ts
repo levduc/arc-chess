@@ -1,6 +1,6 @@
 import type { Address, Hex } from "viem";
 import { decodeWire, parseRelayMessage, toWire, type Params, type RelayMessage, type RelaySigner } from "@arena/sdk";
-import type { XmtpTransport } from "./transport.js";
+import { UNDETERMINED, type XmtpTransport } from "./transport.js";
 
 /**
  * Plan 5.7 (spec §3): the per-channel inbound budget. These are the host relay's own numbers
@@ -36,12 +36,17 @@ const key = (id: Hex) => id.toLowerCase() as Hex;
  * `{"arena":1,"msg":<RelayMessage wire JSON>}` (the host relay's own `toWire` encoding), and accepts an inbound text
  * only when, in this order:
  * 1. it is at most `maxPayloadBytes` (UTF-8);
- * 2. its XMTP sender is the channel's opponent signer;
- * 3. it arrived in the DM with that same address;
+ * 2. its XMTP sender is the channel's opponent signer, or `UNDETERMINED`;
+ * 3. it arrived in the DM with that same address, or one `UNDETERMINED`;
  * 4. the channel's inbound token bucket has a token (`XMTP_INBOUND_BURST` / `XMTP_INBOUND_PER_SEC`);
  * 5. it decodes as wire JSON with `arena === 1`, its `msg` passes `parseRelayMessage`, and `msg.channelId` is the
  *    channel whose client received it.
- * Anything else is dropped and counted (`dropped`). The session still verifies every state and close signature.
+ * Anything else is dropped and counted (`dropped`): a known stranger at 2 or 3, before it can spend the channel's
+ * budget. The session still verifies every state and close signature.
+ *
+ * Spec §3: a message whose sender or conversation the transport could not determine passes on to the session like
+ * any other; it is tagged, and when the session rejects it, `countRejected` counts it as dropped instead of the daemon
+ * reporting an error -- during a lookup outage it may well be a stranger's.
  */
 export class XmtpRelay {
   private readonly xmtp: XmtpTransport;
@@ -53,6 +58,8 @@ export class XmtpRelay {
   private readonly channels = new Map<Hex, Channel>();
   private readonly drops = new Map<Hex, number>();
   private readonly handlers = new Set<(msg: RelayMessage) => void>();
+  /** Accepted messages whose sender or conversation was `UNDETERMINED` (held weakly: gone with the message). */
+  private readonly undetermined = new WeakSet<RelayMessage>();
   private readonly unsubscribe: () => void;
   private stopped = false;
 
@@ -148,6 +155,16 @@ export class XmtpRelay {
     return this.drops.get(key(channelId)) ?? 0;
   }
 
+  /** Spec §3: the session rejected `msg`. True when it came from XMTP with its sender undetermined: it is then counted
+   *  in `dropped` (logged only by the throttled drop summary), and the caller reports nothing. False for anything
+   *  else -- the host relay's messages and the opponent's own -- which the caller handles as before. */
+  countRejected(msg: RelayMessage): boolean {
+    if (!this.undetermined.delete(msg)) return false;
+    const id = key(msg.channelId);
+    if (this.channels.has(id)) this.drop(id, "rejected by the session; its sender could not be determined");
+    return true;
+  }
+
   /** Forgets the channel (its counters too) and stops its XMTP client. */
   async close(channelId: Hex): Promise<void> {
     const id = key(channelId);
@@ -191,8 +208,11 @@ export class XmtpRelay {
     const ch = this.channels.get(id);
     if (!ch) return; // not (or no longer) one of ours: nothing to count it against
     if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > this.maxPayloadBytes) return this.drop(id, "oversized");
-    if (typeof from !== "string" || !same(from, ch.opponent)) return this.drop(id, "not from the opponent");
-    if (typeof dm !== "string" || !same(dm, ch.opponent)) return this.drop(id, "not in the DM with the opponent");
+    // A known stranger is dropped here, before the bucket; an undetermined sender or conversation goes on.
+    const fromUndetermined = typeof from === "string" && same(from, UNDETERMINED);
+    const dmUndetermined = typeof dm === "string" && same(dm, UNDETERMINED);
+    if (!fromUndetermined && (typeof from !== "string" || !same(from, ch.opponent))) return this.drop(id, "not from the opponent");
+    if (!dmUndetermined && (typeof dm !== "string" || !same(dm, ch.opponent))) return this.drop(id, "not in the DM with the opponent");
     if (!this.takeToken(ch)) return this.drop(id, "rate limited");
     let msg: RelayMessage;
     try {
@@ -205,6 +225,7 @@ export class XmtpRelay {
       return this.drop(id, `malformed: ${errorText(err)}`);
     }
     if (!same(msg.channelId, id)) return this.drop(id, "for another channel");
+    if (fromUndetermined || dmUndetermined) this.undetermined.add(msg);
     for (const h of this.handlers) {
       try {
         h(msg);

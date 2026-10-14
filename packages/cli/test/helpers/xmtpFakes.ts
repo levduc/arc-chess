@@ -198,7 +198,19 @@ export class FakeSdk {
   /** The opponent DM's history, oldest first (what `dm.messages()` returns, newest first, limited). */
   readonly history: FakeMessage[] = [];
   readonly messagesCalls: Array<Record<string, unknown>> = [];
+  /** getConversationById calls. */
   lookups = 0;
+  /** Local inbox-state reads (`preferences.getInboxStates`) and network inbox lookups (`fetchInboxIdByIdentifier`). */
+  inboxStateReads = 0;
+  inboxLookups = 0;
+  /** Makes the next N local inbox-state reads throw (a busy DB). */
+  inboxStateFailures = 0;
+  /** Makes the next N network inbox lookups throw (the network is out). */
+  inboxLookupFailures = 0;
+  /** Overrides the local inbox state of an inbox (default: bound to the address its id is made of). */
+  inboxStateOf: ((inboxId: string) => { identifiers: Array<{ identifier: string; identifierKind: number }> }) | null = null;
+  /** Conversation ids of the opponent's stitched duplicate DMs (`dm.duplicateDms()`). */
+  readonly duplicates: string[] = [];
   /** Whether the opponent has registered (`fetchInboxIdByIdentifier` finds it). */
   peerRegistered = true;
   /** Makes the next N streamAllMessages calls fail to start (a `syncAll` failure while offline): like the real
@@ -241,15 +253,28 @@ export class FakeSdk {
           const newestFirst = [...sdk.history].reverse();
           return opts.limit !== undefined ? newestFirst.slice(0, opts.limit) : newestFirst;
         },
+        duplicateDms: async () => sdk.duplicates.map((id) => ({ id, peerInboxId: peerInbox })),
       };
     };
     const client = {
       inboxId: meInbox,
-      fetchInboxIdByIdentifier: async (id: { identifier: string }) =>
-        sdk.peerRegistered && id.identifier.toLowerCase() === peer.toLowerCase() ? peerInbox : null,
+      fetchInboxIdByIdentifier: async (id: { identifier: string }) => {
+        sdk.inboxLookups++;
+        if (sdk.inboxLookupFailures > 0) {
+          sdk.inboxLookupFailures--;
+          throw new Error("network unreachable");
+        }
+        return sdk.peerRegistered && id.identifier.toLowerCase() === peer.toLowerCase() ? peerInbox : null;
+      },
       preferences: {
-        getInboxStates: async (ids: string[]) =>
-          ids.map((i) => ({ identifiers: [{ identifier: i.replace(/^inbox-/, ""), identifierKind: 0 }] })),
+        getInboxStates: async (ids: string[]) => {
+          sdk.inboxStateReads++;
+          if (sdk.inboxStateFailures > 0) {
+            sdk.inboxStateFailures--;
+            throw new Error("database is locked");
+          }
+          return ids.map((i) => sdk.inboxStateOf?.(i) ?? { identifiers: [{ identifier: i.replace(/^inbox-/, ""), identifierKind: 0 }] });
+        },
       },
       conversations: {
         createDmWithIdentifier: async (id: { identifier: string }) => {
@@ -317,6 +342,13 @@ export class FakeSdk {
     return id;
   }
 
+  /** The opponent's stitched duplicate DM with B (as when both sides created a DM at once). */
+  duplicateDm(id: string): string {
+    this.duplicates.push(id);
+    this.conversations.set(id, { id, peerInboxId: FakeSdk.inboxOf(this.peer), consent: [], updateConsentState(s) { this.consent.push(s); } });
+    return id;
+  }
+
   /** A text from `from` in `conversationId`. */
   msg(id: string, from: Address, text: string, conversationId = "dm-ab"): FakeMessage {
     this.clock += 1_000n;
@@ -324,8 +356,8 @@ export class FakeSdk {
   }
 
   /** The opponent sends `text` into the DM: it is in the DM's history, and arrives on the live stream. */
-  arrive(id: string, from: Address, text: string): FakeMessage {
-    const m = this.msg(id, from, text);
+  arrive(id: string, from: Address, text: string, conversationId = "dm-ab"): FakeMessage {
+    const m = this.msg(id, from, text, conversationId);
     this.history.push(m);
     this.stream.push(m);
     return m;

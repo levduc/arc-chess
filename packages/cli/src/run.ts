@@ -1,7 +1,7 @@
 import type { Server } from "node:http";
 import { join } from "node:path";
 import type { Hex } from "viem";
-import type { RelayClient } from "@arena/sdk";
+import type { RelayClient, RelayMessage } from "@arena/sdk";
 import { startApi } from "./api.js";
 import { loadConfig, loadToken, loadWalletKey, type XmtpConfig } from "./config.js";
 import { ArenaDaemon } from "./daemon.js";
@@ -51,6 +51,7 @@ export async function startDaemonProcess(
     const hostRelay = host.relay;
     let relay: RelayClient = hostRelay;
     let transportOf = (id: Hex): ChannelTransport => (hostRelay.isJoined(id) ? "relay" : "none");
+    let relayRejected: ((msg: RelayMessage) => boolean) | undefined;
     // Plan 5.7 (spec §4): the XMTP fallback, only when the host published `xmtp` (cached by init) and the SDK
     // loads. Otherwise the daemon gets the host relay itself, exactly as before.
     if (config.xmtp) {
@@ -67,6 +68,7 @@ export async function startDaemonProcess(
         fallback = fb;
         relay = fb;
         transportOf = (id) => fb.transportOf(id);
+        relayRejected = (msg) => fb.countRejected(msg);
         log(`xmtp: fallback on (env ${config.xmtp.env}, node-sdk ${loaded.version})`);
       } else {
         log(`xmtp: fallback off: ${loaded.reason}`);
@@ -81,6 +83,7 @@ export async function startDaemonProcess(
       log: opts.log,
       transportOf,
       fallback: fallback ? "xmtp" : "off",
+      relayRejected,
     });
     await daemon.start();
 

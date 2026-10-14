@@ -283,6 +283,10 @@ export type DaemonOptions = {
   transportOf?: (channelId: Hex) => ChannelStatus["transport"];
   /** Plan 5.7: whether `relay` falls back to XMTP (the daemon's start line). Default `"off"`. */
   fallback?: "xmtp" | "off";
+  /** Plan 5.7 (spec §3): called when the session rejects a relayed message. True means the relay has counted it as
+   *  dropped -- an XMTP message whose sender could not be determined, a stranger's as likely as not -- so it sets no
+   *  `lastError` and logs nothing. `run.ts` passes `FallbackRelay`'s; without it every rejection is reported. */
+  relayRejected?: (msg: RelayMessage) => boolean;
 };
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
@@ -2224,19 +2228,24 @@ export class ArenaDaemon {
     const l = this.live.get(msg.channelId);
     if (!l) return;
     let closeReceived = false;
+    let accepted = false;
     try {
       if (msg.type === "state") {
         // A re-send after a reconnect (§7) can land as "duplicate" (we already hold it) or "stale" (we've moved
         // past it): both are success, not an error, and neither needs an autoPlay pass.
         const result = await l.session.receive(msg.signed);
+        accepted = true;
         if (this.stopped) return;
         if (result !== "duplicate" && result !== "stale") await this.autoPlay(l);
       } else {
         await l.session.receiveClose(msg.close);
+        accepted = true;
         closeReceived = true;
       }
       l.lastError = null;
     } catch (err) {
+      // Plan 5.7 (spec §3): the relay counts a rejected message whose sender it could not determine; nothing changed.
+      if (!accepted && this.opts.relayRejected?.(msg) === true) return;
       l.lastError = errorText(err);
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }

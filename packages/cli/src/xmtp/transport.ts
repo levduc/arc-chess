@@ -12,19 +12,30 @@ export interface XmtpTransport {
   /** Starts (or resumes from its DB) the XMTP client for one channel's session key, and opens a DM to `peer`. */
   open(channelId: Hex, me: RelaySigner, peer: Address): Promise<void>;
   send(channelId: Hex, text: string): Promise<void>;
-  /** `from` is the XMTP sender's Ethereum address; `dm` is the peer address of the conversation it arrived in. */
+  /** `from` is the XMTP sender's Ethereum address; `dm` is the peer address of the conversation it arrived in.
+   *  Either is `NOT_THE_PEER` when it is known not to be the opponent, and `UNDETERMINED` when it could not be
+   *  determined (spec §3: such a message still reaches the session, which checks every signature). */
   onText(handler: (channelId: Hex, from: Address, dm: Address, text: string) => void): () => void;
   close(channelId: Hex): Promise<void>;
   stop(): Promise<void>;
 }
 
 /**
- * What the node-SDK transport reports as `from` (or `dm`) for a sender (or conversation) that is not the channel's
- * opponent. It never resolves a stranger's inbox to an address: once the opponent's inbox is known, a flood from third
- * parties costs one string compare each, and the zero address can never equal a channel's signer, so `XmtpRelay`
- * drops it as a wrong sender.
+ * What the node-SDK transport reports as `from` (or `dm`) for a sender (or conversation) known not to be the
+ * channel's opponent. It never resolves a stranger's inbox to an address: once the opponent's inbox is known, a
+ * flood from third parties costs one string compare each, and the zero address can never equal a channel's signer,
+ * so `XmtpRelay` drops it as a wrong sender, before the channel's rate limit.
  */
 export const NOT_THE_PEER: Address = "0x0000000000000000000000000000000000000000";
+
+/**
+ * What the node-SDK transport reports as `from` (or `dm`) when it could not tell whether the sender (or the
+ * conversation) is the opponent's: a local read failed or came back empty, and the network has not answered yet.
+ * Spec §3: such a message is delivered, in arrival order, like any other; the session verifies every state and
+ * close signature, and `XmtpRelay` counts a rejection of it silently. Like `NOT_THE_PEER`, an address nobody holds
+ * a key for.
+ */
+export const UNDETERMINED: Address = "0x0000000000000000000000000000000000000001";
 
 /** How many of the opponent DM's latest messages are re-delivered each time the inbound stream (re)starts: a stream
  *  only carries messages that arrive after it starts, so a message that landed while the daemon was down (a restart
@@ -59,13 +70,16 @@ type SdkDm = SdkConversation & {
   readonly peerInboxId: string;
   sendText(text: string): Promise<string>;
   messages(opts?: { limit?: number; direction?: number }): Promise<SdkMessage[]>;
+  /** The opponent's other DMs with us, which XMTP stitches into this one (both sides created one at once). */
+  duplicateDms?(): Promise<SdkConversation[]>;
 };
 /** The SDK's AsyncStreamProxy: async-iterable, ended by `end()`. */
 type SdkStream = AsyncIterable<SdkMessage | undefined> & { end(): Promise<unknown> };
+type SdkInboxState = { identifiers?: SdkIdentifier[]; recoveryIdentifier?: SdkIdentifier };
 type SdkClient = {
   readonly inboxId: string;
   fetchInboxIdByIdentifier(identifier: SdkIdentifier): Promise<string | null>;
-  preferences?: { getInboxStates(inboxIds: string[]): Promise<Array<{ identifiers?: SdkIdentifier[] }>> };
+  preferences?: { getInboxStates(inboxIds: string[]): Promise<SdkInboxState[]> };
   conversations: {
     createDmWithIdentifier(identifier: SdkIdentifier): Promise<SdkDm>;
     getConversationById(id: string): Promise<SdkConversation | undefined>;
@@ -87,6 +101,9 @@ type NodeSdk = {
   isText?: (m: SdkMessage) => boolean;
 };
 
+/** Who sent a message, as far as this channel can tell (spec §3). */
+type Sender = "opponent" | "stranger" | "undetermined";
+
 type Entry = {
   channelId: Hex;
   me: RelaySigner;
@@ -95,37 +112,26 @@ type Entry = {
   stream: SdkStream | null;
   dm: SdkDm | null;
   peerInboxId: string | null;
+  /** When (monotonic ms) the opponent's inbox was last looked up on the network, and whether a lookup is running. */
   lastPeerLookup: number;
+  peerLookupRunning: boolean;
   opening: Promise<void>;
   closed: boolean;
   /** Cancels the restart back-off sleep, if one is running. */
   wake: (() => void) | null;
   /** XMTP message ids already delivered, oldest first (bounded): the catch-up and the stream can overlap. */
   seen: Set<string>;
-  /** conversationId -> the DM's peer inbox id (null: not a DM), so a conversation is looked up once, not per message.
-   *  Only definitive answers are cached: a lookup that came back empty (the SDK turns any error into `undefined`) is
-   *  retried, no sooner than `unresolvedUntil` allows. */
+  /** conversationId -> the DM's peer inbox id (null: not a DM). Only definitive answers are cached: the opponent's
+   *  DM and its stitched duplicates (from `open`), and conversations looked up once (bounded). A message in a
+   *  conversation cached as the opponent's DM is the opponent's, with no lookup at all (the fast path). */
   convPeer: Map<string, string | null>;
-  /** conversationId -> when (monotonic ms) a lookup that came back empty may be tried again (bounded). */
-  unresolvedUntil: Map<string, number>;
+  /** conversationId -> when (monotonic ms) a lookup that came back empty may be tried again (bounded). This only
+   *  spares the native DB a lookup per message: it never holds a message, which is delivered as undetermined. */
+  lookupAgainAt: Map<string, number>;
   /** Sender inbox ids found not to be the opponent's while its inbox was still unknown (bounded). */
   notPeer: Set<string>;
   /** Strangers' conversations already denied (bounded). */
   denied: Set<string>;
-  /** Set when an opponent message's conversation could not be resolved: from then on every opponent message is
-   *  held (in `held`, neither emitted nor `seen`), so none can overtake it, until a catch-up -- which finds the DM by
-   *  the opponent's address, the path that handles XMTP's DM stitching -- resolves them all, in order. */
-  gap: boolean;
-  /** The opponent's messages held while `gap` is set, in arrival order (bounded: `HELD_MAX`). */
-  held: SdkMessage[];
-  /** While `gap` is set: when (monotonic ms) the next catch-up may be tried, and the back-off after that. */
-  gapRetryAt: number;
-  gapBackoffMs: number;
-  /** While `gap` is set: restarts the stream when the next catch-up is due, so the gap closes even if no further
-   *  message arrives. One pending at a time. */
-  refresh: ReturnType<typeof setTimeout> | undefined;
-  /** The next restart is a deliberate one: no back-off. */
-  refreshing: boolean;
 };
 
 /** A failed or ended stream is re-created after this back-off, doubling up to the cap, for as long as the channel is
@@ -135,25 +141,14 @@ const STREAM_RESTART_MAX_MS = 30_000;
 /** A stream that stayed up this long resets the back-off. */
 const STREAM_HEALTHY_MS = 60_000;
 /** The opponent's inbox id is looked up on the network at most this often until it is known (it is null until the
- *  opponent's own client has registered). */
+ *  opponent's own client has registered). The lookup runs beside the inbound queue, never in it. */
 const PEER_LOOKUP_INTERVAL_MS = 1_000;
+/** A conversation whose lookup came back empty is not looked up again for this long. */
+const LOOKUP_RETRY_MS = 5_000;
 /** Bounds on the per-channel caches above. */
 const SEEN_MAX = 512;
 const CACHE_MAX = 256;
-/** An opponent message whose conversation lookup comes back empty is retried in place this many times, after these
- *  pauses, before it is passed on as "not in the DM" (and left un-`seen`, so a later catch-up can deliver it). The
- *  channel's later messages wait meanwhile: delivery order is kept. */
-const UNRESOLVED_RETRY_MS = [100, 400, 1_500];
-/** After that, the same conversation is not looked up again for this long (a hot loop is impossible). */
-const UNRESOLVED_HOLD_MS = 5_000;
-/** While a gap is open: the first catch-up retry comes after this long, doubling up to the cap. */
-const GAP_RETRY_MIN_MS = 5_000;
-const GAP_RETRY_MAX_MS = 60_000;
-/** At most this many opponent messages are held while a gap is open, each at most `HELD_TEXT_MAX` characters (larger
- *  ones are over XmtpRelay's 16 KiB anyway). A catch-up reads `XMTP_CATCH_UP_MESSAGES` plus the held count back. */
-const HELD_MAX = 64;
-const HELD_TEXT_MAX = 64 * 1024;
-/** The network calls on the inbound path (the opponent's inbox, the DM) give up after this long. */
+/** The network calls of the catch-up (the DM, its history) give up after this long. */
 const NETWORK_TIMEOUT_MS = 5_000;
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
@@ -163,6 +158,13 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 function remember<T>(set: Set<T>, value: T, max: number): void {
   set.add(value);
   if (set.size > max) set.delete(set.values().next().value as T);
+}
+
+/** Sets `key` in a bounded insertion-ordered map (re-inserted last), evicting the oldest. */
+function cache<V>(map: Map<string, V>, key: string, value: V, max: number): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > max) map.delete(map.keys().next().value as string);
 }
 
 /** `p`, or a rejection after `ms` (the call itself carries on). The timer never keeps the process alive. */
@@ -189,21 +191,25 @@ const monotonic = () => performance.now();
  * is read, which is why `onValue` is never used. The transport owns the restart loop (`retryOnFail: false`): a
  * stream that fails or ends is re-created with back-off for as long as the channel is open, and never after `close`.
  *
- * Sender and conversation are resolved against the opponent's inbox only (see `NOT_THE_PEER`). A DM's peer is looked
- * up once per conversation and cached; a lookup that comes back empty is retried in place (bounded), never cached. If
- * it stays empty, the channel opens a *gap*: that message and every later one from the opponent are held (bounded,
- * never emitted or marked delivered), and a catch-up -- which finds the DM by the opponent's address, across XMTP's
- * DM stitching, with no conversation lookup -- resolves them all and delivers them in send order. It is tried at once,
- * then with back-off (a stream restart arms each retry, so the gap closes even if the opponent sends nothing more)
- * until it succeeds. Only the opponent's own messages can open a gap; a stranger never can.
+ * Acceptance (spec §3), per message, with no network call and no wait on the inbound path:
+ * - **Fast path.** `open` creates (or finds) the DM to the opponent and caches its conversation id and those of its
+ *   stitched duplicates. A message in one of them is the opponent's: a DM has two members, and our own echoes are
+ *   skipped. No lookup.
+ * - **Otherwise the sender is looked up**, locally: against the opponent's inbox id once known, else in the sender's
+ *   own inbox state (it lists the identifiers bound to that inbox). The opponent's message is then checked to be in
+ *   a DM with the opponent, by one conversation lookup, cached.
+ * - **A known stranger** -- the lookup succeeded and the sender is not the opponent, or the conversation is not a DM
+ *   with the opponent -- is passed on as `NOT_THE_PEER`, for `XmtpRelay` to drop and count before its rate limit,
+ *   and its DM is set to consent `Denied`.
+ * - **Anything else is undetermined** -- a local read failed or came back empty, or the opponent's inbox is not
+ *   known yet (it is then looked up on the network in the background, for later messages) -- and is passed on as
+ *   `UNDETERMINED`, at once and in order, never held: the session, which checks every signature, decides.
  *
- * Strangers: a stranger's DM is set to consent `Denied` on its first message -- once the opponent's inbox is known,
- * or earlier, when the sender's own inbox (read locally) is bound to addresses that do not include the opponent's.
- * Every stream (re)start also denies any group still in `Unknown` consent (an arena channel never uses groups). Streams
- * and syncs ask only for `Allowed` and `Unknown` conversations, so a stranger is dropped and counted once and its
- * conversation is not synced again. What the SDK stores regardless: each stranger's welcome (the new conversation),
- * the messages it delivered before the deny (for a group: what the next restart's sync fetched), and its inbox's
- * identity record -- all in the channel's own encrypted DB.
+ * Strangers: every stream (re)start also denies any group still in `Unknown` consent (an arena channel never uses
+ * groups). Streams and syncs ask only for `Allowed` and `Unknown` conversations, so a known stranger is dropped and
+ * counted once and its conversation is not synced again. What the SDK stores regardless: each stranger's welcome
+ * (the new conversation), the messages it delivered before the deny (for a group: what the next restart's sync
+ * fetched), and its inbox's identity record -- all in the channel's own encrypted DB.
  *
  * The SDK has no public way to close a client: `close`/`stop` end the channel's stream, stop its restart loop and drop
  * every reference; the native client releases its DB when it is garbage-collected. The DB file is never deleted.
@@ -230,91 +236,79 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     }
   }
 
-  /** The opponent's inbox id, if known yet, and whether `sender` is definitely someone else. While the opponent's
-   *  inbox is unknown, the sender is checked locally first (an inbox lists the addresses bound to it, each by that
-   *  address's own signature, so an inbox whose list lacks the opponent's address is not the opponent's), then on the
-   *  network, throttled and with a timeout. */
-  async function peerInboxIdOf(e: Entry, sender: string): Promise<{ peer: string | null; stranger: boolean }> {
-    if (e.peerInboxId !== null) return { peer: e.peerInboxId, stranger: !same(sender, e.peerInboxId) };
-    if (e.dm) {
-      e.peerInboxId = e.dm.peerInboxId;
-      return { peer: e.peerInboxId, stranger: !same(sender, e.peerInboxId) };
-    }
-    if (!e.client) return { peer: null, stranger: false };
-    if (e.notPeer.has(sender)) return { peer: null, stranger: true };
-    const states = (await e.client.preferences?.getInboxStates([sender]).catch(() => [])) ?? [];
-    const bound = (states[0]?.identifiers ?? []).filter((i) => i.identifierKind === ethereum);
-    if (bound.some((i) => same(i.identifier, e.peer))) {
-      e.peerInboxId = sender;
-      return { peer: sender, stranger: false };
-    }
-    if (bound.length > 0) {
-      remember(e.notPeer, sender, CACHE_MAX); // bound to other addresses only: definitely not the opponent
-      return { peer: null, stranger: true };
-    }
-    if (monotonic() - e.lastPeerLookup >= PEER_LOOKUP_INTERVAL_MS) {
-      e.lastPeerLookup = monotonic();
-      const client = e.client;
-      const id = await withTimeout(client.fetchInboxIdByIdentifier(identifierOf(e.peer)), NETWORK_TIMEOUT_MS, "inbox lookup").catch(
-        () => null,
-      );
-      if (id) e.peerInboxId = id;
-    }
-    return { peer: e.peerInboxId, stranger: e.peerInboxId !== null && !same(sender, e.peerInboxId) };
+  /** The opponent's inbox id, once known (from its DM, its own messages, or the network). */
+  function peerInboxOf(e: Entry): string | null {
+    if (e.peerInboxId === null && e.dm) e.peerInboxId = e.dm.peerInboxId;
+    return e.peerInboxId;
   }
 
-  /** The DM to the opponent, created (or found: the SDK returns an existing DM) on first use. It fails until the
-   *  opponent's client has registered, so it is retried on every `send` and stream (re)start. */
-  async function dmOf(e: Entry): Promise<SdkDm> {
-    if (e.dm) return e.dm;
-    if (!e.client) throw new Error("xmtp: client not started");
-    const dm = await e.client.conversations.createDmWithIdentifier(identifierOf(e.peer));
-    e.dm = dm;
-    if (e.peerInboxId === null) e.peerInboxId = dm.peerInboxId;
-    e.convPeer.set(dm.id, dm.peerInboxId);
-    e.unresolvedUntil.delete(dm.id);
-    return dm;
+  /** Whether a conversation is cached as our DM with the opponent: the fast path. */
+  function isOpponentDm(e: Entry, conversationId: string): boolean {
+    const peerInbox = peerInboxOf(e);
+    const dmPeer = e.convPeer.get(conversationId);
+    return peerInbox !== null && typeof dmPeer === "string" && same(dmPeer, peerInbox);
   }
 
-  /** Whether a conversation whose lookup came back empty is still inside its hold (not to be looked up yet). */
-  function isHeld(e: Entry, conversationId: string): boolean {
-    const until = e.unresolvedUntil.get(conversationId);
-    return until !== undefined && monotonic() < until;
+  /** Looks the opponent's inbox id up on the network, in the background (throttled, one at a time, with a timeout),
+   *  so that later messages can be told apart. The message at hand never waits for it. */
+  function lookUpPeerInbox(e: Entry): void {
+    const client = e.client;
+    if (!client || e.peerLookupRunning || monotonic() - e.lastPeerLookup < PEER_LOOKUP_INTERVAL_MS) return;
+    e.peerLookupRunning = true;
+    e.lastPeerLookup = monotonic();
+    const lookup = Promise.resolve().then(() => client.fetchInboxIdByIdentifier(identifierOf(e.peer)));
+    withTimeout(lookup, NETWORK_TIMEOUT_MS, "inbox lookup")
+      .then(
+        (id) => {
+          if (id && e.peerInboxId === null) e.peerInboxId = id;
+        },
+        () => undefined,
+      )
+      .finally(() => {
+        e.peerLookupRunning = false;
+      });
   }
 
-  /** A conversation, never looked up while held. */
+  /** Who sent a message. Known only on a definitive answer: the opponent's inbox id compared, or the sender's own
+   *  inbox state (read locally) listing identifiers -- the opponent's address among them or not. A failed or empty
+   *  read leaves the sender undetermined. */
+  async function senderOf(e: Entry, sender: string): Promise<Sender> {
+    const peerInbox = peerInboxOf(e);
+    if (peerInbox !== null) return same(sender, peerInbox) ? "opponent" : "stranger";
+    if (e.notPeer.has(sender)) return "stranger";
+    let state: SdkInboxState | undefined;
+    try {
+      state = (await e.client?.preferences?.getInboxStates([sender]))?.[0];
+    } catch {
+      state = undefined; // a native error: undetermined, below
+    }
+    const ids = [...(state?.identifiers ?? []), ...(state?.recoveryIdentifier ? [state.recoveryIdentifier] : [])];
+    if (ids.some((i) => i.identifierKind === ethereum && same(i.identifier, e.peer))) {
+      e.peerInboxId = sender; // the opponent's inbox: its creating address, the session key, is bound to it
+      return "opponent";
+    }
+    if (ids.length > 0) {
+      remember(e.notPeer, sender, CACHE_MAX); // bound to other identifiers only: definitely not the opponent
+      return "stranger";
+    }
+    lookUpPeerInbox(e);
+    return "undetermined";
+  }
+
+  /** A conversation, or undefined (the SDK's answer to any native error), never looked up again within
+   *  `LOOKUP_RETRY_MS` of an empty answer. */
   async function lookUp(e: Entry, conversationId: string): Promise<SdkConversation | undefined> {
-    if (isHeld(e, conversationId)) return undefined;
-    const conv = await e.client?.conversations.getConversationById(conversationId);
-    if (conv) e.unresolvedUntil.delete(conversationId);
+    const again = e.lookupAgainAt.get(conversationId);
+    if (again !== undefined && monotonic() < again) return undefined;
+    let conv: SdkConversation | undefined;
+    try {
+      conv = await e.client?.conversations.getConversationById(conversationId);
+    } catch {
+      conv = undefined;
+    }
+    if (conv) e.lookupAgainAt.delete(conversationId);
+    else cache(e.lookupAgainAt, conversationId, monotonic() + LOOKUP_RETRY_MS, CACHE_MAX);
     return conv;
-  }
-
-  function holdUnresolved(e: Entry, conversationId: string): void {
-    e.unresolvedUntil.delete(conversationId); // re-inserted last: the bound evicts the oldest hold
-    e.unresolvedUntil.set(conversationId, monotonic() + UNRESOLVED_HOLD_MS);
-    if (e.unresolvedUntil.size > CACHE_MAX) e.unresolvedUntil.delete(e.unresolvedUntil.keys().next().value as string);
-  }
-
-  /** A conversation's DM peer inbox id (null when not a DM), cached once known; `unresolved` when the lookup came
-   *  back empty even after `UNRESOLVED_RETRY_MS`. */
-  async function convPeerOf(e: Entry, conversationId: string): Promise<{ peer: string | null; conv?: SdkConversation; unresolved?: true }> {
-    if (e.convPeer.has(conversationId)) return { peer: e.convPeer.get(conversationId) ?? null };
-    if (isHeld(e, conversationId)) return { peer: null, unresolved: true }; // no lookup, no retries: still held
-    let conv = await lookUp(e, conversationId);
-    for (const pause of UNRESOLVED_RETRY_MS) {
-      if (conv || e.closed) break;
-      await sleep(e, pause);
-      conv = await lookUp(e, conversationId);
-    }
-    if (!conv) {
-      holdUnresolved(e, conversationId);
-      return { peer: null, unresolved: true };
-    }
-    const peer = typeof conv.peerInboxId === "string" ? conv.peerInboxId : null;
-    e.convPeer.set(conversationId, peer);
-    if (e.convPeer.size > CACHE_MAX) e.convPeer.delete(e.convPeer.keys().next().value as string);
-    return { peer, conv };
   }
 
   /** Sets a conversation's consent; never throws (a native failure only means it is tried again later). */
@@ -328,18 +322,28 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     }
   }
 
-  /** Stops a stranger's DM from being streamed or synced again (spec §3: it has been dropped and counted once). */
+  /** Whether the opponent's message arrived in a DM with the opponent, by one lookup per conversation (cached);
+   *  undetermined while the lookup comes back empty. */
+  async function inOpponentDm(e: Entry, conversationId: string): Promise<boolean | "undetermined"> {
+    if (!e.convPeer.has(conversationId)) {
+      const conv = await lookUp(e, conversationId);
+      if (!conv) return "undetermined";
+      const peer = typeof conv.peerInboxId === "string" ? conv.peerInboxId : null;
+      cache(e.convPeer, conversationId, peer, CACHE_MAX);
+      if (isOpponentDm(e, conversationId)) setConsent(conv, consent?.Allowed);
+    }
+    return isOpponentDm(e, conversationId);
+  }
+
+  /** Stops a known stranger's DM from being streamed or synced again (spec §3: it has been dropped and counted). */
   async function deny(e: Entry, conversationId: string, sender: string): Promise<void> {
     if (consent?.Denied === undefined || e.denied.has(conversationId)) return;
-    if (isHeld(e, conversationId)) return;
     const conv = await lookUp(e, conversationId);
-    if (!conv) {
-      holdUnresolved(e, conversationId); // tried again on a later message, no sooner than the hold allows
-      return;
-    }
+    if (!conv) return; // tried again on a later message, no sooner than LOOKUP_RETRY_MS
     // Only ever a DM whose peer is this stranger: never the opponent's.
     if (typeof conv.peerInboxId !== "string" || !same(conv.peerInboxId, sender)) return;
-    if (e.peerInboxId !== null && same(conv.peerInboxId, e.peerInboxId)) return;
+    const peerInbox = peerInboxOf(e);
+    if (peerInbox !== null && same(conv.peerInboxId, peerInbox)) return;
     if (setConsent(conv, consent.Denied)) remember(e.denied, conversationId, CACHE_MAX);
   }
 
@@ -358,134 +362,89 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
     if (n > 0) log(`xmtp: channel ${e.channelId}: denied ${n} group invite(s) from strangers`);
   }
 
-  /** One inbound message, start to finish; called strictly one at a time per channel. */
+  /** Hands one message on, once (spec §3: dedupe by XMTP message id). */
+  function pass(e: Entry, m: SdkMessage, from: Address, dm: Address): void {
+    remember(e.seen, m.id, SEEN_MAX);
+    emit(e.channelId, from, dm, m.content as string);
+  }
+
+  /** One inbound message, start to finish; called strictly one at a time per channel. It never waits on the network
+   *  and never holds a message back. */
   async function deliver(e: Entry, m: SdkMessage | undefined): Promise<void> {
     if (!m || e.closed || !e.client || !isText(m)) return;
     if (e.seen.has(m.id)) return; // already delivered by the catch-up (or the stream)
     if (same(m.senderInboxId, e.client.inboxId)) return; // our own send, echoed back by the stream
-    const { peer: peerInbox, stranger } = await peerInboxIdOf(e, m.senderInboxId);
-    if (peerInbox === null || !same(m.senderInboxId, peerInbox)) {
-      // A stranger: it cannot be in our DM with the opponent (a DM has two members), so neither field is the peer.
-      // Nothing here can open a gap, hold a message or restart the stream.
-      if (stranger) await deny(e, m.conversationId, m.senderInboxId).catch(() => undefined);
+    if (isOpponentDm(e, m.conversationId)) return pass(e, m, e.peer, e.peer); // the fast path
+    const sender = await senderOf(e, m.senderInboxId);
+    if (e.closed) return;
+    if (sender === "stranger") {
+      // It cannot be in our DM with the opponent (a DM has two members), so neither field is the peer.
+      await deny(e, m.conversationId, m.senderInboxId).catch(() => undefined);
       emit(e.channelId, NOT_THE_PEER, NOT_THE_PEER, m.content as string);
       return;
     }
-    if (e.gap) {
-      // An earlier opponent message is still unresolved: nothing of the opponent's may overtake it.
-      hold(e, m);
-      if (monotonic() >= e.gapRetryAt) await closeGap(e);
-      return;
-    }
-    const { peer: dmPeer, conv, unresolved } = await convPeerOf(e, m.conversationId);
+    if (sender === "undetermined") return pass(e, m, UNDETERMINED, UNDETERMINED);
+    const inDm = await inOpponentDm(e, m.conversationId);
     if (e.closed) return;
-    if (unresolved) {
-      // Not resolvable by its conversation id: hold it, and resolve it at once the way the catch-up does.
-      e.gap = true;
-      e.gapBackoffMs = GAP_RETRY_MIN_MS;
-      e.gapRetryAt = 0;
-      log(`xmtp: channel ${e.channelId}: the opponent's message ${m.id} could not be placed; holding the opponent's messages until a catch-up resolves them`);
-      hold(e, m);
-      await closeGap(e);
+    if (inDm === false) {
+      emit(e.channelId, e.peer, NOT_THE_PEER, m.content as string); // the opponent, but not in its DM with us
       return;
     }
-    const inTheDm = dmPeer !== null && same(dmPeer, peerInbox);
-    if (inTheDm && conv) setConsent(conv, consent?.Allowed);
-    if (inTheDm) remember(e.seen, m.id, SEEN_MAX); // delivered for good: a catch-up must not repeat it
-    emit(e.channelId, e.peer, inTheDm ? e.peer : NOT_THE_PEER, m.content as string);
+    pass(e, m, e.peer, inDm === true ? e.peer : UNDETERMINED);
   }
 
-  /** Keeps an opponent message for the gap's catch-up (bounded; never emitted or marked `seen` here). */
-  function hold(e: Entry, m: SdkMessage): void {
-    if (e.held.some((h) => h.id === m.id)) return;
-    if (e.held.length >= HELD_MAX || (m.content as string).length > HELD_TEXT_MAX) {
-      if (e.held.length === HELD_MAX) log(`xmtp: channel ${e.channelId}: ${HELD_MAX} opponent messages held; later ones are left to the catch-up`);
+  /** The DM to the opponent, created (or found: the SDK returns an existing DM) on first use. It fails until the
+   *  opponent's client has registered, so it is retried on every `send` and stream (re)start. */
+  async function dmOf(e: Entry): Promise<SdkDm> {
+    if (e.dm) return e.dm;
+    if (!e.client) throw new Error("xmtp: client not started");
+    const dm = await e.client.conversations.createDmWithIdentifier(identifierOf(e.peer));
+    e.dm = dm;
+    if (e.peerInboxId === null) e.peerInboxId = dm.peerInboxId;
+    cache(e.convPeer, dm.id, dm.peerInboxId, CACHE_MAX);
+    e.lookupAgainAt.delete(dm.id);
+    return dm;
+  }
+
+  /** Caches the conversation ids of the opponent DM's stitched duplicates (both sides created a DM at once), so
+   *  messages in them take the fast path too. Best-effort: a duplicate it misses costs one lookup, once. */
+  async function rememberDuplicates(e: Entry, dm: SdkDm): Promise<void> {
+    if (typeof dm.duplicateDms !== "function") return;
+    let dups: SdkConversation[];
+    try {
+      dups = await withTimeout(dm.duplicateDms(), NETWORK_TIMEOUT_MS, "duplicate DMs");
+    } catch {
       return;
     }
-    e.held.push(m);
+    for (const d of dups) {
+      if (typeof d.peerInboxId === "string" && same(d.peerInboxId, dm.peerInboxId)) cache(e.convPeer, d.id, d.peerInboxId, CACHE_MAX);
+    }
   }
 
-  /** Emits one of the opponent's messages known to be in its DM, once. */
-  function emitOpponent(e: Entry, m: SdkMessage, peerInbox: string): void {
-    if (!isText(m) || e.seen.has(m.id) || !same(m.senderInboxId, peerInbox)) return;
-    remember(e.seen, m.id, SEEN_MAX);
-    emit(e.channelId, e.peer, e.peer, m.content as string);
-  }
-
-  /** Tries the catch-up that closes an open gap; on failure, schedules the next try (back-off) and a stream restart
-   *  for then, so the gap closes even if the opponent sends nothing more. */
-  async function closeGap(e: Entry): Promise<void> {
-    if (!e.gap || e.closed) return;
-    if (await catchUp(e)) return;
-    e.gapRetryAt = monotonic() + e.gapBackoffMs;
-    scheduleRefresh(e, e.gapBackoffMs);
-    log(`xmtp: channel ${e.channelId}: catch-up failed with ${e.held.length} message(s) held; retrying in ${e.gapBackoffMs / 1000}s`);
-    e.gapBackoffMs = Math.min(GAP_RETRY_MAX_MS, e.gapBackoffMs * 2);
-  }
-
-  /** Restarts the channel's stream after `ms` (one pending at a time): the restart runs a catch-up first. */
-  function scheduleRefresh(e: Entry, ms: number): void {
-    if (e.refresh !== undefined || e.closed) return;
-    e.refresh = setTimeout(() => {
-      e.refresh = undefined;
-      if (e.closed || !e.gap || !e.stream) return;
-      e.refreshing = true;
-      void e.stream.end().catch(() => undefined);
-    }, ms);
-    e.refresh.unref?.();
-  }
-
-  /**
-   * Re-delivers the opponent DM's latest messages, oldest first. The DM is found by the opponent's address (`dmOf`,
-   * which the SDK resolves across XMTP's duplicate-DM stitching), so no conversation lookup is involved, and every
-   * message it lists is the DM's. While a gap is open it also reads back as far as the held messages reach, merges
-   * them in (by send time), and on success closes the gap. Returns whether it ran to the end.
-   */
-  async function catchUp(e: Entry): Promise<boolean> {
+  /** Re-delivers the opponent DM's latest messages, oldest first, through `deliver`. The DM is found by the
+   *  opponent's address (`dmOf`), so its own messages take the fast path. */
+  async function catchUp(e: Entry): Promise<void> {
     let dm: SdkDm;
     try {
       dm = await withTimeout(dmOf(e), NETWORK_TIMEOUT_MS, "DM lookup");
     } catch {
-      return false; // the opponent has not registered yet (or the network is out): nothing to catch up on now
+      return; // the opponent has not registered yet (or the network is out): nothing to catch up on now
     }
-    const limit = XMTP_CATCH_UP_MESSAGES + (e.gap ? e.held.length : 0);
+    await rememberDuplicates(e, dm);
     let recent: SdkMessage[];
     try {
-      recent = await withTimeout(dm.messages({ limit, direction: sdk.SortDirection?.Descending }), NETWORK_TIMEOUT_MS, "catch-up");
+      recent = await withTimeout(
+        dm.messages({ limit: XMTP_CATCH_UP_MESSAGES, direction: sdk.SortDirection?.Descending }),
+        NETWORK_TIMEOUT_MS,
+        "catch-up",
+      );
     } catch {
-      return false;
+      return;
     }
-    if (e.closed) return false;
-    const peerInbox = dm.peerInboxId;
-    const ordered = recent.slice(0, limit).reverse(); // oldest first
-    const ids = new Set(ordered.map((m) => m.id));
-    let lost = 0;
-    if (e.gap) {
-      // Held messages the listing did not reach: still the DM's if they arrived in it (or a stitched duplicate of it).
-      for (const h of e.held) {
-        if (ids.has(h.id)) continue;
-        const cached = e.convPeer.get(h.conversationId);
-        if (h.conversationId === dm.id || (typeof cached === "string" && same(cached, peerInbox))) {
-          ordered.push(h);
-          ids.add(h.id);
-        } else lost++;
-      }
+    for (const m of recent.slice(0, XMTP_CATCH_UP_MESSAGES).reverse()) {
+      if (e.closed) return;
+      await deliver(e, m);
     }
-    // By send time when every message carries one (a stable sort keeps arrival order among equals).
-    if (ordered.every((m) => typeof m.sentAtNs === "bigint")) {
-      ordered.sort((a, b) => ((a.sentAtNs as bigint) < (b.sentAtNs as bigint) ? -1 : (a.sentAtNs as bigint) > (b.sentAtNs as bigint) ? 1 : 0));
-    }
-    const wasGap = e.gap;
-    const heldCount = e.held.length;
-    e.gap = false;
-    e.held = [];
-    clearTimeout(e.refresh);
-    e.refresh = undefined;
-    for (const m of ordered) emitOpponent(e, m, peerInbox);
-    if (wasGap) {
-      log(`xmtp: channel ${e.channelId}: catch-up resolved ${heldCount} held message(s)` + (lost > 0 ? `; ${lost} could not be found in the DM` : ""));
-    }
-    return true;
   }
 
   /** Waits `ms`, or less if the channel is closed meanwhile. Never keeps the process alive. */
@@ -526,8 +485,7 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       if (stream && !e.closed) {
         e.stream = stream;
         denyStrangerGroups(e);
-        if (e.gap) await closeGap(e);
-        else await catchUp(e);
+        await catchUp(e);
         if (first) ready();
         first = false;
         for await (const m of stream) {
@@ -539,8 +497,7 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       if (first) ready();
       first = false;
       if (e.closed) return;
-      if (monotonic() - startedAt >= STREAM_HEALTHY_MS || e.refreshing) backoff = STREAM_RESTART_MIN_MS;
-      e.refreshing = false;
+      if (monotonic() - startedAt >= STREAM_HEALTHY_MS) backoff = STREAM_RESTART_MIN_MS;
       log(`xmtp: channel ${e.channelId}: inbound stream ended; restarting in ${backoff / 1000}s`);
       await sleep(e, backoff);
       backoff = Math.min(STREAM_RESTART_MAX_MS, backoff * 2);
@@ -579,21 +536,16 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
         stream: null,
         dm: null,
         peerInboxId: null,
-        lastPeerLookup: 0,
+        lastPeerLookup: Number.NEGATIVE_INFINITY,
+        peerLookupRunning: false,
         opening: Promise.resolve(),
         closed: false,
         wake: null,
         seen: new Set(),
         convPeer: new Map(),
-        unresolvedUntil: new Map(),
+        lookupAgainAt: new Map(),
         notPeer: new Set(),
         denied: new Set(),
-        gap: false,
-        held: [],
-        gapRetryAt: 0,
-        gapBackoffMs: GAP_RETRY_MIN_MS,
-        refresh: undefined,
-        refreshing: false,
       };
       e.opening = start(e).catch((err: unknown) => {
         // Forgotten, so the next `open` starts over (XmtpRelay retries it).
@@ -620,7 +572,6 @@ export function createNodeSdkTransport(opts: { sdk: unknown; dbDir: string; conf
       if (!e) return;
       entries.delete(channelId);
       e.closed = true;
-      clearTimeout(e.refresh);
       e.wake?.();
       await e.stream?.end().catch(() => undefined);
       await e.opening.catch(() => undefined);

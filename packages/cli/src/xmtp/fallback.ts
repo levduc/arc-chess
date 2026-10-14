@@ -66,7 +66,9 @@ const key = (id: Hex) => id.toLowerCase() as Hex;
  * chain fallback (challenge and respond) covers it, as before.
  *
  * Receive: messages from both transports go to the same handlers. A message that arrives by both is harmless: the
- * session treats an exact repeat as a no-op, and the close path is idempotent. `onJoined` is the host's alone.
+ * session treats an exact repeat as a no-op, and the close path is idempotent. `onJoined` is the host's alone. An
+ * XMTP message whose sender could not be determined reaches the handlers too (spec §3); the daemon hands a session
+ * rejection of it back to `countRejected`.
  *
  * When a channel goes down, the last few messages it sent via the host (`HOST_SENT_KEPT`) are replayed once over
  * XMTP at the end of the window: a frame the host accepted just before it died is otherwise never re-sent, since
@@ -164,9 +166,17 @@ export class FallbackRelay implements RelayClient {
     return this.pastGrace(ch) ? "xmtp" : "none";
   }
 
-  /** Messages dropped by the XMTP acceptance checks, per channel (spec §3). */
+  /** Messages dropped by the XMTP acceptance checks, per channel (spec §3), including those the session rejected
+   *  after XMTP could not determine their sender (`countRejected`). */
   dropped(channelId: Hex): number {
     return this.xmtp.dropped(channelId);
+  }
+
+  /** Spec §3: the daemon's session rejected `msg`. True when it came over XMTP with its sender undetermined: it is
+   *  counted in `dropped`, and the daemon sets no `lastError` and logs nothing for it. False for every other message
+   *  (the host relay's included), which the daemon reports exactly as before. */
+  countRejected(msg: RelayMessage): boolean {
+    return this.xmtp.countRejected(msg);
   }
 
   /** Stops every channel's XMTP client. The host connection is the caller's to close. */

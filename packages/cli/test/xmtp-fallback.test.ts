@@ -5,14 +5,18 @@ import type { Address, Hex } from "viem";
 import { keccak256, toHex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ChannelSession, toWire, type CloseSignature, type RelayMessage, type SignedState } from "@arena/sdk";
+import { ChannelSession, toWire, type CloseSignature, type RelayClient, type RelayMessage, type SignedState } from "@arena/sdk";
 import { initHome, loadConfig, parseXmtpConfig, type ArenaConfig } from "../src/config.js";
-import { connectHost } from "../src/host.js";
+import { ArenaDaemon, type DaemonOptions } from "../src/daemon.js";
+import { connectHost, type HostRelay } from "../src/host.js";
 import { startDaemonProcess } from "../src/run.js";
 import { buildStatus } from "../src/status.js";
 import { FallbackRelay, HOST_DOWN_GRACE_MS, XMTP_MAX_PAYLOAD_BYTES, XMTP_SEND_WAIT_MS } from "../src/xmtp/fallback.js";
 import { XMTP_INBOUND_BURST, XMTP_INBOUND_PER_SEC } from "../src/xmtp/relay.js";
-import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
+import { NOT_THE_PEER, UNDETERMINED } from "../src/xmtp/transport.js";
+import { ANVIL_KEYS, RPC, deployArena, mintUsdc, now } from "../../sdk/test/helpers/chain.js";
+import { waitFor } from "./helpers/harness.js";
+import { MemoryArena } from "./helpers/memoryArena.js";
 import { FakeHost, FakeXmtp, domain, sessionPair, settle } from "./helpers/xmtpFakes.js";
 
 // ------------------------------------------------------------------------------------------------- fixtures
@@ -461,6 +465,43 @@ describe("FallbackRelay: XMTP acceptance (spec §3)", () => {
     expect(relay.dropped(id)).toBe(0);
   });
 
+  it("an undetermined sender or conversation is accepted and tagged: only a session rejection of it is counted", async () => {
+    const { a, id, xmtp, host, relay, opponent } = await bSide({ joined: true });
+    const got: RelayMessage[] = [];
+    relay.onMessage((m) => got.push(m));
+    const m = stateMsg(id, await a.move("e2e4"));
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(m)); // neither sender nor conversation known
+    xmtp.deliver(id, opponent, UNDETERMINED, frame(m)); // the opponent, in a conversation not resolved
+    xmtp.deliver(id, opponent, opponent, frame(m)); // the opponent, in its DM
+    host.deliver(m); // the host relay's
+    expect(got).toHaveLength(4);
+    expect(got.map((g) => relay.countRejected(g))).toEqual([true, true, false, false]);
+    expect(relay.countRejected(got[0])).toBe(false); // counted once
+    expect(relay.dropped(id)).toBe(2);
+    // A known stranger stays one, whatever the other field says; and an undetermined text passes every other check.
+    xmtp.deliver(id, NOT_THE_PEER, UNDETERMINED, frame(m));
+    xmtp.deliver(id, UNDETERMINED, NOT_THE_PEER, frame(m));
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, "not json");
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, toWire({ arena: 1, msg: m, pad: "x".repeat(XMTP_MAX_PAYLOAD_BYTES) }));
+    expect(got).toHaveLength(4);
+    expect(relay.dropped(id)).toBe(6);
+  });
+
+  it("undetermined senders share the channel's budget (spec §3's accepted residual); rejections log a throttled summary only", async () => {
+    const { a, id, xmtp, relay, opponent } = await bSide({ joined: true });
+    const got: RelayMessage[] = [];
+    relay.onMessage((m) => got.push(m));
+    const text = frame(stateMsg(id, await a.move("e2e4")));
+    for (let i = 0; i < 250; i++) xmtp.deliver(id, UNDETERMINED, UNDETERMINED, text);
+    for (const g of got.splice(0)) relay.countRejected(g);
+    expect(relay.dropped(id)).toBe(250);
+    // No line per message: the drop summary's first and every 100th.
+    expect(logs.filter((l) => l.includes("dropped an inbound message"))).toHaveLength(3);
+    for (let i = 0; i < XMTP_INBOUND_BURST - 250; i++) xmtp.deliver(id, UNDETERMINED, UNDETERMINED, text);
+    xmtp.deliver(id, opponent, opponent, text);
+    expect(got).toHaveLength(XMTP_INBOUND_BURST - 250); // the opponent's was rate-limited
+  });
+
   it("rate-limits inbound per channel with the host relay's budget; strangers never spend it", async () => {
     const { a, id, xmtp, relay, opponent } = await bSide({ joined: true });
     let got = 0;
@@ -654,6 +695,9 @@ describe("status and config", () => {
 
 // ------------------------------------------------------------------------------------------------- run.ts wiring
 
+/** The options a daemon was started with (white-box: what run.ts wired). */
+const optsOf = (d: ArenaDaemon) => (d as unknown as { opts: DaemonOptions }).opts;
+
 describe("startDaemonProcess: choosing the relay", () => {
   // Real timers here: the daemon and its RPC client run for real against Anvil.
   beforeEach(() => vi.useRealTimers());
@@ -695,6 +739,7 @@ describe("startDaemonProcess: choosing the relay", () => {
       expect(proc.relay).toBe(proc.host.relay);
       expect(proc.fallback).toBe("off");
       expect(proc.daemon.fallback).toBe("off");
+      expect(optsOf(proc.daemon).relayRejected).toBeUndefined(); // every rejection is reported, as before
       expect(load).not.toHaveBeenCalled();
       expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual([]);
     } finally {
@@ -736,6 +781,9 @@ describe("startDaemonProcess: choosing the relay", () => {
       expect(proc.relay).toBeInstanceOf(FallbackRelay);
       expect(proc.fallback).toBe("xmtp");
       expect(proc.daemon.fallback).toBe("xmtp");
+      // The daemon hands session rejections to FallbackRelay.countRejected (a host relay message is never one).
+      const host = { type: "close", channelId: keccak256(toHex("c")), close: { stateHash: keccak256("0x01"), by: 0, sig: "0x" } };
+      expect(optsOf(proc.daemon).relayRejected?.(host as RelayMessage)).toBe(false);
       expect(seen).toEqual([{ dbDir: join(dir, "xmtp", "db"), env: "dev" }]);
       expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual(["xmtp: fallback on (env dev, node-sdk 6.0.0)"]);
     } finally {
@@ -757,5 +805,140 @@ describe("startDaemonProcess: choosing the relay", () => {
     expect(out.some((l) => l.includes("xmtp: stop still pending"))).toBe(true);
     const again = await startDaemonProcess(dir, { log: () => undefined }); // the lock was released
     await again.stop();
+  });
+});
+
+// ------------------------------------------------------------------------------------------------- the daemon (spec §3)
+
+describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is undetermined", () => {
+  // Real timers here: the daemons and their RPC clients run for real against Anvil.
+  beforeEach(() => vi.useRealTimers());
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  /** The memory relay as a host relay that always has the channel joined, plus `inject`: a message from the host. */
+  function asHost(relay: RelayClient): HostRelay & { inject(m: RelayMessage): void } {
+    const handlers = new Set<(m: RelayMessage) => void>();
+    return {
+      join: (id, params, signer) => relay.join(id, params, signer),
+      send: (m) => relay.send(m),
+      onMessage: (h) => {
+        handlers.add(h);
+        const off = relay.onMessage(h);
+        return () => {
+          handlers.delete(h);
+          off();
+        };
+      },
+      onJoined: (h) => relay.onJoined(h),
+      leave: (id) => relay.leave(id),
+      isJoined: () => true,
+      onLinkChange: () => () => undefined,
+      inject: (m) => {
+        for (const h of handlers) h(m);
+      },
+    };
+  }
+
+  /** Alice on the memory relay; Bob on a FallbackRelay over it (as his host) and a FakeXmtp, wired as run.ts does. */
+  async function aliceAndBob() {
+    const env = await deployArena();
+    const arena = new MemoryArena(async () => ({
+      rules: env.rules,
+      feeRecipient: env.host,
+      feePerPlayer: 5_000n,
+      fundingWindow: 3600n,
+      now: await now(),
+    }));
+    const config: ArenaConfig = {
+      rpcUrl: RPC,
+      chainId: env.domain.chainId,
+      hub: env.hub,
+      usdc: env.usdc,
+      rules: env.rules,
+      serverUrl: "memory:",
+      port: 0,
+      maxFeePerPlayer: 10_000n,
+      sessionGasWei: 10n ** 16n,
+      pollMs: 100,
+      minChallengeTimeout: 60n,
+    };
+    const homes: string[] = [];
+    const start = async (walletKey: Hex, wire: (relay: RelayClient) => Partial<DaemonOptions>) => {
+      const home = mkdtempSync(join(tmpdir(), "arena-xmtp-daemon-"));
+      homes.push(home);
+      const own = { ...config };
+      initHome(home, own, walletKey);
+      await mintUsdc(env.usdc, privateKeyToAccount(walletKey).address, 10_000_000n);
+      const client = arena.client();
+      const daemon = new ArenaDaemon({ home, config: own, walletKey, lobby: client.lobby, relay: client.relay, ...wire(client.relay) });
+      await daemon.start();
+      return { daemon, client };
+    };
+    const bobLogs: string[] = [];
+    const xmtp = new FakeXmtp();
+    let host: ReturnType<typeof asHost> | undefined;
+    let fallback: FallbackRelay | undefined;
+    const alice = await start(ANVIL_KEYS[1], () => ({}));
+    const bob = await start(ANVIL_KEYS[2], (relay) => {
+      const h = asHost(relay);
+      const fb = new FallbackRelay({ host: h, xmtp, log: (l) => bobLogs.push(l) });
+      host = h;
+      fallback = fb;
+      return { relay: fb, relayRejected: (m) => fb.countRejected(m), log: (l) => bobLogs.push(l) };
+    });
+    cleanup = async () => {
+      await alice.daemon.stop();
+      await bob.daemon.stop();
+      await fallback?.stop();
+      for (const h of homes) rmSync(h, { recursive: true, force: true });
+    };
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "alice open");
+    await waitFor(async () => (await bob.daemon.status(id)).phase === "Open", 30_000, "bob open");
+    return { alice, bob, id, xmtp, host: host as ReturnType<typeof asHost>, fallback: fallback as FallbackRelay, bobLogs };
+  }
+
+  it("rejected: counted, no lastError, no line per message; the genuine move is applied and a replay of it is a no-op", async () => {
+    const { alice, bob, id, xmtp, host, fallback, bobLogs } = await aliceAndBob();
+    bob.client.disconnect(); // Bob hears nothing from the host relay from here on
+    await alice.daemon.move(id, "e4", { actor: "agent" });
+    const genuine = alice.daemon.handle(id).session.latest;
+    expect(genuine.state.turnNum).toBe(1n);
+    expect(bob.daemon.handle(id).session.latest.state.turnNum).toBe(0n);
+    const eve = privateKeyToAccount(generatePrivateKey());
+    const bad = await eve.signMessage({ message: "not the opponent" });
+    const forged: SignedState = { ...genuine, sigA: bad, sigB: bad };
+
+    // 150 forgeries from an undetermined sender: the session rejects each; none is an error.
+    for (let i = 0; i < 150; i++) xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, forged)));
+    await waitFor(() => fallback.dropped(id) === 150, 20_000, "150 rejections counted");
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(bob.daemon.handle(id).session.latest.state.turnNum).toBe(0n);
+    expect(bobLogs.filter((l) => l.includes("signature"))).toEqual([]); // no daemon line per message
+    expect(bobLogs.filter((l) => l.includes("dropped an inbound message"))).toHaveLength(2); // the 1st and the 100th
+
+    // The same forgery from the host relay is reported exactly as before.
+    host.inject(stateMsg(id, forged));
+    await waitFor(() => bob.daemon.handle(id).lastError !== null, 10_000, "host rejection reported");
+    expect(bob.daemon.handle(id).lastError).toContain("invalid opponent signature");
+    expect(bobLogs.filter((l) => l.includes("invalid opponent signature"))).toHaveLength(1);
+    expect(fallback.dropped(id)).toBe(150);
+
+    // Alice's genuine move, from an undetermined sender, is applied; a replay of it changes nothing.
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, genuine)));
+    await waitFor(() => bob.daemon.handle(id).session.latest.state.turnNum === 1n, 10_000, "genuine move applied");
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+    const before = bob.daemon.handle(id).session.snapshot();
+    xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, genuine)));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(bob.daemon.handle(id).session.snapshot()).toEqual(before);
+    expect(bob.daemon.handle(id).lastError).toBeNull();
+    expect(fallback.dropped(id)).toBe(150);
   });
 });
