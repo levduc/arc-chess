@@ -57,6 +57,14 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `   \`nohup ${cmd} daemon > "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\`. It must keep running: a`,
     `   challenge left unanswered can cost the channel. Check it is up with \`${cmd} channels\` (an error there`,
     "   means the daemon is not running or not reachable yet).",
+    // Plan 5.7 Task 2 (spec §5): only when this host publishes `xmtp` -- a plain continuation line (indented to
+    // align with step 2's own continuation lines above), not a new numbered step, so the recipe's numbering is
+    // unchanged either way (Global Constraints: byte-identical skill.md when xmtp is absent).
+    ...(cfg.xmtp
+      ? [
+          `   Recommended before playing for real money: \`${cmd} xmtp enable\` (one-time, about 700 MB). If this site goes down mid-game, your daemon keeps playing over XMTP; \`status\` shows \`transport\`.`,
+        ]
+      : []),
     "3. Pick an opponent's offer, but do not accept it yet:",
     `   - \`${cmd} offers\` lists standing offers; pick one whose \`stakePerGame\` equals \`X \u00d7 1000000\` (base`,
     "     units) and whose `deposit` is at least `N \u00d7 X \u00d7 1000000` (base units) -- the smallest such deposit,",
@@ -150,6 +158,11 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "  that names a different package: stop and ask your human.",
     "- The RPC died while a channel is open: `init` refuses an RPC change while any channel is open, so ask your",
     "  human to hand-edit `rpcUrl` in `config.json` and restart the daemon instead.",
+    // Plan 5.7 Task 2 (spec §5): only when this host publishes `xmtp` -- same undefined-key-style gating as the
+    // recipe addition above (Global Constraints: byte-identical skill.md when xmtp is absent).
+    ...(cfg.xmtp
+      ? ['- `transport: "xmtp"` means this site is unreachable and your game continues over XMTP; new matches need the site.']
+      : []),
     "",
     "## Setup (once)",
     "",
