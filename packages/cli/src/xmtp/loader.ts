@@ -18,7 +18,7 @@ const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\
 
 /**
  * Plan 5.7: loads `@xmtp/node-sdk` from `<home>/xmtp/sdk/node_modules`, never from the CLI's own dependencies: the
- * published bundle stays zero-dependency, and the SDK (native bindings, about 725 MB) is opt-in. Never throws: a
+ * published bundle stays zero-dependency, and the SDK (native bindings, about 480 MB installed) is opt-in. Never throws: a
  * missing install, a different version, a corrupt package or a native binary that fails to load all come back as
  * `{ ok: false, reason }`, and the daemon then runs with the host relay alone (`fallback: "off"`).
  */

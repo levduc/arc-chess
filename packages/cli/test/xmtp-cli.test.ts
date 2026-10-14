@@ -302,7 +302,7 @@ describe("arena xmtp enable|status|disable", () => {
 });
 
 // Opt-in: the real install, against the real npm registry -- never run by plain `pnpm test:cli`. Downloads the
-// real @xmtp/node-sdk@6.1.0 (native binaries included, about SIZE_MB on disk), so it is gated behind
+// real @xmtp/node-sdk@6.1.0 (native binaries included, about 480 MB on disk), so it is gated behind
 // ARENA_XMTP_REAL_INSTALL=1 and given a generous timeout; its temp HOME is removed in `afterEach` like every other
 // test here.
 describe.skipIf(process.env.ARENA_XMTP_REAL_INSTALL !== "1")("arena xmtp enable: the real install (opt-in: ARENA_XMTP_REAL_INSTALL=1)", () => {
@@ -315,7 +315,7 @@ describe.skipIf(process.env.ARENA_XMTP_REAL_INSTALL !== "1")("arena xmtp enable:
     const payload = JSON.parse(t.out.at(-1)!) as Record<string, unknown>;
     expect(payload.enabled).toBe(true);
     expect(payload.version).toBe(XMTP_SDK_VERSION);
-    // About SIZE_MB; loosely bounded so this isn't brittle against a minor packaging change.
+    // About 480 MB (6.1.0); loosely bounded so this isn't brittle against a minor packaging change.
     // eslint-disable-next-line no-console
     console.log(`arena xmtp enable (real install): sizeMB ${String(payload.sizeMB)}`);
     expect(payload.sizeMB as number).toBeGreaterThan(100);
@@ -455,7 +455,7 @@ describe("arena bot: a hint when xmtp is configured but the fallback is off (spe
     const controller = new AbortController();
     controller.abort(); // the loop body never runs; only the top-of-function hint log should fire
     const logs: string[] = [];
-    const hint = 'bot: xmtp is configured but not enabled on this machine: run "arena xmtp enable" (about 700 MB, one-time)';
+    const hint = 'bot: xmtp is configured but not enabled on this machine: run "arena xmtp enable" (about 480 MB, one-time)';
     await runBot({} as unknown as ArenaDaemon, {
       usdc: "0x0000000000000000000000000000000000000000" as Address,
       deposit: 0n,

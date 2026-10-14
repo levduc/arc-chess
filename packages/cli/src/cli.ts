@@ -106,7 +106,7 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
        sometimes a check or a capture, else a random move. Refuses any chain but 31337 unless --allow-real-chain.)
   xmtp enable | status | disable
        (Plan 5.7: the XMTP fallback transport's SDK -- opt-in, never bundled, loaded only once installed.
-        enable installs the pinned @xmtp/node-sdk (about 700 MB, one-time) into <ARENA_HOME>/xmtp/sdk and prints
+        enable installs the pinned @xmtp/node-sdk (about 480 MB, one-time) into <ARENA_HOME>/xmtp/sdk and prints
         {enabled, version, sizeMB}; a running daemon loads it only when it starts, so restart the daemon after
         enabling. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
         installing anything: daemon is what the RUNNING daemon loaded ("xmtp" or "off") or "not running".
@@ -187,7 +187,7 @@ export function daemonStartLine(proc: { apiUrl: string; pid: number; wallet: str
 /** Plan 5.7 Task 4: the npm binary `arena xmtp enable` installs with. Next to this build's own `process.execPath`
  *  when present (the same Node install's own npm, e.g. nvm/Volta), else the bare name -- resolved from PATH by
  *  the shell-less `spawn` itself. `ARENA_XMTP_NPM` overrides it outright: the one seam tests use to point at a
- *  fake installer script that copies a fixture package, instead of ever reaching the real ~725 MB npm download. */
+ *  fake installer script that copies a fixture package, instead of ever reaching the real ~480 MB npm download. */
 export function resolveNpmBinary(io: CliIo): string {
   const override = io.env.ARENA_XMTP_NPM;
   if (override) return override;
@@ -298,7 +298,7 @@ async function runningDaemonFallback(home: string, io: CliIo): Promise<{ fallbac
  */
 export function xmtpBotHint(xmtpConfigured: boolean, fallback: "xmtp" | "off"): string | null {
   if (!xmtpConfigured || fallback === "xmtp") return null;
-  return `xmtp is configured but not enabled on this machine: run "${CLI_COMMAND} xmtp enable" (about 700 MB, one-time)`;
+  return `xmtp is configured but not enabled on this machine: run "${CLI_COMMAND} xmtp enable" (about 480 MB, one-time)`;
 }
 
 /**
@@ -1410,7 +1410,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         mkdirSync(tmpDir, { recursive: true });
         try {
           const npmBin = resolveNpmBinary(io);
-          io.err(`xmtp enable: installing @xmtp/node-sdk@${XMTP_SDK_VERSION} into ${sdkDir} (about 700 MB; this can take a while)...`);
+          io.err(`xmtp enable: installing @xmtp/node-sdk@${XMTP_SDK_VERSION} into ${sdkDir} (about 480 MB; this can take a while)...`);
           await runNpmInstall(npmBin, tmpDir, XMTP_SDK_VERSION, io);
           const loaded = await loadXmtpSdkFrom(join(tmpDir, "node_modules"));
           if (!loaded.ok) throw new Error(`xmtp enable: installed, but the SDK failed to load: ${loaded.reason}`);
