@@ -124,11 +124,14 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   (Docker); nothing in this repo exercises XMTP's real `dev` or production network. Before mainnet, run the
   manual smoke script (spec §7) against XMTP's public `dev` network, and confirm the fallback actually works
   against production XMTP, not just the local-node fixture.
-- **Supply-chain note for the pinned native SDK.** `@xmtp/node-sdk@6.0.0` is installed at runtime (`arena xmtp
+- **Supply-chain note for the pinned native SDK.** `@xmtp/node-sdk@6.1.0` is installed at runtime (`arena xmtp
   enable`), never bundled into the published CLI, and pinned by exact version (`--save-exact`). It is a native
   module (not pure JS) fetched from npm outside the workspace's own lockfile/audit surface — confirm its
   provenance and integrity (npm's own signature/provenance checks, or a manual hash pin) before relying on it for
   real-money games, the same way Plan 5.6's gates treat the CLI's own published tarball.
+- **The XMTP SDK runs inside the process that holds the wallet key.** `@xmtp/node-sdk` and its native bindings
+  run in the daemon's own process, with the wallet key and every session key in memory: a supply-chain risk (and
+  a native crash there stops the watchtower too). Isolate the SDK in its own process before real funds.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
