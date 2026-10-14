@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Address, Hex } from "viem";
@@ -6,14 +6,14 @@ import { keccak256, toHex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChannelSession, toWire, type CloseSignature, type RelayClient, type RelayMessage, type SignedState } from "@arena/sdk";
-import { initHome, loadConfig, parseXmtpConfig, type ArenaConfig } from "../src/config.js";
+import { initHome, loadConfig, parseXmtpConfig, readConfig, type ArenaConfig } from "../src/config.js";
 import { ArenaDaemon, type DaemonOptions } from "../src/daemon.js";
 import { connectHost, type HostRelay } from "../src/host.js";
 import { startDaemonProcess } from "../src/run.js";
 import { buildStatus } from "../src/status.js";
 import { FallbackRelay, HOST_DOWN_GRACE_MS, XMTP_MAX_PAYLOAD_BYTES, XMTP_SEND_WAIT_MS } from "../src/xmtp/fallback.js";
 import { XMTP_DROP_LOG_INTERVAL_MS, XMTP_INBOUND_BURST, XMTP_INBOUND_PER_SEC } from "../src/xmtp/relay.js";
-import { NOT_THE_PEER, UNDETERMINED } from "../src/xmtp/transport.js";
+import { NOT_THE_PEER, UNDETERMINED, XMTP_CATCH_UP_MESSAGES } from "../src/xmtp/transport.js";
 import { ANVIL_KEYS, RPC, deployArena, mintUsdc, now } from "../../sdk/test/helpers/chain.js";
 import { waitFor } from "./helpers/harness.js";
 import { MemoryArena } from "./helpers/memoryArena.js";
@@ -28,8 +28,9 @@ let clock = 0;
 let logs: string[] = [];
 const relays: FallbackRelay[] = [];
 
-/** B's side of a channel: a FallbackRelay over fakes, joined as B's session key. */
-async function bSide(opts: { joined?: boolean } = {}) {
+/** B's side of a channel: a FallbackRelay over fakes, joined as B's session key, and armed (the channel is Open on
+ *  chain: spec §3) unless `armed: false`. */
+async function bSide(opts: { joined?: boolean; armed?: boolean } = {}) {
   const pair = await sessionPair();
   const host = new FakeHost();
   const xmtp = new FakeXmtp();
@@ -37,6 +38,7 @@ async function bSide(opts: { joined?: boolean } = {}) {
   const relay = new FallbackRelay({ host, xmtp, now: () => clock, log: (l) => logs.push(l) });
   relays.push(relay);
   await relay.join(pair.id, pair.params, pair.signers[1]);
+  if (opts.armed !== false) relay.arm(pair.id);
   await settle();
   return { ...pair, host, xmtp, relay, opponent: pair.signers[0].address };
 }
@@ -71,10 +73,10 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     expect(relay.transportOf(id)).toBe("relay");
   });
 
-  it("joins the host as before and opens XMTP to the opponent without waiting for it", async () => {
+  it("joins the host as before, and opens XMTP to the opponent only once armed, without waiting for it", async () => {
     const { id, params, signers, host } = await bSide();
     expect(host.joins).toEqual([id]);
-    // An XMTP open that never settles must not hold up the host join.
+    // An XMTP open that never settles must not hold up the host join, or anything else.
     const host2 = new FakeHost();
     const xmtp2 = new FakeXmtp();
     xmtp2.openImpl = () => new Promise<void>(() => undefined);
@@ -82,7 +84,61 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     relays.push(relay2);
     await relay2.join(id, params, signers[1]);
     expect(host2.joins).toEqual([id]);
+    expect(xmtp2.opened).toEqual([]); // joined at match time: no XMTP client yet (I-1)
+    relay2.arm(id); // the daemon saw the channel Open on chain
+    relay2.arm(id); // idempotent
     expect(xmtp2.opened).toEqual([{ channelId: id, me: signers[1].address, peer: signers[0].address }]);
+  });
+
+  it("I-1: a channel not armed (not Open on chain yet) is the host relay's alone: no XMTP client, host sends, no xmtp transport", async () => {
+    const { a, id, host, xmtp, relay } = await bSide({ armed: false });
+    expect(xmtp.opened).toEqual([]);
+    expect(relay.armed(id)).toBe(false);
+    const m = stateMsg(id, await a.move("e2e4"));
+    // The host does not have it joined: the send fails exactly as on the host relay alone, never held for XMTP.
+    await expect(relay.send(m)).rejects.toThrow("relay not connected");
+    await advance(HOST_DOWN_GRACE_MS * 10);
+    expect(relay.transportOf(id)).toBe("none");
+    expect(xmtp.sent).toEqual([]);
+    expect(xmtp.opened).toEqual([]);
+    host.setJoined(id, true);
+    await relay.send(m);
+    expect(host.sent).toEqual([m]);
+    expect(relay.transportOf(id)).toBe("relay");
+    // Armed later with the host down: what it last sent via the host is replayed over XMTP once past the window.
+    host.setJoined(id, false);
+    relay.arm(id);
+    expect(xmtp.opened).toHaveLength(1);
+    await advance(HOST_DOWN_GRACE_MS);
+    expect(xmtp.messages()).toEqual([m]);
+    expect(relay.transportOf(id)).toBe("xmtp");
+  });
+
+  it("I-1: at most maxClients channels are armed at once; one past it runs without the fallback, logged once, until a slot frees", async () => {
+    const host = new FakeHost();
+    const xmtp = new FakeXmtp();
+    const relay = new FallbackRelay({ host, xmtp, now: () => clock, log: (l) => logs.push(l), maxClients: 2 });
+    relays.push(relay);
+    const pairs = [await sessionPair(), await sessionPair(), await sessionPair(), await sessionPair()];
+    for (const p of pairs) await relay.join(p.id, p.params, p.signers[1]);
+    for (const p of pairs.slice(0, 3)) relay.arm(p.id);
+    relay.arm(pairs[2].id); // asked again on the next chain refresh: still refused, not logged again
+    expect(xmtp.opened.map((o) => o.channelId)).toEqual([pairs[0].id, pairs[1].id]);
+    expect(logs.filter((l) => l.includes("XMTP clients already open"))).toHaveLength(1);
+    expect(logs.find((l) => l.includes("XMTP clients already open"))).toContain(pairs[2].id.toLowerCase());
+    // The refused channel behaves as without XMTP: never "xmtp", sends to the host.
+    await advance(HOST_DOWN_GRACE_MS * 2);
+    expect(relay.transportOf(pairs[2].id)).toBe("none");
+    expect(relay.transportOf(pairs[0].id)).toBe("xmtp");
+    // A finalized channel frees its slot once its client has closed (and its DB is purged); the refused one stays
+    // without the fallback for good, and the next channel gets the slot.
+    relay.leave(pairs[0].id);
+    await settle();
+    expect(xmtp.purged).toEqual([pairs[0].id.toLowerCase()]);
+    relay.arm(pairs[2].id);
+    relay.arm(pairs[3].id);
+    expect(xmtp.opened.map((o) => o.channelId)).toEqual([pairs[0].id, pairs[1].id, pairs[3].id]);
+    expect(relay.transportOf(pairs[2].id)).toBe("none");
   });
 
   it("a channel never joined: held for the grace window, then via XMTP; the host's later join switches back", async () => {
@@ -270,6 +326,7 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     const relay = new FallbackRelay({ host, xmtp, graceMs: 50 }); // no `now`: the default clock
     relays.push(relay);
     await relay.join(id, params, signers[1]);
+    relay.arm(id);
     const realNow = Date.now();
     const spy = vi.spyOn(Date, "now").mockReturnValue(realNow - 3_600_000); // NTP stepped the clock back an hour
     try {
@@ -292,6 +349,7 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     const relay = new FallbackRelay({ host, xmtp, graceMs: 500, now: () => clock, log: (l) => logs.push(l) });
     relays.push(relay);
     await relay.join(pair.id, pair.params, pair.signers[1]);
+    relay.arm(pair.id);
     await settle();
     expect(xmtp.opened).toHaveLength(1);
     expect(logs.some((l) => l.includes("client failed to start (network down); retrying in 1s"))).toBe(true);
@@ -309,14 +367,30 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     expect(xmtp.opened).toHaveLength(3); // open now: no more retries
   });
 
-  it("leave leaves the host relay, closes XMTP, and forgets the channel", async () => {
+  it("leave leaves the host relay, closes XMTP and purges its DB (finalized), and forgets the channel", async () => {
     const { id, host, xmtp, relay } = await bSide({ joined: true });
     relay.leave(id);
     await settle();
     expect(host.left).toEqual([id]);
-    expect(xmtp.closed).toEqual([id]);
+    expect(xmtp.closed).toEqual([id.toLowerCase()]);
+    expect(xmtp.purged).toEqual([id.toLowerCase()]);
     expect(relay.transportOf(id)).toBe("none");
     expect(relay.dropped(id)).toBe(0);
+  });
+
+  it("m-1: leave of a channel never armed in this process still purges its XMTP DB (one from an earlier run)", async () => {
+    const { id, xmtp, relay } = await bSide({ joined: true, armed: false });
+    relay.leave(id);
+    await settle();
+    expect(xmtp.opened).toEqual([]);
+    expect(xmtp.purged).toEqual([id.toLowerCase()]);
+  });
+
+  it("stop closes every client without purging (a restarted daemon resumes the same installations)", async () => {
+    const { xmtp, relay } = await bSide({ joined: true });
+    await relay.stop();
+    expect(xmtp.stopped).toBe(true);
+    expect(xmtp.purged).toEqual([]);
   });
 
   it("transportOf is none for a channel never joined through it, and a send for one is the host's own", async () => {
@@ -539,6 +613,9 @@ describe("FallbackRelay: XMTP acceptance (spec §3)", () => {
     expect(got).toBe(XMTP_INBOUND_BURST);
     expect(relay.dropped(id)).toBe(101);
     expect(logs.some((l) => l.includes("(rate limited)") || l.includes("dropped an inbound message"))).toBe(true);
+    // K1: the turned-away text is re-delivered by a catch-up once the bucket has refilled (a catch-up's worth:
+    // XMTP_CATCH_UP_MESSAGES tokens), asked of the transport -- never by a stream restart. Strangers never ask.
+    expect(xmtp.catchUps).toEqual([{ channelId: id.toLowerCase(), afterMs: Math.ceil((XMTP_CATCH_UP_MESSAGES / XMTP_INBOUND_PER_SEC) * 1000) }]);
     // One token back per 1/400 s.
     clock += Math.ceil(1000 / XMTP_INBOUND_PER_SEC);
     xmtp.deliver(id, opponent, opponent, text);
@@ -668,6 +745,9 @@ describe("status and config", () => {
     const input = { record, snapshot: a.snapshot(), myTurn: true, chain: null, lastError: null };
     expect(buildStatus(input).transport).toBe("none");
     expect(buildStatus({ ...input, transport: "xmtp" }).transport).toBe("xmtp");
+    // K3: the XMTP drop count, 0 without the fallback.
+    expect(buildStatus(input).xmtpDropped).toBe(0);
+    expect(buildStatus({ ...input, xmtpDropped: 7 }).xmtpDropped).toBe(7);
   });
 
   it("parseXmtpConfig accepts the three envs with optional apiUrl/gatewayHost and refuses anything else", () => {
@@ -711,8 +791,19 @@ describe("status and config", () => {
       expect("xmtp" in loadConfig(home)).toBe(false);
       initHome(home, { ...base, xmtp: { env: "local", apiUrl: "http://127.0.0.1:5556" } });
       expect(loadConfig(home).xmtp).toEqual({ env: "local", apiUrl: "http://127.0.0.1:5556" });
+      // m-7: an invalid xmtp (a hand edit, or a newer CLI's value) is dropped with one warning, never a throw.
       initHome(home, { ...base, xmtp: { env: "nope" } as unknown as ArenaConfig["xmtp"] });
-      expect(() => loadConfig(home)).toThrow("xmtp.env");
+      const warnings: string[] = [];
+      const cfg = loadConfig(home, { warn: (l) => warnings.push(l) });
+      expect("xmtp" in cfg).toBe(false);
+      expect(cfg.rpcUrl).toBe(RPC);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/^warning: config\.json's xmtp is invalid \(xmtp\.env: .*\), so the XMTP fallback is off/);
+      const read = readConfig(home);
+      expect(read.xmtpProblem).toContain("xmtp.env");
+      expect("xmtp" in read.config).toBe(false);
+      // The file itself is left as it was.
+      expect((JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as { xmtp: unknown }).xmtp).toEqual({ env: "nope" });
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -767,8 +858,41 @@ describe("startDaemonProcess: choosing the relay", () => {
       expect(proc.daemon.fallback).toBe("off");
       expect(optsOf(proc.daemon).relayRejected).toBeUndefined(); // every rejection is reported, as before
       expect(optsOf(proc.daemon).relayUndetermined).toBeUndefined(); // and every success clears lastError
+      expect(optsOf(proc.daemon).armFallback).toBeUndefined();
       expect(load).not.toHaveBeenCalled();
       expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual([]);
+      expect(proc.daemon.fallbackInfo()).toEqual({
+        fallback: "off",
+        reason: "the XMTP fallback is not configured (config.json has no xmtp)",
+      });
+    } finally {
+      await proc.stop();
+    }
+  });
+
+  it("m-7: an invalid xmtp in config.json: the daemon still starts, fallback off, one line, the reason on GET /fallback", async () => {
+    const dir = await home();
+    const path = join(dir, "config.json");
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify({ ...raw, xmtp: { env: "mainnet" } }));
+    const out: string[] = [];
+    const load = vi.fn();
+    const proc = await startDaemonProcess(dir, { log: (l) => out.push(l), xmtp: { load } });
+    try {
+      expect(proc.relay).toBe(proc.host.relay);
+      expect(proc.fallback).toBe("off");
+      expect(load).not.toHaveBeenCalled();
+      const lines = out.filter((l) => l.startsWith("xmtp:"));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^xmtp: fallback off: config\.json's xmtp is invalid \(xmtp\.env/);
+      const token = (JSON.parse(readFileSync(join(dir, "token.json"), "utf8")) as { token: string }).token;
+      const res = await fetch(`${proc.apiUrl}/fallback`, { headers: { authorization: `Bearer ${token}` } });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { fallback: string; reason: string };
+      expect(body.fallback).toBe("off");
+      expect(body.reason).toContain("config.json's xmtp is invalid");
+      // Read-only and token-gated like every other data route.
+      expect((await fetch(`${proc.apiUrl}/fallback`)).status).toBe(401);
     } finally {
       await proc.stop();
     }
@@ -784,6 +908,9 @@ describe("startDaemonProcess: choosing the relay", () => {
       const lines = out.filter((l) => l.startsWith("xmtp:"));
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain("xmtp: fallback off: the XMTP SDK is not installed");
+      const info = proc.daemon.fallbackInfo();
+      expect(info.fallback).toBe("off");
+      expect(info.reason).toContain("the XMTP SDK is not installed");
     } finally {
       await proc.stop();
     }
@@ -797,7 +924,7 @@ describe("startDaemonProcess: choosing the relay", () => {
     const proc = await startDaemonProcess(dir, {
       log: (l) => out.push(l),
       xmtp: {
-        load: async () => ({ ok: true, sdk: {}, version: "6.0.0" }),
+        load: async () => ({ ok: true, sdk: {}, version: "6.1.0" }),
         transport: (o) => {
           seen.push({ dbDir: o.dbDir, env: o.config.env });
           return fake;
@@ -813,7 +940,14 @@ describe("startDaemonProcess: choosing the relay", () => {
       expect(optsOf(proc.daemon).relayRejected?.(host as RelayMessage)).toBe(false);
       expect(optsOf(proc.daemon).relayUndetermined?.(host as RelayMessage)).toBe(false);
       expect(seen).toEqual([{ dbDir: join(dir, "xmtp", "db"), env: "dev" }]);
-      expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual(["xmtp: fallback on (env dev, node-sdk 6.0.0)"]);
+      expect(out.filter((l) => l.startsWith("xmtp:"))).toEqual(["xmtp: fallback on (env dev, node-sdk 6.1.0)"]);
+      // I-1: the daemon arms a channel's XMTP side on its chain refresh (Open), through FallbackRelay.arm.
+      expect(typeof optsOf(proc.daemon).armFallback).toBe("function");
+      expect(optsOf(proc.daemon).xmtpDroppedOf?.(keccak256(toHex("c")))).toBe(0);
+      // I-2: GET /fallback says what this running daemon loaded.
+      const token = (JSON.parse(readFileSync(join(dir, "token.json"), "utf8")) as { token: string }).token;
+      const res = await fetch(`${proc.apiUrl}/fallback`, { headers: { authorization: `Bearer ${token}` } });
+      expect(await res.json()).toEqual({ fallback: "xmtp" });
     } finally {
       await proc.stop();
     }
@@ -825,7 +959,7 @@ describe("startDaemonProcess: choosing the relay", () => {
     const out: string[] = [];
     const hung = new FakeXmtp();
     hung.stop = () => new Promise<void>(() => undefined);
-    const wiring = { load: async () => ({ ok: true as const, sdk: {}, version: "6.0.0" }), transport: () => hung };
+    const wiring = { load: async () => ({ ok: true as const, sdk: {}, version: "6.1.0" }), transport: () => hung };
     const proc = await startDaemonProcess(dir, { log: (l) => out.push(l), xmtp: wiring });
     const t0 = Date.now();
     await proc.stop();
@@ -871,8 +1005,9 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
     };
   }
 
-  /** Alice on the memory relay; Bob on a FallbackRelay over it (as his host) and a FakeXmtp, wired as run.ts does. */
-  async function aliceAndBob() {
+  /** Alice on the memory relay; Bob on a FallbackRelay over it (as his host) and a FakeXmtp, wired as run.ts does.
+   *  `bobUnfunded`: Bob's wallet holds no USDC, so the channel stays in Funding after the match (no wait for Open). */
+  async function aliceAndBob(opts: { bobUnfunded?: boolean } = {}) {
     const env = await deployArena();
     const arena = new MemoryArena(async () => ({
       rules: env.rules,
@@ -895,12 +1030,12 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
       minChallengeTimeout: 60n,
     };
     const homes: string[] = [];
-    const start = async (walletKey: Hex, wire: (relay: RelayClient) => Partial<DaemonOptions>) => {
+    const start = async (walletKey: Hex, wire: (relay: RelayClient) => Partial<DaemonOptions>, funded = true) => {
       const home = mkdtempSync(join(tmpdir(), "arena-xmtp-daemon-"));
       homes.push(home);
       const own = { ...config };
       initHome(home, own, walletKey);
-      await mintUsdc(env.usdc, privateKeyToAccount(walletKey).address, 10_000_000n);
+      if (funded) await mintUsdc(env.usdc, privateKeyToAccount(walletKey).address, 10_000_000n);
       const client = arena.client();
       const daemon = new ArenaDaemon({ home, config: own, walletKey, lobby: client.lobby, relay: client.relay, ...wire(client.relay) });
       await daemon.start();
@@ -920,9 +1055,13 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
         relay: fb,
         relayRejected: (m) => fb.countRejected(m),
         relayUndetermined: (m) => fb.isUndetermined(m),
+        armFallback: (id) => fb.arm(id),
+        xmtpDroppedOf: (id) => fb.dropped(id),
+        transportOf: (id) => fb.transportOf(id),
+        fallback: "xmtp",
         log: (l) => bobLogs.push(l),
       };
-    });
+    }, opts.bobUnfunded !== true);
     cleanup = async () => {
       await alice.daemon.stop();
       await bob.daemon.stop();
@@ -932,10 +1071,34 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
     const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await bob.daemon.acceptOffer(offerId);
     const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
-    await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "alice open");
-    await waitFor(async () => (await bob.daemon.status(id)).phase === "Open", 30_000, "bob open");
-    return { alice, bob, id, xmtp, host: host as ReturnType<typeof asHost>, fallback: fallback as FallbackRelay, bobLogs };
+    await waitFor(() => bob.daemon.channelIds()[0], 20_000, "bob's match");
+    if (opts.bobUnfunded !== true) {
+      await waitFor(async () => (await alice.daemon.status(id)).phase === "Open", 30_000, "alice open");
+      await waitFor(async () => (await bob.daemon.status(id)).phase === "Open", 30_000, "bob open");
+      await waitFor(() => xmtp.opened.length === 1, 10_000, "bob's XMTP client armed");
+    }
+    const mintBob = () => mintUsdc(env.usdc, privateKeyToAccount(ANVIL_KEYS[2]).address, 10_000_000n);
+    return { alice, bob, id, xmtp, host: host as ReturnType<typeof asHost>, fallback: fallback as FallbackRelay, bobLogs, mintBob };
   }
+
+  it("I-1: a match alone (no deposit from the acceptor) starts no XMTP client; the channel Open on chain does", async () => {
+    const { bob, id, xmtp, fallback, mintBob } = await aliceAndBob({ bobUnfunded: true });
+    // Bob's daemon has the channel, joined on the relay, and its passes run (pollMs 100): still in Funding.
+    await new Promise((r) => setTimeout(r, 1_500));
+    const st = await bob.daemon.status(id);
+    expect(st.phase).not.toBe("Open");
+    expect(xmtp.opened).toEqual([]);
+    expect(fallback.armed(id)).toBe(false);
+    expect(st.transport).toBe("relay");
+    expect(st.xmtpDropped).toBe(0);
+    // Bob's USDC arrives: his daemon funds, the channel opens, and only now is its XMTP client started -- once.
+    await mintBob();
+    await waitFor(async () => (await bob.daemon.status(id)).phase === "Open", 30_000, "bob open");
+    await waitFor(() => xmtp.opened.length === 1, 10_000, "bob's XMTP client armed");
+    await new Promise((r) => setTimeout(r, 500));
+    expect(xmtp.opened).toHaveLength(1);
+    expect(xmtp.opened[0].channelId.toLowerCase()).toBe(id.toLowerCase());
+  });
 
   it("rejected: counted, no lastError, no line per message; the genuine move is applied and a replay of it is a no-op", async () => {
     const { alice, bob, id, xmtp, host, fallback, bobLogs } = await aliceAndBob();
@@ -951,6 +1114,7 @@ describe("ArenaDaemon over a FallbackRelay: an XMTP message whose sender is unde
     // 150 forgeries from an undetermined sender: the session rejects each; none is an error.
     for (let i = 0; i < 150; i++) xmtp.deliver(id, UNDETERMINED, UNDETERMINED, frame(stateMsg(id, forged)));
     await waitFor(() => fallback.dropped(id) === 150, 20_000, "150 rejections counted");
+    expect((await bob.daemon.status(id)).xmtpDropped).toBe(150); // K3: in the channel's status
     expect(bob.daemon.handle(id).lastError).toBeNull();
     expect(bob.daemon.handle(id).session.latest.state.turnNum).toBe(0n);
     expect(bobLogs.filter((l) => l.includes("signature"))).toEqual([]); // no daemon line per message

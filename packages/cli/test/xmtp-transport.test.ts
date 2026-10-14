@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Address, Hex } from "viem";
@@ -490,6 +490,99 @@ describe("createNodeSdkTransport: the inbound stream", () => {
   });
 });
 
+describe("createNodeSdkTransport: closing clients (I-1, m-1)", () => {
+  /** Puts the channel's DB files (and a neighbour's) in place, as the native client would. */
+  function dbFiles(dir: string, channelId: Hex): string[] {
+    const other = `0x${"cd".repeat(32)}`;
+    const names = [`${channelId}.db3`, `${channelId}.db3-wal`, `${channelId}.db3-shm`, `${other}.db3`, `${other}.db3-wal`];
+    for (const n of names) writeFileSync(join(dir, n), "x");
+    return names;
+  }
+
+  it("asks for one DB connection per client, not a pool (6.1.0 useSingleConnection)", async () => {
+    const { sdk } = await bTransport();
+    expect(sdk.creates).toHaveLength(1);
+    expect(sdk.creates[0]).toMatchObject({ useSingleConnection: true, disableDeviceSync: true });
+  });
+
+  it("close(…, {purge}) ends the stream, closes the client, then deletes that channel's DB files only", async () => {
+    const { sdk, t, channelId } = await bTransport();
+    const dir = dirs.at(-1) as string;
+    dbFiles(dir, channelId);
+    await t.close(channelId, { purge: true });
+    expect(sdk.stream.isDone).toBe(true);
+    expect(sdk.closes).toBe(1);
+    expect(readdirSync(dir).sort()).toEqual([`0x${"cd".repeat(32)}.db3`, `0x${"cd".repeat(32)}.db3-wal`]);
+    await advance(120_000);
+    expect(sdk.streamCalls).toHaveLength(1); // no restart after close
+  });
+
+  it("stop closes every client but keeps the DB files (a restart resumes the same installation)", async () => {
+    const { sdk, t, channelId } = await bTransport();
+    const dir = dirs.at(-1) as string;
+    const names = dbFiles(dir, channelId);
+    await t.stop();
+    expect(sdk.closes).toBe(1);
+    expect(readdirSync(dir).sort()).toEqual([...names].sort());
+  });
+
+  it("a plain close (no purge) keeps the DB files", async () => {
+    const { sdk, t, channelId } = await bTransport();
+    const dir = dirs.at(-1) as string;
+    const names = dbFiles(dir, channelId);
+    await t.close(channelId);
+    expect(sdk.closes).toBe(1);
+    expect(readdirSync(dir).sort()).toEqual([...names].sort());
+  });
+
+  it("close of a channel with no client in this process still purges its DB (a finalized channel from an earlier run)", async () => {
+    const { sdk, t } = await bTransport({ open: false });
+    const dir = dirs.at(-1) as string;
+    const channelId = `0x${"ef".repeat(32)}` as Hex;
+    dbFiles(dir, channelId);
+    await t.close(channelId, { purge: true });
+    expect(sdk.closes).toBe(0);
+    expect(readdirSync(dir).some((n) => n.startsWith(channelId))).toBe(false);
+  });
+
+  it("a client whose Client.create returns after the close is closed as it returns, and purged (the leak path)", async () => {
+    const { a, b, sdk, t, channelId } = await bTransport({ open: false });
+    let release: () => void = () => undefined;
+    sdk.createGate = new Promise<void>((r) => (release = r));
+    const dir = dirs.at(-1) as string;
+    const opening = t.open(channelId, b, a.address);
+    await settle();
+    expect(sdk.creates).toHaveLength(1); // Client.create is running
+    const closing = t.close(channelId, { purge: true });
+    await settle();
+    await advance(2_000); // past the close's wait for a create still running
+    await closing;
+    expect(sdk.closes).toBe(0); // nothing to close yet
+    dbFiles(dir, channelId); // the native client opened its DB meanwhile
+    release();
+    await opening;
+    await settle();
+    expect(sdk.closes).toBe(1); // closed as it returned, never handed out
+    expect(sdk.streamCalls).toHaveLength(0);
+    expect(readdirSync(dir).some((n) => n.startsWith(channelId))).toBe(false);
+  });
+
+  it("a Client.close() that hangs is bounded: close returns, the DB is kept, and it is logged", async () => {
+    const { sdk, t, channelId } = await bTransport();
+    const dir = dirs.at(-1) as string;
+    dbFiles(dir, channelId);
+    sdk.closeHangs = true;
+    const closing = t.close(channelId, { purge: true });
+    for (let i = 0; i < 10; i++) await advance(500); // past the close's own bound
+    await closing;
+    sdk.closeHangs = false;
+    expect(sdk.closes).toBe(1);
+    expect(readdirSync(dir).some((n) => n === `${channelId}.db3`)).toBe(true);
+    expect(logs.some((l) => l.includes("client close failed") && l.includes("timed out"))).toBe(true);
+    expect(logs.some((l) => l.includes("its DB files are kept"))).toBe(true);
+  });
+});
+
 describe("FallbackRelay over the node-sdk transport: what reaches the session (I3 scenarios, spec §3)", () => {
   /** B's FallbackRelay over a fake host that is down and the fake-SDK transport, feeding B's real session. A
    *  rejection is handed back to `countRejected`, as the daemon does. `dmKnown`: A registered before B opened.
@@ -521,6 +614,7 @@ describe("FallbackRelay over the node-sdk transport: what reaches the session (I
       });
     });
     await relay.join(pair.id, pair.params, bSigner);
+    relay.arm(pair.id); // the channel is Open on chain (spec §3)
     await settle();
     if (opts.registerLater !== true) sdk.peerRegistered = true;
     let n = 0;
@@ -646,6 +740,78 @@ describe("FallbackRelay over the node-sdk transport: what reaches the session (I
     await drained();
     expect(results).toEqual(["move"]);
     expect(sdk.messagesCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("K1: a message the rate limit turned away is re-delivered by a catch-up once the bucket refills, with no stream restart; one taken after it is re-delivered after it", async () => {
+    const { a, b, id, signers, sdk, results, drained } = await bOverXmtp({ dmKnown: true });
+    const aAddr = signers[0].address;
+    // The opponent's own junk spends the burst (it passes the sender checks, then fails to decode).
+    for (let i = 0; i < XMTP_INBOUND_BURST; i++) sdk.stream.push(sdk.msg(`junk-${i}`, aAddr, "junk"));
+    sdk.arrive("a-resign", aAddr, toWire({ arena: 1, msg: { type: "state", channelId: id, signed: await a.resign() } }));
+    await settle();
+    await drained();
+    expect(results).toEqual([]); // the resign was turned away
+    await advance(5); // two tokens back: the next message is taken, ahead of the resign
+    const ca = await a.signClose();
+    sdk.arrive("a-close", aAddr, toWire({ arena: 1, msg: { type: "close", channelId: id, close: ca } }));
+    await settle();
+    await drained();
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatch(/^error: /); // the session refuses a Close for a state it does not hold yet
+    // The catch-up, a second after the drop: both again, in order, from the DM's history.
+    await advance(1_000);
+    await settle();
+    await drained();
+    expect(results.slice(1)).toEqual(["move", "close"]);
+    expect(b.snapshot().closeSigs[0]).toBe(ca.sig);
+    expect(sdk.streams).toHaveLength(1); // never a stream restart
+    expect(sdk.messagesCalls).toHaveLength(2); // open's catch-up, then K1's
+    // Delivered now: nothing is re-delivered later.
+    await advance(60_000);
+    await drained();
+    expect(results.slice(1)).toEqual(["move", "close"]);
+    expect(sdk.messagesCalls).toHaveLength(2);
+  });
+
+  it("K1: an undetermined stranger flood that keeps the bucket empty never restarts the stream; catch-ups back off; the opponent's turned-away move lands once it ends", async () => {
+    const { a, id, signers, sdk, results, drained } = await bOverXmtp({ registerLater: true });
+    sdk.inboxStateFailures = 1_000_000; // a lookup outage: every sender is undetermined
+    sdk.inboxLookupFailures = 1_000_000;
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    const conv = sdk.strangerDm(stranger);
+    const dmCallsAtOpen = sdk.dmCalls;
+    /** Lets the transport take every buffered message, with no time passing (so no token is refilled meanwhile). */
+    const drain = async () => {
+      while (sdk.stream.buffer.length > 0) await settle();
+      await settle();
+    };
+    let n = 0;
+    const junk = (count: number) => {
+      for (let i = 0; i < count; i++) sdk.stream.push(sdk.msg(`x-${++n}`, stranger, "junk", conv));
+    };
+    junk(XMTP_INBOUND_BURST); // the whole burst, spent by undetermined junk
+    await drain();
+    sdk.arrive("a-move", signers[0].address, toWire({ arena: 1, msg: { type: "state", channelId: id, signed: await a.move("e2e4") } }));
+    await drain();
+    for (let second = 0; second < 40; second++) {
+      await advance(1_000); // 400 tokens back, and any catch-up due
+      junk(500); // more than come back: the bucket is empty again before the next second
+      await drain();
+    }
+    await drained();
+    expect(results).toEqual([]); // the move was turned away, and no catch-up could find the DM during the outage
+    expect(sdk.streams).toHaveLength(1); // 0 restarts: strangers cannot force one
+    // At most one catch-up per back-off (1 s, doubling to 30 s): a handful of DM lookups in 40 s, not one a message.
+    expect(sdk.dmCalls - dmCallsAtOpen).toBeLessThanOrEqual(7);
+    // The flood ends and the outage heals: the next catch-up delivers the move, still with no restart.
+    sdk.inboxStateFailures = 0;
+    sdk.inboxLookupFailures = 0;
+    sdk.peerRegistered = true;
+    for (let i = 0; i < 31; i++) await advance(1_000);
+    await settle();
+    await drained();
+    expect(results).toEqual(["move"]);
+    expect(sdk.streams).toHaveLength(1);
   });
 
   it("an undetermined sender with the opponent's valid signatures is delivered, in order", async () => {

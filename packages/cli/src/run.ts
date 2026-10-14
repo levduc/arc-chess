@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { Hex } from "viem";
 import type { RelayClient, RelayMessage } from "@arena/sdk";
 import { startApi } from "./api.js";
-import { loadConfig, loadToken, loadWalletKey, type XmtpConfig } from "./config.js";
+import { loadToken, loadWalletKey, readConfig, type XmtpConfig } from "./config.js";
 import { ArenaDaemon } from "./daemon.js";
 import { connectHost, type HostConnection, type HostOptions } from "./host.js";
 import { acquireHomeLock } from "./lock.js";
@@ -19,6 +19,8 @@ export type DaemonProcess = {
   relay: RelayClient;
   /** Plan 5.7 (spec §2): `"xmtp"` when `config.xmtp` is set and the SDK loaded, else `"off"`. */
   fallback: "xmtp" | "off";
+  /** Plan 5.7 (I-2): why `fallback` is `"off"` (absent when it is `"xmtp"`). */
+  fallbackReason?: string;
   stop(): Promise<void>;
 };
 
@@ -43,7 +45,7 @@ export async function startDaemonProcess(
   let daemon: ArenaDaemon | undefined;
   let server: Server | undefined;
   try {
-    const config = loadConfig(home);
+    const { config, xmtpProblem } = readConfig(home);
     const walletKey = loadWalletKey(home);
     const token = loadToken(home);
 
@@ -53,6 +55,14 @@ export async function startDaemonProcess(
     let transportOf = (id: Hex): ChannelTransport => (hostRelay.isJoined(id) ? "relay" : "none");
     let relayRejected: ((msg: RelayMessage) => boolean) | undefined;
     let relayUndetermined: ((msg: RelayMessage) => boolean) | undefined;
+    let armFallback: ((id: Hex) => void) | undefined;
+    let xmtpDroppedOf: ((id: Hex) => number) | undefined;
+    let fallbackReason: string | undefined = "the XMTP fallback is not configured (config.json has no xmtp)";
+    // Plan 5.7 (m-7): an invalid `xmtp` in config.json turns the fallback off, logged once -- never stops the daemon.
+    if (xmtpProblem !== null) {
+      (opts.log ?? (() => undefined))(`xmtp: fallback off: ${xmtpProblem}`);
+      fallbackReason = xmtpProblem;
+    }
     // Plan 5.7 (spec §4): the XMTP fallback, only when the host published `xmtp` (cached by init) and the SDK
     // loads. Otherwise the daemon gets the host relay itself, exactly as before.
     if (config.xmtp) {
@@ -71,8 +81,13 @@ export async function startDaemonProcess(
         transportOf = (id) => fb.transportOf(id);
         relayRejected = (msg) => fb.countRejected(msg);
         relayUndetermined = (msg) => fb.isUndetermined(msg);
+        // Spec §3 (I-1): a channel's XMTP client starts once the daemon sees it Open on chain, never at match time.
+        armFallback = (id) => fb.arm(id);
+        xmtpDroppedOf = (id) => fb.dropped(id);
+        fallbackReason = undefined;
         log(`xmtp: fallback on (env ${config.xmtp.env}, node-sdk ${loaded.version})`);
       } else {
+        fallbackReason = loaded.reason;
         log(`xmtp: fallback off: ${loaded.reason}`);
       }
     }
@@ -87,6 +102,9 @@ export async function startDaemonProcess(
       fallback: fallback ? "xmtp" : "off",
       relayRejected,
       relayUndetermined,
+      armFallback,
+      xmtpDroppedOf,
+      fallbackReason,
     });
     await daemon.start();
 
@@ -106,6 +124,7 @@ export async function startDaemonProcess(
       host: hostRef,
       relay,
       fallback: fallbackRef ? "xmtp" : "off",
+      ...(fallbackReason !== undefined ? { fallbackReason } : {}),
       stop: async () => {
         if (stopped) return;
         stopped = true;

@@ -226,11 +226,41 @@ function required<T>(value: T | null, what: string): T {
   return value;
 }
 
-export function loadConfig(home: string): ArenaConfig {
+/**
+ * Plan 5.7 (m-7): `config.json` as `loadConfig` returns it, plus what was wrong with its `xmtp`, if anything. Only
+ * `xmtp` is validated here, and only when present -- every other field loads exactly as before. An invalid `xmtp` (a
+ * hand edit, or a value a newer CLI wrote) is dropped from the returned config rather than refused: the XMTP fallback
+ * is optional, and refusing would stop every command, `arena daemon` and its watchtower included. `init` stays strict
+ * (it validates with `parseXmtpConfig` itself). The file is not rewritten.
+ */
+export function readConfig(home: string): { config: ArenaConfig; xmtpProblem: string | null } {
   const cfg = required(readJson<ArenaConfig>(arenaPaths(home).config), "config");
-  // Plan 5.7: only `xmtp` is validated here, and only when present -- every other field loads exactly as before.
-  if (cfg.xmtp !== undefined) cfg.xmtp = parseXmtpConfig(cfg.xmtp);
-  return cfg;
+  if (cfg.xmtp === undefined) return { config: cfg, xmtpProblem: null };
+  try {
+    cfg.xmtp = parseXmtpConfig(cfg.xmtp);
+    return { config: cfg, xmtpProblem: null };
+  } catch (err) {
+    delete cfg.xmtp;
+    const why = err instanceof Error ? err.message : String(err);
+    return { config: cfg, xmtpProblem: `config.json's xmtp is invalid (${why}), so the XMTP fallback is off; re-run init to refresh it` };
+  }
+}
+
+/** Problems `loadConfig` has already warned about with its default sink: once per process each. */
+const warnedConfigProblems = new Set<string>();
+
+/** Loads `config.json` (see `readConfig`). An invalid `xmtp` is dropped with one warning: to `opts.warn` when given,
+ *  else to stderr, once per process. */
+export function loadConfig(home: string, opts: { warn?: (line: string) => void } = {}): ArenaConfig {
+  const { config, xmtpProblem } = readConfig(home);
+  if (xmtpProblem !== null) {
+    if (opts.warn) opts.warn(`warning: ${xmtpProblem}`);
+    else if (!warnedConfigProblems.has(xmtpProblem)) {
+      warnedConfigProblems.add(xmtpProblem);
+      process.stderr.write(`warning: ${xmtpProblem}\n`);
+    }
+  }
+  return config;
 }
 
 export function loadWalletKey(home: string): Hex {

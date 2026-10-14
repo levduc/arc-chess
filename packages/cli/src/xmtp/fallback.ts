@@ -8,6 +8,10 @@ import type { XmtpTransport } from "./transport.js";
 export const HOST_DOWN_GRACE_MS = 3000;
 /** Spec §3: the largest XMTP text accepted or sent, in UTF-8 bytes. */
 export const XMTP_MAX_PAYLOAD_BYTES = 16 * 1024;
+/** Spec §3 (I-1): the most XMTP clients one daemon holds at once. A channel armed past it runs without the fallback
+ *  (logged once): its sends go via the host relay alone, and its `transport` is `"relay"` or `"none"`, as without
+ *  XMTP. A client counts from `arm` until its close has finished. */
+export const XMTP_MAX_CLIENTS = 64;
 
 /** The side a channel's sends currently go to (`ChannelStatus.transport`). */
 export type ChannelTransport = "relay" | "xmtp" | "none";
@@ -27,6 +31,14 @@ type Pending = { msg: RelayMessage; done: () => void };
 type Channel = {
   /** The channel id exactly as `join` was given it, for every call to the host relay. */
   hostId: Hex;
+  /** What `arm` opens the channel's XMTP client with. */
+  params: Params;
+  signer: RelaySigner;
+  /** Set by `arm` (the channel is Open on chain) when a client slot was free: only then is there an XMTP side. Until
+   *  then -- and for good once `noFallback` -- the channel behaves exactly as on the host relay alone. */
+  armed: boolean;
+  /** Armed past `maxClients`: this channel runs without the fallback (logged once). */
+  noFallback: boolean;
   /** When the host relay was last seen going down for this channel (or when it was joined, if it never came up);
    *  null while it is up. */
   downSince: number | null;
@@ -65,6 +77,12 @@ const key = (id: Hex) => id.toLowerCase() as Hex;
  * Review Focus 1. A host that has joined the channel but silently drops its frames is out of scope here: the
  * chain fallback (challenge and respond) covers it, as before.
  *
+ * The XMTP side of a channel exists only once the daemon arms it (`arm`), when the channel is Open on chain -- both
+ * deposits in -- not when it is joined at match time: a match costs its acceptor nothing, so a client per match would
+ * let anyone grow this process by accepting offers (I-1). Until then the channel is the host relay's alone: `send`
+ * goes straight to it and `transportOf` is `"relay"` or `"none"`. At most `maxClients` (`XMTP_MAX_CLIENTS`) channels
+ * are armed at once; one past that stays as it was, for good, with one log line.
+ *
  * Receive: messages from both transports go to the same handlers. A message that arrives by both is harmless: the
  * session treats an exact repeat as a no-op, and the close path is idempotent. `onJoined` is the host's alone. An
  * XMTP message whose sender could not be determined reaches the handlers too (spec §3); the daemon hands a session
@@ -84,13 +102,25 @@ export class FallbackRelay implements RelayClient {
   private readonly graceMs: number;
   private readonly now: () => number;
   private readonly log: (l: string) => void;
+  private readonly maxClients: number;
   private readonly channels = new Map<Hex, Channel>();
   private readonly handlers = new Set<(msg: RelayMessage) => void>();
   private readonly unsubscribers: Array<() => void> = [];
+  /** XMTP clients held now: channels armed and not yet left, plus those left whose close has not finished. */
+  private clients = 0;
+  private stopped = false;
 
-  constructor(opts: { host: HostRelay; xmtp: XmtpTransport; graceMs?: number; now?: () => number; log?(l: string): void }) {
+  constructor(opts: {
+    host: HostRelay;
+    xmtp: XmtpTransport;
+    graceMs?: number;
+    now?: () => number;
+    log?(l: string): void;
+    maxClients?: number;
+  }) {
     this.host = opts.host;
     this.graceMs = opts.graceMs ?? HOST_DOWN_GRACE_MS;
+    this.maxClients = opts.maxClients ?? XMTP_MAX_CLIENTS;
     // Monotonic by default: a wall-clock step (NTP) must never stretch or skip the grace window.
     this.now = opts.now ?? (() => performance.now());
     this.log = opts.log ? (l) => opts.log?.(l) : () => undefined;
@@ -102,13 +132,17 @@ export class FallbackRelay implements RelayClient {
     );
   }
 
-  /** Joins the host relay exactly as before (its promise is the host's), and starts the channel's XMTP client in
-   *  the background, so a slow XMTP never delays the host join. */
+  /** Joins the host relay exactly as before (its promise is the host's), and registers the channel. Its XMTP client
+   *  is started later, by `arm`, once the channel is Open on chain. */
   join(channelId: Hex, params: Params, signer: RelaySigner): Promise<void> {
     const id = key(channelId);
     if (!this.channels.has(id)) {
       this.channels.set(id, {
         hostId: channelId,
+        params,
+        signer,
+        armed: false,
+        noFallback: false,
         downSince: this.host.isJoined(channelId) ? null : this.now(),
         outbox: [],
         hostSent: [],
@@ -120,14 +154,43 @@ export class FallbackRelay implements RelayClient {
         timer: undefined,
       });
     }
-    this.xmtp.open(channelId, params, signer).catch((err: unknown) => this.log(`xmtp: channel ${id}: ${errorText(err)}`));
     return this.host.join(channelId, params, signer);
+  }
+
+  /** Spec §3 (I-1): the channel is Open on chain (both deposits in): start its XMTP client, in the background, if a
+   *  client slot is free. Idempotent and cheap (the daemon calls it on every chain refresh); a channel not joined
+   *  here, already armed, refused once, or left is ignored. */
+  arm(channelId: Hex): void {
+    const id = key(channelId);
+    const ch = this.channels.get(id);
+    if (!ch || ch.armed || ch.noFallback || this.stopped) return;
+    if (this.clients >= this.maxClients) {
+      ch.noFallback = true;
+      this.log(`xmtp: channel ${id}: ${this.maxClients} XMTP clients already open (the cap); this channel runs without the XMTP fallback`);
+      return;
+    }
+    ch.armed = true;
+    this.clients += 1;
+    this.xmtp.open(ch.hostId, ch.params, ch.signer).catch((err: unknown) => this.log(`xmtp: channel ${id}: ${errorText(err)}`));
+    // Armed while the host is already down: what it last sent via the host is replayed over XMTP once past the window.
+    this.observe(ch);
+    if (ch.outbox.length > 0 || ch.replayPending) void this.pump(id, ch);
+  }
+
+  /** Whether the channel has an XMTP side now (armed): a channel that does not is the host relay's alone. */
+  armed(channelId: Hex): boolean {
+    return this.channels.get(key(channelId))?.armed === true;
   }
 
   send(msg: RelayMessage): Promise<void> {
     const id = key(msg.channelId);
     const ch = this.channels.get(id);
     if (!ch) return this.host.send(msg); // never joined through here: the host's behaviour, unchanged
+    if (!ch.armed) {
+      // No XMTP side (not Open yet, or over the cap): the host's behaviour, unchanged -- what it took is remembered,
+      // for the replay should the channel be armed and the host go down.
+      return this.host.send(msg).then(() => this.sentViaHost(ch, msg));
+    }
     return new Promise<void>((resolve) => {
       ch.outbox.push({ msg, done: resolve });
       void this.pump(id, ch);
@@ -143,6 +206,8 @@ export class FallbackRelay implements RelayClient {
     return this.host.onJoined(handler);
   }
 
+  /** Leaves the channel for good (the daemon calls it once the channel is finalized): the host relay's leave, then
+   *  the XMTP client is closed and the channel's XMTP DB deleted (I-1, m-1). */
   leave(channelId: Hex): void {
     const id = key(channelId);
     const ch = this.channels.get(id);
@@ -153,15 +218,21 @@ export class FallbackRelay implements RelayClient {
       this.releaseUpWaiters(ch);
     }
     this.host.leave(channelId);
-    this.xmtp.close(channelId).catch((err: unknown) => this.log(`xmtp: channel ${id}: close failed: ${errorText(err)}`));
+    const closing = this.xmtp
+      .close(channelId, { purge: true })
+      .catch((err: unknown) => this.log(`xmtp: channel ${id}: close failed: ${errorText(err)}`));
+    // The client's slot is free once its close has finished (bounded by the transport).
+    if (ch?.armed) void closing.finally(() => (this.clients = Math.max(0, this.clients - 1)));
   }
 
   /** The side this channel's sends go to now: `"relay"` while the host has it joined, `"xmtp"` once it has been down
-   *  for the grace window, `"none"` within the window (sends are held) or for a channel not joined here. */
+   *  for the grace window, `"none"` within the window (sends are held) or for a channel not joined here. A channel
+   *  with no XMTP side (`arm` not called yet, or over the cap) is `"relay"` or `"none"`, as on the host relay alone. */
   transportOf(channelId: Hex): ChannelTransport {
     const id = key(channelId);
     const ch = this.channels.get(id);
     if (!ch) return "none";
+    if (!ch.armed) return this.host.isJoined(ch.hostId) ? "relay" : "none";
     if (this.observe(ch)) return "relay";
     return this.pastGrace(ch) ? "xmtp" : "none";
   }
@@ -186,8 +257,9 @@ export class FallbackRelay implements RelayClient {
     return this.xmtp.isUndetermined(msg);
   }
 
-  /** Stops every channel's XMTP client. The host connection is the caller's to close. */
+  /** Stops every channel's XMTP client (their DBs are kept). The host connection is the caller's to close. */
   async stop(): Promise<void> {
+    this.stopped = true;
     for (const u of this.unsubscribers.splice(0)) u();
     for (const ch of this.channels.values()) {
       clearTimeout(ch.timer);
@@ -235,6 +307,11 @@ export class FallbackRelay implements RelayClient {
     return false;
   }
 
+  private sentViaHost(ch: Channel, msg: RelayMessage): void {
+    ch.hostSent.push(msg);
+    if (ch.hostSent.length > HOST_SENT_KEPT) ch.hostSent.shift();
+  }
+
   private releaseUpWaiters(ch: Channel): void {
     for (const w of [...ch.upWaiters]) w();
     ch.upWaiters.clear();
@@ -244,7 +321,7 @@ export class FallbackRelay implements RelayClient {
     for (const [id, ch] of this.channels) {
       ch.hostFailedSince = null; // the link changed: give the host another try
       if (this.observe(ch)) this.releaseUpWaiters(ch);
-      if (ch.outbox.length > 0 || ch.replayPending) void this.pump(id, ch);
+      if (ch.armed && (ch.outbox.length > 0 || ch.replayPending)) void this.pump(id, ch);
     }
   }
 
@@ -260,7 +337,7 @@ export class FallbackRelay implements RelayClient {
   /** Hands this channel's held sends (and any pending replay) to a transport, in order, until it must wait. One
    *  pump per channel at a time; a send or link change during a pump is picked up by its loop. */
   private async pump(id: Hex, ch: Channel): Promise<void> {
-    if (ch.pumping) return;
+    if (ch.pumping || !ch.armed) return;
     ch.pumping = true;
     try {
       while (this.channels.get(id) === ch) {
@@ -276,8 +353,7 @@ export class FallbackRelay implements RelayClient {
             ch.hostFailedSince = this.now();
             continue;
           }
-          ch.hostSent.push(next.msg);
-          if (ch.hostSent.length > HOST_SENT_KEPT) ch.hostSent.shift();
+          this.sentViaHost(ch, next.msg);
           next.done();
           continue;
         }
