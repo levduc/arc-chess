@@ -1,15 +1,31 @@
 import type { Server } from "node:http";
+import { join } from "node:path";
+import type { Hex } from "viem";
+import type { RelayClient } from "@arena/sdk";
 import { startApi } from "./api.js";
-import { loadConfig, loadToken, loadWalletKey } from "./config.js";
+import { loadConfig, loadToken, loadWalletKey, type XmtpConfig } from "./config.js";
 import { ArenaDaemon } from "./daemon.js";
 import { connectHost, type HostConnection, type HostOptions } from "./host.js";
 import { acquireHomeLock } from "./lock.js";
+import { FallbackRelay, type ChannelTransport } from "./xmtp/fallback.js";
+import { loadXmtpSdk, type XmtpSdkLoad } from "./xmtp/loader.js";
+import { createNodeSdkTransport, type XmtpTransport } from "./xmtp/transport.js";
 
 export type DaemonProcess = {
   daemon: ArenaDaemon;
   apiUrl: string;
   host: HostConnection;
+  /** Plan 5.7: the relay the daemon was given -- `host.relay` itself, or a `FallbackRelay` over it. */
+  relay: RelayClient;
+  /** Plan 5.7 (spec §2): `"xmtp"` when `config.xmtp` is set and the SDK loaded, else `"off"`. */
+  fallback: "xmtp" | "off";
   stop(): Promise<void>;
+};
+
+/** Plan 5.7: seams for tests -- the SDK loader and the transport factory (defaults: the real ones). */
+export type XmtpWiring = {
+  load?: (home: string) => Promise<XmtpSdkLoad>;
+  transport?: (opts: { sdk: unknown; dbDir: string; config: XmtpConfig; log(l: string): void }) => XmtpTransport;
 };
 
 /**
@@ -19,10 +35,11 @@ export type DaemonProcess = {
  */
 export async function startDaemonProcess(
   home: string,
-  opts: { log?: (l: string) => void; host?: HostOptions } = {},
+  opts: { log?: (l: string) => void; host?: HostOptions; xmtp?: XmtpWiring } = {},
 ): Promise<DaemonProcess> {
   const lock = acquireHomeLock(home);
   let host: HostConnection | undefined;
+  let fallback: FallbackRelay | undefined;
   let daemon: ArenaDaemon | undefined;
   let server: Server | undefined;
   try {
@@ -31,7 +48,40 @@ export async function startDaemonProcess(
     const token = loadToken(home);
 
     host = connectHost(config.serverUrl, { log: opts.log, ...opts.host });
-    daemon = new ArenaDaemon({ home, config, walletKey, lobby: host.lobby, relay: host.relay, log: opts.log });
+    const hostRelay = host.relay;
+    let relay: RelayClient = hostRelay;
+    let transportOf = (id: Hex): ChannelTransport => (hostRelay.isJoined(id) ? "relay" : "none");
+    // Plan 5.7 (spec §4): the XMTP fallback, only when the host published `xmtp` (cached by init) and the SDK
+    // loads. Otherwise the daemon gets the host relay itself, exactly as before.
+    if (config.xmtp) {
+      const log = opts.log ?? (() => undefined);
+      const loaded = await (opts.xmtp?.load ?? loadXmtpSdk)(home);
+      if (loaded.ok) {
+        const transport = (opts.xmtp?.transport ?? createNodeSdkTransport)({
+          sdk: loaded.sdk,
+          dbDir: join(home, "xmtp", "db"),
+          config: config.xmtp,
+          log,
+        });
+        const fb = new FallbackRelay({ host: hostRelay, xmtp: transport, log });
+        fallback = fb;
+        relay = fb;
+        transportOf = (id) => fb.transportOf(id);
+        log(`xmtp: fallback on (env ${config.xmtp.env}, node-sdk ${loaded.version})`);
+      } else {
+        log(`xmtp: fallback off: ${loaded.reason}`);
+      }
+    }
+    daemon = new ArenaDaemon({
+      home,
+      config,
+      walletKey,
+      lobby: host.lobby,
+      relay,
+      log: opts.log,
+      transportOf,
+      fallback: fallback ? "xmtp" : "off",
+    });
     await daemon.start();
 
     // 127.0.0.1 only: `host` is deliberately not configurable here (spec §6.1) -- `arena daemon` never exposes
@@ -43,10 +93,13 @@ export async function startDaemonProcess(
     const daemonRef = daemon;
     const hostRef = host;
     const serverRef = server;
+    const fallbackRef = fallback;
     return {
       daemon: daemonRef,
       apiUrl: api.url,
       host: hostRef,
+      relay,
+      fallback: fallbackRef ? "xmtp" : "off",
       stop: async () => {
         if (stopped) return;
         stopped = true;
@@ -58,6 +111,7 @@ export async function startDaemonProcess(
           await new Promise<void>((resolve) => serverRef.close(() => resolve()));
           await daemonRef.stop();
         } finally {
+          await stopFallback(fallbackRef, opts.log);
           hostRef.close();
           lock.release();
         }
@@ -74,9 +128,20 @@ export async function startDaemonProcess(
       }
       if (daemon) await daemon.stop();
     } finally {
+      await stopFallback(fallback, opts.log);
       if (host) host.close();
       lock.release();
     }
     throw err;
+  }
+}
+
+/** Stops the XMTP clients, if any; never throws, so the host close and the lock release after it always run. */
+async function stopFallback(fallback: FallbackRelay | undefined, log?: (l: string) => void): Promise<void> {
+  if (!fallback) return;
+  try {
+    await fallback.stop();
+  } catch (err) {
+    log?.(`xmtp: stop failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }

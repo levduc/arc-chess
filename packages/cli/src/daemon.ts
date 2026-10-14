@@ -278,6 +278,11 @@ export type DaemonOptions = {
   lobby: LobbyClient;
   relay: RelayClient;
   log?: (line: string) => void;
+  /** Plan 5.7: where `relay` sends this channel's messages now (`ChannelStatus.transport`). `run.ts` passes the
+   *  host relay's or `FallbackRelay`'s; without it, a live channel reports `"relay"`. */
+  transportOf?: (channelId: Hex) => ChannelStatus["transport"];
+  /** Plan 5.7: whether `relay` falls back to XMTP (the daemon's start line). Default `"off"`. */
+  fallback?: "xmtp" | "off";
 };
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\n")[0] : String(err));
@@ -511,6 +516,11 @@ export class ArenaDaemon {
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
+  }
+
+  /** Plan 5.7 (spec §2): whether this daemon's relay falls back to XMTP -- the start line's `fallback`. */
+  get fallback(): "xmtp" | "off" {
+    return this.opts.fallback ?? "off";
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -3041,6 +3051,7 @@ export class ArenaDaemon {
       settled: l.settledWake,
       autoReturnSeconds: autoReturnOnChallengeOf(this.opts.config) ? autoReturnSecondsOf(l.record.params.challengeTimeout) : null,
       ignoreHumanMustMove: opts.ignoreHumanMustMove,
+      transport: l.record.finalized ? "none" : (this.opts.transportOf?.(l.record.channelId) ?? "relay"),
     });
   }
 

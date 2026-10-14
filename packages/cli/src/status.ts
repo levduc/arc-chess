@@ -95,6 +95,10 @@ export type ChannelStatus = {
    *  (minor 4) or a retried-and-succeeded abandoned channel (important 1) can mean more than one over its
    *  lifetime; `sweptAmount`/`sweptTx` alone only ever show the latest. Empty if it has never been swept. */
   sweeps: Array<{ amount: string; tx: Hex; at: number }>;
+  /** Plan 5.7 (spec §2): the side this channel's messages are sent on now -- `"relay"` (the host), `"xmtp"` (the
+   *  fallback, once the host has been down for the grace window), or `"none"` (neither yet: within the window, or a
+   *  settled channel). Without the XMTP fallback it is `"relay"` or `"none"`. */
+  transport: "relay" | "xmtp" | "none";
 };
 
 export type StatusInput = {
@@ -119,6 +123,8 @@ export type StatusInput = {
   autoReturnSeconds?: number | null;
   /** Final fix wave (I1): `wait()` has already woken for this challenge's `human-must-move`. */
   ignoreHumanMustMove?: boolean;
+  /** Plan 5.7: see ChannelStatus.transport. Default `"none"`. */
+  transport?: ChannelStatus["transport"];
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
@@ -329,5 +335,6 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     sweptAmount: record.sweptAmount !== undefined ? record.sweptAmount.toString() : null,
     sweptTx: record.sweptTx ?? null,
     sweeps: (record.sweeps ?? []).map((s) => ({ amount: s.amount.toString(), tx: s.tx, at: s.at })),
+    transport: input.transport ?? "none",
   };
 }
