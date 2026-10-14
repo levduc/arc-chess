@@ -26,8 +26,9 @@ export type CliConfig = { package: string; version: string; minVersion?: string 
 
 /** Plan 5.7 Task 2 (spec §5): the same shape as the CLI's own `XmtpConfig` (packages/cli/src/config.ts), but
  *  defined locally -- `@arena/cli` is only a devDependency of `@arena/server` (used in tests), so the server's
- *  runtime has no dependency on the CLI package. `apiUrl` (tests, local node) and `gatewayHost` (production, once
- *  fees are enforced) are both optional. */
+ *  runtime has no dependency on the CLI package. `apiUrl` (tests, local node) and `gatewayHost` (dev and
+ *  production, once fees are enforced -- the XMTP SDK accepts a gateway only for those two environments, which
+ *  also lets the paid gateway be tested on XMTP's `dev` testnet) are both optional. */
 export type XmtpConfig = { env: "local" | "dev" | "production"; apiUrl?: string; gatewayHost?: string };
 
 export type ServerConfig = {
@@ -245,8 +246,10 @@ function parseXmtp(obj: Record<string, unknown>): XmtpConfig | undefined {
 
   const apiUrl = r.apiUrl === undefined ? undefined : httpUrl(r, "apiUrl", "xmtp.apiUrl");
   const gatewayHost = r.gatewayHost === undefined ? undefined : httpUrl(r, "gatewayHost", "xmtp.gatewayHost");
-  if (gatewayHost !== undefined && env !== "production") {
-    fail("xmtp.gatewayHost", 'is allowed only with env: "production"');
+  // Controller ruling (fix round 1): the XMTP SDK accepts a gateway only for "dev" and "production" -- "local"
+  // is the only environment that refuses one, which also lets the paid gateway be tested on XMTP's dev testnet.
+  if (gatewayHost !== undefined && env === "local") {
+    fail("xmtp.gatewayHost", 'is not allowed with env: "local"');
   }
 
   return { env, ...(apiUrl !== undefined ? { apiUrl } : {}), ...(gatewayHost !== undefined ? { gatewayHost } : {}) };

@@ -160,14 +160,21 @@ describe("config", () => {
         parseServerConfig({ ...base, xmtp: { env: "production", gatewayHost: "https://user:pass@host" } }),
       ).toThrow(/xmtp\.gatewayHost/);
     });
-    it("rejects gatewayHost outside env: \"production\", naming the field", () => {
+    it("rejects gatewayHost with env: \"local\", but allows it with \"dev\" and \"production\"", () => {
       const base = validBase();
       expect(() => parseServerConfig({ ...base, xmtp: { env: "local", gatewayHost: "https://host" } })).toThrow(/xmtp\.gatewayHost/);
-      expect(() => parseServerConfig({ ...base, xmtp: { env: "dev", gatewayHost: "https://host" } })).toThrow(/xmtp\.gatewayHost/);
+      expect(parseServerConfig({ ...base, xmtp: { env: "dev", gatewayHost: "https://host" } }).xmtp).toEqual({
+        env: "dev",
+        gatewayHost: "https://host",
+      });
       expect(parseServerConfig({ ...base, xmtp: { env: "production", gatewayHost: "https://host" } }).xmtp).toEqual({
         env: "production",
         gatewayHost: "https://host",
       });
+    });
+    it("drops unknown xmtp keys rather than passing them through", () => {
+      const base = validBase();
+      expect(parseServerConfig({ ...base, xmtp: { env: "local", foo: 1 } }).xmtp).toEqual({ env: "local" });
     });
   });
 });
