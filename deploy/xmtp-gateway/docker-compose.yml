@@ -35,10 +35,12 @@ services:
       # string was given", `XMTPD_REDIS_CONNECTION_STRING=${...:-}` would wrongly try to dial "".
       - XMTPD_REDIS_CONNECTION_STRING
     ports:
-      # 5050/5055: message traffic. 8008: Prometheus metrics. These three variables are host-side port-mapping
+      # 5050/5055: message traffic. 8008: Prometheus metrics. These variables are host-side port-mapping
       # conveniences for this compose file only -- they are never passed into the container's `environment:`
       # block above, so they deliberately do NOT carry the `XMTPD_` prefix (that prefix is reserved for real
       # upstream config; see README.md's "Environment variables" table for the ones that actually are).
-      - "${GATEWAY_PORT:-5050}:5050"
-      - "${GATEWAY_PORT_2:-5055}:5055"
-      - "${GATEWAY_METRICS_PORT:-8008}:8008"
+      # Loopback only by default: the prebuilt image authorizes every request, so its ports are never published on
+      # a public interface unless the operator chooses to (README.md, "Exposing the gateway").
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT:-5050}:5050"
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT_2:-5055}:5055"
+      - "${GATEWAY_METRICS_BIND:-127.0.0.1}:${GATEWAY_METRICS_PORT:-8008}:8008"

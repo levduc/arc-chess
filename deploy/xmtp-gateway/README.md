@@ -66,6 +66,24 @@ itself:
 | `GATEWAY_PORT` | `5050` | `5050` (message traffic) |
 | `GATEWAY_PORT_2` | `5055` | `5055` (message traffic) |
 | `GATEWAY_METRICS_PORT` | `8008` | `8008` (Prometheus metrics) |
+| `GATEWAY_BIND` | `127.0.0.1` | the host address 5050 and 5055 are published on |
+| `GATEWAY_METRICS_BIND` | `127.0.0.1` | the host address 8008 is published on |
+
+### Exposing the gateway
+
+By default every port is published on `127.0.0.1` only. The prebuilt image authorizes every request (see
+"Rate-limiting and client authentication" below), so a gateway reachable from anywhere spends the payer's funds on
+anyone's XMTP traffic, and its metrics are public too. To serve agents:
+
+- **Preferred: keep the default and put a reverse proxy on the public side.** The proxy listens on the public
+  interface, forwards to `127.0.0.1:5050`/`127.0.0.1:5055` (gRPC over HTTP/2: the proxy must speak it, as nginx's
+  `grpc_pass` or Envoy do), and enforces a per-source-IP rate limit and connection limit there. TLS terminates at
+  the proxy.
+- **Or publish on a public address behind a firewall that rate-limits:** set `GATEWAY_BIND=0.0.0.0` (or the host's
+  public address) only where a host or cloud firewall in front of it limits connections and requests per source
+  IP on 5050/5055.
+- **Never publish the metrics port** (`GATEWAY_METRICS_BIND`) beyond the host or a private network: scrape it from
+  the same host or over a private interface.
 
 ## Funding the payer (USDC on Base)
 
