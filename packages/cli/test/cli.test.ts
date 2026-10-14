@@ -133,7 +133,7 @@ describe("arena CLI", () => {
   });
 
   it("Plan 5 Task 2 fix round, CRITICAL 1: the daemon start line never carries the token fragment", () => {
-    const line = daemonStartLine({ apiUrl: "http://127.0.0.1:7010", pid: 4242, wallet: "0xabc123" });
+    const line = daemonStartLine({ apiUrl: "http://127.0.0.1:7010", pid: 4242, wallet: "0xabc123", fallback: "off" });
     const json = JSON.stringify(line);
     expect(json).not.toContain("#token=");
     expect(json).not.toContain("token");
@@ -143,6 +143,13 @@ describe("arena CLI", () => {
       wallet: "0xabc123",
       board: "http://127.0.0.1:7010/board",
       boardHint: "run: arena board",
+      fallback: "off",
+    });
+  });
+
+  it("Plan 5.7 Task 4: the daemon start line carries the daemon's own fallback (\"xmtp\" or \"off\")", () => {
+    expect(daemonStartLine({ apiUrl: "http://127.0.0.1:7010", pid: 1, wallet: "0xabc123", fallback: "xmtp" })).toMatchObject({
+      fallback: "xmtp",
     });
   });
 

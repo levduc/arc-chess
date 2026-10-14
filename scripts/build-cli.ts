@@ -137,6 +137,20 @@ async function main(): Promise<void> {
   });
   chmodSync(join(out, "arena.mjs"), 0o755);
 
+  // Plan 5.7 (Global Constraints): the bundle stays zero-runtime-dependency and must never contain the XMTP SDK
+  // (native bindings, about 725 MB) -- it is loaded only via a dynamic import() resolved at runtime from
+  // <home>/xmtp/sdk, installed separately by "arena xmtp enable". A hard build-time guarantee, not only a test:
+  // this fails the build loudly if `@xmtp/` is ever actually bundled in, whether from a future static import or
+  // an accidental dependency pull-in -- checked against the metafile's own resolved input paths, which name the
+  // real on-disk package directory regardless of how it got there (a workspace symlink, pnpm's store layout, ...).
+  const xmtpInput = Object.keys(result.metafile.inputs).find((input) => input.includes("node_modules/@xmtp/"));
+  if (xmtpInput) {
+    throw new Error(
+      `bundled an XMTP SDK module (${xmtpInput}): the published CLI must never bundle @xmtp/node-sdk -- it is ` +
+        'installed at runtime by "arena xmtp enable", never a build-time dependency',
+    );
+  }
+
   writeFileSync(join(out, "THIRD_PARTY_LICENSES"), thirdPartyLicenses(result.metafile));
 
   const boardOut = join(out, "board");
