@@ -136,12 +136,24 @@ export async function startDaemonProcess(
   }
 }
 
-/** Stops the XMTP clients, if any; never throws, so the host close and the lock release after it always run. */
+/** How long a shutdown waits for the XMTP clients to stop (a client mid-start on a slow network) before moving on. */
+const XMTP_STOP_WAIT_MS = 5_000;
+
+/** Stops the XMTP clients, if any. Never throws and waits at most `XMTP_STOP_WAIT_MS`, so the host close and the
+ *  lock release after it always run, and promptly. */
 async function stopFallback(fallback: FallbackRelay | undefined, log?: (l: string) => void): Promise<void> {
   if (!fallback) return;
-  try {
-    await fallback.stop();
-  } catch (err) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stopping = fallback.stop().catch((err: unknown) => {
     log?.(`xmtp: stop failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  });
+  const waited = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      log?.(`xmtp: stop still pending after ${XMTP_STOP_WAIT_MS} ms; moving on`);
+      resolve();
+    }, XMTP_STOP_WAIT_MS);
+    timer.unref?.();
+  });
+  await Promise.race([stopping, waited]);
+  clearTimeout(timer);
 }

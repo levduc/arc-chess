@@ -276,9 +276,10 @@ export class FallbackRelay implements RelayClient {
     const sending = this.xmtp.send(msg).catch((err: unknown) => this.log(`xmtp: channel ${id}: send failed: ${errorText(err)}`));
     const waited = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
-        this.log(`xmtp: channel ${id}: send still pending after ${XMTP_SEND_WAIT_MS} ms; moving on`);
+        if (this.channels.get(id)) this.log(`xmtp: channel ${id}: send still pending after ${XMTP_SEND_WAIT_MS} ms; moving on`);
         resolve();
       }, XMTP_SEND_WAIT_MS);
+      timer.unref?.(); // never keeps a stopped daemon's process alive
     });
     await Promise.race([sending, waited]);
     clearTimeout(timer);

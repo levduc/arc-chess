@@ -802,4 +802,19 @@ describe("startDaemonProcess: choosing the relay", () => {
     }
     expect(fake.stopped).toBe(true);
   });
+
+  it("a hung XMTP stop delays shutdown by at most a few seconds, and the home lock is still released", async () => {
+    const dir = await home({ env: "dev" });
+    const out: string[] = [];
+    const hung = new FakeXmtp();
+    hung.stop = () => new Promise<void>(() => undefined);
+    const wiring = { load: async () => ({ ok: true as const, sdk: {}, version: "6.0.0" }), transport: () => hung };
+    const proc = await startDaemonProcess(dir, { log: (l) => out.push(l), xmtp: wiring });
+    const t0 = Date.now();
+    await proc.stop();
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(out.some((l) => l.includes("xmtp: stop still pending"))).toBe(true);
+    const again = await startDaemonProcess(dir, { log: () => undefined }); // the lock was released
+    await again.stop();
+  });
 });
