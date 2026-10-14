@@ -115,9 +115,11 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   payer cap, monitored (`deploy/xmtp-gateway/README.md`), and on infrastructure separate from the website; the
   server must publish `gatewayHost` in its `xmtp` config.
 - **Gateway authentication once XMTP ships client auth tokens.** XMTP's `gatewayAuthTokenFetcher` is marked
-  "coming soon" as of 2026-10-13; until then, the gateway's only gate is an IP-based `WithAuthorizers` rate limit
-  (`deploy/xmtp-gateway/README.md`). Once XMTP ships client auth tokens, the gateway must authorize only session
-  keys of currently open channels — not every client that happens to present a token.
+  "coming soon" as of 2026-10-13; until then, the only available gate is IP-based — a custom gateway build using
+  the Go library's `WithAuthorizers` hook, or a per-IP rate limit in front of ports 5050/5055 (reverse proxy or
+  firewall), since the prebuilt image ships with no limiter of its own (`deploy/xmtp-gateway/README.md`). Once
+  XMTP ships client auth tokens, the gateway must authorize only session keys of currently open channels — not
+  every client that happens to present a token.
 - **XMTP production verified end to end before launch.** The system tests run only against XMTP's local node
   (Docker); nothing in this repo exercises XMTP's real `dev` or production network. Before mainnet, run the
   manual smoke script (spec §7) against XMTP's public `dev` network, and confirm the fallback actually works

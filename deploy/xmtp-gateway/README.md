@@ -29,9 +29,11 @@ and the digest above is what `docker buildx imagetools inspect ghcr.io/xmtp/xmtp
 Re-check both registries the next time this is re-pinned, in case XMTP later publishes to Docker Hub too.
 
 **XMTP's own docs say this prebuilt image "authorizes all requests without authentication" and "Never use it in
-production."** It is fine for local testing (and is exactly what runs against XMTP's local node in
-`tests/system/xmtp-local/`), but see "Rate-limiting and client authentication" below before using it against
-mainnet traffic.
+production."** It is fine for ad hoc local testing of the gateway itself, but see "Rate-limiting and client
+authentication" below before using it against mainnet traffic. (It is *not* what the arena's own tests run: no
+test or CI job in this repository starts this gateway at all -- see "Tests never run this" below. The arena's
+system tests run only XMTP's local *node*, `tests/system/xmtp-local/docker-compose.yml`, which has no gateway
+service in it.)
 
 ## Environment variables
 
@@ -138,10 +140,12 @@ notices (see monitoring, below).
 ## Fee enforcement is not yet confirmed
 
 Whether paid messaging through XMTP's mainnet is *currently enforced* is unclear from XMTP's own docs as of
-2026-10-13. The fee-calculation page states that "full audits from Trail of Bits and Octane will be published
-before paid messaging is enforced," implying enforcement is gated on those audits landing, with no published
-date found during this work. (Separately, XMTP's docs elsewhere reference a "testnet-only period" that the
-consulted pages did not spell out in enforcement terms.) Treat mainnet fee enforcement as **not yet confirmed
+2026-10-13. The funding-portal page (<https://docs.xmtp.org/fund-agents-apps/fund-your-app>, fetched 2026-10-13)
+states that "full audits from Trail of Bits and Octane will be published before paid messaging is enforced,"
+implying enforcement is gated on those audits landing, with no published date found on the pages fetched for
+this work. Separately, this plan's own research notes mention XMTP's docs stating "Until November 1: Testnet-only
+period" elsewhere -- that specific line was not confirmed on the pages fetched 2026-10-13, so treat it as a
+secondhand pointer to re-verify, not a confirmed fact. Treat mainnet fee enforcement as **not yet confirmed
 either way** -- verify current status against XMTP's docs before relying on either "it's free for now" or "it's
 already enforced." Per `docs/superpowers/mainnet-gates.md`, no gateway is needed while fees are not enforced; one
 is required, funded and monitored, once they are.

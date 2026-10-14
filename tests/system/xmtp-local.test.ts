@@ -12,6 +12,18 @@
  * in the suite title, so it is visible in the test report even though `vitest.config.ts`'s `onConsoleLog` filter
  * (unrelated to this task) would otherwise drop a plain console tag -- the same pattern board.test.ts uses for a
  * missing Chrome.
+ *
+ * Which port actually answers HTTP, verified empirically (2026-10-13) against the running container's own log
+ * lines, not assumed from the port numbers' names: node-go logs "serving http" on its container port 5555 (the
+ * `XMTP_GRPC_PORT`-mapped port) and "serving grpc" on its container port 5556 (the `XMTP_API_PORT`-mapped port)
+ * -- i.e. the port named "grpc" is the one a plain HTTP GET actually gets a response from, and the port named
+ * "api" never answers HTTP at all (confirmed over 40s of polling: consistently no response). The env var names
+ * are kept exactly as specified (they're just upstream's own 5555/5556 numbers); this test checks HTTP against
+ * `ports.grpc` and falls back to a raw TCP connect against `ports.api` accordingly, so the HTTP check is a real
+ * readiness signal rather than one that can never succeed. A bare TCP connect-success is a weak signal on its
+ * own here -- Docker's userland proxy accepts the TCP handshake on a published port immediately on `up -d`,
+ * before the containerized process has bound anything -- which is exactly why the HTTP check (a real response,
+ * not just a completed handshake) is tried first and given the whole 120s budget before falling back to it.
  */
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { connect } from "node:net";
@@ -70,20 +82,24 @@ suite(skipReason ? `XMTP local-node fixture (SKIPPED: ${skipReason})` : "XMTP lo
   }, 120_000);
 
   it(
-    "answers on the API port, or accepts a TCP connection on the gRPC port, within 120s",
+    "answers HTTP on the port node-go actually serves it on, or accepts a TCP connection on the gRPC port, within 120s",
     async () => {
       const deadline = Date.now() + 120_000;
       let reachable = false;
       let lastHttpErr: unknown;
       while (Date.now() < deadline && !reachable) {
         try {
-          const res = await fetch(`http://127.0.0.1:${ports.api}/`, { signal: AbortSignal.timeout(2_000) });
+          // See the suite-level comment: node-go's real HTTP response is on the `grpc`-named port.
+          const res = await fetch(`http://127.0.0.1:${ports.grpc}/`, { signal: AbortSignal.timeout(2_000) });
           await res.body?.cancel().catch(() => undefined);
-          reachable = true; // node-go's grpc-gateway answering at all (even a 404) means it's up.
+          reachable = true; // an actual HTTP response (even a 404) means node-go itself answered, not just the proxy.
         } catch (err) {
           lastHttpErr = err;
         }
-        if (!reachable) reachable = await tcpConnects(ports.grpc, 2_000);
+        // Weak fallback only: a successful TCP connect on the grpc-only port can be Docker's userland proxy
+        // accepting the handshake before node-go has bound anything (see suite comment) -- it's checked only
+        // because the HTTP probe above already has the whole 120s budget to find the real signal first.
+        if (!reachable) reachable = await tcpConnects(ports.api, 2_000);
         if (!reachable) await sleep(1_000);
       }
       expect(reachable, `fixture never became reachable within 120s (last HTTP error: ${String(lastHttpErr)})`).toBe(true);

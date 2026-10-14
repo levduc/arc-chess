@@ -22,16 +22,18 @@ services:
       # Every required XMTPD_* variable (verbatim names from XMTP's docs) must be set in the environment this
       # compose file is run with (e.g. a .env file next to it, or the host's secret manager) -- `:?` makes compose
       # refuse to start with any of them unset or empty, rather than silently booting a half-configured gateway.
-      XMTPD_PAYER_PRIVATE_KEY: "${XMTPD_PAYER_PRIVATE_KEY:?set the funded payer's secp256k1 private key}"
-      XMTPD_APP_CHAIN_RPC_URL: "${XMTPD_APP_CHAIN_RPC_URL:?set the XMTP app chain RPC URL}"
-      XMTPD_SETTLEMENT_CHAIN_RPC_URL: "${XMTPD_SETTLEMENT_CHAIN_RPC_URL:?set the Base (settlement chain) RPC URL}"
-      XMTPD_APP_CHAIN_WSS_URL: "${XMTPD_APP_CHAIN_WSS_URL:?set the XMTP app chain WebSocket URL}"
-      XMTPD_SETTLEMENT_CHAIN_WSS_URL: "${XMTPD_SETTLEMENT_CHAIN_WSS_URL:?set the Base (settlement chain) WebSocket URL}"
+      - XMTPD_PAYER_PRIVATE_KEY=${XMTPD_PAYER_PRIVATE_KEY:?set the funded payer's secp256k1 private key}
+      - XMTPD_APP_CHAIN_RPC_URL=${XMTPD_APP_CHAIN_RPC_URL:?set the XMTP app chain RPC URL}
+      - XMTPD_SETTLEMENT_CHAIN_RPC_URL=${XMTPD_SETTLEMENT_CHAIN_RPC_URL:?set the Base (settlement chain) RPC URL}
+      - XMTPD_APP_CHAIN_WSS_URL=${XMTPD_APP_CHAIN_WSS_URL:?set the XMTP app chain WebSocket URL}
+      - XMTPD_SETTLEMENT_CHAIN_WSS_URL=${XMTPD_SETTLEMENT_CHAIN_WSS_URL:?set the Base (settlement chain) WebSocket URL}
       # One of: anvil | testnet | mainnet.
-      XMTPD_CONTRACTS_ENVIRONMENT: "${XMTPD_CONTRACTS_ENVIRONMENT:?set anvil, testnet, or mainnet}"
-      # Optional: a Redis instance for nonce management (and, per XMTP's docs, rate-limiting support). Left unset,
-      # the gateway runs without it.
-      XMTPD_REDIS_CONNECTION_STRING: "${XMTPD_REDIS_CONNECTION_STRING:-}"
+      - XMTPD_CONTRACTS_ENVIRONMENT=${XMTPD_CONTRACTS_ENVIRONMENT:?set anvil, testnet, or mainnet}
+      # Optional: a Redis instance for nonce management (and, per XMTP's docs, rate-limiting support). Bare name,
+      # no `=value`/`:-` default, so this is genuinely absent from the container's environment when unset, rather
+      # than set to an empty string -- if the gateway's own config loader treats an empty string as "a connection
+      # string was given", `XMTPD_REDIS_CONNECTION_STRING=${...:-}` would wrongly try to dial "".
+      - XMTPD_REDIS_CONNECTION_STRING
     ports:
       # 5050/5055: message traffic. 8008: Prometheus metrics.
       - "${XMTPD_GATEWAY_PORT:-5050}:5050"
