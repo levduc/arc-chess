@@ -5,8 +5,8 @@
  * (`packages/cli/bin/arena.mjs`) -- so later tasks (dispute e2e, adversarial, chaos, load, LLM games) can build on
  * one API instead of re-inventing process plumbing each time.
  */
-import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,9 +58,12 @@ type Tracked = {
 };
 
 const TRACKED_PGIDS = new Set<number>();
+/** Plan 5.7 Task 5: compose projects `startXmtpLocal` brought up and has not taken down yet. */
+const TRACKED_COMPOSE = new Set<string>();
 let processHooksInstalled = false;
 
-/** Kills every process group this module has ever spawned, best-effort. Shared by the `exit` backstop and the
+/** Kills every process group this module has ever spawned, best-effort, and takes down every XMTP local-node
+ *  fixture still up (synchronously: this also runs as an `exit` listener). Shared by the `exit` backstop and the
  *  explicit SIGINT/SIGTERM handlers below. */
 function killAllTracked(): void {
   for (const pgid of TRACKED_PGIDS) {
@@ -69,6 +72,15 @@ function killAllTracked(): void {
     } catch {
       // already gone
     }
+  }
+  downTrackedComposeSync();
+}
+
+/** Takes down (`down -v`, synchronously) every XMTP local-node fixture `startXmtpLocal` started and has not stopped. */
+function downTrackedComposeSync(): void {
+  for (const project of TRACKED_COMPOSE) {
+    spawnSync("docker", composeArgs(project, ["down", "-v", "--timeout", "5"]), { stdio: "ignore", timeout: 60_000 });
+    TRACKED_COMPOSE.delete(project);
   }
 }
 
@@ -339,11 +351,24 @@ export type Player = {
   /** This player's daemon's current OS pid (a method, not a field, since it changes across `kill()`/`start()`),
    *  or `undefined` if it has exited. For soak/load sampling: `/proc/<pid>/status` (RSS) and `/proc/<pid>/fd`. */
   pid(): number | undefined;
+  /** Plan 5.7 Task 5: how the current daemon process exited (`code` 0 after a clean shutdown; `signal` set when a
+   *  signal killed it outright), or null while it runs. Optional only so hand-built test doubles of `Player` need not
+   *  carry it; `Stack.player()` always provides it. */
+  exitStatus?(): { code: number | null; signal: NodeJS.Signals | null } | null;
 };
 
 /** `serverUrl`/`rpcUrl`: see `Stack.player`. `sessionGasWei`/`sessionGasFloor`: the daemon's session-key dispute gas
  *  target and refill floor (`arena init --session-gas-wei/--session-gas-floor`); default 1e16 wei and half of it. */
-export type PlayerOptions = { serverUrl?: string; rpcUrl?: string; sessionGasWei?: bigint; sessionGasFloor?: bigint };
+export type PlayerOptions = {
+  serverUrl?: string;
+  rpcUrl?: string;
+  sessionGasWei?: bigint;
+  sessionGasFloor?: bigint;
+  /** Plan 5.7 Task 5: an installed SDK directory (`installXmtpSdk().sdkDir`, an `arena xmtp enable` home's
+   *  `xmtp/sdk`). The player's `<home>/xmtp/sdk` becomes a symlink to it before its daemon starts, so a whole test
+   *  run shares one real install. With the server publishing `xmtp`, the daemon then starts with `fallback: "xmtp"`. */
+  xmtpSdkDir?: string;
+};
 
 export type Stack = {
   rpcUrl: string;
@@ -365,6 +390,11 @@ export type Stack = {
   /** Gives `address` native gas (100 ETH) and, unless `usdc` is 0, mints it MockUSDC (default 10 USDC) -- the same
    *  funding `player()` gives a daemon's wallet, for SDK-only actors (a malicious peer, an attacker). */
   fund(address: Address, usdc?: bigint): Promise<void>;
+  /** Plan 5.7 Task 5: stops the host server and leaves it down, the site-outage case: by default SIGTERM (then
+   *  SIGKILL after a grace period); `"SIGKILL"` kills it outright, a crash. `restartServer()` brings it back on the
+   *  same port, config and database. */
+  stopServer(signal?: "SIGTERM" | "SIGKILL"): Promise<void>;
+  /** Stops the server (a no-op when `stopServer()` already did) and starts it again on the same port and DB. */
   restartServer(): Promise<void>;
   setLimits(maxDeposit: bigint, maxCommitted: bigint): Promise<void>;
   setPaused(p: boolean): Promise<void>;
@@ -377,19 +407,37 @@ export type Stack = {
 /** Runs one `arena` CLI command to completion. Asynchronous on purpose (not spawnSync): a caller may be serving the
  *  very endpoint the command talks to from this same process -- e.g. a MITM proxy in front of the server that `arena
  *  init --server` fetches `/templates` through -- and a blocked event loop would deadlock against it. */
-export function runCli(args: string[], home: string): Promise<{ stdout: string; stderr: string; status: number }> {
+export function runCli(
+  args: string[],
+  home: string,
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+): Promise<{ stdout: string; stderr: string; status: number }> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn("node", [CLI_BIN, ...args], {
       cwd: REPO_ROOT,
-      env: { ...process.env, ARENA_HOME: home },
+      env: { ...process.env, ...opts.env, ARENA_HOME: home },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    // Plan 5.7 Task 5: an optional bound (an `xmtp enable` whose npm install hangs must fail the run, not stall it).
+    const timer =
+      opts.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            stderr += `\n[harness] runCli: killed after ${opts.timeoutMs}ms`;
+            child.kill("SIGKILL");
+          }, opts.timeoutMs);
     child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
     child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
-    child.once("error", reject);
-    child.once("close", (code) => resolvePromise({ stdout, stderr, status: code ?? 1 }));
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      resolvePromise({ stdout, stderr, status: code ?? 1 });
+    });
   });
 }
 
@@ -533,6 +581,10 @@ export async function startStack(
     if (init.status !== 0) {
       throw new Error(`arena init failed for player "${name}":\n${init.stderr || init.stdout}`);
     }
+    if (opts.xmtpSdkDir !== undefined) {
+      mkdirSync(join(home, "xmtp"), { recursive: true });
+      symlinkSync(opts.xmtpSdkDir, join(home, "xmtp", "sdk"), "dir");
+    }
 
     let tracked = spawnTracked(`daemon:${name}`, "node", [CLI_BIN, "daemon"], {
       cwd: REPO_ROOT,
@@ -590,6 +642,9 @@ export async function startStack(
       pid(): number | undefined {
         return tracked.child.pid;
       },
+      exitStatus() {
+        return isExited(tracked) ? { code: tracked.child.exitCode, signal: tracked.child.signalCode } : null;
+      },
     };
   }
 
@@ -610,6 +665,19 @@ export async function startStack(
     },
     player,
     fund,
+    async stopServer(signal: "SIGTERM" | "SIGKILL" = "SIGTERM"): Promise<void> {
+      if (signal === "SIGTERM" || isExited(serverTracked) || serverTracked.child.pid === undefined) {
+        await terminate(serverTracked);
+        return;
+      }
+      const exited = waitForExit(serverTracked.child, 10_000);
+      try {
+        process.kill(-serverTracked.child.pid, "SIGKILL");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+      }
+      await exited;
+    },
     async restartServer(): Promise<void> {
       await terminate(serverTracked);
       serverTracked = spawnTracked(`server:${serverPort}`, "node", [SERVER_BIN, "--config", serverConfigPath], { cwd: REPO_ROOT });
@@ -674,4 +742,171 @@ export async function usdcBalanceOf(stack: Stack, who: Address): Promise<bigint>
  *  and that `Player.start()` still succeeds by taking it over). */
 export function hasLockFile(home: string): boolean {
   return existsSync(join(home, "daemon.lock"));
+}
+
+// ------------------------------------------------------------------------------- XMTP local node (Plan 5.7 Task 5)
+
+/** Task 3's fixture: a pinned copy of xmtp/xmtp-local-node, every image pinned by digest, host ports parameterized. */
+export const XMTP_COMPOSE_FILE = join(REPO_ROOT, "tests/system/xmtp-local/docker-compose.yml");
+
+function composeArgs(project: string, args: string[]): string[] {
+  return ["compose", "-p", project, "-f", XMTP_COMPOSE_FILE, ...args];
+}
+
+/** Why the XMTP local node cannot run here (no Docker, the daemon down, no compose plugin), or null when it can. A
+ *  cheap synchronous probe, meant to be checked once at module load (as xmtp-local.test.ts does). */
+export function dockerUnavailableReason(): string | null {
+  const info = spawnSync("docker", ["info"], { stdio: "ignore", timeout: 30_000 });
+  if (info.error) return `docker is not available (${String(info.error.message)})`;
+  if (info.status !== 0) return "`docker info` failed (is the Docker daemon running?)";
+  const compose = spawnSync("docker", ["compose", "version"], { stdio: "ignore", timeout: 30_000 });
+  if (compose.error || compose.status !== 0) return "the `docker compose` plugin is not available";
+  return null;
+}
+
+/** One `docker compose` command, asynchronously (a `spawnSync` would block the event loop, and with it the draining
+ *  of every tracked child's output pipes), bounded by `timeoutMs`. Never rejects. */
+function runCompose(
+  project: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<{ status: number | null; output: string }> {
+  return new Promise((resolvePromise) => {
+    const child = spawn("docker", composeArgs(project, args), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    const timer = setTimeout(() => {
+      output += `\n[harness] docker compose ${args.join(" ")}: killed after ${timeoutMs}ms`;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.stdout.on("data", (c: Buffer) => (output += c.toString("utf8")));
+    child.stderr.on("data", (c: Buffer) => (output += c.toString("utf8")));
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      resolvePromise({ status: null, output: `${output}\n${String(err)}` });
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      resolvePromise({ status: code, output });
+    });
+  });
+}
+
+let composeExitHookInstalled = false;
+
+/** An `exit` backstop for fixtures alone (synchronous `down -v`), installed without any signal handler, so a caller
+ *  with its own SIGINT/SIGTERM teardown (dev-up) keeps it. Test processes also get `installProcessHooks`'s signal
+ *  handlers from their stacks, and those take fixtures down too. */
+function installComposeExitHook(): void {
+  if (composeExitHookInstalled) return;
+  composeExitHookInstalled = true;
+  process.on("exit", downTrackedComposeSync);
+}
+
+export type XmtpLocal = {
+  /** The XMTP SDK's `apiUrl`: the `XMTP_API_PORT`-mapped port (container 5556), node-go's gRPC/HTTP2 endpoint. */
+  apiUrl: string;
+  /** The compose project, unique per call. Every container of the fixture carries it as its project label. */
+  project: string;
+  ports: { grpc: number; api: number; history: number };
+  /** `up -d` (including any image pull) and readiness after it, in milliseconds. */
+  timings: { upMs: number; readyMs: number };
+  /** `docker compose down -v` for this project. Idempotent; never throws (a failure is returned as text). */
+  stop(): Promise<string | null>;
+};
+
+/** Three distinct free host ports (two back-to-back `freeTcpPort()` calls can, rarely, return the same one). */
+async function distinctFreePorts(n: number): Promise<number[]> {
+  const ports = new Set<number>();
+  while (ports.size < n) ports.add(await freeTcpPort());
+  return [...ports];
+}
+
+/**
+ * Plan 5.7 Task 5: brings up XMTP's local node from Task 3's pinned fixture and waits until it answers, modelled on
+ * tests/system/xmtp-local.test.ts:
+ * - a unique compose project per call (`opts.project`, default `arena-xmtp-<pid>-<time>`) and three freshly picked
+ *   host ports, so it never collides with another run or touches anything else;
+ * - readiness is a real HTTP response on the `XMTP_GRPC_PORT`-mapped port (container 5555, the one node-go serves
+ *   HTTP on), never a bare TCP connect (Docker's proxy accepts those before node-go is up);
+ * - teardown is always `down -v`: on a failed start here, from `stop()`, and from the process's `exit` backstop.
+ * History sync is moot: the daemon's transport runs with `disableDeviceSync: true`, so `XMTP_HISTORY_PORT` is only
+ * mapped (to a free port) to keep the fixture off the default 5558.
+ */
+export async function startXmtpLocal(
+  opts: { project?: string; upTimeoutMs?: number; readyTimeoutMs?: number } = {},
+): Promise<XmtpLocal> {
+  const project = opts.project ?? `arena-xmtp-${process.pid}-${Date.now()}`;
+  const [grpc, api, history] = await distinctFreePorts(3);
+  const env = { XMTP_GRPC_PORT: String(grpc), XMTP_API_PORT: String(api), XMTP_HISTORY_PORT: String(history) };
+  installComposeExitHook();
+  TRACKED_COMPOSE.add(project);
+  let stopped = false;
+  const stop = async (): Promise<string | null> => {
+    if (stopped) return null;
+    stopped = true;
+    const down = await runCompose(project, ["down", "-v", "--timeout", "5"], env, 120_000);
+    TRACKED_COMPOSE.delete(project);
+    return down.status === 0 ? null : `docker compose down -v failed (exit ${String(down.status)}): ${down.output.slice(-2000)}`;
+  };
+  try {
+    const t0 = Date.now();
+    // `--pull missing`: a cold first run pulls the five pinned images (minutes); later runs start offline.
+    const up = await runCompose(project, ["up", "-d", "--quiet-pull", "--pull", "missing"], env, opts.upTimeoutMs ?? 600_000);
+    if (up.status !== 0) throw new Error(`docker compose up failed (exit ${String(up.status)}):\n${up.output.slice(-4000)}`);
+    const upMs = Date.now() - t0;
+    const t1 = Date.now();
+    const deadline = t1 + (opts.readyTimeoutMs ?? 120_000);
+    let lastErr: unknown;
+    for (;;) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${grpc}/`, { signal: AbortSignal.timeout(2_000) });
+        await res.body?.cancel().catch(() => undefined);
+        break; // any HTTP response (a 404 included) is node-go itself answering
+      } catch (err) {
+        lastErr = err;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`XMTP local node never answered HTTP on :${grpc} within ${opts.readyTimeoutMs ?? 120_000}ms (last error: ${String(lastErr)})`);
+      }
+      await sleep(500);
+    }
+    return { apiUrl: `http://127.0.0.1:${api}`, project, ports: { grpc, api, history }, timings: { upMs, readyMs: Date.now() - t1 }, stop };
+  } catch (err) {
+    await stop();
+    throw err;
+  }
+}
+
+/** Plan 5.7 Task 5: npm's cache for the SDK install, shared across runs under the system-test temp root, so only a
+ *  cold machine downloads the SDK's ~150 MB of tarballs. Set through npm's own `npm_config_cache` setting; nothing
+ *  else about npm (its registry, scripts, or safety settings) is overridden. */
+export const XMTP_NPM_CACHE = join(tmpdir(), "arena-system-xmtp-npm-cache");
+
+export type XmtpSdkInstall = {
+  /** The temp ARENA_HOME `arena xmtp enable` ran in. */
+  home: string;
+  /** `<home>/xmtp/sdk`: what each player's own `<home>/xmtp/sdk` symlinks to (`PlayerOptions.xmtpSdkDir`). */
+  sdkDir: string;
+  /** How long the install took, in milliseconds. */
+  ms: number;
+  /** Deletes the install (about 437 MB). */
+  remove(): void;
+};
+
+/**
+ * Plan 5.7 Task 5 (ruling 1): installs the real `@xmtp/node-sdk` once, with the real `arena xmtp enable` (npm, the
+ * pinned version, temp-then-rename), into a fresh temp ARENA_HOME. A test file calls this once (in `beforeAll`) and
+ * points every player at it through `PlayerOptions.xmtpSdkDir`, so a run installs the SDK once, not once per home.
+ */
+export async function installXmtpSdk(opts: { timeoutMs?: number } = {}): Promise<XmtpSdkInstall> {
+  const home = mkdtempSync(join(tmpdir(), "arena-system-xmtp-sdk-"));
+  const remove = () => rmSync(home, { recursive: true, force: true });
+  const t0 = Date.now();
+  const r = await runCli(["xmtp", "enable"], home, { env: { npm_config_cache: XMTP_NPM_CACHE }, timeoutMs: opts.timeoutMs ?? 600_000 });
+  if (r.status !== 0) {
+    remove();
+    throw new Error(`arena xmtp enable failed (exit ${r.status}):\n${(r.stderr || r.stdout).slice(-4000)}`);
+  }
+  return { home, sdkDir: join(home, "xmtp", "sdk"), ms: Date.now() - t0, remove };
 }
