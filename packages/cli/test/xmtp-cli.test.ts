@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Address } from "viem";
@@ -62,6 +62,18 @@ function chessTemplate(overrides: Record<string, unknown> = {}) {
 function stubFetch(templates: unknown) {
   return (async (url: string, init?: RequestInit) => {
     if (url.endsWith("/templates")) return new Response(JSON.stringify(templates));
+    const req = JSON.parse(String(init?.body)) as { id: number; method: string };
+    const result = req.method === "eth_chainId" ? "0x7a69" : req.method === "eth_gasPrice" ? "0x3b9aca00" : "0x6080";
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }));
+  }) as unknown as typeof fetch;
+}
+
+/** Fix round 1 (Important 1 / Ruling 1): answers every JSON-RPC POST like `stubFetch` does, but throws if
+ *  `/templates` is ever fetched at all -- used to prove a re-init with every chain flag explicit never fetches
+ *  it, so an `xmtp` carried forward in that case is read from the existing config.json, never from a template. */
+function stubFetchNoTemplates() {
+  return (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/templates")) throw new Error("must not fetch /templates when every chain flag is explicit");
     const req = JSON.parse(String(init?.body)) as { id: number; method: string };
     const result = req.method === "eth_chainId" ? "0x7a69" : req.method === "eth_gasPrice" ? "0x3b9aca00" : "0x6080";
     return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }));
@@ -154,6 +166,48 @@ describe("arena xmtp enable|status|disable", () => {
     const t = io(home, { ARENA_XMTP_NPM: npmScript });
     expect(await runCli(["xmtp", "enable"], t.io)).toBe(1);
     expect(t.err.join("\n")).toContain("failed to load");
+  });
+
+  it("Fix round 1 (Minor 2): enable surfaces a clear error when the npm binary itself cannot be found (ENOENT)", async () => {
+    const home = freshDir("arena-xmtp-cli-");
+    const missing = join(freshDir("arena-xmtp-missing-npm-"), "does-not-exist");
+    const t = io(home, { ARENA_XMTP_NPM: missing });
+    expect(await runCli(["xmtp", "enable"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toMatch(/failed to run/);
+    expect(t.err.join("\n")).toContain("ENOENT");
+    // Fix round 1 (Minor 4): no half-populated dir left behind either.
+    expect(existsSync(join(home, "xmtp", "sdk"))).toBe(false);
+  });
+
+  it("Fix round 1 (Minor 4): a failed enable leaves no half-populated sdk dir, and a retry still succeeds", async () => {
+    const home = freshDir("arena-xmtp-cli-");
+    const badScript = writeFakeNpm(freshDir("arena-xmtp-npm-bad-"), { exitCode: 1, stderr: "boom" });
+    const t = io(home, { ARENA_XMTP_NPM: badScript });
+    expect(await runCli(["xmtp", "enable"], t.io)).toBe(1);
+    expect(existsSync(join(home, "xmtp", "sdk"))).toBe(false);
+    // no leftover .sdk-tmp-* throwaway dirs either.
+    const leftovers = existsSync(join(home, "xmtp")) ? readdirSync(join(home, "xmtp")).filter((n) => n.startsWith(".sdk-tmp-")) : [];
+    expect(leftovers).toEqual([]);
+
+    const goodScript = writeFakeNpm(freshDir("arena-xmtp-npm-good-"));
+    const t2 = io(home, { ARENA_XMTP_NPM: goodScript });
+    expect(await runCli(["xmtp", "enable"], t2.io)).toBe(0);
+    expect(existsSync(join(home, "xmtp", "sdk", "node_modules", "@xmtp", "node-sdk", "package.json"))).toBe(true);
+  });
+
+  it("Fix round 1 (Minor 4): a failed re-install leaves the previous good install untouched", async () => {
+    const home = freshDir("arena-xmtp-cli-");
+    const goodScript = writeFakeNpm(freshDir("arena-xmtp-npm-good2-"));
+    const t1 = io(home, { ARENA_XMTP_NPM: goodScript });
+    expect(await runCli(["xmtp", "enable"], t1.io)).toBe(0);
+
+    const badScript = writeFakeNpm(freshDir("arena-xmtp-npm-bad2-"), { exitCode: 1, stderr: "boom again" });
+    const t2 = io(home, { ARENA_XMTP_NPM: badScript });
+    expect(await runCli(["xmtp", "enable"], t2.io)).toBe(1);
+
+    const t3 = io(home);
+    expect(await runCli(["xmtp", "status"], t3.io)).toBe(0);
+    expect(JSON.parse(t3.out[0])).toMatchObject({ enabled: true, version: XMTP_SDK_VERSION });
   });
 
   it("status reports the env cached by init, even before the SDK is installed", async () => {
@@ -261,6 +315,54 @@ describe("init copies /templates[chess].xmtp into config.json as xmtp (spec §5)
     await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp: { env: "local" } })) });
     expect(loadConfig(home).xmtp).toBeDefined();
     const code = await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate()) });
+    expect(code).toBe(0);
+    expect(loadConfig(home).xmtp).toBeUndefined();
+  });
+
+  it("Fix round 1 (Important 1 / Ruling 1): re-init with every chain flag explicit never drops a cached xmtp", async () => {
+    const home = freshDir("arena-xmtp-init-");
+    const xmtp = { env: "dev", apiUrl: "https://dev.xmtp.test" };
+    await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp })) });
+    expect(loadConfig(home).xmtp).toEqual(xmtp);
+
+    // Every chain flag given explicitly: /templates is never fetched this run (stubFetchNoTemplates throws if
+    // it is), so the only source for xmtp is the config.json this init is about to rewrite -- it must carry the
+    // cached value forward verbatim, not drop it just because this run said nothing about xmtp either way.
+    const t = io(home);
+    const code = await runCli(
+      [
+        "init",
+        "--server",
+        "http://host.test",
+        "--rpc",
+        "http://rpc.test",
+        "--chain-id",
+        "31337",
+        "--hub",
+        `0x${"11".repeat(20)}`,
+        "--usdc",
+        `0x${"22".repeat(20)}`,
+        "--rules",
+        `0x${"33".repeat(20)}`,
+      ],
+      { ...t.io, fetch: stubFetchNoTemplates() },
+    );
+    expect(code, t.err.join("\n")).toBe(0);
+    expect(loadConfig(home).xmtp).toEqual(xmtp);
+  });
+
+  it("Fix round 1 (Minor 5): a published xmtp: null is treated as absent, not an invalid config", async () => {
+    const home = freshDir("arena-xmtp-init-");
+    const code = await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp: null })) });
+    expect(code).toBe(0);
+    expect(loadConfig(home).xmtp).toBeUndefined();
+  });
+
+  it("Fix round 1 (Minor 5): re-init against a published xmtp: null clears a previously cached config", async () => {
+    const home = freshDir("arena-xmtp-init-");
+    await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp: { env: "local" } })) });
+    expect(loadConfig(home).xmtp).toBeDefined();
+    const code = await runCli(["init", "--server", "http://host.test"], { ...io(home).io, fetch: stubFetch(chessTemplate({ xmtp: null })) });
     expect(code).toBe(0);
     expect(loadConfig(home).xmtp).toBeUndefined();
   });
