@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import type { Hex } from "viem";
 import type { Params, RelayClient, RelayMessage, RelaySigner } from "@arena/sdk";
 import type { HostRelay } from "../host.js";
@@ -39,6 +40,11 @@ type Channel = {
   replayPending: boolean;
   /** Set by the first XMTP send of an outage (which is logged), cleared when the host has the channel again. */
   onXmtp: boolean;
+  /** When a host `send` last threw although `isJoined` said yes; the channel counts as down from then until the
+   *  host's next `onLinkChange` (with the real host this cannot happen: `isJoined` is the negation of the throw). */
+  hostFailedSince: number | null;
+  /** Resolved (and emptied) when the host has the channel again: ends an in-flight XMTP wait at once. */
+  upWaiters: Set<() => void>;
   pumping: boolean;
   timer: ReturnType<typeof setTimeout> | undefined;
 };
@@ -66,6 +72,10 @@ const key = (id: Hex) => id.toLowerCase() as Hex;
  * When a channel goes down, the last few messages it sent via the host (`HOST_SENT_KEPT`) are replayed once over
  * XMTP at the end of the window: a frame the host accepted just before it died is otherwise never re-sent, since
  * the daemon re-sends only on the host's `onJoined`. The receiver treats any it already has as repeats.
+ *
+ * Switching back is immediate: once the host has the channel again, the replay stops (the daemon's `onJoined`
+ * re-send covers it), and an XMTP send still in flight is no longer waited for, so the next message goes via the
+ * host at once. The window runs on a monotonic clock by default (`performance.now`).
  */
 export class FallbackRelay implements RelayClient {
   private readonly host: HostRelay;
@@ -80,7 +90,8 @@ export class FallbackRelay implements RelayClient {
   constructor(opts: { host: HostRelay; xmtp: XmtpTransport; graceMs?: number; now?: () => number; log?(l: string): void }) {
     this.host = opts.host;
     this.graceMs = opts.graceMs ?? HOST_DOWN_GRACE_MS;
-    this.now = opts.now ?? Date.now;
+    // Monotonic by default: a wall-clock step (NTP) must never stretch or skip the grace window.
+    this.now = opts.now ?? (() => performance.now());
     this.log = opts.log ? (l) => opts.log?.(l) : () => undefined;
     this.xmtp = new XmtpRelay({ xmtp: opts.xmtp, maxPayloadBytes: XMTP_MAX_PAYLOAD_BYTES, now: this.now, log: this.log });
     this.unsubscribers.push(
@@ -102,6 +113,8 @@ export class FallbackRelay implements RelayClient {
         hostSent: [],
         replayPending: false,
         onXmtp: false,
+        hostFailedSince: null,
+        upWaiters: new Set(),
         pumping: false,
         timer: undefined,
       });
@@ -136,6 +149,7 @@ export class FallbackRelay implements RelayClient {
       this.channels.delete(id);
       clearTimeout(ch.timer);
       for (const p of ch.outbox.splice(0)) p.done(); // left for good: nothing more is sent on it
+      this.releaseUpWaiters(ch);
     }
     this.host.leave(channelId);
     this.xmtp.close(channelId).catch((err: unknown) => this.log(`xmtp: channel ${id}: close failed: ${errorText(err)}`));
@@ -147,8 +161,7 @@ export class FallbackRelay implements RelayClient {
     const id = key(channelId);
     const ch = this.channels.get(id);
     if (!ch) return "none";
-    this.observe(ch);
-    if (this.host.isJoined(ch.hostId)) return "relay";
+    if (this.observe(ch)) return "relay";
     return this.pastGrace(ch) ? "xmtp" : "none";
   }
 
@@ -163,6 +176,7 @@ export class FallbackRelay implements RelayClient {
     for (const ch of this.channels.values()) {
       clearTimeout(ch.timer);
       for (const p of ch.outbox.splice(0)) p.done();
+      this.releaseUpWaiters(ch);
     }
     this.channels.clear();
     this.handlers.clear();
@@ -185,26 +199,35 @@ export class FallbackRelay implements RelayClient {
     return ch.downSince !== null && this.now() - ch.downSince >= this.graceMs;
   }
 
-  /** Brings `downSince` up to date with the host's link: null while joined, set on the first look after it drops. */
-  private observe(ch: Channel): void {
-    if (this.host.isJoined(ch.hostId)) {
+  /** Brings `downSince` up to date with the host's link and returns whether the host is up for this channel: joined,
+   *  and no host send has thrown since the last link change. */
+  private observe(ch: Channel): boolean {
+    const up = this.host.isJoined(ch.hostId) && ch.hostFailedSince === null;
+    if (up) {
       ch.downSince = null;
       ch.replayPending = false; // back up first: the daemon's onJoined re-send covers it
       if (ch.onXmtp) {
         ch.onXmtp = false;
         this.log(`relay: channel ${key(ch.hostId)}: back on the host relay`);
       }
-      return;
+      return true;
     }
     if (ch.downSince === null) {
-      ch.downSince = this.now();
+      ch.downSince = ch.hostFailedSince ?? this.now();
       if (ch.hostSent.length > 0) ch.replayPending = true;
     }
+    return false;
+  }
+
+  private releaseUpWaiters(ch: Channel): void {
+    for (const w of [...ch.upWaiters]) w();
+    ch.upWaiters.clear();
   }
 
   private onLinkChange(): void {
     for (const [id, ch] of this.channels) {
-      this.observe(ch);
+      ch.hostFailedSince = null; // the link changed: give the host another try
+      if (this.observe(ch)) this.releaseUpWaiters(ch);
       if (ch.outbox.length > 0 || ch.replayPending) void this.pump(id, ch);
     }
   }
@@ -223,23 +246,18 @@ export class FallbackRelay implements RelayClient {
   private async pump(id: Hex, ch: Channel): Promise<void> {
     if (ch.pumping) return;
     ch.pumping = true;
-    let hostFailed = false;
     try {
       while (this.channels.get(id) === ch) {
-        this.observe(ch);
-        if (!hostFailed && this.host.isJoined(ch.hostId)) {
+        if (this.observe(ch)) {
           const next = ch.outbox.shift();
           if (!next) return;
           try {
             await this.host.send(next.msg);
           } catch {
-            // The socket went between the check and the send: the same message takes the not-joined path below.
+            // The socket went between the check and the send: the same message takes the not-joined path, and the
+            // channel counts as down from now until the host's next link change.
             ch.outbox.unshift(next);
-            hostFailed = true;
-            if (ch.downSince === null) {
-              ch.downSince = this.now();
-              if (ch.hostSent.length > 0) ch.replayPending = true;
-            }
+            ch.hostFailedSince = this.now();
             continue;
           }
           ch.hostSent.push(next.msg);
@@ -258,30 +276,43 @@ export class FallbackRelay implements RelayClient {
         }
         if (ch.replayPending) {
           ch.replayPending = false;
-          for (const m of ch.hostSent.splice(0)) await this.viaXmtp(id, m);
+          const replay = ch.hostSent.splice(0);
+          for (const m of replay) {
+            // The host is back: stop here, its onJoined re-send covers the rest.
+            if (this.channels.get(id) !== ch || this.observe(ch)) break;
+            await this.viaXmtp(id, ch, m);
+          }
           continue;
         }
         const next = ch.outbox.shift();
         if (!next) return;
         next.done(); // handed over: the daemon never waits on the XMTP network
-        await this.viaXmtp(id, next.msg);
+        await this.viaXmtp(id, ch, next.msg);
       }
     } finally {
       ch.pumping = false;
     }
   }
 
-  private async viaXmtp(id: Hex, msg: RelayMessage): Promise<void> {
+  /** Sends one message over XMTP, waiting for it at most `XMTP_SEND_WAIT_MS`, or until the host has the channel
+   *  again, whichever comes first (the send itself carries on). Never throws. */
+  private async viaXmtp(id: Hex, ch: Channel, msg: RelayMessage): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let upWaiter: (() => void) | undefined;
     const sending = this.xmtp.send(msg).catch((err: unknown) => this.log(`xmtp: channel ${id}: send failed: ${errorText(err)}`));
     const waited = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
-        if (this.channels.get(id)) this.log(`xmtp: channel ${id}: send still pending after ${XMTP_SEND_WAIT_MS} ms; moving on`);
+        if (this.channels.get(id) === ch) this.log(`xmtp: channel ${id}: send still pending after ${XMTP_SEND_WAIT_MS} ms; moving on`);
         resolve();
       }, XMTP_SEND_WAIT_MS);
       timer.unref?.(); // never keeps a stopped daemon's process alive
     });
-    await Promise.race([sending, waited]);
+    const upAgain = new Promise<void>((resolve) => {
+      upWaiter = resolve;
+      ch.upWaiters.add(resolve);
+    });
+    await Promise.race([sending, waited, upAgain]);
     clearTimeout(timer);
+    if (upWaiter) ch.upWaiters.delete(upWaiter);
   }
 }

@@ -5,145 +5,17 @@ import type { Address, Hex } from "viem";
 import { keccak256, toHex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  ChannelSession,
-  MemoryStore,
-  decodeWire,
-  parseRelayMessage,
-  toWire,
-  type ArenaDomain,
-  type CloseSignature,
-  type Params,
-  type RelayMessage,
-  type RelaySigner,
-  type SignedState,
-} from "@arena/sdk";
+import { ChannelSession, toWire, type CloseSignature, type RelayMessage, type SignedState } from "@arena/sdk";
 import { initHome, loadConfig, parseXmtpConfig, type ArenaConfig } from "../src/config.js";
-import { connectHost, type HostRelay } from "../src/host.js";
+import { connectHost } from "../src/host.js";
 import { startDaemonProcess } from "../src/run.js";
 import { buildStatus } from "../src/status.js";
 import { FallbackRelay, HOST_DOWN_GRACE_MS, XMTP_MAX_PAYLOAD_BYTES, XMTP_SEND_WAIT_MS } from "../src/xmtp/fallback.js";
 import { XMTP_INBOUND_BURST, XMTP_INBOUND_PER_SEC } from "../src/xmtp/relay.js";
-import type { XmtpTransport } from "../src/xmtp/transport.js";
 import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
-import { makeParams } from "../../sdk/test/helpers/fixtures.js";
-
-// ------------------------------------------------------------------------------------------------- fakes
-
-/** A host relay whose link the test drives: `setJoined` flips `isJoined` and fires `onLinkChange` (and `onJoined`
- *  on a join), exactly as `connectHost` does. */
-class FakeHost implements HostRelay {
-  readonly joined = new Set<Hex>();
-  readonly sent: RelayMessage[] = [];
-  readonly joins: Hex[] = [];
-  readonly left: Hex[] = [];
-  /** Throws on send even while `isJoined` (the socket dropping between the check and the send). */
-  throwOnSend = false;
-  private readonly msgHandlers = new Set<(m: RelayMessage) => void>();
-  private readonly joinedHandlers = new Set<(id: Hex) => void>();
-  private readonly linkHandlers = new Set<() => void>();
-
-  async join(channelId: Hex): Promise<void> {
-    this.joins.push(channelId);
-  }
-  async send(msg: RelayMessage): Promise<void> {
-    if (this.throwOnSend || !this.joined.has(msg.channelId)) throw new Error("relay not connected");
-    this.sent.push(msg);
-  }
-  onMessage(h: (m: RelayMessage) => void): () => void {
-    this.msgHandlers.add(h);
-    return () => this.msgHandlers.delete(h);
-  }
-  onJoined(h: (id: Hex) => void): () => void {
-    this.joinedHandlers.add(h);
-    return () => this.joinedHandlers.delete(h);
-  }
-  leave(channelId: Hex): void {
-    this.left.push(channelId);
-    if (this.joined.delete(channelId)) for (const h of this.linkHandlers) h();
-  }
-  isJoined(channelId: Hex): boolean {
-    return this.joined.has(channelId);
-  }
-  onLinkChange(h: () => void): () => void {
-    this.linkHandlers.add(h);
-    return () => this.linkHandlers.delete(h);
-  }
-  setJoined(channelId: Hex, up: boolean): void {
-    if (up) this.joined.add(channelId);
-    else this.joined.delete(channelId);
-    for (const h of this.linkHandlers) h();
-    if (up) for (const h of this.joinedHandlers) h(channelId);
-  }
-  deliver(msg: RelayMessage): void {
-    for (const h of this.msgHandlers) h(msg);
-  }
-}
-
-class FakeXmtp implements XmtpTransport {
-  readonly opened: Array<{ channelId: Hex; me: Address; peer: Address }> = [];
-  readonly sent: Array<{ channelId: Hex; text: string }> = [];
-  readonly closed: Hex[] = [];
-  stopped = false;
-  openImpl: () => Promise<void> = async () => undefined;
-  sendImpl: () => Promise<void> = async () => undefined;
-  private readonly handlers = new Set<(channelId: Hex, from: Address, dm: Address, text: string) => void>();
-
-  async open(channelId: Hex, me: RelaySigner, peer: Address): Promise<void> {
-    this.opened.push({ channelId, me: me.address, peer });
-    return this.openImpl();
-  }
-  async send(channelId: Hex, text: string): Promise<void> {
-    await this.sendImpl();
-    this.sent.push({ channelId, text });
-  }
-  onText(h: (channelId: Hex, from: Address, dm: Address, text: string) => void): () => void {
-    this.handlers.add(h);
-    return () => this.handlers.delete(h);
-  }
-  async close(channelId: Hex): Promise<void> {
-    this.closed.push(channelId);
-  }
-  async stop(): Promise<void> {
-    this.stopped = true;
-  }
-  deliver(channelId: Hex, from: Address, dm: Address, text: string): void {
-    for (const h of this.handlers) h(channelId, from, dm, text);
-  }
-  /** The RelayMessages sent so far, decoded from their `{"arena":1,"msg":…}` frames. */
-  messages(): RelayMessage[] {
-    return this.sent.map((s) => {
-      const outer = decodeWire(s.text) as { arena: number; msg: unknown };
-      expect(outer.arena).toBe(1);
-      return parseRelayMessage(outer.msg);
-    });
-  }
-}
+import { FakeHost, FakeXmtp, domain, sessionPair, settle } from "./helpers/xmtpFakes.js";
 
 // ------------------------------------------------------------------------------------------------- fixtures
-
-const domain: ArenaDomain = { chainId: 31337, hub: "0x000000000000000000000000000000000000beef" };
-
-/** A real ChannelSession pair (A is seat 0, B seat 1) over fresh session keys. */
-async function sessionPair() {
-  const keys = [generatePrivateKey(), generatePrivateKey()] as const;
-  const params: Params = makeParams({
-    participants: ["0x00000000000000000000000000000000000000a1", "0x00000000000000000000000000000000000000b2"],
-    sessionKeys: keys,
-    rules: "0x00000000000000000000000000000000000000e5" as Address,
-    feeRecipient: "0x00000000000000000000000000000000000000f6" as Address,
-    fundingDeadline: 2_000_000_000n,
-    salt: `xmtp-${Math.random()}`,
-  });
-  const cfg = (me: 0 | 1) => ({ params, me, sessionKey: keys[me], domain, store: new MemoryStore() });
-  const a = await ChannelSession.create(cfg(0));
-  const b = await ChannelSession.create(cfg(1));
-  const signers = [privateKeyToAccount(keys[0]), privateKeyToAccount(keys[1])] as const;
-  return { a, b, params, id: a.id, signers };
-}
-
-/** Runs every queued microtask and promise continuation (fake timers fake only setTimeout/clearTimeout). */
-const settle = () => new Promise<void>((r) => setImmediate(r));
 
 const frame = (msg: RelayMessage) => toWire({ arena: 1, msg });
 const stateMsg = (id: Hex, signed: SignedState): RelayMessage => ({ type: "state", channelId: id, signed });
@@ -291,19 +163,27 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     expect(xmtp.sent).toHaveLength(1);
   });
 
-  it("a host send that throws while isJoined is not passed on: the message takes the held path", async () => {
-    const { a, id, host, xmtp, relay } = await bSide({ joined: true });
-    host.throwOnSend = true;
+  it("a host send that throws while isJoined stays true: held with a timer, then via XMTP, until a link change (m1)", async () => {
+    const { a, b, id, host, xmtp, relay } = await bSide({ joined: true });
+    host.throwOnSend = true; // isJoined keeps saying yes, and no onLinkChange ever fires
     const m = stateMsg(id, await a.move("e2e4"));
     let settled = false;
     const sending = relay.send(m).then(() => (settled = true));
     await settle();
     expect(settled).toBe(false);
-    host.throwOnSend = false;
-    host.setJoined(id, false);
-    await advance(HOST_DOWN_GRACE_MS);
+    expect(relay.transportOf(id)).toBe("none");
+    await advance(HOST_DOWN_GRACE_MS); // the window's own timer, no link change needed
     await expect(sending).resolves.toBe(true);
     expect(xmtp.messages()).toEqual([m]);
+    expect(relay.transportOf(id)).toBe("xmtp");
+    // The host's next link change gives it another try.
+    host.throwOnSend = false;
+    host.setJoined(id, true);
+    expect(relay.transportOf(id)).toBe("relay");
+    await b.receive(m.type === "state" ? m.signed : (undefined as never));
+    const m2 = stateMsg(id, await b.move("e7e5"));
+    await relay.send(m2);
+    expect(host.sent).toEqual([m2]);
   });
 
   it("an XMTP send failure never rejects to the daemon; it is logged", async () => {
@@ -317,8 +197,8 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     expect(logs.some((l) => l.includes("send failed: xmtp unreachable"))).toBe(true);
   });
 
-  it("a hung XMTP send holds the channel's later messages for at most XMTP_SEND_WAIT_MS", async () => {
-    const { a, id, host, xmtp, relay } = await bSide();
+  it("a hung XMTP send holds the channel's later messages for at most XMTP_SEND_WAIT_MS while the host stays down", async () => {
+    const { a, id, xmtp, relay } = await bSide();
     await advance(HOST_DOWN_GRACE_MS);
     let release: () => void = () => undefined;
     xmtp.sendImpl = () => new Promise<void>((r) => (release = r));
@@ -328,12 +208,73 @@ describe("FallbackRelay: the send rule (spec §2)", () => {
     const sending = relay.send(m2).then(() => (second = true));
     await advance(XMTP_SEND_WAIT_MS - 1);
     expect(second).toBe(false);
-    host.setJoined(id, true); // the host is back meanwhile: the queue still waits out the hung send first
     await advance(1);
     await sending;
-    expect(host.sent).toEqual([m2]);
     expect(logs.some((l) => l.includes(`send still pending after ${XMTP_SEND_WAIT_MS} ms`))).toBe(true);
     release();
+  });
+
+  it("the host back during a hung replay: the replay stops and the next send reaches the host within a tick (I2)", async () => {
+    const { a, b, id, host, xmtp, relay } = await bSide({ joined: true });
+    // Three of B's moves go via the host; then it dies, and XMTP hangs on every send.
+    await b.receive(await a.move("e2e4"));
+    const aMoves = ["g1f3", "b1c3", "a2a3"];
+    for (const [i, mv] of ["e7e5", "d7d6", "c7c6"].entries()) {
+      const signed = await b.move(mv);
+      await relay.send(stateMsg(id, signed));
+      await a.receive(signed);
+      await b.receive(await a.move(aMoves[i]));
+    }
+    expect(host.sent).toHaveLength(3);
+    const releases: Array<() => void> = [];
+    xmtp.sendImpl = () => new Promise<void>((r) => releases.push(r));
+    host.setJoined(id, false);
+    await advance(HOST_DOWN_GRACE_MS); // the replay starts: its first XMTP send hangs
+    expect(releases).toHaveLength(1);
+    await advance(1_000);
+    host.setJoined(id, true); // back, 1 s into a 30 s wait
+    const next = stateMsg(id, await b.move("b7b6"));
+    await relay.send(next);
+    await settle();
+    expect(host.sent.at(-1)).toEqual(next); // at once, not after the hung replay
+    expect(releases).toHaveLength(1); // the rest of the replay was dropped: onJoined's re-send covers it
+    expect(relay.transportOf(id)).toBe("relay");
+    for (const r of releases) r();
+  });
+
+  it("an in-flight outbox XMTP send stops being waited for as soon as the host rejoins", async () => {
+    const { a, id, host, xmtp, relay } = await bSide();
+    await advance(HOST_DOWN_GRACE_MS);
+    let release: () => void = () => undefined;
+    xmtp.sendImpl = () => new Promise<void>((r) => (release = r));
+    await relay.send(stateMsg(id, await a.move("e2e4")));
+    const m2: RelayMessage = { type: "close", channelId: id, close: { stateHash: keccak256("0x04"), by: 1, sig: "0x" } };
+    const sending = relay.send(m2);
+    await advance(50);
+    host.setJoined(id, true);
+    await settle();
+    await sending;
+    expect(host.sent).toEqual([m2]);
+    release();
+  });
+
+  it("the grace window runs on a monotonic clock by default: a wall-clock step back does not stretch it (m2)", async () => {
+    vi.useRealTimers();
+    const { id, params, signers, a } = await sessionPair();
+    const host = new FakeHost();
+    const xmtp = new FakeXmtp();
+    const relay = new FallbackRelay({ host, xmtp, graceMs: 50 }); // no `now`: the default clock
+    relays.push(relay);
+    await relay.join(id, params, signers[1]);
+    const realNow = Date.now();
+    const spy = vi.spyOn(Date, "now").mockReturnValue(realNow - 3_600_000); // NTP stepped the clock back an hour
+    try {
+      await relay.send(stateMsg(id, await a.move("e2e4"))); // held for the 50 ms window...
+      await new Promise((r) => setTimeout(r, 150));
+      expect(xmtp.sent).toHaveLength(1); // ...not for an hour and 50 ms
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("a failed XMTP open is retried in the background with back-off, and at once by a send", async () => {

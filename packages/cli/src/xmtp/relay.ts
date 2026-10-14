@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import type { Address, Hex } from "viem";
 import { decodeWire, parseRelayMessage, toWire, type Params, type RelayMessage, type RelaySigner } from "@arena/sdk";
 import type { XmtpTransport } from "./transport.js";
@@ -65,7 +66,7 @@ export class XmtpRelay {
   }) {
     this.xmtp = opts.xmtp;
     this.maxPayloadBytes = opts.maxPayloadBytes;
-    this.now = opts.now ?? Date.now;
+    this.now = opts.now ?? (() => performance.now()); // monotonic: the token bucket never sees a clock step
     this.log = opts.log ?? (() => undefined);
     this.burst = opts.rate?.burst ?? XMTP_INBOUND_BURST;
     this.perSec = opts.rate?.perSec ?? XMTP_INBOUND_PER_SEC;
