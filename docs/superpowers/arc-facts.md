@@ -1,0 +1,67 @@
+# Arc chain facts (verified 2026-10-19)
+
+Arc **public mainnet has been live since 2026-09-16**. This was verified on-chain on 2026-10-19: chain ID `0x13b2`, client `arc/v1`, latest block ≈ 26.78M with a current timestamp. This file covers `mainnet-gates.md` checklist item 1. Re-verify before deploying.
+
+## Network
+
+| | Mainnet | Testnet |
+|---|---|---|
+| Chain ID | 5042 | 5042002 |
+| RPC | `https://rpc.mainnet.arc.io` (also Alchemy, Blockdaemon, dRPC, QuickNode) | `https://rpc.testnet.arc.io` |
+| Explorer | `https://explorer.arc.io` | `https://explorer.testnet.arc.io` |
+| Faucet | none | `https://faucet.circle.com` |
+| Circle CLI chain id | `ARC` | `ARC-TESTNET` |
+
+The validator set is permissioned at launch. The network itself is public.
+
+## USDC is the gas token, and it is one balance
+
+- The **ERC-20 USDC** contract is `0x3600000000000000000000000000000000000000` on both networks, with **6 decimals**.
+- **Native gas is the same USDC balance**, with **18 decimals**. "Both interfaces share one balance." The ERC-20 `balanceOf` truncates sub-micro-USDC amounts.
+- Native value transfers emit an ERC-20 `Transfer` log (EIP-7708), emitted from `0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE`, in 18 decimals.
+- A transfer to or from a **blocklisted** address **reverts**; it never returns false. Arc's docs also say such an included transaction "consuming gas produce[s] no receipt". Waits must be bounded.
+
+## Fees, blocks and finality
+
+- **EIP-1559.** The base fee has a **20 gwei floor**, and was observed flat at 20 gwei. The priority fee is tiny (about 1.15M wei). The base fee is paid to the proposer, not burned.
+- The mempool **silently drops** any transaction with `maxFeePerGas` below 20 gwei. There is no error, and the transaction never appears.
+- The **block gas limit is 30M**. Our `challenge`, at 2.02M gas, fits; it costs about 0.04 USDC at 20 gwei.
+- A plain value transfer is estimated at **21,225 gas**, not 21,000, because of the EIP-7708 log.
+- Finality is deterministic and instant on inclusion.
+- Blocks are sub-second. `block.timestamp` is non-decreasing at 1 s granularity, so several blocks can share a timestamp.
+- `eth_getTransactionCount(…, "pending")` and `eth_estimateGas(…, "pending")` both work.
+
+## Other differences
+
+- `PREVRANDAO` = 0. We use no on-chain randomness.
+- Blob transactions are not supported.
+- SELFDESTRUCT follows EIP-6780, plus Arc's native-value rules.
+- Most contracts deploy unchanged; Arc targets the Osaka baseline.
+- For Arc-accurate local tests, use Arc Foundry (`arc-anvil --network arc`, `arc-forge`, `arc-cast`). Standard `anvil` does not model native USDC.
+
+## Other Circle contracts on mainnet
+
+| Contract | Address |
+|---|---|
+| CCTP TokenMessengerV2 | `0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d` |
+| CCTP MessageTransmitterV2 | `0x81D40F21F12A8F0E3252Bccb954D722d4c464B64` |
+| GatewayWallet | `0x77777777Dcc4d5A8B6E418Fd04D8997ef11000eE` |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
+| Multicall3 | `0xcA11bde05977b3631167028862bE2a173976CA11` |
+
+## Consequences for Plan 6, found by this check
+
+1. **`fund` and `withdraw --all`.** USDC and gas are one balance on Arc. `fund` must add the gas reserve into the USDC need instead of asking for "native gas" separately. `withdrawReserve()` must keep enough USDC for each live channel's session-gas refills, or `withdraw --all` can strand a channel's dispute gas.
+2. **Session-key top-ups** hard-code `gas: 21_000` (`daemon.ts`, around "The session key is always an EOA"). That is too low on Arc (21,225). Estimate it, or use Arc's figure plus headroom.
+3. **Fee floor.** Clamp every `maxFeePerGas` to at least 20 gwei on Arc. A lower `--fee-ceiling-wei` would make transactions vanish silently.
+4. **Receipts.** A blocklist revert may produce no receipt. The bounded waits already exist; confirm the hub's payout path treats a reverting USDC `transfer` as `owed`.
+5. **Session gas sizing.** The default `sessionGasWei` is 4 × 2.1M × max(fee ceiling 100 gwei, 4 × 20 gwei), which is 0.84 USDC locked per channel until it is swept. Re-derive it for Arc's flat 20 gwei; for example, a 40 gwei ceiling gives about 0.34 USDC.
+6. **Tests.** Run the contract and daemon suites against `arc-anvil --network arc` as well as standard anvil.
+7. **Circle agent wallets on mainnet.** The CLI reference uses `--chain ARC`, and third-party reports show mainnet runs through Circle ARC wallets. Circle's Agent Stack marketing page still says "Arc testnet (mainnet coming soon)". Confirm with `circle blockchain list` once logged in.
+
+Sources:
+- `https://docs.arc.io/arc/references/connect-to-arc`
+- `https://docs.arc.io/arc/references/evm-differences.md`
+- `https://docs.arc.io/arc/references/contract-addresses.md`
+- `https://developers.circle.com/agent-stack/circle-cli/command-reference`
+- `https://technode.global/2026/09/18/circle-launches-arc-mainnet-institutional-ecosystem-builders/`

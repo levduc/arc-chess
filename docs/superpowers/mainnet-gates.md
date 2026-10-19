@@ -138,7 +138,7 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
-1. **Arc chain facts verified and written down.**
+1. **Arc chain facts verified and written down.** Done 2026-10-19 in `docs/superpowers/arc-facts.md`. Arc mainnet has been live since 2026-09-16. The facts below are recorded there, with seven consequences for Plan 6.
    - The block gas limit comfortably exceeds 2.1M; `challenge` at 2.02M has headroom.
    - The fee scale is known: base fee range, priority fee, and whether EIP-1559 is supported.
    - The RPC supports the `pending` tag for `getTransactionCount` and `estimateGas`.
