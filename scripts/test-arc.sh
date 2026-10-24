@@ -2,7 +2,9 @@
 # Plan 6 Task 3 (spec §3): the Arc subset. Runs the contract suite, the SDK/CLI money-moving tests (deposit,
 # close, dispute, sweep, top-up, withdraw) and the system dispute e2e against Arc Foundry's `arc-anvil
 # --network arc` instead of standard anvil, via the ARENA_ANVIL_BIN / ARENA_TEST_ANVIL_PORT overrides in
-# packages/sdk/test/global-setup.ts and tests/system/harness.ts.
+# packages/sdk/test/global-setup.ts and tests/system/harness.ts. Plan 6 Task 4 adds the Arc fee tests to the cli
+# money step, and a step of its own for the Arc-like harness (packages/cli/test/arc/): the hub on the native-USDC
+# proxy, one balance, exact settlement with gas, the 20 gwei floor and the blocklist.
 #
 # Every other suite (`pnpm test:sdk`, `pnpm test:cli`, `pnpm test:contracts`, `pnpm test:system`) is untouched
 # -- those overrides default to unset, which is today's behaviour exactly. This script needs no `flock`: its
@@ -21,15 +23,16 @@ if [[ ! -x "$BIN_DIR/arc-anvil" || ! -x "$BIN_DIR/arc-forge" ]]; then
 fi
 
 export ARENA_ANVIL_BIN="$BIN_DIR/arc-anvil"
-# Fix round 1 (task-3-review.md Minor-2): each of the four vitest invocations below gets its own port, rather
+# Fix round 1 (task-3-review.md Minor-2): each of the vitest invocations below gets its own port, rather
 # than rebinding one shared port back-to-back with no proven margin for the OS to release it between an
-# exiting vitest process's anvil.kill() and the next invocation's bind attempt. All four stay inside the
+# exiting vitest process's anvil.kill() and the next invocation's bind attempt. All of them stay inside the
 # system-test harness's own 8600-8699 reserved range (tests/system/harness.ts), so its "an explicit preferred
 # port outside the reserved range is refused outright" check needs no change for the system step.
 ARENA_TEST_ANVIL_PORT_SDK="${ARENA_TEST_ANVIL_PORT_SDK:-8650}"
 ARENA_TEST_ANVIL_PORT_CLI="${ARENA_TEST_ANVIL_PORT_CLI:-8651}"
 ARENA_TEST_ANVIL_PORT_CLI_SWEEP="${ARENA_TEST_ANVIL_PORT_CLI_SWEEP:-8652}"
 ARENA_TEST_ANVIL_PORT_SYSTEM="${ARENA_TEST_ANVIL_PORT_SYSTEM:-8653}"
+ARENA_TEST_ANVIL_PORT_CLI_ARC="${ARENA_TEST_ANVIL_PORT_CLI_ARC:-8654}"
 
 FAILED=0
 step() {
@@ -57,7 +60,9 @@ step() {
 # invocation right here is isolated.
 step "contracts (arc-forge test -n arc)" bash -c "cd '$ROOT' && pnpm vectors && '$BIN_DIR/arc-forge' test --root contracts -n arc --out out-arc --cache-path cache-arc"
 step "sdk money-moving (lifecycle, hub)" bash -c "cd '$ROOT/packages/sdk' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_SDK' pnpm exec vitest run test/lifecycle.test.ts test/hub.test.ts"
-step "cli money-moving (daemon, lifecycle, withdraw)" bash -c "cd '$ROOT/packages/cli' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_CLI' pnpm exec vitest run test/daemon.test.ts test/lifecycle.test.ts test/withdraw.test.ts"
+# Plan 6 Task 4 (task-2-review.md Minor-4): arc-fees.test.ts too -- the top-up's estimated gas, a reverted top-up, and
+# the profile's floor reaching every sender the daemon builds.
+step "cli money-moving (daemon, lifecycle, withdraw, arc-fees)" bash -c "cd '$ROOT/packages/cli' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_CLI' pnpm exec vitest run test/daemon.test.ts test/lifecycle.test.ts test/withdraw.test.ts test/arc-fees.test.ts"
 # Fix round 1 (task-3-review.md Important-1): spec §3 names `sweep` explicitly, and it was missing from this
 # subset entirely -- the step above covers deposit/close/dispute/top-up/withdraw, but the only real on-chain,
 # exact-accounting sweep test is hardening.test.ts's "Plan 5 Task 1: session-gas sweep" describe block (39
@@ -68,6 +73,10 @@ step "cli money-moving (daemon, lifecycle, withdraw)" bash -c "cd '$ROOT/package
 # sweep invocation entirely, masking whether sweep coverage ran at all).
 step "cli sweep (hardening.test.ts, session-gas sweep only)" bash -c "cd '$ROOT/packages/cli' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_CLI_SWEEP' pnpm exec vitest run test/hardening.test.ts -t 'session-gas sweep'"
 step "system dispute e2e" bash -c "cd '$ROOT/tests/system' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_SYSTEM' pnpm exec vitest run dispute.test.ts"
+# Plan 6 Task 4: the Arc-like harness (ledger ruling): arc-anvil at chain id 31337, the hub's token the native-USDC
+# proxy at 0x3600...0000, and a test-only Arc profile at 31337. These files skip themselves on stock anvil, so this is
+# the only place they run.
+step "cli Arc-like harness (one balance, settlement, floor, blocklist)" bash -c "cd '$ROOT/packages/cli' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_CLI_ARC' pnpm exec vitest run test/arc/"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then
