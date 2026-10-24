@@ -42,7 +42,7 @@ cp "$HUB" "$PRISTINE"
 # --------------------------------------------------------------------------------------------------
 
 mutant_C1() { # claim: pause check at the top of the function
-  sed -i '/^    function claim(address to) external nonReentrant {$/a\        if (paused) revert Paused();' "$HUB"
+  sed -i '/^    function claim() external nonReentrant {$/a\        if (paused) revert Paused();' "$HUB"
 }
 mutant_C2() { # claim: pause check placed after NothingToClaim
   sed -i '/^        if (amount == 0) revert NothingToClaim();$/a\        if (paused) revert Paused();' "$HUB"
@@ -95,6 +95,14 @@ mutant_F13() { # closeCooperative: signature check removed
 }
 mutant_F17() { # respond: does not register the new state
   sed -i '294s/_register(c, s, h);/\/\/ MUTATED: _register(c, s, h);/' "$HUB"
+}
+
+# M1 (2026-10-23 audit): claim() pays msg.sender only. Pattern-anchored; claim kept its line count.
+mutant_M1a() { # claim: pays someone other than the caller (a redirect, as claim(to) allowed)
+  sed -i 's/^        token\.safeTransfer(msg\.sender, amount);$/        token.safeTransfer(feeRecipient, amount);/' "$HUB"
+}
+mutant_M1b() { # claim: Claimed event names the wrong recipient
+  sed -i 's/^        emit Claimed(msg\.sender, msg\.sender, amount);$/        emit Claimed(msg.sender, address(0), amount);/' "$HUB"
 }
 
 # I1 (2026-10-23 audit): no unchecked signature bytes in proof.latest. These are anchored on patterns, not line
@@ -157,6 +165,11 @@ DESC[M2b]="renounceOwnership: silent no-op, no revert"
 
 declare -A RESULT
 FAIL=0
+
+# M1 mutants, registered apart from the arrays above so that each audit item's mutants stand alone.
+MUTANT_IDS+=(M1a M1b)
+DESC[M1a]="claim: pays a non-caller (redirect)"
+DESC[M1b]="claim: Claimed event names the wrong recipient"
 
 for id in "${MUTANT_IDS[@]}"; do
   cp "$PRISTINE" "$HUB"

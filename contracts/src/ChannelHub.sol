@@ -220,13 +220,13 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (c.funded[1]) _pay(p.participants[1], amount);
     }
 
-    /// @notice Withdraw payouts that could not be pushed (e.g. the recipient was blocked by the token).
-    function claim(address to) external nonReentrant {
+    /// @notice Withdraw, to the caller only, payouts that could not be pushed (audit M1: a blocked one stays here).
+    function claim() external nonReentrant {
         uint256 amount = owed[msg.sender];
         if (amount == 0) revert NothingToClaim();
         owed[msg.sender] = 0;
-        emit Claimed(msg.sender, to, amount);
-        token.safeTransfer(to, amount);
+        emit Claimed(msg.sender, msg.sender, amount);
+        token.safeTransfer(msg.sender, amount);
     }
 
     // ----------------------------------------------------------------- close

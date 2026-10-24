@@ -328,13 +328,7 @@ export const channelHubAbi = [
   {
     "type": "function",
     "name": "claim",
-    "inputs": [
-      {
-        "name": "to",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
+    "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
   },

@@ -182,8 +182,9 @@ export class HubClient {
     return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "reclaim", args: [id] }), opts);
   }
 
-  claim(sender: TxSender, to: Address, opts?: WriteOptions): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim", args: [to] }), opts);
+  /** Withdraws `owed[sender]` to the sender's own address: the hub pays the caller only (audit M1). */
+  claim(sender: TxSender, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim" }), opts);
   }
 
   async channelInfo(id: Hex): Promise<ChannelInfo> {
