@@ -3282,6 +3282,8 @@ export class ArenaDaemon {
       lastProgressAt: l.lastProgressAt,
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
+      // H2 (controller request): on a one-balance chain, the session-gas-low action names its amount in USDC.
+      gasFunding: { chainId: this.opts.config.chainId, sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling },
       settled: l.settledWake,
       autoReturnSeconds: autoReturnOnChallengeOf(this.opts.config) ? autoReturnSecondsOf(l.record.params.challengeTimeout) : null,
       ignoreHumanMustMove: opts.ignoreHumanMustMove,

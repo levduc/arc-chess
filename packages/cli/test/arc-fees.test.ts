@@ -323,7 +323,13 @@ describe("Plan 6 Task 2 (audit-daemon I-1): a top-up that is mined but reverts i
       await pair.bob.daemon.acceptOffer(offerId);
       const id = await waitFor(() => d.channelIds()[0], 20_000, "alice's channel");
       const l = d.handle(id);
-      await waitFor(() => /^funding: the session-key top-up 0x[0-9a-f]{64} was mined but reverted/.test(l.lastError ?? ""), 20_000, "funding backs off");
+      // Plan 6 Task 4: both, not the error alone. fund() sets lastError, then awaits a block read before it sets
+      // fundBlockedUntil, so a poll can land between the two. arc-anvil's slower round trip exposed it (test:arc).
+      await waitFor(
+        () => /^funding: the session-key top-up 0x[0-9a-f]{64} was mined but reverted/.test(l.lastError ?? "") && l.fundBlockedUntil !== null,
+        20_000,
+        "funding backs off",
+      );
       expect(l.fundBlockedUntil).not.toBeNull();
       for (let i = 0; i < 4; i++) {
         await d.idle();

@@ -11,6 +11,11 @@ const ANVIL_BIN = process.env.ARENA_ANVIL_BIN ?? "anvil";
  *  through here, so this always stays at 31337) -- inferred from `ANVIL_BIN`'s basename, so a caller only
  *  has to point ARENA_ANVIL_BIN at `arc-anvil` to get both. */
 const ANVIL_NETWORK_ARGS = /(?:^|\/)arc-anvil$/.test(ANVIL_BIN) ? ["--network", "arc"] : [];
+/** Plan 6 Task 4: true when this run's chain is `arc-anvil --network arc` (`pnpm test:arc`), read the same way, from
+ *  ARENA_ANVIL_BIN's basename. A test that needs an anvil-only cheat Arc refuses (`anvil_setNextBlockBaseFeePerGas`),
+ *  or a fee sized for stock anvil's ~1 gwei market (arc-anvil's is ~25 gwei: a 20 gwei floor plus a 1 gwei tip), reads
+ *  it to take its Arc variant. A worker process inherits the variable, so this agrees with the node actually spawned. */
+export const ON_ARC_ANVIL = ANVIL_NETWORK_ARGS.length > 0;
 /** Plan 6 Task 3: ARENA_TEST_ANVIL_PORT overrides this fixed port for `pnpm test:arc`, so it never collides
  *  with a standard-anvil run sharing this same global setup on :8546 (the SDK/CLI suites). Unset, this is
  *  exactly today's 8546. */

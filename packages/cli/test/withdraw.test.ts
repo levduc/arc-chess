@@ -890,7 +890,8 @@ describe("Plan 6 fix round 1 (I-5): on a nativeIsUsdc chain, opening a channel n
       await pair.alice.daemon.acceptOffer(offerId);
       const b = await waitFor(() => pair.bob.daemon.channelIds().find((id) => id !== pair.a), 20_000, "channel B");
       const handle = pair.bob.daemon.handle(b);
-      await waitFor(() => handle.lastError?.startsWith("funding: "), 20_000, "the funding refusal");
+      // Plan 6 Task 4: the back-off too -- fund() sets it one block read after lastError (see arc-fees.test.ts).
+      await waitFor(() => handle.lastError?.startsWith("funding: ") && handle.fundBlockedUntil !== null, 20_000, "the funding refusal");
       expect(handle.lastError).toContain("this wallet holds 1.999999 USDC, 0.000001 USDC short of the 2.000000 USDC this channel needs");
       expect(handle.lastError).toContain("the 0.060000 USDC gas reserve");
       expect(handle.fundBlockedUntil).not.toBeNull();

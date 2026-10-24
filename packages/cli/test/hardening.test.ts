@@ -25,7 +25,19 @@ import {
   type SignedAcceptance,
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
-import { CHAIN, RPC, increaseTime, now, setBaseFeePerGas, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
+import {
+  ARC_FLOOR_WEI,
+  CHAIN,
+  ON_ARC_ANVIL,
+  RPC,
+  increaseTime,
+  now,
+  publicClient,
+  setBaseFeePerGas,
+  setEthBalance,
+  setLimits,
+  setPaused,
+} from "../../sdk/test/helpers/chain.js";
 import {
   ArenaDaemon,
   DaemonError,
@@ -1012,6 +1024,18 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     return original;
   }
 
+  /** Plan 6 Task 4: the fee per gas F that the dust-boundary tests stub `currentFeePerGas` to. On stock anvil it is
+   *  1.5 gwei, as before. arc-anvil holds its base fee at Arc's 20 gwei floor, so its market estimate is about 25 gwei
+   *  (1.2 x the base fee plus a 1 gwei tip). A sweep that reserves ceil(1.3 x 1.5 gwei) per gas there can never pay its
+   *  own send: the session sender refuses it (`TxInsufficientFundsError`) on every attempt, which is how scenario E2
+   *  failed on `pnpm test:arc`. On arc-anvil, F is therefore the chain's own market estimate, read once. The base fee
+   *  cannot move off the floor there (asserted), and the reserve ceil(1.3F) covers the send's own fee at that market. */
+  async function pinnedFee(): Promise<bigint> {
+    if (!ON_ARC_ANVIL) return 1_500_000_000n;
+    expect((await publicClient().getBlock()).baseFeePerGas).toBe(ARC_FLOOR_WEI);
+    return ((await publicClient().estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
+  }
+
   /** Stops the daemon's periodic passes (the `285c4c1` pattern) so a test drives every pass itself: a test that
    *  calls sweepChannel directly holds none of the flags (`mainBusy`) the periodic main pass takes around it. */
   async function stopPeriodicPasses(d: ArenaDaemon): Promise<void> {
@@ -1678,7 +1702,12 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // key after this sweep already ran and reported "true" -- comfortably above dust, not the sweep's own
     // untouched fee reserve (see minor 4's "already" path for that case, covered by the pre-existing
     // "an already-swept channel ... reports already" test just above).
-    const topUp = 1_000_000_000_000_000n;
+    // Plan 6 Task 4: at least 20 x a 21,000-gas transfer at the market fee, so it is never dust. Stock anvil's market
+    // (about 1-2 gwei) leaves this at 1e15 wei, as before. arc-anvil's, at about 25 gwei, makes 1e15 wei dust: the sweep
+    // would reserve 21,000 x ceil(1.3 x 25 gwei) and keep less than one transfer's own gas, so the re-check correctly
+    // declined it as dust and reported "already". That was a fee-level assumption in this test, not a daemon bug.
+    const market = ((await d.client.estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
+    const topUp = 20n * 21_000n * market > 1_000_000_000_000_000n ? 20n * 21_000n * market : 1_000_000_000_000_000n;
     await setEthBalance(session, topUp);
     const walletBefore = await d.client.getBalance({ address: alice.address });
 
@@ -1705,8 +1734,9 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // A fixed F, not a live read: the real market fee can (and, in practice, does) drift by the time the periodic
     // pass gets around to reading it itself -- enough to tip a balance chosen to land exactly on the boundary
     // computed from an earlier read. currentFeePerGas is stubbed to this fixed value below so the boundary this
-    // test computes and the one performSweep actually applies are guaranteed to be the same number.
-    const F = 1_500_000_000n;
+    // test computes and the one performSweep actually applies are guaranteed to be the same number. Plan 6 Task 4:
+    // 1.5 gwei on stock anvil; on arc-anvil the market estimate, read once (see `pinnedFee`).
+    const F = await pinnedFee();
     const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN; // ceil(1.3F)
     // `value = balance - gas*reserve` is dust once `value <= gas*F` -- i.e. `balance <= gas*(reserve+F)` exactly.
     const boundary = gas * (reserve + F);
@@ -1741,7 +1771,14 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       // decision. If the real network fee happened to be above F, the value sent (reserved against F) could come
       // up short and the send itself could fail on TxInsufficientFundsError, flaking this test independently of
       // the boundary math it is actually about. Pinned well below F here so that can never happen.
-      await setBaseFeePerGas(F / 10n);
+      if (ON_ARC_ANVIL) {
+        // Plan 6 Task 4: arc-anvil refuses this cheat ("the next block base fee cannot be overridden on Arc", -32602:
+        // the one Arc-caused test:arc failure). It needs none: its base fee holds at the 20 gwei floor, and F is the
+        // market estimate there (`pinnedFee`), so the send's own fee is about F, well under the ceil(1.3F) it may pay.
+        expect((await publicClient().getBlock()).baseFeePerGas).toBe(ARC_FLOOR_WEI);
+      } else {
+        await setBaseFeePerGas(F / 10n);
+      }
       d.sweepChannel = original;
       await waitFor(() => l.record.swept !== undefined, 20_000, "swept one wei above the boundary");
       expect(l.record.swept).toBe(true);
@@ -1867,7 +1904,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
     const l = alice.daemon.handle(id);
     const sender = l.sessionSender;
-    const F = 1_500_000_000n;
+    const F = await pinnedFee(); // Plan 6 Task 4: 1.5 gwei on stock anvil; arc-anvil's market there (see pinnedFee)
     d.currentFeePerGas = () => Promise.resolve(F);
     const gas = 21_000n;
     const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
