@@ -324,6 +324,54 @@ describe("H1 fix round 1 (review m-3): only refusals in a row skip a block", () 
   });
 });
 
+describe("H3 fix round 1 (review I2): H1's probes, when the RPC refuses the probe too", () => {
+  const REFUSED = () => Object.assign(new Error("requested range too large"), { code: -32012 });
+
+  /** Alice parked, her cursor rewound so the scan's range spans several blocks, and every dispute-event read answered
+   *  by `answer` (the zero-id probe included); the reads are recorded. */
+  async function refusing(answer: (cid: Hex, from: bigint, to: bigint) => "refuse" | "serve") {
+    const m = await matched();
+    const { alice, id } = m;
+    await parked(alice.daemon);
+    const l = alice.daemon.handle(id);
+    const head = await alice.daemon.hub.blockNumber();
+    l.record = { ...l.record, scannedBlock: head - 1n };
+    const reads: Array<{ cid: Hex; from: bigint; to: bigint }> = [];
+    alice.daemon.hub.disputeEvents = async (cid: Hex, from?: bigint, to?: bigint) => {
+      reads.push({ cid, from: from!, to: to! });
+      if (answer(cid, from!, to!) === "refuse") throw REFUSED();
+      return [];
+    };
+    const scan = () => (alice.daemon as unknown as { scanDisputes(l: unknown): Promise<void> }).scanDisputes(l);
+    return { l, reads, scan, head };
+  }
+
+  it("every read refused, the range's probe too: the range is neither split nor counted", async () => {
+    const { l, reads, scan } = await refusing(() => "refuse");
+    const before = l.record.scannedBlock;
+    for (let i = 0; i <= UNREADABLE_BLOCK_PASSES; i++) await scan();
+    const first = reads[0];
+    expect(first.to).toBeGreaterThan(first.from); // a multi-block range
+    expect(reads.filter((r) => r.cid === ZERO_HASH)).toHaveLength(UNREADABLE_BLOCK_PASSES + 1); // probed once a pass
+    expect(reads.every((r) => r.from === first.from && r.to === first.to)).toBe(true); // never a half
+    expect(l.record.skippedEventBlocks).toBeUndefined();
+    expect(l.unreadableBlock).toBeNull();
+    expect(l.record.scannedBlock).toBe(before);
+    expect(l.lastError).toBe("events: requested range too large");
+  });
+
+  it("a range's probe served but a single block's refused: the block is never counted toward a skip", async () => {
+    // A node that refuses any one-block query outright (content-independent), and serves the wider probe.
+    const { l, reads, scan } = await refusing((cid, from, to) => (cid === ZERO_HASH && to > from ? "serve" : "refuse"));
+    for (let i = 0; i <= UNREADABLE_BLOCK_PASSES; i++) await scan();
+    expect(reads.some((r) => r.cid === ZERO_HASH && r.from === r.to)).toBe(true); // the single-block probe ran
+    // Before the guard, the third pass skipped the block although the RPC refused even the empty query on it.
+    expect(l.record.skippedEventBlocks).toBeUndefined();
+    expect(l.unreadableBlock).toBeNull();
+    expect(l.lastError).toBe("events: requested range too large");
+  });
+});
+
 describe("H1 fix round 1 (review m-1): skipped blocks are retried in turn", () => {
   it("a skipped block that never reads does not keep the others from being re-read", async () => {
     const m = await matched();
