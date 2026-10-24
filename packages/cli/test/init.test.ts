@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import {
   KNOWN_DEPLOYMENTS,
+  RPC_CALL_RETRY_DELAYS_MS,
   RPC_TIMEOUT_MS,
   arenaPaths,
   feeCeilingOf,
@@ -184,6 +185,83 @@ describe("arena init --server", () => {
     expect(code).toBe(1);
     expect(err.join("\n")).toContain("serves chain 0x1, not chain 31337");
     expect(existsSync(failed)).toBe(false);
+  });
+
+  describe("H3 (Arc testnet rehearsal §8.3): init's RPC calls ride out a rate limit", () => {
+    /** `stubFetch`'s chain, with the RPC calls `limit` picks answered `answer` instead. */
+    function limited(limit: (method: string, call: number) => Response | null) {
+      const base = stubFetch();
+      const seen: string[] = [];
+      const fetchStub = (async (url: string, init?: RequestInit) => {
+        if (!url.endsWith("/templates")) {
+          const method = (JSON.parse(String(init?.body)) as { method: string }).method;
+          const r = limit(method, seen.filter((m) => m === method).length);
+          seen.push(method);
+          if (r) return r;
+        }
+        return base.fetchStub(url, init);
+      }) as typeof fetch;
+      return { fetchStub, seen };
+    }
+    const tooMany = (headers?: Record<string, string>) => new Response("Too Many Requests", { status: 429, headers });
+    const rateLimit = () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32005, message: "rate limit exceeded" } }));
+
+    async function init(fetchStub: typeof fetch) {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const err: string[] = [];
+      const waits: number[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+        sleep: async (ms) => void waits.push(ms),
+      });
+      return { home, code, err, waits };
+    }
+
+    it("a 429 on eth_getCode (Bob's first init in the rehearsal) is retried after 1 s, and init succeeds", async () => {
+      const { fetchStub, seen } = limited((m, call) => (m === "eth_getCode" && call === 0 ? tooMany() : null));
+      const { home, code, waits } = await init(fetchStub);
+      expect(code).toBe(0);
+      expect(waits).toEqual([1_000]);
+      expect(seen.filter((m) => m === "eth_getCode")).toHaveLength(4); // three contracts, one retried
+      expect(existsSync(arenaPaths(home).config)).toBe(true);
+    });
+
+    it("a JSON-RPC -32005 and a 503 are retried too; a Retry-After is honoured up to 4 s", async () => {
+      const { fetchStub } = limited((m, call) =>
+        m === "eth_chainId" && call === 0 ? rateLimit() : m === "eth_chainId" && call === 1 ? tooMany({ "retry-after": "3600" }) : m === "eth_chainId" && call === 2 ? new Response("", { status: 503 }) : null,
+      );
+      const { code, waits } = await init(fetchStub);
+      expect(code).toBe(0);
+      expect(waits).toEqual([1_000, 4_000, 4_000]);
+    });
+
+    it("a rate limit that persists fails with 'the RPC is rate-limiting' and what to do, after 15 s of retries", async () => {
+      const { fetchStub, seen } = limited(() => tooMany());
+      const { home, code, err, waits } = await init(fetchStub);
+      expect(code).toBe(1);
+      expect(waits).toEqual([...RPC_CALL_RETRY_DELAYS_MS]);
+      expect(waits.reduce((a, b) => a + b, 0)).toBe(15_000);
+      expect(seen).toEqual(Array(5).fill("eth_chainId"));
+      expect(err.join("\n")).toContain(
+        "the RPC is rate-limiting: http://rpc.test answered eth_chainId with status 429 (5 tries); wait a minute, then retry the command",
+      );
+      expect(livePidHoldingLock(home)).toBeNull();
+      expect(existsSync(arenaPaths(home).config)).toBe(false);
+    });
+
+    it("a refusal is not retried", async () => {
+      const { fetchStub, seen } = limited((m) =>
+        m === "eth_chainId" ? new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "method not found" } })) : null,
+      );
+      const { code, err, waits } = await init(fetchStub);
+      expect(code).toBe(1);
+      expect(waits).toEqual([]);
+      expect(seen).toEqual(["eth_chainId"]);
+      expect(err.join("\n")).toContain("RPC http://rpc.test refused eth_chainId: method not found");
+    });
   });
 
   it("Task 3 fix round 4 (N2): every RPC call carries a timeout, and an RPC that never answers fails init with a clear error", async () => {
@@ -465,10 +543,13 @@ describe("arena init --server", () => {
 
   describe("Plan 6 Task 5: the real Arc Testnet pin (contracts/deployments/5042002.json)", () => {
     const ARC_USDC = "0x3600000000000000000000000000000000000000";
-    const PINNED_HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893";
-    const PINNED_RULES = "0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5";
+    const PINNED_HUB = "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41";
+    const PINNED_RULES = "0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01";
+    /** The pre-hardening testnet deploy (superseded 2026-10-24): refused like any other hub. */
+    const SUPERSEDED_HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893";
+    const SUPERSEDED_RULES = "0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5";
     const OTHER = `0x${"44".repeat(20)}` as const;
-    const testnet = () => ({ chainId: 5042002, withCode: [PINNED_HUB, PINNED_RULES, OTHER, ARC_USDC] });
+    const testnet = () => ({ chainId: 5042002, withCode: [PINNED_HUB, PINNED_RULES, SUPERSEDED_HUB, SUPERSEDED_RULES, OTHER, ARC_USDC] });
     const explicit = (hub: string, rules = PINNED_RULES) => [
       "init", "--server", "https://host.test", "--rpc", "http://rpc.test", "--chain-id", "5042002",
       "--hub", hub, "--usdc", ARC_USDC, "--rules", rules, "--session-gas-wei", "10000000000000000",
@@ -503,6 +584,12 @@ describe("arena init --server", () => {
       const badRules = await run(freshHome(), explicit(PINNED_HUB, OTHER), stubFetch(testnet()));
       expect(badRules.code).toBe(1);
       expect(badRules.err).toContain(`rules ${OTHER} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
+
+      // The superseded pre-hardening deploy is refused too: a host still publishing it gets no new home.
+      const superseded = await run(freshHome(), explicit(SUPERSEDED_HUB, SUPERSEDED_RULES), stubFetch(testnet()));
+      expect(superseded.code).toBe(1);
+      expect(superseded.err).toContain(`hub ${SUPERSEDED_HUB} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(superseded.err).toContain(`rules ${SUPERSEDED_RULES} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
     });
 
     it("init on 5042002 accepts the pinned hub, rules and USDC (any case)", async () => {

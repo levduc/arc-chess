@@ -6,8 +6,10 @@ import {
   channelHubAbi,
   decodeWire,
   DEFAULT_FEE_CEILING_WEI,
+  isRateLimited,
   offerId as computeOfferId,
   parseSignedOffer,
+  RPC_RETRY_AFTER_MAX_S,
   type SignedOffer,
 } from "@arena/sdk";
 import { runBot } from "./bot.js";
@@ -61,6 +63,8 @@ export type CliIo = {
   fetch: typeof fetch;
   out(s: string): void;
   err(s: string): void;
+  /** H3: how `rpcCall` waits between retries (default: a real timer); tests pass one that does not wait. */
+  sleep?(ms: number): Promise<void>;
 };
 
 /** Plan 5.6 Task 4 (ruling 3): how *this running CLI* names itself in a message a human or agent must run again
@@ -415,13 +419,52 @@ export function invalidOfferTimeoutReason(
  *  could hold `init` -- and the home lock it holds -- open for minutes (undici's own header and body timeouts). */
 export const RPC_TIMEOUT_MS = 30_000;
 
+/** H3 (Arc testnet rehearsal §8.3): the waits before each retry of an `rpcCall` the RPC rate-limited (an HTTP 429, a
+ *  JSON-RPC `-32005`) or answered with an HTTP 5xx -- 15 s in all. A `Retry-After` is honoured, up to
+ *  `RPC_RETRY_AFTER_MAX_S` per retry. With `RPC_TIMEOUT_MS`, one `rpcCall` takes 45 s at most, retries included. */
+export const RPC_CALL_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
+
+/** One answer `rpcCall` retries: a rate limit (`limited`) or an HTTP 5xx. */
+class RetryableRpcAnswer extends Error {
+  constructor(
+    readonly limited: boolean,
+    readonly what: string,
+    readonly retryAfterMs: number | undefined,
+  ) {
+    super(what);
+  }
+}
+
 /** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors, and when
- *  no full reply arrives within `RPC_TIMEOUT_MS`. */
+ *  no full reply arrives within `RPC_TIMEOUT_MS`. H3: a rate limit or an HTTP 5xx is retried (`RPC_CALL_RETRY_DELAYS_MS`);
+ *  one that persists fails with "the RPC is rate-limiting" and what to do. */
 async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]): Promise<unknown> {
-  const signal = AbortSignal.timeout(RPC_TIMEOUT_MS);
+  const sleep = io.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = Date.now() + RPC_TIMEOUT_MS + RPC_CALL_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await rpcCallOnce(io, url, method, params, Math.min(RPC_TIMEOUT_MS, Math.max(1, deadline - Date.now())));
+    } catch (err) {
+      if (!(err instanceof RetryableRpcAnswer)) throw err;
+      const wait = err.retryAfterMs ?? RPC_CALL_RETRY_DELAYS_MS[attempt];
+      if (attempt >= RPC_CALL_RETRY_DELAYS_MS.length || Date.now() + wait >= deadline) {
+        const tries = `${attempt + 1} tries`;
+        throw new Error(
+          err.limited
+            ? `the RPC is rate-limiting: ${url} answered ${method} with ${err.what} (${tries}); wait a minute, then retry the command`
+            : `RPC ${url} answered ${method} with ${err.what} (${tries}); wait a minute, then retry the command`,
+        );
+      }
+      await sleep(wait);
+    }
+  }
+}
+
+async function rpcCallOnce(io: CliIo, url: string, method: string, params: unknown[], timeoutMs: number): Promise<unknown> {
+  const signal = AbortSignal.timeout(timeoutMs);
   // fetch rejects with the signal's reason, a DOMException named "TimeoutError", when the signal fires.
   const timedOut = (err: unknown) => signal.aborted || (err as { name?: unknown } | null)?.name === "TimeoutError";
-  const timeoutError = () => new Error(`RPC ${url} did not answer ${method} within ${RPC_TIMEOUT_MS / 1000} s`);
+  const timeoutError = () => new Error(`RPC ${url} did not answer ${method} within ${Math.ceil(timeoutMs / 1000)} s`);
   let res: Response;
   try {
     res = await io.fetch(url, {
@@ -434,8 +477,13 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
     if (timedOut(err)) throw timeoutError();
     throw new Error(`RPC ${url} is unreachable (${method}): ${err instanceof Error ? err.message : String(err)}`);
   }
+  if (res.status === 429 || res.status >= 500) {
+    const after = res.headers.get("retry-after");
+    const retryAfterMs = after !== null && /^\s*\d+\s*$/.test(after) ? Math.min(Number(after), RPC_RETRY_AFTER_MAX_S) * 1000 : undefined;
+    throw new RetryableRpcAnswer(res.status === 429, `status ${res.status}`, retryAfterMs);
+  }
   if (!res.ok) throw new Error(`RPC ${url} answered ${method} with status ${res.status}`);
-  let body: { result?: unknown; error?: { message?: string } };
+  let body: { result?: unknown; error?: { code?: unknown; message?: string } };
   try {
     body = (await res.json()) as typeof body;
   } catch (err) {
@@ -443,7 +491,10 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
     throw new Error(`RPC ${url} answered ${method} with a body that is not JSON`);
   }
   if (body === null || typeof body !== "object") throw new Error(`RPC ${url} answered ${method} with a malformed body`);
-  if (body.error) throw new Error(`RPC ${url} refused ${method}: ${body.error.message ?? "unknown error"}`);
+  if (body.error) {
+    if (isRateLimited(body.error)) throw new RetryableRpcAnswer(true, `"${body.error.message ?? "rate limit exceeded"}"`, undefined);
+    throw new Error(`RPC ${url} refused ${method}: ${body.error.message ?? "unknown error"}`);
+  }
   return body.result;
 }
 
