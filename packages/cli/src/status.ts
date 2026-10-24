@@ -122,6 +122,9 @@ export type StatusInput = {
   lobbyError?: string | null;
   /** Final review C1: why the session key's dispute gas is low and the wallet could not refill it, or null. */
   sessionGasLow?: string | null;
+  /** H1 (Task 2 review Minor-2, audit-daemon M-5): what kind of failure `sessionGasLow` is, so its action names a
+   *  remedy that works. Absent: `"funds"`, the action as before. */
+  sessionGasLowCause?: SessionGasLowCause | null;
   /** Final review m4: the channel settled while the daemon watched it and no `wait()` has woken for it yet. */
   settled?: boolean;
   /** Final fix wave (I1): seconds before the deadline at which the daemon returns a human-held seat that must move
@@ -162,14 +165,59 @@ export function gasReasonInUsdc(reason: string): string {
 }
 
 /**
+ * H1 (Task 2 review Minor-2, audit-daemon M-5): why a refill failed, as the daemon classified it.
+ * - `funds`: the wallet cannot pay the refill (`TxInsufficientFundsError`) -- funding the wallet fixes it.
+ * - `fee-cap`: a refill needs a fee over the wallet's fee ceiling (`TxFeeCapError`).
+ * - `estimate`: the refill's fee or gas estimate failed.
+ * - `reverted`: the top-up was mined and reverted (`txHash`); nothing reached the key.
+ * - `failing`: `failures` refills in a row failed in transit (dropped, stuck, no receipt, a nonce race).
+ * Only `funds` is fixed by sending the wallet money, so only its action asks for any.
+ */
+export type SessionGasLowCause =
+  | { kind: "funds" }
+  | { kind: "fee-cap" }
+  | { kind: "estimate" }
+  | { kind: "reverted"; txHash: Hex }
+  | { kind: "failing"; failures: number };
+
+/**
  * The `session-gas-low` action, first in `suggestedActions` (final review C1). Chain-neutral by default, unchanged:
  * fund the wallet and the daemon refills the key on its next pass. Plan 6 hardening H2 (audit-journey I-2): on a
  * chain whose gas is USDC (Arc), the reason is shown in USDC (`gasReasonInUsdc`), and the action names the asset,
  * the network and the amount -- one channel's gas budget, as `arena fund` counts it: its `sessionGasWei` (the most
  * one refill can send) plus `FUND_TX_GAS_UNITS` x the wallet's fee ceiling for the refill's own gas, rounded up.
+ * H1 (Task 2 review Minor-2): that holds only when the wallet's balance is the cause (`cause` absent or `funds`).
+ * Any other cause gets its own remedy, says that funding the wallet will not fix it, and asks for no amount.
  */
-export function sessionGasLowAction(channelId: Hex, reason: string, gasFunding?: StatusInput["gasFunding"]): string {
+export function sessionGasLowAction(
+  channelId: Hex,
+  reason: string,
+  gasFunding?: StatusInput["gasFunding"],
+  cause?: SessionGasLowCause | null,
+): string {
   const profile = gasFunding !== undefined ? chainProfile(gasFunding.chainId) : undefined;
+  if (cause && cause.kind !== "funds") {
+    const why = profile?.nativeIsUsdc === true ? gasReasonInUsdc(reason) : reason;
+    const low = `dispute gas for channel ${channelId} is low (${why})`;
+    const notFunds = "funding the wallet will not fix it; the daemon retries with back-off";
+    switch (cause.kind) {
+      case "reverted":
+        return (
+          `check the refill: a top-up of channel ${channelId}'s session key reverted on-chain (tx ${cause.txHash}), so ` +
+          `nothing reached the key and ${low}; ${notFunds}. A top-up reverts when the wallet or the session key ` +
+          "cannot send or receive (on Arc: a blocklisted address)"
+        );
+      case "fee-cap":
+        return `wait: ${low}; a refill needs a fee over the wallet's fee ceiling right now, and ${notFunds} as fees fall`;
+      case "estimate":
+        return `check the RPC: ${low}; the refill's fee or gas estimate failed, so nothing was sent, and ${notFunds}`;
+      case "failing":
+        return (
+          `check the RPC: ${low}; the last ${cause.failures} refills failed before they could be confirmed (dropped, ` +
+          `stuck or without a receipt), and ${notFunds}. On Arc, a transfer from or to a blocklisted address gets no receipt`
+        );
+    }
+  }
   if (gasFunding === undefined || profile?.nativeIsUsdc !== true) {
     return `fund your wallet: dispute gas for channel ${channelId} is low (${reason}); the daemon refills it on its next pass`;
   }
@@ -343,7 +391,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   if (input.lobbyError) {
     suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
   }
-  if (gasLow) suggestedActions.unshift(sessionGasLowAction(record.channelId, gasLow, input.gasFunding));
+  if (gasLow) suggestedActions.unshift(sessionGasLowAction(record.channelId, gasLow, input.gasFunding, input.sessionGasLowCause));
 
   return {
     channelId: record.channelId,

@@ -70,7 +70,7 @@ import { FileSessionStore } from "./fileStore.js";
 import { FUND_TX_GAS_UNITS, formatUsdc6, oneBalanceOpenNeed } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
-import { buildStatus, type ChannelStatus } from "./status.js";
+import { buildStatus, type ChannelStatus, type SessionGasLowCause } from "./status.js";
 import { selfCommand } from "./version.js";
 
 export type Actor = "agent" | "human";
@@ -115,6 +115,16 @@ export const TOP_UP_GAS_MARGIN_PERCENT = 20n;
 export const TOP_UP_GAS_MARGIN_FIXED = 5_000n;
 export function topUpGasLimit(estimate: bigint): bigint {
   return estimate + (estimate * TOP_UP_GAS_MARGIN_PERCENT + 99n) / 100n + TOP_UP_GAS_MARGIN_FIXED;
+}
+
+/** H1 (Task 2 review Minor-2): the `session-gas-low` cause of a refill error that raises it at once (see
+ *  `SessionGasLowCause`), or null for a transient one (logged, counted toward `REFILL_TRANSIENT_FAILURES_ALERT`). */
+export function refillFailureCause(err: unknown): SessionGasLowCause | null {
+  if (err instanceof TxInsufficientFundsError) return { kind: "funds" };
+  if (err instanceof TxFeeCapError) return { kind: "fee-cap" };
+  if (err instanceof SessionGasEstimateError) return { kind: "estimate" };
+  if (err instanceof TopUpRevertedError) return { kind: "reverted", txHash: err.hash };
+  return null;
 }
 
 /** Final fix wave (M4): a chain read a sweep attempt makes before it sends anything (the on-chain settled check,
@@ -192,6 +202,19 @@ export type ChannelHandle = {
   /** Final review C1: `wait()` has already woken for the current `sessionGasLow` episode (so it does not return at
    *  once on every call while the wallet stays empty). */
   sessionGasLowWoken: boolean;
+  /** H1 (Task 2 review Minor-2, audit-daemon M-5): what kind of failure `sessionGasLow` reports -- the status action
+   *  names its remedy from it. Null with `sessionGasLow`. */
+  sessionGasLowCause: SessionGasLowCause | null;
+  /** H1 (audit-daemon M-5): refills in a row that failed in transit (dropped, stuck, no receipt, a nonce race). At
+   *  `REFILL_TRANSIENT_FAILURES_ALERT` the channel raises `session-gas-low` (cause `failing`). 0 after any refill
+   *  that goes through, or a key already at its floor. */
+  refillTransientFailures: number;
+  /** H1 (audit-daemon M-8, Task 2 review Minor-2): set while the refill back-off episode was caused by the wallet's
+   *  own balance (`TxInsufficientFundsError`): the wallet balance that covers the refill (its value plus its gas at
+   *  the wallet's fee ceiling). Only then does a rise in the wallet's balance end the back-off early, and only a rise
+   *  to at least this. Null for every other cause -- a reverted top-up, a fee cap, a failed estimate, a send lost in
+   *  transit -- which funding the wallet does not fix. */
+  refillNeedWei: bigint | null;
   /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
    *  woken for it yet: drives the one-shot `settled` attention. */
   settledWake: boolean;
@@ -405,6 +428,11 @@ export const SETTLED_GRACE_SECONDS = 600n;
 /** Final review I3: at most this many evicted channels' final statuses are kept in memory; older ones are served
  *  from disk (`status`), and no longer listed by `channels()`. */
 export const SETTLED_CACHE_MAX = 1000;
+
+/** H1 (audit-daemon M-5): after this many refills in a row fail in transit -- each one logged and retried as
+ *  transient -- the channel raises `session-gas-low` (cause `failing`), so the agent is told. On Arc, a top-up from
+ *  or to a blocklisted address is included without a receipt, so it never fails any other way. */
+export const REFILL_TRANSIENT_FAILURES_ALERT = 3;
 
 /** Plan 5 Task 1 (mainnet gates: refill and sweep back-off): the first back-off, in wall-clock ms, after a failed
  *  refill or sweep -- doubled on each further failure, up to `BACKOFF_MAX_MS`. */
@@ -1520,6 +1548,9 @@ export class ArenaDaemon {
       refillBackoffMs: 0,
       refillLastWalletBalance: null,
       sessionGasLowWoken: false,
+      sessionGasLowCause: null,
+      refillTransientFailures: 0,
+      refillNeedWei: null,
       settledWake: false,
       humanMustMoveWoken: null,
       settledAt: null,
@@ -1738,6 +1769,7 @@ export class ArenaDaemon {
         return;
       }
       if (balance >= floor) {
+        l.refillTransientFailures = 0;
         this.clearSessionGasLow(l);
         this.endRefillBackoff(l);
         return;
@@ -1747,6 +1779,7 @@ export class ArenaDaemon {
           l.refills++;
           this.log(`channel ${l.record.channelId}: refilled the session key's dispute gas (it was at ${balance} wei, floor ${floor})`);
         }
+        l.refillTransientFailures = 0;
         this.clearSessionGasLow(l);
         this.endRefillBackoff(l);
       } catch (err) {
@@ -1758,20 +1791,32 @@ export class ArenaDaemon {
         // Plan 6 Task 2 (audit-daemon I-1): so is a top-up that was mined and reverted -- it is not a refill (the
         // count and the back-off are left alone), and sending it again on the next pass would only pay for another
         // revert, so the back-off below holds it off.
-        if (
-          err instanceof TxInsufficientFundsError ||
-          err instanceof TxFeeCapError ||
-          err instanceof SessionGasEstimateError ||
-          err instanceof TopUpRevertedError
-        ) {
-          const first = l.sessionGasLow === null;
-          l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
-          this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
-          if (first) this.notify();
-        } else {
+        // H1 (audit-daemon M-5): transient failures are counted, and REFILL_TRANSIENT_FAILURES_ALERT of them in a row
+        // raise it too. H1 (Task 2 review Minor-2): every raise carries its cause, which picks the status action.
+        const cause = refillFailureCause(err);
+        if (cause === null) {
+          l.refillTransientFailures++;
           const name = err instanceof Error ? err.name : "Error";
           this.log(`channel ${l.record.channelId}: refill failed, ${name}: ${errorText(err)} (re-evaluated on the next pass)`);
+        } else {
+          l.refillTransientFailures = 0;
         }
+        const raised: SessionGasLowCause | null =
+          cause ?? (l.refillTransientFailures >= REFILL_TRANSIENT_FAILURES_ALERT ? { kind: "failing", failures: l.refillTransientFailures } : null);
+        if (raised !== null) {
+          const first = l.sessionGasLow === null;
+          l.sessionGasLow =
+            raised.kind === "failing"
+              ? `the session key holds ${balance} wei, below the floor of ${floor}, and the last ${raised.failures} refills failed in transit: ${errorText(err)}`
+              : `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
+          l.sessionGasLowCause = raised;
+          this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
+          if (first) this.notify();
+        }
+        // H1 (audit-daemon M-8): only a shortfall of the wallet's own may end the back-off on a balance rise, and only
+        // on one that covers the refill: its value, plus its gas at the wallet's fee ceiling.
+        l.refillNeedWei =
+          cause?.kind === "funds" ? this.opts.config.sessionGasWei - balance + topUpGasLimit(21_000n) * this.wallet.feeCeiling : null;
         this.startOrBumpRefillBackoff(l);
       }
     }).catch(() => undefined);
@@ -1785,10 +1830,17 @@ export class ArenaDaemon {
    *  to reset otherwise, so the common (not backed off) case costs no RPC call at all. */
   private async refillBackoffGate(l: ChannelHandle): Promise<boolean> {
     if (!(l.refillBlockedUntil > 0)) return true;
-    const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
-    if (balance !== null) {
-      if (l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance) this.endRefillBackoff(l);
-      l.refillLastWalletBalance = balance;
+    // H1 (audit-daemon M-8, Task 2 review Minor-2): on Arc every USDC inflow -- a payout, a sweep of another channel
+    // -- raises the wallet's balance. Only a back-off the wallet's own shortfall caused ends on a rise, and only on a
+    // rise that covers the refill (`refillNeedWei`); a reverted top-up, a fee cap, a failed estimate or a send lost
+    // in transit waits its back-off out, and its balance is not even read.
+    if (l.refillNeedWei !== null) {
+      const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
+      if (balance !== null) {
+        const rose = l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance;
+        if (rose && balance >= l.refillNeedWei) this.endRefillBackoff(l);
+        l.refillLastWalletBalance = balance;
+      }
     }
     return !(l.refillBlockedUntil > 0 && Date.now() < l.refillBlockedUntil);
   }
@@ -1814,8 +1866,10 @@ export class ArenaDaemon {
   }
 
   private clearSessionGasLow(l: ChannelHandle): void {
+    l.refillNeedWei = null;
     if (l.sessionGasLow === null) return;
     l.sessionGasLow = null;
+    l.sessionGasLowCause = null;
     l.sessionGasLowWoken = false;
     this.notify();
   }
@@ -3479,6 +3533,7 @@ export class ArenaDaemon {
       lastProgressAt: l.lastProgressAt,
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
+      sessionGasLowCause: l.sessionGasLowCause,
       // H2 (controller request): on a one-balance chain, the session-gas-low action names its amount in USDC.
       gasFunding: { chainId: this.opts.config.chainId, sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling },
       settled: l.settledWake,

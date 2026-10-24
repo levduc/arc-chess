@@ -273,7 +273,9 @@ describe("Plan 6 Task 2: the session-key top-up's gas comes from the node's esti
         const s = await d.status(id);
         return s.attention === "session-gas-low" ? s : null;
       }, 10_000, "session-gas-low");
-      expect(st.suggestedActions[0]).toMatch(/^fund your wallet: dispute gas for channel/);
+      // H1 (Task 2 review Minor-2): funding the wallet does not fix a failed estimate, so the action does not ask for it.
+      expect(st.suggestedActions[0]).toMatch(/^check the RPC: dispute gas for channel .*the refill's fee or gas estimate failed/);
+      expect(l.sessionGasLowCause).toEqual({ kind: "estimate" });
       expect(l.sessionGasLow).toMatch(/gas estimate failed: RPC unreachable/);
       expect(l.refillBlockedUntil).toBeGreaterThan(0);
       await d.idle();
