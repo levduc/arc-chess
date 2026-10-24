@@ -336,6 +336,16 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         emit PausedSet(paused_);
     }
 
+    /// @dev Declared here rather than with the other errors, so that the lines `scripts/tools/mutants.sh`
+    /// addresses by number do not move.
+    error RenounceDisabled();
+
+    /// @notice Always reverts (audit M2): an ownerless hub could never be unpaused or have its caps raised again.
+    /// Hand over with `transferOwnership` and `acceptOwnership` (Ownable2Step) instead.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
     // -------------------------------------------------------------- internal
 
     function _setFee(uint256 feePerPlayer_, address feeRecipient_) private {
