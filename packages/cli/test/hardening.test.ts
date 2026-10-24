@@ -974,7 +974,10 @@ describe("Plan 4.5 Task 10: the watchtower retries a failed cooperative close", 
     }
     await alice.daemon.close(id, "agent"); // alice alone: nothing to submit yet
     await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
-    await expect(bob.daemon.close(id, "agent")).rejects.toThrow(/HTTP request failed/);
+    // H3 fix round 1 (review M4): Bob's Close is signed and relayed, so close() resolves; only its on-chain submission
+    // failed, which the watchtower retries (shown as a `close:` lastError meanwhile).
+    await bob.daemon.close(id, "agent");
+    expect(failures).toEqual(["bob"]);
     // Before the fix nothing retried: the channel stayed Open with a fully co-signed close.
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Finalized", 10_000, "the watchtower's retry");
     await waitFor(() => alice.daemon.handle(id).lastError === null && bob.daemon.handle(id).lastError === null, 5_000, "close: cleared");
