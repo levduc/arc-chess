@@ -64,6 +64,9 @@ export type ChannelStatus = {
   };
   attention:
     | null
+    /** H1 fix round 1 (review I-1): Challenged on a registered state newer than this daemon holds, whose event could
+     *  not be read -- unanswered, the current game is forfeited at the deadline. Whoever holds the seat. */
+    | "challenge-unseen"
     | "session-gas-low"
     | "human-must-move"
     | "your-turn"
@@ -128,6 +131,9 @@ export type StatusInput = {
   /** H1 (Task 2 review Minor-2, audit-daemon M-5): what kind of failure `sessionGasLow` is, so its action names a
    *  remedy that works. Absent: `"funds"`, the action as before. */
   sessionGasLowCause?: SessionGasLowCause | null;
+  /** H1 fix round 1 (review I-1): set by the daemon once a registered state newer than its latest has stayed unread
+   *  past its debounce (`challenge-unseen`). */
+  unseenChallenge?: { registeredTurn: bigint; deadline: bigint } | null;
   /** Final review m4: the channel settled while the daemon watched it and no `wait()` has woken for it yet. */
   settled?: boolean;
   /** Final fix wave (I1): seconds before the deadline at which the daemon returns a human-held seat that must move
@@ -315,8 +321,10 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   // Final review C1: first, and whoever controls the channel -- a session key that cannot pay cannot answer a
   // challenge, and an unanswered one can roll the channel back.
   const gasLow = live && input.sessionGasLow ? input.sessionGasLow : null;
+  const unseen = phase === "Challenged" && input.unseenChallenge ? input.unseenChallenge : null;
   const skippedBlocks = (record.skippedEventBlocks ?? []).map((b) => b.toString());
-  if (gasLow) attention = "session-gas-low";
+  if (unseen) attention = "challenge-unseen";
+  else if (gasLow) attention = "session-gas-low";
   else if (live && record.controller === "agent") {
     if (myTurn) attention = "your-turn";
     else if (newGame === "proposed_by_opponent" && !closing) attention = "new-game-proposed";
@@ -401,7 +409,15 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     skippedBlocks.length > 0
       ? `block(s) ${skippedBlocks.join(", ")} hold dispute events for this channel that the RPC refuses to serve, even alone`
       : null;
-  if (skippedNote && live) {
+  if (unseen) {
+    const left = chain ? Math.max(0, Number(unseen.deadline - chain.now)) : null;
+    suggestedActions.unshift(
+      `switch RPC: channel ${record.channelId} is challenged on turn ${unseen.registeredTurn}, newer than this daemon holds ` +
+        `(turn ${s.turnNum}), and the challenge's event could not be read${skippedNote ? ` (${skippedNote})` : ""}; unanswered, ` +
+        `the current game is forfeited at the deadline (${unseen.deadline}${left !== null ? `, in ${left}s` : ""}). Set ` +
+        "rpcUrl in config.json to an RPC that serves larger getLogs responses, and restart the daemon",
+    );
+  } else if (skippedNote && live) {
     suggestedActions.push(
       `check the RPC: ${skippedNote}; the daemon skipped them so later events stay readable, and retries them every ` +
         "few minutes. If a challenge's state is in one of them, set rpcUrl in config.json to an RPC that serves larger " +

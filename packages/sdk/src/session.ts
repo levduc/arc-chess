@@ -599,6 +599,7 @@ export class ChannelSession {
     return this.lock(async () => {
       const draft = structuredClone(this.data);
       const pending = draft.pendingCheckpoint;
+      let repaired = false;
       const accepted = await this.asProtocolError(async () => {
         const clonedSigned = structuredClone(signed);
         if (clonedSigned.state.channelId !== this.id) throw new ArenaProtocolError("wrong channel");
@@ -608,10 +609,21 @@ export class ChannelSession {
         } catch {
           throw new ArenaProtocolError("unverifiable on-chain state");
         }
-        if (turnNum <= draft.latest.state.turnNum) return null;
+        if (turnNum <= draft.latest.state.turnNum) {
+          // H1 fix round 1 (review I-1(b)): an event for a state this session already holds -- typically one it
+          // adopted unsigned from the hub's storage (`adoptRegistered`) -- may carry the signature it lacks.
+          repaired = await this.repairFromEvent(draft, clonedSigned);
+          return null;
+        }
         return this.verifyOnChainState(draft, clonedSigned);
       });
-      if (accepted === null) return false;
+      if (accepted === null) {
+        if (repaired) {
+          await this.store.save(draft);
+          this.data = draft;
+        }
+        return false;
+      }
 
       if (accepted.onPending && pending) {
         this.adoptMoveOnPending(draft, pending, accepted.signed);
@@ -624,6 +636,80 @@ export class ChannelSession {
       this.data = draft;
       return true;
     });
+  }
+
+  /**
+   * H1 fix round 1 (review I-1(b)): adopts the hub's *registered* state, read from contract storage, when its event
+   * cannot be read -- an oversized `Challenged` event whose `getLogs` response the RPC refuses. Without it, the dispute
+   * pass holds nothing newer than its latest, cannot answer, and the challenger's `timeout` forfeits this player's
+   * current game. The hub endorses a `prev` whose hash is `registeredHash` with no signature at all
+   * (`ChannelHub._supported`), so a move made on the adopted state can answer the challenge.
+   *
+   * Accepted only as the canonical successor of `latest`: exactly the next turn, chaining from it, recomputed by the
+   * rules, not a checkpoint, the opponent's move, and hashing to `registeredHash` (which the caller reads from the
+   * hub). It is stored with no signature -- none was verified -- so it is provable only while it is registered:
+   * after this player's respond, a later challenge needs the opponent's signature, which a later event that can be
+   * read supplies (`ingestOnChain` repairs it). An RPC that lies about both reads can at worst make this player sign
+   * a move no proof accepts. Returns false, changing nothing, for anything else.
+   */
+  adoptRegistered(state: State, registeredHash: Hex): Promise<boolean> {
+    return this.lock(async () => {
+      const draft = structuredClone(this.data);
+      if (draft.closeState !== null) return false;
+      let canonical: State;
+      try {
+        canonical = this.canonicalState(structuredClone(state));
+      } catch {
+        return false;
+      }
+      const latest = draft.latest.state;
+      if (canonical.channelId !== this.id || canonical.turnNum !== latest.turnNum + 1n) return false;
+      if (canonical.prevHash !== hashState(latest, this.domain)) return false;
+      if (!this.endorsed(draft.latest) || mover(latest) !== this.opponent) return false;
+      let expected: State;
+      try {
+        expected = this.successorFrom(latest, canonical.move);
+      } catch {
+        return false;
+      }
+      const h = hashState(expected, this.domain);
+      if (h !== hashState(canonical, this.domain) || h !== registeredHash || isCheckpoint(expected)) return false;
+      draft.pendingCheckpoint = null;
+      draft.incomingCheckpoint = null;
+      this.ingestLatest(draft, unsigned(expected));
+      await this.store.save(draft);
+      this.data = draft;
+      return true;
+    });
+  }
+
+  /** H1 fix round 1: fills an empty signature slot of `latest` or `prev` from an on-chain event for the same state,
+   *  when the event's signature for that slot verifies. Returns whether anything was filled. Never throws. */
+  private async repairFromEvent(draft: SessionSnapshot, msg: SignedState): Promise<boolean> {
+    let state: State;
+    let sigs: [Hex, Hex];
+    try {
+      state = this.canonicalState(msg.state);
+      sigs = [this.asHexSig(msg.sigA), this.asHexSig(msg.sigB)];
+    } catch {
+      return false;
+    }
+    const h = hashState(state, this.domain);
+    let filled = false;
+    for (const slot of ["latest", "prev"] as const) {
+      const ss = draft[slot];
+      if (!ss || hashState(ss.state, this.domain) !== h) continue;
+      const out = { ...ss };
+      for (const p of [0, 1] as const) {
+        const key = p === 0 ? "sigA" : "sigB";
+        if (out[key] === NO_SIG && (await this.signedBy(p, ss.state, sigs[p]))) {
+          out[key] = sigs[p];
+          filled = true;
+        }
+      }
+      draft[slot] = out;
+    }
+    return filled;
   }
 
   /**

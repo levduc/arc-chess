@@ -711,6 +711,9 @@ describe("watchtower", () => {
     // failure while behind), so Bob's local `latest` stays stuck at turn 0 no matter how many ticks run.
     const session = bob.daemon.handle(id).session;
     session.ingestOnChain = () => Promise.reject(new Error("simulated ingest failure"));
+    // H1 fix round 1: and nor can it adopt the registered state from storage (the fallback for an event it cannot
+    // read) -- this test is about the on-move invariant of a session that stays behind.
+    session.adoptRegistered = () => Promise.resolve(false);
     bob.client.disconnect(); // Bob also never receives Alice's move over the relay
     await alice.daemon.move(undefined, "e4", { actor: "agent" }); // turn 1; Bob (black) is on move there
     await alice.daemon.challenge(undefined, "agent"); // registers turn 1 on-chain
@@ -735,6 +738,8 @@ describe("watchtower", () => {
     // R9/4: the always-failing event was never marked processed, so it is retried (and never skipped).
     expect(bob.daemon.handle(id).processedEvents).toBe(0);
     expect(bob.daemon.handle(id).lastError).toMatch(/^ingest:/);
+    // H1 fix round 1 (review I-1): and Bob is told -- before, nothing said he was about to lose the game.
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "challenge-unseen", 10_000, "challenge-unseen");
   });
 
   it("calls timeout in its favour once a stale challenge can no longer be answered past the deadline (I2)", async () => {

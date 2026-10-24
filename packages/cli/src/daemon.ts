@@ -239,6 +239,12 @@ export type ChannelHandle = {
   skippedRetryAt: number;
   /** H1 fix round 1 (review m-1): which skipped block `retrySkippedEventBlock` tries next (rotating). */
   skippedRetryIndex: number;
+  /** H1 fix round 1 (review I-1): set while the channel is Challenged on a registered state newer than this session's
+   *  latest -- its event not (yet) ingested. `passes` counts dispute passes that found it; `raised` once the
+   *  `challenge-unseen` attention is up. Keyed by the challenge (its deadline and registered turn). */
+  unseenRegistered: { key: string; turn: bigint; deadline: bigint; passes: number; raised: boolean } | null;
+  /** H1 fix round 1: `wait()` has already woken for this `challenge-unseen` (keyed like `unseenRegistered`). */
+  challengeUnseenWoken: string | null;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -395,6 +401,11 @@ export const DISPUTE_RESCAN_BLOCKS = 32n;
 /** H1 (audit-contracts I1, "oversized events"): the most `getLogs` reads one dispute scan of one channel makes -- its
  *  chunks plus the halves of any range the RPC refused (each split adds one read). */
 export const DISPUTE_SCAN_READS_PER_PASS = 64;
+
+/** H1 fix round 1 (review I-1): a registered state newer than this session's latest is left to the scan for this
+ *  many dispute passes -- after any opponent move by challenge it is, for a pass or two, until the event is ingested
+ *  -- before the daemon adopts it from storage or raises `challenge-unseen`. At once when a block was skipped. */
+export const UNSEEN_REGISTERED_PASSES = 3;
 
 /** H1: a single block whose dispute events for a channel the RPC refuses on this many passes in a row, while it
  *  serves the same query for no channel, is skipped (see `skipUnreadableBlock`). */
@@ -1568,6 +1579,8 @@ export class ArenaDaemon {
       unreadableBlock: null,
       skippedRetryAt: 0,
       skippedRetryIndex: 0,
+      unseenRegistered: null,
+      challengeUnseenWoken: null,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -3260,6 +3273,10 @@ export class ArenaDaemon {
     await this.scanDisputes(l);
     if (this.stopped) return true;
     const registered = await this.hub.registeredState(id);
+    // H1 fix round 1 (review I-1): a registered state newer than anything this session holds, whose event the scan
+    // could not read. Adopted from storage when it can be (then the branches below see it), else surfaced.
+    await this.handleUnseenRegistered(l, info, registered);
+    if (this.stopped) return true;
     const latest = l.session.latest.state;
     if (now < info.deadline && latest.turnNum > registered.turnNum) {
       // Stale challenge, and there is still time to answer it: we hold a newer supported state.
@@ -3292,6 +3309,64 @@ export class ArenaDaemon {
     if (this.stopped) return true;
     await this.settleCheck(l);
     return true;
+  }
+
+  /**
+   * H1 fix round 1 (review I-1): the dispute pass found the channel Challenged on a registered state newer than this
+   * session's latest. Normally that is the opponent's move by challenge whose event the scan ingests within a pass;
+   * but if its event cannot be read (a griefer's oversized proof that the RPC refuses), this player cannot answer, and
+   * the challenger's `timeout` forfeits the current game at the deadline -- silently, before this.
+   *
+   * After `UNSEEN_REGISTERED_PASSES` passes (at once if a block was skipped):
+   * - (b) when the registered state is the very next turn, it is adopted from storage, unsigned
+   *   (`ChannelSession.adoptRegistered`), checked against the hub's `registeredHash` on a fresh read. The player can
+   *   then move, and the move answers the challenge: a lock at worst (a later challenge needs the opponent's
+   *   signature, which a readable event repairs), never a forfeit.
+   * - (c) otherwise, the `challenge-unseen` attention (status: switch RPC, and the deadline), once per challenge.
+   * Never throws.
+   */
+  private async handleUnseenRegistered(
+    l: ChannelHandle,
+    info: Awaited<ReturnType<HubClient["channelInfo"]>>,
+    registered: Awaited<ReturnType<HubClient["registeredState"]>>,
+  ): Promise<void> {
+    const latest = l.session.latest.state;
+    if (registered.turnNum <= latest.turnNum) {
+      if (l.unseenRegistered?.raised) this.notify();
+      l.unseenRegistered = null;
+      return;
+    }
+    const key = `${info.deadline}:${registered.turnNum}`;
+    const u = l.unseenRegistered?.key === key ? l.unseenRegistered : { key, turn: registered.turnNum, deadline: info.deadline, passes: 0, raised: false };
+    u.passes++;
+    l.unseenRegistered = u;
+    const skipped = (l.record.skippedEventBlocks?.length ?? 0) > 0;
+    if (u.passes < UNSEEN_REGISTERED_PASSES && !skipped) return;
+    const id = l.record.channelId;
+    try {
+      if (registered.turnNum === latest.turnNum + 1n) {
+        const fresh = await this.hub.channelInfo(id);
+        if (fresh.phase === "Challenged" && fresh.hasRegistered && (await l.session.adoptRegistered(registered, fresh.registeredHash))) {
+          this.log(
+            `channel ${id}: adopted the registered turn ${registered.turnNum} from the hub's storage: its event could not be ` +
+              "read, and a move on it answers the challenge",
+          );
+          l.unseenRegistered = null;
+          this.notify();
+          return;
+        }
+      }
+    } catch (err) {
+      this.log(`channel ${id}: reading the registered state to adopt it failed (retried on the next pass): ${errorText(err)}`);
+    }
+    if (!u.raised) {
+      u.raised = true;
+      this.log(
+        `channel ${id}: challenged on turn ${registered.turnNum}, newer than this daemon holds (turn ${latest.turnNum}), and ` +
+          `its event could not be read: unanswered, the current game is forfeited at the deadline (${info.deadline})`,
+      );
+      this.notify();
+    }
   }
 
   /**
@@ -3551,6 +3626,17 @@ export class ArenaDaemon {
         if (prev === undefined) controllers.set(id, l.record.controller);
         else if (prev !== l.record.controller) return { channelId: id, reason: "control-changed" };
         let st = this.statusOf(l);
+        let ignoreChallengeUnseen = false;
+        if (st.attention === "challenge-unseen") {
+          // H1 fix round 1 (review I-1): whoever holds the seat, one wake per challenge.
+          const key = l.unseenRegistered?.key ?? "";
+          if (l.challengeUnseenWoken !== key) {
+            l.challengeUnseenWoken = key;
+            return { channelId: id, reason: st.attention };
+          }
+          ignoreChallengeUnseen = true;
+          st = this.statusOf(l, { ignoreChallengeUnseen });
+        }
         let ignoreSessionGasLow = false;
         if (st.attention === "session-gas-low") {
           // Final review C1: one wake per low-gas episode. While the wallet stays empty, later waits see the
@@ -3560,7 +3646,7 @@ export class ArenaDaemon {
             return { channelId: id, reason: st.attention };
           }
           ignoreSessionGasLow = true;
-          st = this.statusOf(l, { ignoreSessionGasLow });
+          st = this.statusOf(l, { ignoreSessionGasLow, ignoreChallengeUnseen });
         }
         if (st.attention === "human-must-move") {
           // Final fix wave (I1): whoever holds the seat, one wake per challenge (keyed by its deadline).
@@ -3569,7 +3655,7 @@ export class ArenaDaemon {
             l.humanMustMoveWoken = deadline;
             return { channelId: id, reason: st.attention };
           }
-          st = this.statusOf(l, { ignoreSessionGasLow, ignoreHumanMustMove: true });
+          st = this.statusOf(l, { ignoreSessionGasLow, ignoreHumanMustMove: true, ignoreChallengeUnseen });
         }
         // Final review m4: `settled` wakes one wait, then is gone.
         if (st.attention === "settled") l.settledWake = false;
@@ -3588,7 +3674,10 @@ export class ArenaDaemon {
     return l.xmtpDropped;
   }
 
-  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean } = {}): ChannelStatus {
+  private statusOf(
+    l: ChannelHandle,
+    opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean; ignoreChallengeUnseen?: boolean } = {},
+  ): ChannelStatus {
     return buildStatus({
       record: l.record,
       snapshot: l.session.snapshot(),
@@ -3599,6 +3688,10 @@ export class ArenaDaemon {
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
       sessionGasLowCause: l.sessionGasLowCause,
+      unseenChallenge:
+        l.unseenRegistered?.raised && !opts.ignoreChallengeUnseen
+          ? { registeredTurn: l.unseenRegistered.turn, deadline: l.unseenRegistered.deadline }
+          : null,
       // H2 (controller request): on a one-balance chain, the session-gas-low action names its amount in USDC.
       gasFunding: { chainId: this.opts.config.chainId, sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling },
       settled: l.settledWake,

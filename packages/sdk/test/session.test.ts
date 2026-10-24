@@ -1034,3 +1034,54 @@ describe("H1: ingestOnChain stores only signatures it verified (audit-contracts 
     expect(again.latest).toEqual(restored.latest);
   });
 });
+
+// H1 fix round 1 (review I-1(b)): a registered state whose event cannot be read is adopted from the hub's storage,
+// unsigned, only as the canonical next move of the opponent with the hub's own registered hash.
+describe("H1 fix round 1: adoptRegistered and the signature an event later supplies", () => {
+  it("adopts the opponent's canonical next move with the matching hash; refuses anything else", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    await b.receive(e4);
+    const e5 = await b.move("e7e5"); // never delivered to a
+    const h = hashState(e5.state, domain);
+    // A wrong hash, a state two turns ahead, a non-successor and a malformed state change nothing.
+    expect(await a.adoptRegistered(e5.state, `0x${"00".repeat(32)}`)).toBe(false);
+    expect(await a.adoptRegistered({ ...e5.state, turnNum: 3n }, h)).toBe(false);
+    expect(await a.adoptRegistered({ ...e5.state, move: e5.state.move + 1 }, h)).toBe(false);
+    expect(await a.adoptRegistered({ ...e5.state, board: 1n }, hashState({ ...e5.state, board: 1n }, domain))).toBe(false);
+    expect(a.latest.state.turnNum).toBe(1n);
+    // Its own move is never adopted from storage: a second session on the same key signs e4 behind c's back.
+    const { a: c, cfgA: cfgC } = await setup();
+    const fork = await ChannelSession.create({ ...cfgC, store: new MemoryStore() });
+    const own = await fork.move("e2e4");
+    expect(await c.adoptRegistered(own.state, hashState(own.state, domain))).toBe(false);
+    expect(c.latest.state.turnNum).toBe(0n);
+    // The real one: adopted unsigned, a's turn, and a move on it is provable with `prev` endorsed by the hub's hash.
+    expect(await a.adoptRegistered(e5.state, h)).toBe(true);
+    expect(a.latest).toEqual({ state: e5.state, sigA: "0x", sigB: "0x" });
+    expect(a.isMyTurn()).toBe(true);
+    const nf3 = await a.move("g1f3");
+    const proof = a.challengeProof();
+    expect(proof).toMatchObject({ hasPrev: true, prev: { state: e5.state, sigA: "0x", sigB: "0x" }, latest: nf3 });
+    // Adopting again is a no-op (not the next turn any more).
+    expect(await a.adoptRegistered(e5.state, h)).toBe(false);
+  });
+
+  it("an event for a state already held repairs its missing signature -- verified only -- and saves once", async () => {
+    const { a, b, cfgA } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    expect(await a.adoptRegistered(e5.state, hashState(e5.state, domain))).toBe(true);
+    await a.move("g1f3");
+    const store = cfgA.store as MemoryStore;
+    const saves = store.snapshots.length;
+    // Junk for the slot is refused; Bob's real signature on e5 fills `prev`, which the next proof carries.
+    expect(await a.ingestOnChain({ state: e5.state, sigA: "0x01", sigB: "0x02" })).toBe(false);
+    expect(a.snapshot().prev?.sigB).toBe("0x");
+    expect(store.snapshots.length).toBe(saves);
+    expect(await a.ingestOnChain({ state: e5.state, sigA: "0x01", sigB: e5.sigB })).toBe(false);
+    expect(a.snapshot().prev).toEqual({ state: e5.state, sigA: "0x", sigB: e5.sigB });
+    expect(store.snapshots.length).toBe(saves + 1);
+    expect(a.challengeProof().prev.sigB).toBe(e5.sigB);
+  });
+});

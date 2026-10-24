@@ -13,7 +13,7 @@ import type { Hex } from "viem";
 import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, type DisputeEvent } from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
-import { UNREADABLE_BLOCK_PASSES } from "../src/daemon.js";
+import { UNREADABLE_BLOCK_PASSES, UNSEEN_REGISTERED_PASSES } from "../src/daemon.js";
 import { increaseTime, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
@@ -176,6 +176,101 @@ async function griefedDrawOn(m: Awaited<ReturnType<typeof matched>>, junk: Hex) 
   expect(events.find((e) => e.kind === "Responded")?.signed.sigA).toBe(junk); // the hub took the junk and re-emitted it
   return { ...m, junkBlock: junkBlock!, bobSender, bobDrawProof };
 }
+
+/**
+ * H1 fix round 1 (review I-1): the oversized event is a `Challenged` that registers a move Alice never received. Bob
+ * (white's opponent) signs e5 on Alice's e4 without relaying it and challenges on it, with junk in Alice's slot; Alice's
+ * RPC refuses that block even alone. Before the fix Alice held nothing newer than e4, could not answer, and was told
+ * nothing: Bob's timeout forfeited her current game at the deadline.
+ */
+async function griefedChallengeOn(m: Awaited<ReturnType<typeof matched>>, junk: Hex) {
+  const { alice, bob, id } = m;
+  await alice.daemon.move(undefined, "e4", { actor: "agent" });
+  await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+  bob.client.disconnect(); // his e5 reaches Alice only through the chain
+  const hub = bob.daemon.hub;
+  const real = hub.challenge.bind(hub);
+  let junkBlock: bigint | undefined;
+  hub.challenge = async (sender, proof, opts) => {
+    const r = await real(sender, { ...proof, latest: { ...proof.latest, sigA: junk } }, opts);
+    junkBlock = r.blockNumber;
+    return r;
+  };
+  await bob.daemon.move(undefined, "e5", { actor: "agent" }); // signed, never relayed
+  await bob.daemon.challenge(undefined, "agent");
+  expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+  const bobSigned = bob.daemon.handle(id).session.latest;
+  await bob.daemon.stop();
+  return { ...m, junkBlock: junkBlock!, bobSigned };
+}
+
+describe("H1 fix round 1 (review I-1): a challenge whose event cannot be read is never a silent forfeit", () => {
+  it("(b) the registered move is adopted from the hub's storage: Alice moves on it and her move answers the challenge", async () => {
+    const m = await matched();
+    capResponses(m.alice.daemon, { limit: 10_000, alone: true }); // the challenge's block is unreadable, even alone
+    const g = await griefedChallengeOn(m, `0x${"01".repeat(100_000)}`);
+    const { alice, id } = g;
+    const l = alice.daemon.handle(id);
+    // Before the fix: Alice stayed at turn 1 -- "not your turn" -- until Bob's timeout took her current game.
+    await waitFor(() => l.session.latest.state.turnNum === 2n, 20_000, "the registered move is adopted");
+    expect(l.session.latest).toEqual({ state: g.bobSigned.state, sigA: "0x", sigB: "0x" }); // unsigned: none was verified
+    const st = await alice.daemon.status(id);
+    expect(st.challenge?.mustMove).toBe(true);
+    expect(st.attention).toBe("your-turn");
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 20_000, "alice's move answers the challenge");
+    expect((await alice.daemon.hub.registeredState(id)).turnNum).toBe(3n);
+    // The lock the review describes: Alice's own later challenge needs Bob's signature on e5. Once the block can be
+    // read, the retried event carries it, and her proof is complete again.
+    expect(l.session.snapshot().prev?.sigB).toBe("0x");
+    const plain = new HubClient(alice.daemon.hub.hub, alice.daemon.client); // the RPC serves the block again
+    alice.daemon.hub.disputeEvents = plain.disputeEvents.bind(plain);
+    l.skippedRetryAt = 0;
+    await waitFor(() => l.session.snapshot().prev?.sigB === g.bobSigned.sigB, 20_000, "bob's signature is repaired from the event");
+    await alice.daemon.challenge(id, "agent"); // single-signature endorsement of e5 by Bob: accepted
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+  });
+
+  it("(c) when the registered state cannot be adopted: the challenge-unseen attention names the deadline, and wakes wait once", async () => {
+    const m = await matched();
+    capResponses(m.alice.daemon, { limit: 10_000, alone: true });
+    const l = m.alice.daemon.handle(m.id);
+    l.session.adoptRegistered = async () => false; // e.g. a registered state that is not the next turn
+    const g = await griefedChallengeOn(m, `0x${"01".repeat(100_000)}`);
+    const { alice, id } = g;
+    const st = await waitFor(async () => {
+      const s = await alice.daemon.status(id);
+      return s.attention === "challenge-unseen" ? s : null;
+    }, 20_000, "challenge-unseen");
+    const deadline = (await alice.daemon.hub.channelInfo(id)).deadline;
+    expect(st.suggestedActions[0]).toMatch(
+      new RegExp(`^switch RPC: channel ${id} is challenged on turn 2, newer than this daemon holds \\(turn 1\\)`),
+    );
+    expect(st.suggestedActions[0]).toContain(`forfeited at the deadline (${deadline}`);
+    expect(st.suggestedActions[0]).toContain(`block(s) ${g.junkBlock} hold dispute events`);
+    expect(await alice.daemon.wait({ ref: id, timeoutMs: 1_000 })).toEqual({ channelId: id, reason: "challenge-unseen" });
+    expect((await alice.daemon.wait({ ref: id, timeoutMs: 500 })).reason).not.toBe("challenge-unseen"); // once per challenge
+  });
+
+  it("debounced: an unrelayed move registered by a readable challenge is ingested by the scan, with no attention", async () => {
+    const m = await matched();
+    const { alice, bob, id } = m;
+    await alice.daemon.move(undefined, "e4", { actor: "agent" });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+    bob.client.disconnect();
+    await bob.daemon.move(undefined, "e5", { actor: "agent" });
+    await bob.daemon.challenge(undefined, "agent");
+    const l = alice.daemon.handle(id);
+    await waitFor(() => l.session.latest.state.turnNum === 2n, 20_000, "the scan ingests e5");
+    expect(l.session.latest.sigB).not.toBe("0x"); // from the event, signed -- not adopted from storage
+    for (let i = 0; i < UNSEEN_REGISTERED_PASSES; i++) {
+      await alice.daemon.idle();
+      await alice.daemon.tick();
+    }
+    expect(l.unseenRegistered).toBeNull();
+    expect((await alice.daemon.status(id)).attention).toBe("your-turn");
+  });
+});
 
 /** Stops `daemon`'s periodic passes, so every scan below is one the test drives. */
 async function parked(daemon: ArenaDaemon) {
