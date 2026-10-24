@@ -62,8 +62,9 @@ import {
   DEFAULT_LOG_CHUNK_BLOCKS,
   type ArenaConfig,
 } from "./config.js";
+import { chainProfile, weiToUsdc6Up, type ChainProfile } from "./chains.js";
 import { FileSessionStore } from "./fileStore.js";
-import { formatUsdc6 } from "./funding.js";
+import { FUND_TX_GAS_UNITS, formatUsdc6 } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
@@ -398,14 +399,33 @@ export const MAX_MATCH_RETRIES = 20;
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
 
+/** Plan 6: what `withdrawReserve` is computed from. */
+export type WithdrawReserveInput = {
+  /** The chain's built-in profile (`chainProfile(config.chainId)`); undefined for a chain without one. */
+  profile: ChainProfile | undefined;
+  /** This daemon's channels that are not finalized: each one's session key may still need a refill. */
+  unsettledChannels: number;
+  sessionGasWei: bigint;
+  /** The wallet sender's fee ceiling per gas (`SerialTxSender.feeCeiling`). */
+  feeCeilingWei: bigint;
+};
+
 /**
- * Plan 5.6 Task 3 (spec §4.4): the USDC `withdraw()` always leaves in the wallet. 0 on every chain this daemon runs
- * on today, whose gas is native, so `withdraw --all` empties the wallet's USDC.
- * Plan 6: Arc USDC-gas reserve -- on Arc, gas is paid in USDC, and live channels' session keys are refilled from
- * this wallet (`ensureSessionGas`), so a reserve for those refills belongs here.
+ * Plan 5.6 Task 3 (spec §4.4): the USDC (6 decimals) `withdraw()` always leaves in the wallet.
+ * - **0** with no input, or on a chain whose gas is native (no profile, or one without `nativeIsUsdc`):
+ *   `withdraw --all` empties the wallet's USDC, as before.
+ * - Plan 6 (spec §2.1, Review Focus 1): on a `nativeIsUsdc` chain (Arc), gas is paid from the same USDC balance,
+ *   and every unsettled channel's session key is refilled from this wallet (`ensureSessionGas`). So the reserve is
+ *   `unsettledChannels x sessionGasWei + FUND_TX_GAS_UNITS x feeCeilingWei` (wei), converted to 6 decimals rounded
+ *   UP: a full refill per channel, so `withdraw --all` never strands a channel's dispute gas, plus the wallet's own
+ *   transactions, the withdraw itself included.
  */
-export function withdrawReserve(): bigint {
-  return 0n;
+export function withdrawReserve(input?: WithdrawReserveInput): bigint {
+  if (input === undefined || input.profile?.nativeIsUsdc !== true) return 0n;
+  if (input.unsettledChannels < 0 || !Number.isInteger(input.unsettledChannels)) {
+    throw new RangeError("unsettledChannels must be a non-negative integer");
+  }
+  return weiToUsdc6Up(BigInt(input.unsettledChannels) * input.sessionGasWei + FUND_TX_GAS_UNITS * input.feeCeilingWei);
 }
 
 /**
@@ -741,16 +761,34 @@ export class ArenaDaemon {
 
       const usdc = this.opts.config.usdc;
       const balance = await this.usdcBalance(usdc);
-      const reserve = withdrawReserve();
+      // Plan 6 (spec §2.1, Review Focus 1): 0 on a native-gas chain; on Arc, the USDC gas every unsettled channel and
+      // this wallet's own transactions may still need.
+      const profile = chainProfile(this.opts.config.chainId);
+      const unsettledChannels = profile?.nativeIsUsdc === true ? this.unsettledChannelCount() : 0;
+      const reserve = withdrawReserve({
+        profile,
+        unsettledChannels,
+        sessionGasWei: this.opts.config.sessionGasWei,
+        feeCeilingWei: this.wallet.feeCeiling,
+      });
       const withdrawable = balance > reserve ? balance - reserve : 0n;
       const amount = "all" in req ? withdrawable : req.amount;
       const closeFirst =
         `funds escrowed in channels are not in the wallet: close open channels first (${selfCommand()} close), then withdraw`;
-      if (amount <= 0n) throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC; ${closeFirst}`);
+      // Only when there is a reserve: on every other chain, these messages are exactly as before.
+      const reserveNote =
+        reserve > 0n
+          ? ` -- ${formatUsdc6(reserve)} USDC of it is the gas reserve, which always stays in the wallet: gas on ` +
+            `${profile?.name ?? `chain ${this.opts.config.chainId}`} is paid in USDC, for the session gas of ${unsettledChannels} ` +
+            "unsettled channel(s) and this wallet's own transactions"
+          : "";
+      if (amount <= 0n) {
+        throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC${reserveNote}; ${closeFirst}`);
+      }
       if (amount > withdrawable) {
         throw new DaemonError(
           400,
-          `${formatUsdc6(amount)} USDC is more than this wallet can withdraw (${formatUsdc6(withdrawable)} USDC); ${closeFirst}`,
+          `${formatUsdc6(amount)} USDC is more than this wallet can withdraw (${formatUsdc6(withdrawable)} USDC)${reserveNote}; ${closeFirst}`,
         );
       }
       if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
@@ -793,6 +831,20 @@ export class ArenaDaemon {
     } finally {
       this.withdrawing = false;
     }
+  }
+
+  /**
+   * Plan 6 (spec §2.1): the channels whose session keys this wallet may still have to refill -- every channel record
+   * that is not finalized, whether live or recorded on disk and not yet opened (degraded ones excluded: they are
+   * never watched). The same candidates `channelsAwaitingOwnDeposit` reads.
+   */
+  private unsettledChannelCount(): number {
+    const ids = new Set<Hex>();
+    for (const l of this.live.values()) if (!l.record.finalized) ids.add(l.record.channelId);
+    for (const r of this.records.channels()) {
+      if (!r.finalized && !this.degraded.has(r.channelId) && !this.live.has(r.channelId)) ids.add(r.channelId);
+    }
+    return ids.size;
   }
 
   /** The wallet's USDC balance at the latest block. */

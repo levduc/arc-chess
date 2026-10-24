@@ -6,7 +6,7 @@ import { offerId as computeOfferId, signOffer, toWire, type Offer } from "@arena
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
-import { arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, runCli, writeJsonAtomic } from "../src/index.js";
+import { arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
 import { computeFundingNeed, fundMessage } from "../src/funding.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = [], opts: { chainId?: number } = {}) {
@@ -693,5 +693,123 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
 
     const t3 = fundIo(home);
     expect(await runCli(["wallet", "--wait-for-usdc", "1", "--timeout", "abc"], t3.io)).toBe(1);
+  });
+});
+
+// ------------------------------------------------------------- Plan 6 (spec §2.1): one balance on Arc (wallet, fund)
+
+const ARC_USDC = "0x3600000000000000000000000000000000000000";
+
+/** An Arc home (chain `chainId`, its profile's USDC), written by an explicit-flag init: no /templates, and only the
+ *  chain-id and code checks over the RPC, which `io()` answers. */
+async function initArcHome(chainId = 5042002) {
+  const home = mkdtempSync(join(tmpdir(), "arena-cli-arc-"));
+  const args = [
+    "init", "--rpc", "http://arc-rpc.test", "--chain-id", String(chainId),
+    "--hub", "0x000000000000000000000000000000000000beef", "--usdc", ARC_USDC,
+    "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
+    "--session-gas-wei", "10000000000000000", // 1e16 wei = 0.01 USDC
+  ];
+  const t = io(home, [], { chainId });
+  expect(await runCli(args, t.io), t.err.join("\n")).toBe(0);
+  return home;
+}
+
+/** JSON-RPC calls `arcIo` answered, each as its method -- an `eth_call` with its 4-byte selector. */
+function arcIo(home: string, opts: { balanceWei: bigint | (() => bigint); env?: Record<string, string> }) {
+  const rpc: string[] = [];
+  const out: string[] = [];
+  const err: string[] = [];
+  const fetchFn = (async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/templates")) return new Response(JSON.stringify(CHESS_TEMPLATE()));
+    const req = JSON.parse(String(init?.body)) as { id: number; method: string; params: Array<{ data?: string }> };
+    rpc.push(req.method === "eth_call" ? `eth_call ${String(req.params[0]?.data).slice(0, 10)}` : req.method);
+    const balance = typeof opts.balanceWei === "function" ? opts.balanceWei() : opts.balanceWei;
+    const result =
+      req.method === "eth_getBalance"
+        ? `0x${balance.toString(16)}`
+        : req.method === "eth_call"
+          ? `0x${(5_000n).toString(16).padStart(64, "0")}` // the hub's feePerPlayer: 0.005 USDC
+          : null;
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }));
+  }) as unknown as typeof fetch;
+  return {
+    rpc,
+    out,
+    err,
+    io: { env: { ARENA_HOME: home, ...opts.env }, fetch: fetchFn, out: (s: string) => out.push(s), err: (s: string) => err.push(s) },
+    json: () => JSON.parse(out.join("\n")) as Record<string, unknown>,
+  };
+}
+
+describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc chain", () => {
+  it("wallet prints {address, chainId, usdc}: the native balance / 10^12, rounded down -- one eth_getBalance, no balanceOf", async () => {
+    for (const chainId of [5042, 5042002]) {
+      const home = await initArcHome(chainId);
+      const t = arcIo(home, { balanceWei: 1_234_567_890_123_456_789n });
+      expect(await runCli(["wallet"], t.io), t.err.join("\n")).toBe(0);
+      expect(t.rpc).toEqual(["eth_getBalance"]);
+      const printed = t.json();
+      expect(Object.keys(printed)).toEqual(["address", "chainId", "usdc"]);
+      expect(printed).toMatchObject({ chainId, usdc: "1.234567" });
+    }
+  });
+
+  it("wallet rounds a sub-micro-USDC remainder down: 10^12 - 1 wei is 0.000000, 10^12 + 1 wei is 0.000001", async () => {
+    const home = await initArcHome();
+    for (const [wei, shown] of [[10n ** 12n - 1n, "0.000000"], [10n ** 12n, "0.000001"], [10n ** 12n + 1n, "0.000001"], [1n, "0.000000"]] as const) {
+      const t = arcIo(home, { balanceWei: wei });
+      expect(await runCli(["wallet"], t.io)).toBe(0);
+      expect(t.json().usdc, String(wei)).toBe(shown);
+    }
+  });
+
+  it("wallet --wait-for-usdc waits on the one balance; --wait-for-native is refused (exit 1) with no read", async () => {
+    const home = await initArcHome();
+    let polls = 0;
+    const t = arcIo(home, { balanceWei: () => (++polls >= 2 ? 2n * 10n ** 18n : 10n ** 18n), env: { ARENA_WAIT_POLL_MS: "200" } });
+    expect(await runCli(["wallet", "--wait-for-usdc", "1.5", "--timeout", "10"], t.io), t.err.join("\n")).toBe(0);
+    const printed = t.json();
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "usdc", "reached", "waitedSeconds"]);
+    expect(printed).toMatchObject({ usdc: "2.000000", reached: true });
+    expect(t.rpc).toEqual(["eth_getBalance", "eth_getBalance"]); // one read per poll
+
+    const n = arcIo(home, { balanceWei: 10n ** 18n });
+    expect(await runCli(["wallet", "--wait-for-native", "0.5", "--timeout", "5"], n.io)).toBe(1);
+    expect(n.err.join("\n")).toMatch(/--wait-for-native does not apply on Arc Testnet: its gas is paid in USDC.*--wait-for-usdc/);
+    expect(n.rpc).toEqual([]);
+    expect(n.out).toEqual([]);
+  });
+
+  it("fund folds the gas into usdc.need, prints no native, and its message asks for USDC only", async () => {
+    const home = await initArcHome();
+    const address = privateKeyToAccount(loadWalletKey(home)).address;
+
+    const t = arcIo(home, { balanceWei: 0n });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io), t.err.join("\n")).toBe(0);
+    const printed = t.json();
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "message"]);
+    expect(printed.deposit).toBe("3.000000");
+    expect(printed.feePerPlayer).toBe("0.005000");
+    // 3 + 0.005 + ceil((1e16 session gas + 500,000 x 100 gwei) / 10^12) = 3.005 + 0.06
+    expect(printed.usdc).toEqual({ have: "0.000000", need: "3.065000", shortfall: "3.065000" });
+    expect(printed.message).toBe(
+      `Please send 3.065000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`,
+    );
+    // The one balance is the native one: no USDC balanceOf (0x70a08231) at all.
+    expect(t.rpc.filter((m) => m.startsWith("eth_call 0x70a08231"))).toEqual([]);
+    expect(t.rpc.filter((m) => m === "eth_getBalance")).toHaveLength(1);
+
+    // Part of it already there: have is the native balance rounded down; the shortfall is the rest.
+    const part = arcIo(home, { balanceWei: 1_500_000_000_000_000_001n });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], part.io)).toBe(0);
+    expect(part.json().usdc).toEqual({ have: "1.500000", need: "3.065000", shortfall: "1.565000" });
+    expect(part.json().message).toBe(`Please send 1.565000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`);
+
+    // Enough: nothing to send.
+    const enough = arcIo(home, { balanceWei: 3_065_000n * 10n ** 12n });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], enough.io)).toBe(0);
+    expect(enough.json().usdc).toEqual({ have: "3.065000", need: "3.065000", shortfall: "0.000000" });
+    expect(enough.json().message).toBe("This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me the address to return winnings to.");
   });
 });

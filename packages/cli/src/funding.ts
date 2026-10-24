@@ -1,4 +1,5 @@
 import type { Address } from "viem";
+import { weiToUsdc6Down, weiToUsdc6Up } from "./chains.js";
 
 /** Plan 5.6 Task 2 (spec §4.1): one channel's dispute-gas reserve plus the gas of the approve/deposit/close
  *  transactions a fund-then-play run makes -- the unit `native.need` is budgeted in, alongside the session key's
@@ -21,12 +22,18 @@ export type Amounts = { have: bigint; need: bigint; shortfall: bigint };
 
 export type FundingNeed = { deposit: bigint; feePerPlayer: bigint; usdc: Amounts; native: Amounts };
 
+/** Plan 6 (spec §2.1): the need on a chain whose gas is USDC (`nativeIsUsdc`): one balance, so the gas is folded into
+ *  `usdc` and there is no `native` at all. */
+export type OneBalanceFundingNeed = { deposit: bigint; feePerPlayer: bigint; usdc: Amounts };
+
+/** Plan 6: `computeOneBalanceFundingNeed`'s input -- `computeFundingNeed`'s, with the one native balance (wei, 18
+ *  decimals) in place of the two balances. */
+export type OneBalanceFundingInput = Omit<FundingInput, "usdcHave" | "nativeHave"> & { balanceWei: bigint };
+
 const short = (have: bigint, need: bigint): Amounts => ({ have, need, shortfall: need > have ? need - have : 0n });
 
-/** Plan 5.6 Task 2 (spec §4.1): works out what `arena fund` should ask the human for -- a pure function of the
- *  chain's current numbers, so it is unit-testable with no RPC at all. `deposit` defaults to `min(games x stake,
- *  cap)`; an explicit one must still fall inside `[stake, cap]`. */
-export function computeFundingNeed(i: FundingInput): FundingNeed {
+/** The deposit `fund` sizes for: `min(games x stake, cap)` by default; an explicit one must fall inside `[stake, cap]`. */
+function fundingDeposit(i: Pick<FundingInput, "games" | "stake" | "deposit" | "cap">): bigint {
   if (i.games <= 0n || i.stake <= 0n) throw new RangeError("games and stake must be positive");
   const max = i.games * i.stake;
   const deposit = i.deposit ?? (max < i.cap ? max : i.cap);
@@ -37,11 +44,37 @@ export function computeFundingNeed(i: FundingInput): FundingNeed {
       `deposit must be between the stake and the cap: ${formatUsdc6(i.stake)} to ${formatUsdc6(i.cap)} USDC (asked for ${formatUsdc6(deposit)} USDC)`,
     );
   }
+  return deposit;
+}
+
+/** The gas `fund` budgets for, in native wei: the session key's `sessionGasWei`, plus the wallet's own transactions. */
+function fundingGasWei(i: Pick<FundingInput, "sessionGasWei" | "feeCeilingWei">): bigint {
+  return i.sessionGasWei + FUND_TX_GAS_UNITS * i.feeCeilingWei;
+}
+
+/** Plan 5.6 Task 2 (spec §4.1): works out what `arena fund` should ask the human for -- a pure function of the
+ *  chain's current numbers, so it is unit-testable with no RPC at all. `deposit` defaults to `min(games x stake,
+ *  cap)`; an explicit one must still fall inside `[stake, cap]`. For a chain whose native gas is a separate asset;
+ *  see `computeOneBalanceFundingNeed` for one whose gas is USDC. */
+export function computeFundingNeed(i: FundingInput): FundingNeed {
+  const deposit = fundingDeposit(i);
   return {
     deposit,
     feePerPlayer: i.feePerPlayer,
     usdc: short(i.usdcHave, deposit + i.feePerPlayer),
-    native: short(i.nativeHave, i.sessionGasWei + FUND_TX_GAS_UNITS * i.feeCeilingWei),
+    native: short(i.nativeHave, fundingGasWei(i)),
+  };
+}
+
+/** Plan 6 (spec §2.1, Review Focus 1): `computeFundingNeed` on a `nativeIsUsdc` chain, where USDC and gas are one
+ *  balance -- never asked for as two assets. `usdc.need` = deposit + fee + the gas budget converted from 18 to 6
+ *  decimals rounded UP; `usdc.have` = the native balance converted rounded DOWN. */
+export function computeOneBalanceFundingNeed(i: OneBalanceFundingInput): OneBalanceFundingNeed {
+  const deposit = fundingDeposit(i);
+  return {
+    deposit,
+    feePerPlayer: i.feePerPlayer,
+    usdc: short(weiToUsdc6Down(i.balanceWei), deposit + i.feePerPlayer + weiToUsdc6Up(fundingGasWei(i))),
   };
 }
 
@@ -73,16 +106,17 @@ export function formatNativeCeil4(wei: bigint): string {
  *  variant is pinned character for character in `funding.test.ts` -- a human sends the wrong amount, chain or
  *  token if this is ever ambiguous. Uses the **shortfall** (what is actually missing), not the full need. */
 export function fundMessage(
-  n: FundingNeed,
+  n: FundingNeed | OneBalanceFundingNeed,
   ctx: { address: Address; chainId: number; ownerSet: boolean; games: bigint; stake: bigint },
 ): string {
   const usdcShort = n.usdc.shortfall > 0n;
-  const nativeShort = n.native.shortfall > 0n;
+  // Plan 6: a one-balance need has no `native`: the sentence then names USDC only.
+  const nativeShort = "native" in n && n.native.shortfall > 0n;
   let body: string;
   if (usdcShort || nativeShort) {
     const parts: string[] = [];
     if (usdcShort) parts.push(`${formatUsdc6(n.usdc.shortfall)} USDC`);
-    if (nativeShort) parts.push(`${formatNativeCeil4(n.native.shortfall)} native gas`);
+    if (nativeShort && "native" in n) parts.push(`${formatNativeCeil4(n.native.shortfall)} native gas`);
     body = `Please send ${parts.join(" and ")} to ${ctx.address} on chain ${ctx.chainId}.`;
   } else {
     body = `This wallet already holds enough to play ${ctx.games} games at ${formatUsdc6(ctx.stake)} USDC.`;

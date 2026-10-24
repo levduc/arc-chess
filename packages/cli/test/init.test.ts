@@ -273,6 +273,113 @@ describe("arena init --server", () => {
     expect((await run()).err).not.toMatch(/WARNING/);
   });
 
+  describe("Plan 6 (spec §2.5, Review Focus 3): on a chain with a profile, init refuses a non-pinned USDC, hub or rules", () => {
+    const ARC_USDC = "0x3600000000000000000000000000000000000000";
+    const HUB = `0x${"11".repeat(20)}` as const;
+    const RULES = `0x${"33".repeat(20)}` as const;
+    const OTHER = `0x${"44".repeat(20)}` as const;
+    const arcChain = (chainId: number, withCode = [HUB, RULES, OTHER, ARC_USDC, `0x${"22".repeat(20)}`]) => ({ chainId, withCode });
+    const explicit = (o: { chainId?: number; hub?: string; usdc?: string; rules?: string } = {}) => [
+      "init", "--server", "https://host.test", "--rpc", "http://rpc.test", "--chain-id", String(o.chainId ?? 5042002),
+      "--hub", o.hub ?? HUB, "--usdc", o.usdc ?? ARC_USDC, "--rules", o.rules ?? RULES, "--session-gas-wei", "10000000000000000",
+    ];
+    const fromServer = ["init", "--server", "https://host.test", "--session-gas-wei", "10000000000000000"];
+    const run = async (home: string, args: string[], stub: ReturnType<typeof stubFetch>) => {
+      const err: string[] = [];
+      const code = await runCli(args, { env: { ARENA_HOME: home }, fetch: stub.fetchStub, out: () => undefined, err: (s) => err.push(s) });
+      return { code, err: err.join("\n"), calls: stub.calls };
+    };
+    const freshHome = () => join(mkdtempSync(join(tmpdir(), "arena-init-arc-")), "home");
+    const pin = async <T>(chainId: number, entry: { name: string; hub: `0x${string}`; rules: `0x${string}` }, body: () => Promise<T>): Promise<T> => {
+      KNOWN_DEPLOYMENTS[chainId] = entry;
+      try {
+        return await body();
+      } finally {
+        delete KNOWN_DEPLOYMENTS[chainId];
+      }
+    };
+
+    it("a USDC other than the profile's is refused -- from /templates or from --usdc, on 5042 and 5042002 -- before any RPC call, writing nothing", async () => {
+      for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
+        // The host publishes its own "USDC" for the chain.
+        const home1 = freshHome();
+        const viaTemplates = await run(home1, fromServer, stubFetch({ templates: templatesResponse({ chainId }), ...arcChain(chainId) }));
+        expect(viaTemplates.code, name).toBe(1);
+        expect(viaTemplates.err).toContain(`refusing to init on ${name} (chain ${chainId}): usdc 0x${"22".repeat(20)} is not ${name}'s USDC ${ARC_USDC}`);
+        expect(viaTemplates.calls.map((c) => c.method ?? "templates"), name).toEqual(["templates"]); // no RPC call at all
+        expect(existsSync(home1), name).toBe(false); // a failed first init leaves no home behind
+
+        // The same address as an explicit flag.
+        const home2 = freshHome();
+        const viaFlag = await run(home2, explicit({ chainId, usdc: `0x${"22".repeat(20)}` }), stubFetch(arcChain(chainId)));
+        expect(viaFlag.code, name).toBe(1);
+        expect(viaFlag.err).toContain(`usdc 0x${"22".repeat(20)} is not ${name}'s USDC ${ARC_USDC}`);
+        expect(viaFlag.calls, name).toEqual([]);
+        expect(existsSync(home2), name).toBe(false);
+      }
+    });
+
+    it("with no pinned deployment, the profile's USDC (any case) is accepted with any hub and rules that hold code", async () => {
+      const home = freshHome();
+      const r = await run(home, fromServer, stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC.toUpperCase().replace("0X", "0x") }), ...arcChain(5042002) }));
+      expect(r.code, r.err).toBe(0);
+      expect(loadConfig(home)).toMatchObject({ chainId: 5042002, hub: HUB, rules: RULES });
+      expect(r.err).not.toMatch(/WARNING|refusing/);
+    });
+
+    it("once the chain's deployment is pinned, another hub or rules is refused -- from /templates or from flags", async () => {
+      await pin(5042002, { name: "Arc Testnet", hub: OTHER, rules: RULES }, async () => {
+        const viaTemplates = await run(freshHome(), fromServer, stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC }), ...arcChain(5042002) }));
+        expect(viaTemplates.code).toBe(1);
+        expect(viaTemplates.err).toContain(`refusing to init on Arc Testnet (chain 5042002): hub ${HUB} is not the pinned Arc Testnet hub ${OTHER}`);
+        expect(viaTemplates.calls.map((c) => c.method ?? "templates")).toEqual(["templates"]);
+
+        const viaFlag = await run(freshHome(), explicit({ hub: HUB }), stubFetch(arcChain(5042002)));
+        expect(viaFlag.code).toBe(1);
+        expect(viaFlag.err).toContain(`hub ${HUB} is not the pinned Arc Testnet hub ${OTHER}`);
+        expect(viaFlag.calls).toEqual([]);
+
+        const badRules = await run(freshHome(), explicit({ hub: OTHER, rules: HUB }), stubFetch(arcChain(5042002)));
+        expect(badRules.code).toBe(1);
+        expect(badRules.err).toContain(`rules ${HUB} is not the pinned Arc Testnet rules ${RULES}`);
+        expect(badRules.err).not.toMatch(/hub .* is not the pinned/);
+
+        // The pinned deployment itself, any case: accepted.
+        const home = freshHome();
+        const ok = await run(home, explicit({ hub: OTHER.toUpperCase().replace("0X", "0x") }), stubFetch(arcChain(5042002)));
+        expect(ok.code, ok.err).toBe(0);
+        expect(ok.err).not.toMatch(/WARNING|refusing/);
+
+        // A pin on 5042002 says nothing about Arc mainnet (5042): its own profile USDC check still applies there.
+        const mainnet = await run(freshHome(), explicit({ chainId: 5042, hub: HUB }), stubFetch(arcChain(5042)));
+        expect(mainnet.code, mainnet.err).toBe(0);
+      });
+    });
+
+    it("re-running init on an existing home is checked too: a home whose hub is no longer the pinned one is refused, config.json unchanged", async () => {
+      const home = freshHome();
+      expect((await run(home, explicit(), stubFetch(arcChain(5042002)))).code).toBe(0);
+      const before = readFileSync(join(home, "config.json"), "utf8");
+      await pin(5042002, { name: "Arc Testnet", hub: OTHER, rules: RULES }, async () => {
+        const r = await run(home, explicit(), stubFetch(arcChain(5042002)));
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(`hub ${HUB} is not the pinned Arc Testnet hub ${OTHER}`);
+        expect(r.calls).toEqual([]);
+      });
+      expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+    });
+
+    it("a chain without a profile keeps today's warning-only behaviour, even with a table entry (31337)", async () => {
+      await pin(31337, { name: "test chain", hub: OTHER, rules: OTHER }, async () => {
+        const r = await run(freshHome(), explicit({ chainId: 31337, usdc: `0x${"22".repeat(20)}` }), stubFetch({ withCode: [HUB, RULES, `0x${"22".repeat(20)}`] }));
+        expect(r.code, r.err).toBe(0);
+        expect(r.err).toMatch(/WARNING: hub 0x1{40} is not the canonical test chain hub 0x4{40}/);
+        expect(r.err).toMatch(/WARNING: rules 0x3{40} is not the canonical test chain rules 0x4{40}/);
+        expect(r.err).not.toMatch(/refusing/);
+      });
+    });
+  });
+
   it("final review C1: the default sessionGasWei is 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price); the floor defaults to half", async () => {
     const init = async (args: string[], gasPrice: bigint) => {
       const home = mkdtempSync(join(tmpdir(), "arena-init-"));

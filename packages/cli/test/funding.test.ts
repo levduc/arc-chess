@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { computeFundingNeed, formatNativeCeil4, fundMessage, FUND_TX_GAS_UNITS, type FundingInput } from "../src/funding.js";
+import {
+  computeFundingNeed,
+  computeOneBalanceFundingNeed,
+  formatNativeCeil4,
+  fundMessage,
+  FUND_TX_GAS_UNITS,
+  type FundingInput,
+  type OneBalanceFundingInput,
+} from "../src/funding.js";
 
 const ADDRESS = "0x00000000000000000000000000000000000000Aa" as const;
 const CHAIN_ID = 31337;
@@ -110,5 +118,65 @@ describe("fundMessage", () => {
     expect(fundMessage(covered, { address: ADDRESS, chainId: CHAIN_ID, ownerSet: false, ...stake10at1 })).toBe(
       "This wallet already holds enough to play 10 games at 1.000000 USDC. Tell me the address to return winnings to.",
     );
+  });
+});
+
+// Plan 6 (spec §2.1, Review Focus 1): on a chain whose gas is USDC (Arc), one balance and one ask.
+describe("computeOneBalanceFundingNeed (nativeIsUsdc)", () => {
+  const ONE: OneBalanceFundingInput = {
+    games: 3n,
+    stake: 1_000_000n,
+    cap: 10_000_000n,
+    feePerPlayer: 5_000n,
+    sessionGasWei: 10_000_000_000_000_000n, // 1e16 wei = 0.01 USDC
+    feeCeilingWei: 100_000_000_000n, // 500_000 x 100 gwei = 5e16 wei = 0.05 USDC
+    balanceWei: 0n,
+  };
+
+  it("usdc.need = deposit + fee + ceil((sessionGasWei + 500,000 x feeCeiling) / 10^12); there is no native", () => {
+    const n = computeOneBalanceFundingNeed(ONE);
+    expect(n.deposit).toBe(3_000_000n);
+    expect(n.usdc).toEqual({ have: 0n, need: 3_000_000n + 5_000n + 60_000n, shortfall: 3_065_000n });
+    expect("native" in n).toBe(false);
+    expect(Object.keys(n)).toEqual(["deposit", "feePerPlayer", "usdc"]);
+  });
+
+  it("at Arc's own numbers: 0.336 USDC of session gas (4 x 2.1M x 40 gwei) plus 0.02 USDC for the wallet's transactions", () => {
+    const n = computeOneBalanceFundingNeed({ ...ONE, sessionGasWei: 4n * 2_100_000n * 40_000_000_000n, feeCeilingWei: 40_000_000_000n });
+    expect(n.usdc.need).toBe(3_005_000n + 336_000n + 20_000n);
+  });
+
+  it("the gas rounds UP to the next micro-USDC and the balance rounds DOWN, so the ask is never short", () => {
+    const tiny = { ...ONE, sessionGasWei: 1n, feeCeilingWei: 0n };
+    expect(computeOneBalanceFundingNeed(tiny).usdc.need).toBe(3_005_001n); // 1 wei of gas -> 1 micro-USDC
+    expect(computeOneBalanceFundingNeed({ ...tiny, sessionGasWei: 10n ** 12n }).usdc.need).toBe(3_005_001n);
+    expect(computeOneBalanceFundingNeed({ ...tiny, sessionGasWei: 10n ** 12n + 1n }).usdc.need).toBe(3_005_002n);
+    expect(computeOneBalanceFundingNeed({ ...ONE, balanceWei: 10n ** 12n - 1n }).usdc.have).toBe(0n);
+    expect(computeOneBalanceFundingNeed({ ...ONE, balanceWei: 10n ** 12n + 1n }).usdc.have).toBe(1n);
+    // Exactly the need, in wei: covered, nothing short.
+    const exact = computeOneBalanceFundingNeed({ ...ONE, balanceWei: 3_065_000n * 10n ** 12n });
+    expect(exact.usdc.shortfall).toBe(0n);
+    expect(computeOneBalanceFundingNeed({ ...ONE, balanceWei: 3_065_000n * 10n ** 12n - 1n }).usdc.shortfall).toBe(1n);
+  });
+
+  it("the deposit rules are computeFundingNeed's own", () => {
+    expect(computeOneBalanceFundingNeed({ ...ONE, games: 20n }).deposit).toBe(10_000_000n);
+    expect(computeOneBalanceFundingNeed({ ...ONE, deposit: 2_000_000n }).deposit).toBe(2_000_000n);
+    expect(() => computeOneBalanceFundingNeed({ ...ONE, deposit: ONE.stake - 1n })).toThrow(RangeError);
+    expect(() => computeOneBalanceFundingNeed({ ...ONE, deposit: ONE.cap + 1n })).toThrow(RangeError);
+    expect(() => computeOneBalanceFundingNeed({ ...ONE, games: 0n })).toThrow(RangeError);
+  });
+
+  it("fundMessage names USDC only -- never native gas", () => {
+    const n = computeOneBalanceFundingNeed(ONE);
+    const ctx = { address: ADDRESS, chainId: 5042, games: ONE.games, stake: ONE.stake };
+    expect(fundMessage(n, { ...ctx, ownerSet: false })).toBe(
+      "Please send 3.065000 USDC to 0x00000000000000000000000000000000000000Aa on chain 5042. Also tell me the address to return winnings to.",
+    );
+    expect(fundMessage(n, { ...ctx, ownerSet: true })).toBe(
+      "Please send 3.065000 USDC to 0x00000000000000000000000000000000000000Aa on chain 5042.",
+    );
+    const covered = computeOneBalanceFundingNeed({ ...ONE, balanceWei: 10n * 10n ** 18n }); // 10 USDC
+    expect(fundMessage(covered, { ...ctx, ownerSet: true })).toBe("This wallet already holds enough to play 3 games at 1.000000 USDC.");
   });
 });

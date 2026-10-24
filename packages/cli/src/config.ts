@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
+import { CHAIN_PROFILES, type ChainProfile } from "./chains.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import { selfCommand } from "./version.js";
 
@@ -97,14 +98,52 @@ export function parseXmtpConfig(x: unknown): XmtpConfig {
 export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc?: Address };
 
 /**
- * Final review I2: the canonical deployments, by chain id. `arena init` warns loudly when the hub, rules (or USDC,
- * where listed) it is about to use on a listed chain differ from these -- the addresses usually come from the
- * host's /templates, and a wrong hub is where deposits go.
+ * Final review I2: the canonical deployments, by chain id -- the addresses usually come from the host's /templates,
+ * and a wrong hub is where deposits go.
+ * - Plan 6 (spec §2.5, Review Focus 3): on a chain with a built-in profile (`CHAIN_PROFILES`), `arena init`
+ *   **refuses** a hub, rules (or USDC, where listed) that differ from the entry here (`pinnedDeploymentRefusals`).
+ * - On any other chain it only warns (`knownDeploymentWarnings`), as before.
  *
- * TODO(Plan 6): add Arc mainnet (and Arc Testnet, if used) once the contracts are deployed and verified. Until then
- * the table is empty and init only checks that the addresses hold code.
+ * Arc's entries are pinned once each deployment is verified; until then the chain has no entry, and `init` on it
+ * only checks the profile's USDC and that the addresses hold code. Never add a placeholder address: an entry here
+ * refuses every other hub on its chain.
  */
-export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {};
+export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {
+  // 5042: Arc mainnet -- pinned by Plan 6 Task 6, after the gated mainnet deploy (contracts/deployments/5042.json).
+  // 5042002: Arc Testnet -- pinned by Plan 6 Task 5, after the testnet deploy (contracts/deployments/5042002.json).
+};
+
+/**
+ * Plan 6 (spec §2.5, Review Focus 3): why `init` must refuse `addresses` on `chainId` -- empty when it may go on.
+ * Only for a chain with a built-in profile (any other chain gets `knownDeploymentWarnings`):
+ * - a USDC other than the profile's is always refused, even before the chain's deployment is pinned;
+ * - once `table` pins the chain, a hub or rules (or a listed USDC) other than the pinned one is refused.
+ * The check runs on the resolved addresses, so it holds whether they came from /templates or from explicit flags.
+ */
+export function pinnedDeploymentRefusals(
+  chainId: number,
+  addresses: { hub: Address; rules: Address; usdc: Address },
+  opts: { profiles?: Record<number, ChainProfile>; table?: Record<number, KnownDeployment> } = {},
+): string[] {
+  const profiles = opts.profiles ?? CHAIN_PROFILES;
+  const table = opts.table ?? KNOWN_DEPLOYMENTS;
+  if (!Object.hasOwn(profiles, chainId)) return [];
+  const profile = profiles[chainId];
+  const out: string[] = [];
+  const wrongUsdc = profile.usdc.toLowerCase() !== addresses.usdc.toLowerCase();
+  if (wrongUsdc) out.push(`usdc ${addresses.usdc} is not ${profile.name}'s USDC ${profile.usdc}`);
+  const known = Object.hasOwn(table, chainId) ? table[chainId] : undefined;
+  if (known) {
+    for (const field of ["hub", "rules", "usdc"] as const) {
+      const want = known[field];
+      if (field === "usdc" && wrongUsdc) continue; // already refused against the profile, above
+      if (want !== undefined && want.toLowerCase() !== addresses[field].toLowerCase()) {
+        out.push(`${field} ${addresses[field]} is not the pinned ${known.name} ${field} ${want}`);
+      }
+    }
+  }
+  return out;
+}
 
 /** The warnings for `addresses` on `chainId` against `table` (empty for a chain it does not list). */
 export function knownDeploymentWarnings(

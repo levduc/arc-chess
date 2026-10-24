@@ -36,6 +36,7 @@ import {
   type CliIo,
   type DaemonProcess,
 } from "../src/index.js";
+import { CHAIN_PROFILES, chainProfile, type ChainProfile } from "../src/chains.js";
 import { ownerChangeMessage, setOwner } from "../src/owner.js";
 import { RPC, deployArena, increaseTime, mintUsdc, publicClient, setEthBalance, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { startPair, waitFor } from "./helpers/harness.js";
@@ -671,5 +672,118 @@ describe("confirmsTransfer: the receipt check behind withdraw (fix round 4, N4/N
     ] as Array<[string, Log[]]>) {
       expect(confirmsTransfer(logs, want), what).toBe(false);
     }
+  });
+});
+
+// ------------------------------------------------------------------ Plan 6 (spec §2.1, Review Focus 1): the reserve
+
+describe("Plan 6: withdrawReserve on a nativeIsUsdc chain", () => {
+  const ARC = chainProfile(5042)!;
+  const ARC_SESSION_GAS = 4n * 2_100_000n * ARC.feeCeilingWei; // init's default at Arc's 40 gwei: 0.336 USDC
+  const reserve = (unsettledChannels: number, o: Partial<{ sessionGasWei: bigint; feeCeilingWei: bigint; profile: ChainProfile | undefined }> = {}) =>
+    withdrawReserve({
+      profile: "profile" in o ? o.profile : ARC,
+      unsettledChannels,
+      sessionGasWei: o.sessionGasWei ?? ARC_SESSION_GAS,
+      feeCeilingWei: o.feeCeilingWei ?? ARC.feeCeilingWei,
+    });
+
+  it("0, 1 and 3 unsettled channels: channels x sessionGasWei + 500,000 x feeCeiling, in micro-USDC", () => {
+    expect(reserve(0)).toBe(20_000n); // 500,000 x 40 gwei = 0.02 USDC: the wallet's own transactions
+    expect(reserve(1)).toBe(356_000n); // + 0.336 USDC of session gas
+    expect(reserve(3)).toBe(1_028_000n); // + 3 x 0.336
+    expect(reserve(0, { profile: chainProfile(5042002) })).toBe(20_000n); // Arc Testnet: the same
+  });
+
+  it("converts 18 to 6 decimals rounding UP, so the reserve is never short by a fraction of a micro-USDC", () => {
+    expect(reserve(1, { sessionGasWei: 1n, feeCeilingWei: 0n })).toBe(1n);
+    expect(reserve(1, { sessionGasWei: 10n ** 12n - 1n, feeCeilingWei: 0n })).toBe(1n);
+    expect(reserve(1, { sessionGasWei: 10n ** 12n, feeCeilingWei: 0n })).toBe(1n);
+    expect(reserve(1, { sessionGasWei: 10n ** 12n + 1n, feeCeilingWei: 0n })).toBe(2n);
+    expect(reserve(3, { sessionGasWei: 10n ** 12n + 1n, feeCeilingWei: 0n })).toBe(4n); // 3e12 + 3 wei
+    expect(reserve(0, { sessionGasWei: 1n, feeCeilingWei: 0n })).toBe(0n);
+  });
+
+  it("0 on a chain without a profile, or with one whose gas is not USDC -- whatever the channels", () => {
+    expect(withdrawReserve()).toBe(0n);
+    expect(reserve(3, { profile: undefined })).toBe(0n);
+    expect(reserve(3, { profile: { ...ARC, nativeIsUsdc: false } })).toBe(0n);
+  });
+
+  it("refuses a negative or fractional channel count", () => {
+    expect(() => reserve(-1)).toThrow(RangeError);
+    expect(() => reserve(0.5)).toThrow(RangeError);
+  });
+});
+
+describe("Plan 6: withdraw keeps the reserve on a nativeIsUsdc chain (a test-only profile for anvil 31337)", () => {
+  /** Runs `body` with a USDC-gas profile for 31337, so the daemon's own `withdraw()` path keeps a reserve. Anvil's
+   *  gas stays native: only the arithmetic and the refusals are under test here (Task 4 covers arc-anvil). */
+  const asOneBalance = async <T>(usdc: Address, body: () => Promise<T>): Promise<T> => {
+    CHAIN_PROFILES[31337] = { name: "Local USDC-gas", usdc, nativeIsUsdc: true, minFeePerGas: 1n, feeCeilingWei: 40_000_000_000n };
+    try {
+      return await body();
+    } finally {
+      delete CHAIN_PROFILES[31337];
+    }
+  };
+  // No feeCeilingWei in these configs: the wallet sender's default, 100 gwei. 500,000 x 100 gwei = 0.05 USDC.
+  const NO_CHANNEL_RESERVE = 50_000n;
+
+  it("with no channel: --amount above balance - reserve is refused naming the reserve; --all moves balance - reserve", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    await asOneBalance(env.usdc, async () => {
+      const over = cliIo(home);
+      expect(await runCli(["withdraw", "--amount", "10"], over.io)).toBe(1);
+      const why = over.err.join("\n");
+      expect(why).toContain("10.000000 USDC is more than this wallet can withdraw (9.950000 USDC)");
+      expect(why).toContain("0.050000 USDC of it is the gas reserve, which always stays in the wallet");
+      expect(why).toContain("gas on Local USDC-gas is paid in USDC, for the session gas of 0 unsettled channel(s)");
+      expect(why).toMatch(/close open channels first/);
+      expect(await usdcBalance(env.usdc, owner)).toBe(0n);
+
+      const all = cliIo(home);
+      expect(await runCli(["withdraw", "--all"], all.io), all.err.join("\n")).toBe(0);
+      expect(all.json().amount).toBe("9.950000");
+      expect(all.json().usdcAfter).toBe("0.050000");
+      expect(await usdcBalance(env.usdc, owner)).toBe(10_000_000n - NO_CHANNEL_RESERVE);
+      expect(await usdcBalance(env.usdc, wallet)).toBe(NO_CHANNEL_RESERVE);
+
+      // Only the reserve is left: nothing to withdraw, and the message says why.
+      const empty = cliIo(home);
+      expect(await runCli(["withdraw", "--all"], empty.io)).toBe(1);
+      expect(empty.err.join("\n")).toContain("nothing to withdraw: this wallet holds 0.050000 USDC -- 0.050000 USDC of it is the gas reserve");
+      const one = cliIo(home);
+      expect(await runCli(["withdraw", "--amount", "0.000001"], one.io)).toBe(1);
+      expect(one.err.join("\n")).toContain("0.000001 USDC is more than this wallet can withdraw (0.000000 USDC) -- 0.050000 USDC");
+    });
+    expect(livePidHoldingLock(home)).toBeNull();
+  });
+
+  it("with one open channel: the reserve adds that channel's whole sessionGasWei", async () => {
+    const pair = await startPair();
+    cleanups.push(() => pair.cleanup());
+    const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => pair.bob.daemon.channelIds()[0], 20_000, "bob's channel");
+    await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(id)).phase === "Open", 30_000, "open");
+    const owner = newAddress();
+    await firstSet(pair.bob.home, owner);
+    const balance = await usdcBalance(pair.env.usdc, pair.bob.address);
+    // 1 x 1e16 (the harness's sessionGasWei) + 500,000 x 100 gwei = 6e16 wei = 0.06 USDC.
+    const reserve = 60_000n;
+    await asOneBalance(pair.env.usdc, async () => {
+      const refused = pair.bob.daemon.withdraw({ amount: balance - reserve + 1n });
+      await expect(refused).rejects.toMatchObject({ code: 400 });
+      await expect(refused).rejects.toThrow("0.060000 USDC of it is the gas reserve");
+      await expect(refused).rejects.toThrow("for the session gas of 1 unsettled channel(s)");
+
+      const r = await pair.bob.daemon.withdraw({ all: true });
+      expect(r.amount).toBe(balance - reserve);
+    });
+    expect(await usdcBalance(pair.env.usdc, owner)).toBe(balance - reserve);
+    expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(reserve);
   });
 });

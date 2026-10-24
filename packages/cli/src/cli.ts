@@ -24,11 +24,20 @@ import {
   defaultSessionGasWei,
   knownDeploymentWarnings,
   parseXmtpConfig,
+  pinnedDeploymentRefusals,
   readConfig,
   type ArenaConfig,
   type XmtpConfig,
 } from "./config.js";
-import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
+import { chainProfile, weiToUsdc6Down } from "./chains.js";
+import {
+  computeFundingNeed,
+  computeOneBalanceFundingNeed,
+  formatUsdc6,
+  fundMessage,
+  type FundingNeed,
+  type OneBalanceFundingNeed,
+} from "./funding.js";
 import { readJson } from "./jsonfile.js";
 import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecordedOwner, setOwner, UsageError } from "./owner.js";
 import { RecordStore } from "./records.js";
@@ -66,7 +75,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         with the current owner's signature. Re-running init keeps the recorded owner)
   daemon [start]
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
-  wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
+  wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed;
+           on a chain whose gas is USDC, such as Arc, one balance: {address, chainId, usdc}, and no --wait-for-native)
           [--wait-for-usdc A] [--wait-for-native B] [--timeout SECONDS (default 1800, max 3600)]
           (with a --wait-for-* flag: polls every 5s -- ARENA_WAIT_POLL_MS overrides it, never below 200 -- until every given
            threshold holds or the timeout passes, then prints the same JSON plus {reached, waitedSeconds}.
@@ -80,9 +90,11 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         longer open exits 1. Every amount, in the output and in errors, is in whole USDC.
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
         Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
-        message is a ready-to-relay sentence. faucet is present only when a faucet call was attempted: on
-        success it is {usdc, native} (the wallet's new balances, formatted like "arena faucet"); on failure
-        (unreachable, rate-limited, wrong origin, ...) it is the string "skipped: <reason>" instead, and the
+        message is a ready-to-relay sentence. On a chain whose gas is USDC, such as Arc, there is no native:
+        the gas is part of usdc.need, and message asks for USDC only. faucet is present only when a faucet
+        call was attempted: on success it is {usdc, native} (the wallet's new balances, formatted like
+        "arena faucet"); on failure (unreachable, rate-limited, wrong origin, ...) it is the string
+        "skipped: <reason>" instead, and the
         usdc/native fields above keep reporting the shortfall as it actually stands. Exit 0 whenever the
         computation succeeds -- a shortfall is data, not an error; exit 1 if the server or the hub cannot be
         read at all (for example, a hub address with no contract code on this chain).)
@@ -99,7 +111,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            wallet's deposit. Funds escrowed in channels are not in the wallet: close open channels first. Succeeds
            only when the receipt shows the USDC Transfer to the owner. Prints {to, amount, txHash, usdcAfter}
            (usdcAfter null, with a note, if the balance cannot be read after it); a note on stderr if this wallet
-           still has open offers.)
+           still has open offers. On a chain whose gas is USDC, such as Arc, --all keeps a gas reserve for the
+           unsettled channels and the wallet's own transactions, and --amount never dips into it.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -574,6 +587,18 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const hub = asAddress("hub", hubRaw);
         const usdc = asAddress("usdc", usdcRaw);
         const rules = asAddress("rules", rulesRaw);
+        // Plan 6 (spec §2.5, Review Focus 3): on a chain with a built-in profile (Arc), only the profile's USDC and, once
+        // the chain's deployment is pinned, only its hub and rules -- whether they came from /templates or from flags.
+        // On every init, fresh or re-run, before any network call (other than a --server's /templates) and before
+        // anything is written. Other chains keep the warnings below (`knownDeploymentWarnings`).
+        const pinnedRefusals = pinnedDeploymentRefusals(chainId, { hub, rules, usdc });
+        if (pinnedRefusals.length > 0) {
+          const name = chainProfile(chainId)?.name ?? `chain ${chainId}`;
+          throw new Error(
+            `refusing to init on ${name} (chain ${chainId}): ${pinnedRefusals.join("; ")}. Deposits go to the hub this ` +
+              `config names, so on ${name} only the CLI's own pinned addresses are accepted, whatever the server publishes`,
+          );
+        }
         // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
         // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
         // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl may
@@ -855,19 +880,28 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
+      // Plan 6 (spec §2.1, Review Focus 1): on a chain whose gas is USDC (`nativeIsUsdc`), USDC and gas are one
+      // balance. Its source of truth is the native balance (18 decimals), read alone and shown as `usdc` rounded down
+      // to 6 decimal places; there is no `native` key. Every other chain reads and prints both, exactly as before.
+      const profile = chainProfile(cfg.chainId);
+      const oneBalance = profile?.nativeIsUsdc === true;
+      const readBalances = async (): Promise<{ usdc: bigint; native: bigint | undefined }> => {
+        if (oneBalance) return { usdc: weiToUsdc6Down(await nativeBalanceOf(io, cfg.rpcUrl, address)), native: undefined };
+        const usdc = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+        const native = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        return { usdc, native };
+      };
+      const shown = (b: { usdc: bigint; native: bigint | undefined }) => ({
+        address,
+        chainId: cfg.chainId,
+        usdc: formatUsdc6(b.usdc),
+        ...(b.native !== undefined ? { native: formatNativeBalance(b.native) } : {}),
+      });
 
       const waitUsdcRaw = flag("wait-for-usdc");
       const waitNativeRaw = flag("wait-for-native");
       if (waitUsdcRaw === undefined && waitNativeRaw === undefined) {
-        const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-        const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
-        io.out(
-          JSON.stringify(
-            { address, chainId: cfg.chainId, usdc: formatUsdc6(usdcBalance), native: formatNativeBalance(nativeBalance) },
-            null,
-            2,
-          ),
-        );
+        io.out(JSON.stringify(shown(await readBalances()), null, 2));
         return 0;
       }
 
@@ -876,6 +910,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // (a malformed --wait-for-* amount, a malformed --timeout, or one outside [1, 3600]) is deliberately a
       // plain Error, not this CLI's usual UsageError (exit 2): an agent that sees exit 2 here must read it as
       // "timed out, not malfunctioned", never as "bad flags", so no input mistake may share that code.
+      // Plan 6: a one-balance chain has no separate native gas to wait for (exit 1, like every input problem here).
+      if (oneBalance && waitNativeRaw !== undefined) {
+        throw new Error(
+          `--wait-for-native does not apply on ${profile?.name ?? `chain ${cfg.chainId}`}: its gas is paid in USDC, from the same balance -- use --wait-for-usdc`,
+        );
+      }
       let usdcThreshold: bigint | undefined;
       if (waitUsdcRaw !== undefined) {
         if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(waitUsdcRaw)) {
@@ -905,20 +945,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
       const startedAt = Date.now();
       for (;;) {
-        const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-        const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        const balances = await readBalances();
         const reached =
-          (usdcThreshold === undefined || usdcBalance >= usdcThreshold) &&
-          (nativeThreshold === undefined || nativeBalance >= nativeThreshold);
+          (usdcThreshold === undefined || balances.usdc >= usdcThreshold) &&
+          (nativeThreshold === undefined || (balances.native !== undefined && balances.native >= nativeThreshold));
         const elapsedMs = Date.now() - startedAt;
-        const body = {
-          address,
-          chainId: cfg.chainId,
-          usdc: formatUsdc6(usdcBalance),
-          native: formatNativeBalance(nativeBalance),
-          reached,
-          waitedSeconds: Math.floor(elapsedMs / 1000),
-        };
+        const body = { ...shown(balances), reached, waitedSeconds: Math.floor(elapsedMs / 1000) };
         if (reached) {
           io.out(JSON.stringify(body, null, 2));
           return 0;
@@ -1093,23 +1125,35 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           : depositRaw !== undefined
             ? " (--deposit takes whole USDC)"
             : "";
-      const computeNeed = (usdcHave: bigint, nativeHave: bigint): FundingNeed => {
+      // Plan 6 (spec §2.1, Review Focus 1): on a chain whose gas is USDC (`nativeIsUsdc`), one balance -- the native
+      // one, read alone -- and one ask: the gas is folded into `usdc.need`, and there is no `native`. Every other
+      // chain reads both balances and asks for both, exactly as before.
+      const oneBalance = chainProfile(cfg.chainId)?.nativeIsUsdc === true;
+      const sized = <T>(compute: () => T): T => {
         try {
-          return computeFundingNeed({
-            games: fundGames,
-            stake: fundStake,
-            deposit: explicitDeposit,
-            cap,
-            feePerPlayer,
-            sessionGasWei: cfg.sessionGasWei,
-            feeCeilingWei,
-            usdcHave,
-            nativeHave,
-          });
+          return compute();
         } catch (err) {
           if (err instanceof RangeError) throw new Error(`${err.message}${rangeHint}`);
           throw err;
         }
+      };
+      const readNeed = async (): Promise<FundingNeed | OneBalanceFundingNeed> => {
+        const common = {
+          games: fundGames,
+          stake: fundStake,
+          deposit: explicitDeposit,
+          cap,
+          feePerPlayer,
+          sessionGasWei: cfg.sessionGasWei,
+          feeCeilingWei,
+        };
+        if (oneBalance) {
+          const balanceWei = await nativeBalanceOf(io, cfg.rpcUrl, address);
+          return sized(() => computeOneBalanceFundingNeed({ ...common, balanceWei }));
+        }
+        const usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+        const nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        return sized(() => computeFundingNeed({ ...common, usdcHave, nativeHave }));
       };
 
       const feePerPlayerRaw = await rpcCall(io, cfg.rpcUrl, "eth_call", [
@@ -1130,20 +1174,16 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const feePerPlayer = hexToBigIntOrThrow(feePerPlayerRaw, `RPC ${cfg.rpcUrl} eth_call (feePerPlayer)`);
       const feeCeilingWei = cfg.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
 
-      let usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-      let nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
-      let funding: FundingNeed = computeNeed(usdcHave, nativeHave);
+      let funding = await readNeed();
 
       // spec §4.1: call the faucet (as init does) only when something is actually short and the template
       // advertises one; never fails fund -- a failed top-up just leaves the shortfall for the human to cover.
       let faucetReported: { usdc: string; native: string } | string | undefined;
-      if ((funding.usdc.shortfall > 0n || funding.native.shortfall > 0n) && faucetUrl !== undefined) {
+      if ((funding.usdc.shortfall > 0n || ("native" in funding && funding.native.shortfall > 0n)) && faucetUrl !== undefined) {
         try {
           const funded = await callFaucet(io, faucetUrl, cfg.serverUrl, address);
           faucetReported = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
-          usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-          nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
-          funding = computeNeed(usdcHave, nativeHave);
+          funding = await readNeed();
         } catch (err) {
           faucetReported = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
         }
@@ -1161,11 +1201,16 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         deposit: formatUsdc6(funding.deposit),
         feePerPlayer: formatUsdc6(funding.feePerPlayer),
         usdc: { have: formatUsdc6(funding.usdc.have), need: formatUsdc6(funding.usdc.need), shortfall: formatUsdc6(funding.usdc.shortfall) },
-        native: {
-          have: formatNativeBalance(funding.native.have),
-          need: formatNativeBalance(funding.native.need),
-          shortfall: formatNativeBalance(funding.native.shortfall),
-        },
+        // Plan 6: absent on a one-balance chain, whose gas is in `usdc` above.
+        ...("native" in funding
+          ? {
+              native: {
+                have: formatNativeBalance(funding.native.have),
+                need: formatNativeBalance(funding.native.need),
+                shortfall: formatNativeBalance(funding.native.shortfall),
+              },
+            }
+          : {}),
         owner,
       };
       if (faucetReported !== undefined) body.faucet = faucetReported;
