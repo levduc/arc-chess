@@ -505,6 +505,35 @@ export function confirmsTransfer(logs: Log[], t: { token: Address; from: Address
   );
 }
 
+/**
+ * H1 (audit-daemon M-6): what `withdraw()` reports when its transfer's receipt wait ended without a receipt. Each
+ * of these leaves the transfer possibly landed, so it is a 502 naming every hash sent, with the same "check it
+ * before retrying" as an unconfirmed transfer -- never a bare 500, which reads as "nothing happened" and invites a
+ * second `--amount X` that pays the owner twice if the first one landed:
+ * - `TxReceiptMissingError`: the node reports it mined; its nonce is used, so a retry is a fresh, second transfer.
+ * - `TxStuckError` / `TxDroppedError`: still pending, or no longer known to this node; a retry replaces it at the
+ *   same nonce (at most one of the two lands), but it may land first.
+ * - `TxWaitAbortedError`: the daemon is stopping (503); the transaction may still land.
+ * Any other error is returned unchanged.
+ */
+export function withdrawWaitError(err: unknown, amount: bigint, owner: Address): unknown {
+  const what = `the transfer of ${formatUsdc6(amount)} USDC to ${owner}`;
+  const check = `check the owner's balance or an explorer before retrying: a retry can pay the owner twice`;
+  if (err instanceof TxReceiptMissingError) {
+    return new DaemonError(502, `${what} was mined (tx ${err.hash}, block ${err.blockNumber}) but its receipt could not be read; ${check}`);
+  }
+  if (err instanceof TxStuckError) {
+    return new DaemonError(502, `${what} is still pending (tx ${err.hashes.join(", ")}); it may still land: ${check}`);
+  }
+  if (err instanceof TxDroppedError) {
+    return new DaemonError(502, `${what} (tx ${err.hash}) is no longer known to the RPC and was not seen mined; it may still land: ${check}`);
+  }
+  if (err instanceof TxWaitAbortedError) {
+    return new DaemonError(503, `the daemon is stopping: ${what} (tx ${err.hashes.join(", ")}) was sent and may still land; ${check}`);
+  }
+  return err;
+}
+
 /** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
  *  cosmetic. */
@@ -884,7 +913,7 @@ export class ArenaDaemon {
         receipt = await this.hub.transfer(this.wallet, usdc, owner, amount);
       } catch (err) {
         if (err instanceof HubRevertError) throw new DaemonError(409, `the USDC transfer to ${owner} was refused: ${err.message}`);
-        throw err;
+        throw withdrawWaitError(err, amount, owner);
       }
       const txHash = receipt.transactionHash;
       // Task 3 fix round 4 (N4, N5; spec §4.4): a mined, successful transfer is not proof the money moved -- a token
@@ -1566,13 +1595,7 @@ export class ArenaDaemon {
         ownGasWei: keyBalance < target ? target - keyBalance : 0n,
         exclude: l.record.channelId,
       });
-      if (why !== null) {
-        const message = `funding: ${why}`;
-        if (l.lastError !== message) this.log(`channel ${l.record.channelId}: ${message} (retried in ${FUND_BACKOFF_SECONDS}s of chain time)`);
-        l.lastError = message;
-        l.fundBlockedUntil = (await this.client.getBlock()).timestamp + FUND_BACKOFF_SECONDS;
-        return;
-      }
+      if (why !== null) return this.backOffFunding(l, `funding: ${why}`, { log: true });
     }
     // Plan 4.5 Task 10: read the allowance every time instead of remembering "approved" in memory -- a reorg can
     // drop the approve transaction (and a wallet owner can revoke it), after which a remembered flag would make
@@ -1601,13 +1624,7 @@ export class ArenaDaemon {
       // Plan 6 Task 2 (audit-daemon I-1): a top-up mined and reverted reached nothing, and the next pass would send
       // (and pay for) the same revert: funding backs off like a launch-limit revert below, and no deposit goes in
       // for a channel whose key holds no dispute gas.
-      if (err instanceof TopUpRevertedError) {
-        const message = `funding: ${err.message}`;
-        if (l.lastError !== message) this.log(`channel ${l.record.channelId}: ${message} (retried in ${FUND_BACKOFF_SECONDS}s of chain time)`);
-        l.lastError = message;
-        l.fundBlockedUntil = (await this.client.getBlock()).timestamp + FUND_BACKOFF_SECONDS;
-        return;
-      }
+      if (err instanceof TopUpRevertedError) return this.backOffFunding(l, `funding: ${err.message}`, { log: true });
       throw err;
     }
     if (this.stopped) return;
@@ -1618,15 +1635,25 @@ export class ArenaDaemon {
       // raises a cap or unpauses) or never resolve (reclaim after the deadline). Either way, retrying it on every
       // tick is a hot loop against the RPC/chain for no benefit, so back off instead of rethrowing.
       if (err instanceof HubRevertError && err.errorName && LIMIT_REVERTS.has(err.errorName)) {
-        l.lastError = `funding: ${err.errorName}`;
-        const chainNow = (await this.client.getBlock()).timestamp;
-        l.fundBlockedUntil = chainNow + FUND_BACKOFF_SECONDS;
-        return;
+        return this.backOffFunding(l, `funding: ${err.errorName}`, { log: false });
       }
       throw err;
     }
     l.fundBlockedUntil = null;
     if (l.lastError?.startsWith("funding:")) l.lastError = null;
+  }
+
+  /** Backs `fund()` off for `FUND_BACKOFF_SECONDS` of chain time, with `message` as the channel's `lastError`. H1
+   *  (Task 4 report, concern on `fund()`): the block is read first, so `lastError` and `fundBlockedUntil` are set
+   *  together -- a status read in between never shows the reason without the back-off -- and a failed read sets
+   *  neither (the error reaches the watch pass, which records it; the next pass retries). */
+  private async backOffFunding(l: ChannelHandle, message: string, opts: { log: boolean }): Promise<void> {
+    const until = (await this.client.getBlock()).timestamp + FUND_BACKOFF_SECONDS;
+    if (opts.log && l.lastError !== message) {
+      this.log(`channel ${l.record.channelId}: ${message} (retried in ${FUND_BACKOFF_SECONDS}s of chain time)`);
+    }
+    l.lastError = message;
+    l.fundBlockedUntil = until;
   }
 
   /** Runs `work` as this channel's one session-key top-up at a time (final review C1): a caller that finds one in

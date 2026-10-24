@@ -19,9 +19,10 @@ import {
 import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { LobbyClient, RelayClient } from "@arena/sdk";
+import { TxDroppedError, TxReceiptMissingError, TxStuckError, TxWaitAbortedError, type LobbyClient, type RelayClient } from "@arena/sdk";
 import {
   ArenaDaemon,
+  DaemonError,
   KNOWN_DEPLOYMENTS,
   MAX_MATCH_RETRIES,
   RecordStore,
@@ -36,6 +37,7 @@ import {
   startApi,
   startDaemonProcess,
   withdrawReserve,
+  withdrawWaitError,
   writeJsonAtomic,
   type ArenaConfig,
   type CliIo,
@@ -1000,5 +1002,45 @@ describe("Plan 6 fix round 1 (m-1): the daemon re-checks the pin when it starts"
     } finally {
       delete KNOWN_DEPLOYMENTS[31337];
     }
+  });
+});
+
+// ------------------------------------------------------------------ H1 (audit-daemon M-6): explicit wait errors
+
+describe("H1 (audit-daemon M-6): a transfer whose wait ended without a receipt is never a bare 500", () => {
+  const OWNER = "0x00000000000000000000000000000000000000a5" as Address;
+  const H1 = `0x${"11".repeat(32)}` as Hex;
+  const H2 = `0x${"22".repeat(32)}` as Hex;
+
+  it("withdrawWaitError: 502 naming every hash and 'check ... before retrying' for a missing receipt, a stuck or a dropped transfer; 503 when stopping", () => {
+    const cases: Array<[unknown, number, RegExp]> = [
+      [new TxReceiptMissingError(H1, 7n, 3), 502, /was mined \(tx 0x1{64}, block 7\) but its receipt could not be read/],
+      [new TxStuckError([H1, H2], false, 3), 502, /is still pending \(tx 0x1{64}, 0x2{64}\); it may still land/],
+      [new TxDroppedError(H2, 3), 502, /\(tx 0x2{64}\) is no longer known to the RPC/],
+      [new TxWaitAbortedError([H1], 3), 503, /the daemon is stopping: .*\(tx 0x1{64}\) was sent and may still land/],
+    ];
+    for (const [err, code, text] of cases) {
+      const mapped = withdrawWaitError(err, 3_000_000n, OWNER) as DaemonError;
+      expect(mapped).toBeInstanceOf(DaemonError);
+      expect(mapped.code).toBe(code);
+      expect(mapped.message).toMatch(text);
+      expect(mapped.message).toContain(`the transfer of 3.000000 USDC to ${OWNER}`);
+      expect(mapped.message).toMatch(/check the owner's balance or an explorer before retrying: a retry can pay the owner twice/);
+    }
+    const other = new Error("socket hang up");
+    expect(withdrawWaitError(other, 1n, OWNER)).toBe(other); // anything else, unchanged
+  });
+
+  it("withdraw() answers 502 with the hash when the transfer's receipt went missing (in-process daemon)", async () => {
+    const pair = await startPair();
+    cleanups.push(pair.cleanup);
+    await firstSet(pair.alice.home, newAddress());
+    pair.alice.daemon.hub.transfer = async () => {
+      throw new TxReceiptMissingError(H1, 9n, 0);
+    };
+    const err = (await pair.alice.daemon.withdraw({ amount: 1_000_000n }).catch((e: unknown) => e)) as DaemonError;
+    expect(err).toBeInstanceOf(DaemonError);
+    expect(err.code).toBe(502);
+    expect(err.message).toMatch(/was mined \(tx 0x1{64}, block 9\) but its receipt could not be read; check/);
   });
 });
