@@ -1,5 +1,5 @@
 import { Chess } from "chess.js";
-import type { Hex } from "viem";
+import { formatUnits, type Hex } from "viem";
 import {
   KIND,
   PROMO_LETTER,
@@ -15,7 +15,9 @@ import {
   type PlayerIndex,
   type SessionSnapshot,
 } from "@arena/sdk";
+import { chainProfile, weiToUsdc6Up } from "./chains.js";
 import type { ChainView } from "./daemon.js";
+import { FUND_TX_GAS_UNITS, formatUsdc6 } from "./funding.js";
 import type { ChannelRecord, Controller } from "./records.js";
 
 export type ChannelStatus = {
@@ -131,9 +133,48 @@ export type StatusInput = {
   transport?: ChannelStatus["transport"];
   /** Plan 5.7 (K3): see ChannelStatus.xmtpDropped. Default 0. */
   xmtpDropped?: number;
+  /** Plan 6 hardening H2 (audit-journey I-2): the chain and gas numbers `session-gas-low` is worded from -- the
+   *  daemon's `config.chainId` and `config.sessionGasWei`, and its wallet's fee ceiling. On a chain whose gas is USDC
+   *  (Arc), the reason is then shown in USDC, not wei, and the action says how much USDC to send. Absent, or on any
+   *  other chain: the chain-neutral wording, unchanged. See `sessionGasLowAction`. */
+  gasFunding?: { chainId: number; sessionGasWei: bigint; feeCeilingWei: bigint };
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
+
+/**
+ * Plan 6 hardening H2 (audit-journey I-2): a `session-gas-low` reason (the daemon's own text, in wei) as an agent on a
+ * chain whose gas is USDC should read it. Every native amount (`N wei`) becomes USDC at 18 decimals, as does the
+ * session key's floor (the daemon prints it without a unit), and a fee per gas (`N wei per gas`, or a bare fee
+ * floor) becomes gwei: on Arc, 10^18 wei is 1 USDC. Anything else in the text is kept as it is.
+ */
+export function gasReasonInUsdc(reason: string): string {
+  return reason
+    .replace(/\b(\d+) wei per gas\b/g, (_m, n: string) => `${formatUnits(BigInt(n), 9)} gwei per gas`)
+    .replace(/\b(fee floor of )(\d+)\b(?! g?wei)/g, (_m, pre: string, n: string) => `${pre}${formatUnits(BigInt(n), 9)} gwei per gas`)
+    .replace(/\b(\d+) wei\b/g, (_m, n: string) => `${formatUnits(BigInt(n), 18)} USDC`)
+    .replace(/\b(below the floor of )(\d+)\b(?! (?:g?wei|USDC))/g, (_m, pre: string, n: string) => `${pre}${formatUnits(BigInt(n), 18)} USDC`);
+}
+
+/**
+ * The `session-gas-low` action, first in `suggestedActions` (final review C1). Chain-neutral by default, unchanged:
+ * fund the wallet and the daemon refills the key on its next pass. Plan 6 hardening H2 (audit-journey I-2): on a
+ * chain whose gas is USDC (Arc), the reason is shown in USDC (`gasReasonInUsdc`), and the action names the asset,
+ * the network and the amount -- one channel's gas budget, as `arena fund` counts it: its `sessionGasWei` (the most
+ * one refill can send) plus `FUND_TX_GAS_UNITS` x the wallet's fee ceiling for the refill's own gas, rounded up.
+ */
+export function sessionGasLowAction(channelId: Hex, reason: string, gasFunding?: StatusInput["gasFunding"]): string {
+  const profile = gasFunding !== undefined ? chainProfile(gasFunding.chainId) : undefined;
+  if (gasFunding === undefined || profile?.nativeIsUsdc !== true) {
+    return `fund your wallet: dispute gas for channel ${channelId} is low (${reason}); the daemon refills it on its next pass`;
+  }
+  const ask = formatUsdc6(weiToUsdc6Up(gasFunding.sessionGasWei + FUND_TX_GAS_UNITS * gasFunding.feeCeilingWei));
+  return (
+    `fund your wallet: dispute gas for channel ${channelId} is low (${gasReasonInUsdc(reason)}); on ${profile.name}, ` +
+    `gas is paid in USDC: ask your human to send at least ${ask} USDC to this wallet on ${profile.name} ` +
+    `(chain id ${gasFunding.chainId}), and the daemon refills it on its next pass once that arrives`
+  );
+}
 
 export function usdc(amount: bigint): string {
   const whole = amount / 1_000_000n;
@@ -297,11 +338,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   if (input.lobbyError) {
     suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
   }
-  if (gasLow) {
-    suggestedActions.unshift(
-      `fund your wallet: dispute gas for channel ${record.channelId} is low (${gasLow}); the daemon refills it on its next pass`,
-    );
-  }
+  if (gasLow) suggestedActions.unshift(sessionGasLowAction(record.channelId, gasLow, input.gasFunding));
 
   return {
     channelId: record.channelId,

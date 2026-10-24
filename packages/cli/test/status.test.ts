@@ -299,3 +299,45 @@ describe("buildStatus", () => {
     expect(view(a, { ...rec(0), finalized: true }, none).suggestedActions[0]).toMatch(/^done: the funding window closed/);
   });
 });
+
+// Plan 6 hardening H2 (audit-journey I-2): on Arc, session-gas-low is worded in USDC, with the amount to send.
+describe("session-gas-low wording", () => {
+  // The daemon's own reason text (daemon.ts ensureSessionGas), at Arc's default numbers: a key at 0.012 USDC, its
+  // floor 0.168 USDC (half of 0.336), and the SDK's insufficient-funds detail.
+  const REASON =
+    "the session key holds 12000000000000000 wei, below the floor of 168000000000000000, and the wallet could not " +
+    "refill it: the balance pays at most 1000000000 wei per gas, under this chain's fee floor of 20000000000";
+  const ARC_GAS = { sessionGasWei: 336_000_000_000_000_000n, feeCeilingWei: 40_000_000_000n };
+
+  it("gasReasonInUsdc shows every native amount in USDC and every fee per gas in gwei", async () => {
+    const { gasReasonInUsdc } = await import("../src/status.js");
+    expect(gasReasonInUsdc(REASON)).toBe(
+      "the session key holds 0.012 USDC, below the floor of 0.168 USDC, and the wallet could not refill it: the " +
+        "balance pays at most 1 gwei per gas, under this chain's fee floor of 20 gwei per gas",
+    );
+    expect(gasReasonInUsdc(REASON)).not.toMatch(/\bwei\b/);
+    // Text with no amounts in it is kept as it is.
+    expect(gasReasonInUsdc("gas estimate failed: RPC unreachable")).toBe("gas estimate failed: RPC unreachable");
+  });
+
+  it("on Arc: fund USDC, on Arc, with the amount; elsewhere, or with no gas numbers, the chain-neutral text, unchanged", async () => {
+    const { a, rec } = await sessions();
+    const at = (gasFunding?: StatusInput["gasFunding"]) =>
+      buildStatus({ record: rec(0), snapshot: a.snapshot(), myTurn: a.isMyTurn(), chain: OPEN, lastError: null, sessionGasLow: REASON, gasFunding });
+    const id = rec(0).channelId;
+    for (const [chainId, name] of [[5042, "Arc"], [5042002, "Arc Testnet"]] as const) {
+      const s = at({ chainId, ...ARC_GAS });
+      expect(s.attention).toBe("session-gas-low");
+      // 0.336 of session gas + 500,000 x 40 gwei for the refill's own gas = 0.356 USDC.
+      expect(s.suggestedActions[0]).toBe(
+        `fund your wallet: dispute gas for channel ${id} is low (the session key holds 0.012 USDC, below the floor of ` +
+          "0.168 USDC, and the wallet could not refill it: the balance pays at most 1 gwei per gas, under this chain's " +
+          `fee floor of 20 gwei per gas); on ${name}, gas is paid in USDC: ask your human to send at least 0.356000 USDC ` +
+          `to this wallet on ${name} (chain id ${chainId}), and the daemon refills it on its next pass once that arrives`,
+      );
+    }
+    const neutral = `fund your wallet: dispute gas for channel ${id} is low (${REASON}); the daemon refills it on its next pass`;
+    expect(at().suggestedActions[0]).toBe(neutral);
+    expect(at({ chainId: 31337, ...ARC_GAS }).suggestedActions[0]).toBe(neutral);
+  });
+});
