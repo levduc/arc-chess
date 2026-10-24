@@ -272,6 +272,8 @@ type SweepBackoff = {
   pendingTx?: Hex[];
   /** Final fix wave (M3): how many probes of `pendingTx` in a row found it still pending. */
   pendingProbes?: number;
+  /** H1 (audit-daemon M-4): how many probes of `pendingTx` in a row found it mined with no receipt to read. */
+  receiptlessProbes?: number;
 };
 
 /** Plan 5 fix round: what one sweep attempt on a session key resolved to. `"skipped"` covers every reason the
@@ -1732,7 +1734,7 @@ export class ArenaDaemon {
     // fee estimate. One whose cause is the wallet's balance is reported as exactly that.
     let estimated: bigint;
     try {
-      estimated = await this.client.estimateGas({ account: this.wallet.address, to: l.sessionSender.address, data: "0x", value });
+      estimated = await this.valueTransferGas(this.wallet.address, l.sessionSender.address, value);
     } catch (err) {
       if (isInsufficientFundsError(err)) throw new TxInsufficientFundsError(this.wallet.address, err);
       throw new SessionGasEstimateError(err, "gas");
@@ -1882,20 +1884,24 @@ export class ArenaDaemon {
 
   // ------------------------------------------------------------------ sweep (Plan 5 Task 1)
 
-  /** Cached once (round 4, m7): whether `this.wallet.address` holds contract code, so `performSweep` doesn't read
-   *  it again for every channel it sweeps. `undefined` = not yet read. */
-  private walletHasCode: boolean | undefined;
+  /**
+   * The gas limit of a sweep: the node's estimate of this very value transfer (the session key to the wallet). H1
+   * (audit-daemon M-3): never a fixed 21,000. A plain transfer costs 21,000 on Arc today (arc-facts.md), but a chain
+   * whose value transfers cost more would have made every sweep fail until it was abandoned, stranding the key's gas.
+   * With the top-up (`valueTransferGas`), one helper for both value transfers. Unlike the top-up's limit, no margin:
+   * a value transfer to an EOA costs exactly its estimate, and the sweep reserves `gas x fee` out of what it sends, so
+   * a margin would only leave `margin x fee` in a retired key for good. (A contract wallet, which may run logic on
+   * receipt, was always estimated.) The estimate is the sweep's own dry run, so its failure -- e.g. a wallet that
+   * rejects the transfer, or a blocklisted address on Arc -- is charged like a failed send, not a read (M4).
+   */
+  private gasForSweep(sender: SerialTxSender): Promise<bigint> {
+    return this.valueTransferGas(sender.address, this.wallet.address, 1n);
+  }
 
-  private async gasForSweep(sender: SerialTxSender): Promise<bigint> {
-    if (this.walletHasCode === undefined) {
-      const code = await this.sweepRead(() => this.client.getCode({ address: this.wallet.address }));
-      this.walletHasCode = code !== undefined && code !== "0x";
-    }
-    // A plain transfer to an EOA always costs exactly 21000 gas; a contract wallet may run more logic (a proxy, a
-    // multisig's fallback), so its cost is estimated instead of assumed. That estimate is the sweep's own dry run,
-    // so its failure (e.g. a wallet that rejects the transfer) is charged like a failed send, not a read (M4).
-    if (!this.walletHasCode) return 21_000n;
-    return this.client.estimateGas({ account: sender.address, to: this.wallet.address, value: 1n });
+  /** H1 (audit-daemon M-3): the node's gas estimate for a plain value transfer of `value` from `from` to `to` --
+   *  shared by the top-up (which adds `topUpGasLimit`'s margin) and the sweep (which uses it as is). */
+  private valueTransferGas(from: Address, to: Address, value: bigint): Promise<bigint> {
+    return this.client.estimateGas({ account: from, to, data: "0x", value });
   }
 
   private async currentFeePerGas(): Promise<bigint> {
@@ -1978,6 +1984,8 @@ export class ArenaDaemon {
       // live dead transaction that needs answering for.
       await this.sweepRead(() => sender.refresh());
       const balance = await this.sweepRead(() => this.client.getBalance({ address: sender.address }));
+      // H1 (M-3): an empty key is dust before anything is estimated (the estimate sends 1 wei, which it cannot).
+      if (balance === 0n) return { status: "dust" };
       const gasLimit = await this.gasForSweep(sender);
       // Plan 6 Task 2: never under the session sender's fee floor -- the send below is floored, so a reserve sized on
       // a lower estimate could not pay its own transaction, and every attempt would be refused until abandoned.
@@ -2071,14 +2079,37 @@ export class ArenaDaemon {
         // Final fix wave (M3): the first probe is immediate, but once one has found the transaction still
         // pending, the next waits out the back-off like any other attempt instead of re-probing every pass.
         const probed = backoff.pendingProbes ?? 0;
-        if (probed > 0 && !opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) {
+        const receiptless = backoff.receiptlessProbes ?? 0;
+        if ((probed > 0 || receiptless > 0) && !opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) {
           return { kind: "skipped", record };
         }
         const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
-        // An RPC failure (or a mined transaction whose receipt could not be read) is retried on the next pass,
-        // not counted as a pending probe.
+        // An RPC failure is retried on the next pass, not counted as a pending probe.
         if (recovered === "unknown") return { kind: "skipped", record };
-        if (recovered === "pending") {
+        let giveUp = false;
+        if (recovered === "receiptless") {
+          // H1 (audit-daemon M-4): mined, but no receipt can be read. Arc documents exactly that for an included
+          // revert (a blocklisted address), so it may never change: probed with the back-off, and after
+          // SWEEP_PENDING_PROBES in a row it is charged as a failed attempt and the sweep goes on -- before, every
+          // pass found "unknown" again, and the record was never re-sent, abandoned or evicted.
+          backoff.receiptlessProbes = receiptless + 1;
+          if (backoff.receiptlessProbes < SWEEP_PENDING_PROBES) {
+            this.bumpSweepBackoff(record.channelId, backoff);
+            return { kind: "skipped", record };
+          }
+          this.log(
+            `channel ${record.channelId}: sweep transaction(s) ${backoff.pendingTx.join(", ")} mined with no readable receipt ` +
+              `${backoff.receiptlessProbes} times in a row: counted as a failed attempt`,
+          );
+          giveUp = true;
+        }
+        if (giveUp) {
+          backoff.pendingTx = undefined;
+          backoff.pendingProbes = 0;
+          backoff.receiptlessProbes = 0;
+          persistPending();
+          backoff.attempts++;
+        } else if (recovered === "pending") {
           backoff.pendingProbes = probed + 1;
           // Not a failure (no attempt charged), but backed off. After SWEEP_PENDING_PROBES probes, fall through
           // to a normal attempt: its send replaces the released entry at the same nonce with raised fees (at
@@ -2087,9 +2118,10 @@ export class ArenaDaemon {
             this.bumpSweepBackoff(record.channelId, backoff);
             return { kind: "skipped", record };
           }
-        } else {
+        } else if (recovered !== "receiptless") {
           backoff.pendingTx = undefined;
           backoff.pendingProbes = 0;
+          backoff.receiptlessProbes = 0;
           if (recovered !== "failed") {
             const updated = appendSweep(record, recovered.amount, recovered.hash);
             save(updated);
@@ -2142,9 +2174,11 @@ export class ArenaDaemon {
       const remember = (hashes: Hex[]) => {
         backoff.pendingTx = [...new Set([...(backoff.pendingTx ?? []), ...hashes])];
       };
-      if (err instanceof TxReceiptMissingError) {
+      if (err instanceof TxReceiptMissingError || err instanceof TxDroppedError) {
         // Minor 2: remember this hash so the very next attempt (see the top of this method) checks it before
         // trying anything else -- the transaction is most likely already mined; only the receipt went missing.
+        // H1 (audit-daemon M-12): a reported drop too. A load-balanced RPC can report a transaction dropped that
+        // another of its nodes mines later; the next attempt's check records that as the sweep, not as "dust".
         remember([err.hash]);
       } else if (err instanceof TxStuckError || err instanceof TxWaitAbortedError) {
         // Fix round 3, I-1(c): probe E3 -- a sweep this wait gave up on (a tight giveUpAt, or stop()) can still
@@ -2163,6 +2197,13 @@ export class ArenaDaemon {
         // next pass re-reads the chain and, if still unswept, tries again fresh. No back-off, no attempt charged.
         this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
         return { kind: "skipped", record };
+      }
+      if (err instanceof TxDroppedError) {
+        // H1 (M-12): not charged here -- the next attempt checks the hash first, and charges the attempt if the
+        // transaction is really gone (a "failed" recovery), or records the sweep if it landed after all.
+        this.log(`channel ${record.channelId}: sweep transaction ${err.hash} was reported dropped; checked first on the next attempt`);
+        this.bumpSweepBackoff(record.channelId, backoff);
+        return { kind: "error", record, error: err };
       }
       if (err instanceof SweepReadError) {
         // Final fix wave (M4): an RPC blip before anything was sent -- backed off, never charged, so an RPC outage
@@ -2203,6 +2244,7 @@ export class ArenaDaemon {
     backoff.attempts = 0;
     backoff.pendingTx = undefined;
     backoff.pendingProbes = 0;
+    backoff.receiptlessProbes = 0;
     if (wasBackedOff) this.log(`channel ${channelId}: sweep back-off ended`);
   }
 
@@ -2227,7 +2269,11 @@ export class ArenaDaemon {
    *  for the one intent this backoff gave up on -- at most one of them can ever mine (they share a nonce), but
    *  it is never necessarily the last one this daemon happened to be watching when it gave up, so every one of
    *  them is checked. */
-  private async recoverPendingSweepTx(hashes: Hex[]): Promise<"pending" | "unknown" | "failed" | { amount: bigint; hash: Hex }> {
+  /** H1 (audit-daemon M-4): `"receiptless"` (it was `"unknown"`) when a hash is reported mined but no receipt can be
+   *  read for it; `"unknown"` is left to read failures. */
+  private async recoverPendingSweepTx(
+    hashes: Hex[],
+  ): Promise<"pending" | "unknown" | "receiptless" | "failed" | { amount: bigint; hash: Hex }> {
     try {
       let anyPending = false;
       let anyMined = false;
@@ -2258,7 +2304,7 @@ export class ArenaDaemon {
           else anyMined = true; // mined, but its receipt could not be read just now
         }
       }
-      if (anyMined) return "unknown";
+      if (anyMined) return "receiptless";
       return anyPending ? "pending" : "failed";
     } catch (err) {
       this.log(`sweep recovery: ${errorText(err)} looking up ${hashes.length} pending hash(es) (retried next attempt)`);

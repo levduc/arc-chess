@@ -2372,6 +2372,101 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       expect(c.budgetMs!).toBeGreaterThan(SWEEP_PER_RECORD_TIMEOUT_MS - 5_000);
     }
   });
+
+  it("H1 (audit-daemon M-4): a sweep transaction mined with no readable receipt is charged after SWEEP_PENDING_PROBES probes, not probed forever", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await stopPeriodicPasses(d);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    const l = d.handle(id);
+    const hash = ("0x" + "6b".repeat(32)) as Hex;
+    l.sweep.pendingTx = [hash];
+    const internals = d as unknown as {
+      recoverPendingSweepTx(hashes: Hex[]): Promise<unknown>;
+      performSweep(sender: unknown, giveUpAt?: number): Promise<unknown>;
+      sweepChannel(l: unknown): Promise<void>;
+    };
+    let probes = 0;
+    let sends = 0;
+    // Arc's included revert of a blocklisted transfer: mined, and no receipt is ever served for it.
+    internals.recoverPendingSweepTx = async () => {
+      probes++;
+      return "receiptless";
+    };
+    internals.performSweep = async () => {
+      sends++;
+      throw new Error("simulated: the fresh attempt fails too");
+    };
+    // Before H1 this was "unknown": skipped on every pass (an RPC probe every pollMs), never charged, never abandoned.
+    for (let i = 0; i < 10; i++) await internals.sweepChannel(l);
+    expect(probes).toBe(1); // later probes wait out the back-off the first one started
+    expect(l.sweep.attempts).toBe(0);
+    for (let p = 2; p <= SWEEP_PENDING_PROBES; p++) {
+      l.sweep.blockedUntil = 0;
+      await internals.sweepChannel(l);
+      expect(probes).toBe(p);
+    }
+    // The last probe gave the hash up: one attempt charged for it, and the attempt went ahead (and failed: charged too).
+    expect(l.sweep.pendingTx).toBeUndefined();
+    expect(sends).toBe(1);
+    expect(l.sweep.attempts).toBe(2);
+    expect(l.record.swept).toBeUndefined();
+  });
+
+  it("H1 (audit-daemon M-4): recoverPendingSweepTx tells a mined transaction with no receipt ('receiptless') from a read failure ('unknown')", async () => {
+    const { alice } = await matched();
+    const d = alice.daemon;
+    const recover = (d as unknown as { recoverPendingSweepTx(h: Hex[]): Promise<unknown> }).recoverPendingSweepTx.bind(d);
+    const hash = ("0x" + "7c".repeat(32)) as Hex;
+    const realReceipt = d.client.getTransactionReceipt.bind(d.client);
+    const realTx = d.client.getTransaction.bind(d.client);
+    try {
+      d.client.getTransactionReceipt = (async () => {
+        throw new TransactionReceiptNotFoundError({ hash });
+      }) as typeof d.client.getTransactionReceipt;
+      d.client.getTransaction = (async () => ({ hash, blockNumber: 5n })) as unknown as typeof d.client.getTransaction;
+      expect(await recover([hash])).toBe("receiptless");
+      d.client.getTransaction = (async () => {
+        throw new Error("socket hang up");
+      }) as typeof d.client.getTransaction;
+      expect(await recover([hash])).toBe("unknown");
+    } finally {
+      d.client.getTransactionReceipt = realReceipt;
+      d.client.getTransaction = realTx;
+    }
+  });
+
+  it("H1 (audit-daemon M-12): a sweep reported dropped keeps its hash; one that landed after all is recorded as the sweep, not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    // A real sweep-shaped transaction that lands -- one a load-balanced RPC reported dropped before another of its
+    // nodes mined it.
+    const balance = await d.client.getBalance({ address: sender.address });
+    const gas = 21_000n;
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const value = balance - gas * ((maxFeePerGas * 13n + 9n) / 10n);
+    const req = { to: alice.address, data: "0x" as Hex, value, gas };
+    const hash = await sender.send(req);
+    await d.client.waitForTransactionReceipt({ hash });
+    sender.tracker?.settle(hash);
+    const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    internals.performSweep = () => Promise.reject(new TxDroppedError(hash, 0));
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx?.[0] === hash, 10_000, "the dropped hash is remembered");
+    expect(l.sweep.attempts).toBe(0); // not charged: the next attempt checks the hash first
+    internals.performSweep = realPerformSweep;
+    l.sweep.blockedUntil = 0;
+    // Before H1: the hash was forgotten, and the next attempt read the near-empty key as "dust".
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptTx).toBe(hash);
+    expect(l.record.sweptAmount).toBe(value);
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {

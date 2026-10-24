@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createPublicClient, createTestClient, http, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { DEFAULT_FEE_CEILING_WEI, NO_FEE_CEILING, type SerialTxSender, type TxRequest } from "@arena/sdk";
-import { CHAIN, RPC, setEthBalance } from "../../sdk/test/helpers/chain.js";
+import { CHAIN, RPC, deployArena, setEthBalance } from "../../sdk/test/helpers/chain.js";
 import {
   ArenaDaemon,
   RESPOND_GAS_BUDGET,
@@ -208,6 +208,50 @@ describe("Plan 6 Task 2: the profile reaches every sender the daemon builds", ()
       expect(await d.client.getBalance({ address: wallet })).toBeGreaterThan(10n ** 18n - 10n ** 15n);
     } finally {
       delete CHAIN_PROFILES[31337];
+    }
+  });
+});
+
+describe("H1 (audit-daemon M-3): the sweep's gas limit is the node's estimate, not a fixed 21,000", () => {
+  it("a node that prices the key's transfer to the wallet at 25,000 gets a 25,000-gas sweep, reserved for in full", async () => {
+    const walletKey = generatePrivateKey();
+    const wallet = privateKeyToAccount(walletKey).address;
+    const home = mkdtempSync(join(tmpdir(), "arena-sweepgas-"));
+    const env = await deployArena();
+    const cfg: ArenaConfig = {
+      rpcUrl: RPC,
+      chainId: env.domain.chainId,
+      hub: env.hub,
+      usdc: env.usdc,
+      rules: env.rules,
+      serverUrl: "memory:",
+      port: 0,
+      maxFeePerPlayer: 10_000n,
+      sessionGasWei: 10n ** 16n,
+      pollMs: 100,
+    };
+    initHome(home, cfg, walletKey);
+    const d = new ArenaDaemon({ home, config: cfg, walletKey, lobby: {} as never, relay: {} as never });
+    const session = (d as unknown as { sessionSenderFor(k: Hex): SerialTxSender }).sessionSenderFor(generatePrivateKey());
+    const start = 10n ** 16n;
+    await setEthBalance(session.address, start);
+    const asked: EstimateArgs[] = [];
+    const restore = stubEstimate(d, wallet, async (args) => {
+      asked.push(args);
+      return 25_000n;
+    });
+    try {
+      const swept = await (d as unknown as {
+        performSweep(s: SerialTxSender): Promise<{ status: string; amount?: bigint; hash?: Hex }>;
+      }).performSweep(session);
+      expect(swept.status).toBe("swept");
+      expect(asked.at(-1)).toMatchObject({ account: session.address, to: wallet });
+      const tx = await d.client.getTransaction({ hash: swept.hash! });
+      expect(tx.gas).toBe(25_000n);
+      expect((start - swept.amount!) % 25_000n).toBe(0n); // the reserve is the estimated gas x a fee per gas
+      expect(start - swept.amount!).toBeGreaterThan(21_000n * tx.maxFeePerGas!);
+    } finally {
+      restore();
     }
   });
 });
