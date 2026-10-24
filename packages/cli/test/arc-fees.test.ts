@@ -185,7 +185,9 @@ describe("Plan 6 Task 2: the profile reaches every sender the daemon builds", ()
       const market = ((await d.client.estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
       expect(market).toBeLessThan(floor); // the floor binds here
       expect(d.wallet.minFeePerGas).toBe(floor);
-      expect(d.wallet.feeCeiling).toBe(40n * GWEI);
+      // H1 (Task 2 review Minor-3): a ceiling is never under the floor -- on arc-anvil (a 25 gwei market) this test's
+      // floor is over the profile's 40 gwei ceiling, which then reads as the floor.
+      expect(d.wallet.feeCeiling).toBe(bigMax(40n * GWEI, floor));
 
       const h = await d.wallet.send({ to: privateKeyToAccount(generatePrivateKey()).address, data: "0x", value: 1n });
       const sent = await d.client.waitForTransactionReceipt({ hash: h }).then(() => d.client.getTransaction({ hash: h }));

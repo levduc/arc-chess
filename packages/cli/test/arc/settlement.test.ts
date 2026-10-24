@@ -196,10 +196,15 @@ describe.skipIf(!ON_ARC_ANVIL)("Plan 6 Task 4 (arc-anvil): games, disputes and p
     const [first, second] = events.filter((e) => e.kind === "Challenged").sort((x, y) => Number(x.blockNumber - y.blockNumber));
     expect(await senderOf(first.transactionHash)).toBe(keys.alice.toLowerCase());
     expect(await senderOf(second.transactionHash)).toBe(keys.bob.toLowerCase());
-    expect(await senderOf(events.find((e) => e.kind === "Responded")!.transactionHash)).toBe(keys.bob.toLowerCase());
+    // H1 (flake fix; it failed 2 runs in 6 on arc-anvil before H1 too): both watchtowers may answer the first
+    // challenge -- Bob's right after his move, Alice's once the relay brings it (Plan 4.5 Task 8) -- and either can
+    // land first. What matters here is that a session key paid for it.
+    const responder = await senderOf(events.find((e) => e.kind === "Responded")!.transactionHash);
+    expect([keys.alice.toLowerCase(), keys.bob.toLowerCase()]).toContain(responder);
     expect(await senderOf(fin.hash)).toBe(keys.bob.toLowerCase()); // the timeout
-    expect(a.keyTxs.length).toBeGreaterThanOrEqual(2); // the challenge and the sweep
-    expect(b.keyTxs.length).toBeGreaterThanOrEqual(4); // respond, challenge, timeout and the sweep
+    // Alice's challenge and sweep; Bob's challenge, timeout and sweep; and the respond, from whichever key sent it.
+    expect(a.keyTxs.length).toBeGreaterThanOrEqual(responder === keys.alice.toLowerCase() ? 3 : 2);
+    expect(b.keyTxs.length).toBeGreaterThanOrEqual(responder === keys.bob.toLowerCase() ? 4 : 3);
     expect(gasPaid(b.keyTxs)).toBeGreaterThan(0n);
   });
 
