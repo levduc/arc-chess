@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { createPublicClient, custom, toEventSelector, type PublicClient } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { HubClient, HubRevertError, LocalKeyTxSender } from "../src/index.js";
+import { HUB_EVENT_ABI, HUB_EVENT_KINDS, HubClient, HubRevertError, LocalKeyTxSender, channelHubAbi } from "../src/index.js";
 import { ANVIL_KEYS, CHAIN, RPC, deployArena, mintUsdc, usdcBalance } from "./helpers/chain.js";
 
 // Plan 5.6 Task 3: `HubClient.transfer` -- the ERC-20 `transfer` the CLI's owner-locked `arena withdraw` sends
@@ -35,5 +36,48 @@ describe("HubClient.transfer", () => {
     expect((err as HubRevertError).errorName).toBe("ERC20InsufficientBalance");
     expect(await usdcBalance(env.usdc, to)).toBe(0n);
     expect(await usdcBalance(env.usdc, sender.address)).toBe(have);
+  });
+});
+
+// Plan 6 Task 5 (the Arc testnet rehearsal): Arc's RPC refuses an eth_getLogs whose topic-0 list has more than 10
+// entries, even for one block (-32012 "requested range too large", on testnet and mainnet alike). The hub's ABI has
+// 15 events; hubEvents' full read must ask for the 7 that carry a channelId and nothing else.
+describe("HubClient.hubEvents on an RPC that caps topic-0 lists at 10", () => {
+  const HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893" as const;
+  /** A transport that answers eth_getLogs like Arc's RPC: refused with more than 10 topics in position 0, else []. */
+  function arcLikeClient(seen: unknown[][]): PublicClient {
+    return createPublicClient({
+      transport: custom({
+        async request({ method, params }: { method: string; params?: unknown }) {
+          if (method !== "eth_getLogs") throw new Error(`unexpected ${method}`);
+          const filter = (params as Array<{ topics?: unknown[] }>)[0];
+          const topic0 = filter.topics?.[0];
+          seen.push(Array.isArray(topic0) ? topic0 : [topic0]);
+          if (Array.isArray(topic0) && topic0.length > 10) throw Object.assign(new Error("requested range too large"), { code: -32012 });
+          return [];
+        },
+      }),
+    }) as PublicClient;
+  }
+
+  it("the full read asks for exactly the channel events' selectors, no more than 10", async () => {
+    const seen: unknown[][] = [];
+    const hub = new HubClient(HUB, arcLikeClient(seen));
+    expect(await hub.hubEvents(1n, 1000n)).toEqual([]);
+    expect(seen).toHaveLength(1);
+    const want = HUB_EVENT_KINDS.map((name) => toEventSelector(channelHubAbi.find((x) => x.type === "event" && x.name === name)!));
+    expect([...seen[0]].sort()).toEqual([...want].sort());
+    expect(seen[0].length).toBeLessThanOrEqual(10);
+    // The kinds are exactly the ABI's events that carry a channelId.
+    const withChannelId = channelHubAbi.filter((x) => x.type === "event" && x.inputs.some((i) => i.name === "channelId")).map((x) => x.name);
+    expect([...HUB_EVENT_KINDS].sort()).toEqual([...withChannelId].sort());
+    expect(HUB_EVENT_ABI.map((x) => x.name).sort()).toEqual([...HUB_EVENT_KINDS].sort());
+  });
+
+  it("a read of every ABI event (15 topics) is what such an RPC refuses", async () => {
+    const seen: unknown[][] = [];
+    const client = arcLikeClient(seen);
+    await expect(client.getContractEvents({ address: HUB, abi: channelHubAbi, fromBlock: 1n, toBlock: 1n })).rejects.toThrow();
+    expect(seen[0].length).toBeGreaterThan(10);
   });
 });
