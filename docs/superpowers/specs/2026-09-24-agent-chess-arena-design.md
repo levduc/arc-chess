@@ -685,6 +685,21 @@ The stream closes on client disconnect, daemon stop, or server close.
     `ingestOnChain` ignores states it already holds, so the overlap is harmless. The server indexer uses the same
     pattern over all hub events: chunked cursor plus a trailing 32-block rescan, with `apply` idempotent through
     each row's `lastEvent`. A rescanned chunk never moves the indexer's cursor back.
+    *Plan 6 hardening H1:* when the RPC refuses a chunk, the scan splits it. A single block it refuses even on its
+    own, while the RPC is otherwise up, is skipped, so later events stay readable. The skip is recorded per channel
+    (`skippedEventBlocks`), shown in `status`, and the skipped blocks are retried in turn every few minutes; a block
+    that reads again resets its count. The dispute pass reads the phase and the registered state from the hub's
+    storage, not from events, so a skip cannot hide a challenge.
+    - If the unreadable event is a `Challenged` that registered a move this daemon never received, the daemon adopts
+      the registered move from storage when the hub's endorsement makes that safe, and answers it. The worst case is
+      a lock: a later challenge needs the opponent's signature, which a later readable event repairs. It is not a
+      forfeit.
+    - When adoption is impossible, the daemon raises the attention `challenge-unseen`. It names the turn and the
+      deadline. The fix is the human's: switch `rpcUrl` and restart the daemon.
+    - The server indexer applies the same split-and-skip, skipping only a refused block's `Challenged`/`Responded`
+      events. It reports the count as `arena_indexer_skipped_blocks` on `/metrics`.
+    - The contract proposal on branch `proposal/hub-hardening` (audit I1) caps emitted signed states. With it, an
+      oversized event cannot arise from a daemon-signed state.
 19. **Host connection lifecycle (CLI).**
     - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
       or the local API. A failed join is recorded as the channel's `lastError`.

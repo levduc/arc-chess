@@ -414,14 +414,15 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     suggestedActions.unshift(
       `switch RPC: channel ${record.channelId} is challenged on turn ${unseen.registeredTurn}, newer than this daemon holds ` +
         `(turn ${s.turnNum}), and the challenge's event could not be read${skippedNote ? ` (${skippedNote})` : ""}; unanswered, ` +
-        `the current game is forfeited at the deadline (${unseen.deadline}${left !== null ? `, in ${left}s` : ""}). Set ` +
-        "rpcUrl in config.json to an RPC that serves larger getLogs responses, and restart the daemon",
+        `the current game is forfeited at the deadline (${unseen.deadline}${left !== null ? `, in ${left}s` : ""}). Tell ` +
+        "your human now: they (never you) set rpcUrl in config.json to an RPC that serves larger getLogs responses, " +
+        "then restart the daemon",
     );
   } else if (skippedNote && live) {
     suggestedActions.push(
       `check the RPC: ${skippedNote}; the daemon skipped them so later events stay readable, and retries them every ` +
-        "few minutes. If a challenge's state is in one of them, set rpcUrl in config.json to an RPC that serves larger " +
-        "getLogs responses, and restart the daemon",
+        "few minutes. If a challenge's state is in one of them, tell your human: they (never you) set rpcUrl in " +
+        "config.json to an RPC that serves larger getLogs responses, then restart the daemon",
     );
   }
 

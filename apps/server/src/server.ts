@@ -17,6 +17,8 @@ export type Metrics = {
   relayMessages: number;
   indexerBlock: bigint | null;
   indexerLag: bigint | null;
+  /** H1 fix round 1: blocks whose dispute events the RPC refused to serve, even alone (`Indexer.skippedBlocks()`). */
+  indexerSkippedBlocks?: number;
 };
 
 /** `wsPingMs` overrides the app-level `/ws` ping interval (25 s), for tests. */
@@ -193,6 +195,12 @@ function renderMetrics(m: Metrics, offersOpen: number): string {
       "Chain head minus the indexer's processed block.",
       "gauge",
       m.indexerLag === null ? "NaN" : m.indexerLag.toString(),
+    ) +
+    line(
+      "arena_indexer_skipped_blocks",
+      "Blocks whose dispute events the RPC refused to serve, even alone (monitor: should stay 0).",
+      "gauge",
+      m.indexerSkippedBlocks ?? 0,
     )
   );
 }
@@ -293,7 +301,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   const FAUCET_COOLDOWN_MS = 10 * 60 * 1000;
   const faucetLastRequest = new Map<string, number>();
 
-  const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
+  const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null, indexerSkippedBlocks: 0 };
 
   const postLimiter = new RateLimiter(cfg.limits.httpPostBurst, cfg.limits.httpPostPerSec);
   const getLimiter = new RateLimiter(cfg.limits.httpGetBurst, cfg.limits.httpGetPerSec);
@@ -317,6 +325,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
       const offersOpen = repo.openOfferTotal(await chain.now());
       metrics.indexerBlock = repo.cursor() ?? 0n;
       metrics.indexerLag = await indexer.lag();
+      metrics.indexerSkippedBlocks = indexer.skippedBlocks().length;
       ctx.res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
       ctx.res.end(renderMetrics(metrics, offersOpen));
       return true;

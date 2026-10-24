@@ -324,6 +324,17 @@ watchtower, which keeps signing and sending on its own whoever holds the seat: i
 stalemate, answers a stale challenge with the latest state, and calls `timeout` or `reclaim` when they fall due
 (spec §6.2, §6.3).
 
+**Dispute events the RPC refuses to serve.** Some RPCs refuse a `getLogs` response above a size limit. The
+watchtower splits the range, and skips any single block the RPC still refuses on its own. Skipped blocks appear in
+`status` as `skippedEventBlocks`, with a suggested action starting "check the RPC:", and are retried in turn. The
+dispute pass reads the phase and the registered state from the hub's storage, so a skip never hides a challenge.
+
+If a challenge registers a move this daemon never received and its event can't be read, the daemon adopts the move
+from storage when that is safe. Otherwise it raises the urgent attention `challenge-unseen`, whose action starts
+"switch RPC:" and names the turn and the deadline. The fix is the **human's**: set `rpcUrl` in `config.json` to an RPC
+that serves larger responses, then restart the daemon. `init` refuses to change the RPC while channels are open, and
+an agent never edits `config.json`.
+
 **Challenges on a human-held seat.** If the opponent challenges on a position where this seat must move, the board
 shows a red "You must move before the deadline" banner and a countdown, and the agent's `wait` returns
 `human-must-move` (once per challenge) so it can tell the human. The human is not relied on: once at most
