@@ -992,3 +992,58 @@ against 46 in the first. The daemons do not timestamp the switch itself. The mov
   spawned, so the POST symptom is expected here. Rerun once more on current HEAD to see H3's effect.
 - **8.4, the sweep recorded as dust.** It did not recur. H3's `abde97a` ("a sent sweep keeps its hash") also was not
   yet in the daemons that ran.
+
+## 11. Live agent run (2026-10-24, 17:46–19:48 UTC)
+
+This was the first run with real, unprimed Claude agents (`claude -p`, `claude-opus-5-5`). Each agent was run
+through `scripts/claude-opponent.ts --human-pay` against the `testnet:up` stack, with the hardened hub and two house
+bots.
+
+- **Prompt.** Each agent got the stack's agent message, plus the owner's cash-out address.
+- **Funding.** No agent had a faucet. The human, played by the watcher and the stack's `bin/pay`, paid exactly what
+  each agent's `fund` asked for.
+
+| Agent | Games | Funded | Withdrawn to owner | Net |
+|---|---|---|---|---|
+| A (5 games, house-1) | 5–0 | 1.361 | 1.827822 | +0.485599 |
+| B (3 games, house-2, concurrent with A2) | 3–0 | 1.361 | 1.631386 | +0.289163 |
+| A2 (A's home, fresh session, 3 games, house-1) | 3–0 | 1.342223 | 1.627825 | +0.285602 |
+
+- **Settlement.** Every channel closed cooperatively, then reached `Finalized` with `swept: true`.
+- **Cash-out.** Each agent ran `withdraw --all` itself, after asking for a yes or being given one.
+- **Left behind.** 0.018777 stays in each agent wallet as the gas reserve, and 0.0002667–0.000588 stays on each
+  session key.
+- **Deployer.** 14.547055991 → 15.598542991. The agents won 1.1 from the bots, and the deployer also collected
+  0.03 in fees.
+- **Cost.** Claude cost \$16.10 in total: A \$3.85, B \$3.61, A2 \$8.63.
+- **Wall clock.** A took 45.8 min from start to withdraw, B 36.2 min and A2 74.7 min.
+
+Frictions, most important first:
+
+1. **No agent relayed the funding ask in its own words.** All three ran `fund`, then went straight to
+   `wallet --wait-for-usdc`. A said "I'll relay and wait", and later "that exact amount arrived … before I had asked
+   you for it". A human sees the ask only in the tool output. skill.md step 4 (or `fund` itself) should tell the
+   agent to put `message` in its reply.
+2. **None told the human the `audit` text or the cap before funding.** Two did so only in their final report, and
+   one never did.
+3. **Public RPC rate limiting set the pace.** No action failed.
+   - A: 36 "took effect, but the chain could not be read" notes and 8 rate-limit errors.
+   - With two agents up: 429s on `wallet` (A2's funding seen 62 s late), and Open took 2 min after `accept`.
+4. **The daemon dies with the agent's tool session.** Every agent backgrounded `arena daemon` with its tool, and
+   none used skill.md's restart loop. The session was stopped twice mid-game with A2's channel open. Each time, on
+   resume, A2 read the CLI's "cannot reach the daemon … start it with arena daemon" and restarted it (62 s and 23 s
+   down). There was no challenge. `withdraw` works without a daemon running.
+5. **Concurrent agents pick the same first offer.** A2 lost the race to B, got `offer … not found`, and recovered
+   through Troubleshooting.
+6. **Smaller.**
+   - XMTP was skipped by all three: "optional, large".
+   - A 2.5 USDC house bot holds one channel at a time.
+   - On a reused home, the starting balance includes the old leftover.
+
+The harness hit trouble of its own, now fixed. The watcher missed the agents' asks, because there was no
+"send X USDC" in their text; `102dcda` added the `fund`-output fallback. Two watchers' pays collided on the
+deployer's nonce; `6ff700c` added a lock. The stack's "`ARENA_HOME=$PWD/arena-home`" message also needs a prefixed
+allow rule.
+
+The full report, with every transaction hash, phase timings and quotes, is
+`.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`.
