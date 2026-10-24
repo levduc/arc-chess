@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import {
   KNOWN_DEPLOYMENTS,
@@ -291,14 +291,32 @@ describe("arena init --server", () => {
       return { code, err: err.join("\n"), calls: stub.calls };
     };
     const freshHome = () => join(mkdtempSync(join(tmpdir(), "arena-init-arc-")), "home");
+    /** Runs `body` with `entry` pinned for `chainId`, then puts back whatever was there (Plan 6 Task 5: a real pin, or
+     *  none) -- a plain `delete` would drop a real pin for every later test in the process. */
     const pin = async <T>(chainId: number, entry: { name: string; hub: `0x${string}`; rules: `0x${string}` }, body: () => Promise<T>): Promise<T> => {
+      const saved = Object.hasOwn(KNOWN_DEPLOYMENTS, chainId) ? KNOWN_DEPLOYMENTS[chainId] : undefined;
       KNOWN_DEPLOYMENTS[chainId] = entry;
       try {
         return await body();
       } finally {
-        delete KNOWN_DEPLOYMENTS[chainId];
+        if (saved !== undefined) KNOWN_DEPLOYMENTS[chainId] = saved;
+        else delete KNOWN_DEPLOYMENTS[chainId];
       }
     };
+    // Plan 6 Task 5: these cases use synthetic addresses, so they run with Arc's real pins (5042002 since Task 5, 5042
+    // once Task 6 pins it) taken out of the table, and put back after each one. The real pin is tested below.
+    const realPins = new Map<number, (typeof KNOWN_DEPLOYMENTS)[number]>();
+    beforeEach(() => {
+      for (const chainId of [5042, 5042002]) {
+        if (!Object.hasOwn(KNOWN_DEPLOYMENTS, chainId)) continue;
+        realPins.set(chainId, KNOWN_DEPLOYMENTS[chainId]);
+        delete KNOWN_DEPLOYMENTS[chainId];
+      }
+    });
+    afterEach(() => {
+      for (const [chainId, entry] of realPins) KNOWN_DEPLOYMENTS[chainId] = entry;
+      realPins.clear();
+    });
 
     it("a USDC other than the profile's is refused -- from /templates or from --usdc, on 5042 and 5042002 -- before any RPC call, writing nothing", async () => {
       for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
@@ -442,6 +460,57 @@ describe("arena init --server", () => {
         expect(r.err).toMatch(/WARNING: rules 0x3{40} is not the canonical test chain rules 0x4{40}/);
         expect(r.err).not.toMatch(/refusing/);
       });
+    });
+  });
+
+  describe("Plan 6 Task 5: the real Arc Testnet pin (contracts/deployments/5042002.json)", () => {
+    const ARC_USDC = "0x3600000000000000000000000000000000000000";
+    const PINNED_HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893";
+    const PINNED_RULES = "0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5";
+    const OTHER = `0x${"44".repeat(20)}` as const;
+    const testnet = () => ({ chainId: 5042002, withCode: [PINNED_HUB, PINNED_RULES, OTHER, ARC_USDC] });
+    const explicit = (hub: string, rules = PINNED_RULES) => [
+      "init", "--server", "https://host.test", "--rpc", "http://rpc.test", "--chain-id", "5042002",
+      "--hub", hub, "--usdc", ARC_USDC, "--rules", rules, "--session-gas-wei", "10000000000000000",
+    ];
+    const run = async (home: string, args: string[], stub: ReturnType<typeof stubFetch>) => {
+      const err: string[] = [];
+      const code = await runCli(args, { env: { ARENA_HOME: home }, fetch: stub.fetchStub, out: () => undefined, err: (s) => err.push(s) });
+      return { code, err: err.join("\n"), calls: stub.calls };
+    };
+    const freshHome = () => join(mkdtempSync(join(tmpdir(), "arena-init-testnet-")), "home");
+
+    it("init on 5042002 refuses a hub other than the pinned one -- from /templates or from --hub -- before any RPC call, writing nothing", async () => {
+      expect(KNOWN_DEPLOYMENTS[5042002]).toEqual({ name: "Arc Testnet", hub: PINNED_HUB, rules: PINNED_RULES, usdc: ARC_USDC });
+      const home1 = freshHome();
+      const viaTemplates = await run(
+        home1,
+        ["init", "--server", "https://host.test", "--session-gas-wei", "10000000000000000"],
+        stubFetch({ templates: templatesResponse({ chainId: 5042002, hub: OTHER, usdc: ARC_USDC, rules: PINNED_RULES }), ...testnet() }),
+      );
+      expect(viaTemplates.code).toBe(1);
+      expect(viaTemplates.err).toContain(`refusing to init on Arc Testnet (chain 5042002): hub ${OTHER} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(viaTemplates.calls.map((c) => c.method ?? "templates")).toEqual(["templates"]);
+      expect(existsSync(home1)).toBe(false);
+
+      const home2 = freshHome();
+      const viaFlag = await run(home2, explicit(OTHER), stubFetch(testnet()));
+      expect(viaFlag.code).toBe(1);
+      expect(viaFlag.err).toContain(`hub ${OTHER} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(viaFlag.calls).toEqual([]);
+      expect(existsSync(home2)).toBe(false);
+
+      const badRules = await run(freshHome(), explicit(PINNED_HUB, OTHER), stubFetch(testnet()));
+      expect(badRules.code).toBe(1);
+      expect(badRules.err).toContain(`rules ${OTHER} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
+    });
+
+    it("init on 5042002 accepts the pinned hub, rules and USDC (any case)", async () => {
+      const home = freshHome();
+      const r = await run(home, explicit(PINNED_HUB.toLowerCase(), PINNED_RULES.toUpperCase().replace("0X", "0x")), stubFetch(testnet()));
+      expect(r.code, r.err).toBe(0);
+      expect(r.err).not.toMatch(/WARNING|refusing/);
+      expect(loadConfig(home)).toMatchObject({ chainId: 5042002, usdc: ARC_USDC });
     });
   });
 

@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CHAIN_PROFILES, WEI_PER_USDC_UNIT, chainProfile, weiToUsdc6Down, weiToUsdc6Up, type ChainProfile } from "../src/chains.js";
-import { pinnedDeploymentRefusals, type KnownDeployment } from "../src/config.js";
+import { KNOWN_DEPLOYMENTS, pinnedDeploymentRefusals, type KnownDeployment } from "../src/config.js";
 
 const ARC_USDC = "0x3600000000000000000000000000000000000000";
 
@@ -92,5 +94,20 @@ describe("Plan 6 (spec §2.5, Review Focus 3): pinnedDeploymentRefusals", () => 
     expect(pinnedDeploymentRefusals(31337, { hub: HUB, rules: RULES, usdc: OTHER }, { profiles, table: {} })).toEqual([
       `usdc ${OTHER} is not Local's USDC ${HUB}`,
     ]);
+  });
+});
+
+describe("Plan 6 Task 5: the pinned Arc deployments match contracts/deployments/<chainId>.json", () => {
+  it("KNOWN_DEPLOYMENTS[5042002] is the committed testnet deployment, with the profile's USDC", () => {
+    const file = join(import.meta.dirname, "../../../contracts/deployments/5042002.json");
+    const deployed = JSON.parse(readFileSync(file, "utf8")) as { channelHub: string; chessRules: string; token: string };
+    const pinned = KNOWN_DEPLOYMENTS[5042002];
+    expect(pinned.name).toBe(chainProfile(5042002)!.name);
+    expect(pinned.hub).toBe(deployed.channelHub);
+    expect(pinned.rules).toBe(deployed.chessRules);
+    expect(pinned.usdc).toBe(deployed.token);
+    expect(pinned.usdc).toBe(chainProfile(5042002)!.usdc);
+    // A pinned deployment refuses nothing of its own.
+    expect(pinnedDeploymentRefusals(5042002, { hub: deployed.channelHub as `0x${string}`, rules: deployed.chessRules as `0x${string}`, usdc: ARC_USDC })).toEqual([]);
   });
 });

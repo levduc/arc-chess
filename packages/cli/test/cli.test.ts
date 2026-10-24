@@ -6,7 +6,7 @@ import { offerId as computeOfferId, signOffer, toWire, type Offer } from "@arena
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
-import { arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
+import { KNOWN_DEPLOYMENTS, arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
 import { computeFundingNeed, fundMessage } from "../src/funding.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = [], opts: { chainId?: number } = {}) {
@@ -707,14 +707,22 @@ describe("Plan 5.6 Task 2: arena wallet --wait-for-usdc / --wait-for-native", ()
 
 const ARC_USDC = "0x3600000000000000000000000000000000000000";
 
+/** Plan 6 Task 5: an Arc chain's hub and rules for an explicit-flag init -- its pinned deployment once there is one
+ *  (`init` refuses any other), else placeholders. `io()` answers that every address holds code. */
+function arcContracts(chainId: number): { hub: string; rules: string } {
+  const pinned = Object.hasOwn(KNOWN_DEPLOYMENTS, chainId) ? KNOWN_DEPLOYMENTS[chainId] : undefined;
+  return { hub: pinned?.hub ?? "0x000000000000000000000000000000000000beef", rules: pinned?.rules ?? "0x00000000000000000000000000000000000000e5" };
+}
+
 /** An Arc home (chain `chainId`, its profile's USDC), written by an explicit-flag init: no /templates, and only the
  *  chain-id and code checks over the RPC, which `io()` answers. */
 async function initArcHome(chainId = 5042002) {
   const home = mkdtempSync(join(tmpdir(), "arena-cli-arc-"));
+  const { hub, rules } = arcContracts(chainId);
   const args = [
     "init", "--rpc", "http://arc-rpc.test", "--chain-id", String(chainId),
-    "--hub", "0x000000000000000000000000000000000000beef", "--usdc", ARC_USDC,
-    "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
+    "--hub", hub, "--usdc", ARC_USDC,
+    "--rules", rules, "--server", "http://127.0.0.1:3000", "--port", "7010",
     "--session-gas-wei", "10000000000000000", // 1e16 wei = 0.01 USDC
     // Fix round 1 (m-3): explicit, so the pinned amounts below do not move with the profile's default ceiling
     // (Task 2). 500,000 x 40 gwei = 0.02 USDC.
@@ -891,10 +899,11 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     const initWithOwner = async (chainId: number) => {
       const home = mkdtempSync(join(tmpdir(), "arena-cli-arc-owner-"));
       const t = io(home, [], { chainId });
+      const { hub, rules } = arcContracts(chainId);
       const args = [
         "init", "--rpc", "http://arc-rpc.test", "--chain-id", String(chainId),
-        "--hub", "0x000000000000000000000000000000000000beef", "--usdc", ARC_USDC,
-        "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
+        "--hub", hub, "--usdc", ARC_USDC,
+        "--rules", rules, "--server", "http://127.0.0.1:3000", "--port", "7010",
         "--session-gas-wei", "10000000000000000", "--fee-ceiling-wei", "40000000000", "--owner", OWNER,
       ];
       expect(await runCli(args, t.io), t.err.join("\n")).toBe(0);
