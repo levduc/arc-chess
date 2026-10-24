@@ -34,7 +34,7 @@ import {
   type XmtpConfig,
 } from "./config.js";
 import { chainProfile, weiToUsdc6Down } from "./chains.js";
-import { DETACH_WAIT_DEFAULT_S, startDetachedDaemon } from "./detach.js";
+import { DETACH_WAIT_DEFAULT_S, STOP_WAIT_DEFAULT_S, startDetachedDaemon, stopDaemon } from "./detach.js";
 import {
   computeFundingNeed,
   computeOneBalanceFundingNeed,
@@ -100,6 +100,12 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            (--timeout, default ${DETACH_WAIT_DEFAULT_S} s), then prints {detached, pid, api, log} and exits 0. Refused
            while a daemon already runs on this home; exit 1, with the log's last lines, if it does not come up --
            one still starting is then stopped.)
+  daemon stop [--timeout SECONDS] [--yes-i-understand]
+          (stops this home's running daemon with SIGTERM, a clean shutdown, and waits until it has exited (default
+           ${STOP_WAIT_DEFAULT_S} s); prints {stopped, pid}. The pid comes from daemon.lock and is signalled only if that process
+           started before the lock was written (never a reused pid) and is "daemon" itself, not "bot" or a withdraw.
+           Refused while a channel is Open or Challenged (or not read yet) -- with no daemon nothing answers a
+           challenge -- unless --yes-i-understand.)
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed;
            on a chain whose gas is USDC, such as Arc, one balance: {address, chainId, usdc}, and no --wait-for-native)
@@ -591,6 +597,7 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
     else if (a === "--no-faucet") flags.set("no-faucet", true);
     else if (a === "--allow-real-chain") flags.set("allow-real-chain", true);
     else if (a === "--detach") flags.set("detach", true);
+    else if (a === "--yes-i-understand") flags.set("yes-i-understand", true);
     // Plan 5.6 Task 3 (fix round 1, M5): `--all` is a boolean for every command, not only `withdraw` -- a future
     // command that wants `--all <value>` must special-case it here, or it will silently get `true`.
     else if (a === "--all") flags.set("all", true);
@@ -983,15 +990,31 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     }
 
     if (cmd === "daemon") {
-      if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
-      // Plan 6 hardening H4 (live run friction 4): a daemon that outlives the agent's tool session -- see
-      // startDetachedDaemon. The child it starts is this same branch without --detach.
-      if (flags.has("detach")) {
-        const waitRaw = flag("timeout") ?? String(DETACH_WAIT_DEFAULT_S);
+      if (arg !== undefined && arg !== "start" && arg !== "stop") throw new UsageError(`unknown daemon subcommand ${arg}`);
+      const waitMs = (def: number) => {
+        const waitRaw = flag("timeout") ?? String(def);
         if (!/^[0-9]+$/.test(waitRaw) || Number(waitRaw) < 1 || Number(waitRaw) > 600) {
           throw new UsageError("--timeout must be a whole number of seconds from 1 to 600");
         }
-        const started = await startDetachedDaemon(home, { env: io.env, fetch: io.fetch, waitMs: Number(waitRaw) * 1000, command: CLI_COMMAND });
+        return Number(waitRaw) * 1000;
+      };
+      // H4 add-on: the way to stop a detached daemon -- see stopDaemon.
+      if (arg === "stop") {
+        if (flags.has("detach")) throw new UsageError("daemon stop takes no --detach");
+        const stopped = await stopDaemon(home, {
+          fetch: io.fetch,
+          waitMs: waitMs(STOP_WAIT_DEFAULT_S),
+          command: CLI_COMMAND,
+          override: flags.has("yes-i-understand"),
+          warn: io.err,
+        });
+        io.out(JSON.stringify(stopped));
+        return 0;
+      }
+      // Plan 6 hardening H4 (live run friction 4): a daemon that outlives the agent's tool session -- see
+      // startDetachedDaemon. The child it starts is this same branch without --detach.
+      if (flags.has("detach")) {
+        const started = await startDetachedDaemon(home, { env: io.env, fetch: io.fetch, waitMs: waitMs(DETACH_WAIT_DEFAULT_S), command: CLI_COMMAND });
         io.out(JSON.stringify(started));
         return 0;
       }
