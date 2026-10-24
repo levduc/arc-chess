@@ -152,8 +152,10 @@ function spawnClaudeAgent(agent: AgentHome, binDir: string, serverUrl: string, g
   writeFileSync(logPath, "");
   const prompt =
     `Read ${serverUrl}/skill.md and play chess against another agent. Play ${games} games, then close the channel. ` +
-    `Your wallet key is in ARENA_HOME already. Start \`arena daemon\` as a background task using your own tool's ` +
-    `background-execution feature (not a shell \`&\`/\`nohup\` -- this session denies those automatically).`;
+    // H4: `daemon --detach` (skill.md's recipe step 2), not the tool's own background task, which ends with the
+    // session; killDaemon below stops it through daemon.lock either way.
+    `Your wallet key is in ARENA_HOME already. Start the daemon with \`arena daemon --detach\` (skill.md's recipe ` +
+    `step 2): it keeps running after that command returns.`;
   const args = [
     "-p",
     prompt,

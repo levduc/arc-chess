@@ -306,7 +306,8 @@ async function main(): Promise<void> {
     if (watchTimer !== undefined) clearInterval(watchTimer);
     // One last pass: an agent that relays its ask and then ends its turn must still be paid.
     if (watcher !== undefined) await watcher.poll();
-    // M7: the agent's own daemon (nohup'd per skill.md's recipe step 3) otherwise outlives this script --
+    // M7: the agent's own daemon (started with `daemon --detach`, per skill.md's recipe step 2, so it outlives the
+    // session by design, unless the agent ran `daemon stop` at the end of the recipe) otherwise outlives this script --
     // holding funds in any open channel, and the next dev-up run wipes its home out from underneath it. Read
     // the pid this specific ARENA_HOME's lock names, and stop only that, only if it is still alive and still
     // looks like an arena daemon (not some unrelated process that has since reused the same pid).
