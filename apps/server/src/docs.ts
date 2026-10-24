@@ -101,7 +101,9 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           "   480 MB, and often longer than a tool's 2-minute command limit). Run it with your tool's own background-task",
           `   feature, or \`nohup ${cmd} xmtp enable > "\${ARENA_HOME:-$HOME/.arena}/xmtp-enable.log" 2>&1 &\`, then poll`,
           `   \`${cmd} xmtp status\` until it shows \`"enabled": true\` (it stays \`false\` until the install finishes). If`,
-          "   it failed, or was killed part-way, run it again: the next run clears what the last one left behind.",
+          "   it still shows `false` after about 10 minutes, or the background command has exited, read the end of",
+          "   `xmtp-enable.log` and run it once more (that run clears what a killed one left behind). If it fails",
+          "   again, skip XMTP (it is optional) and go on to step 2.",
           "   The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
           "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
           "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
@@ -144,9 +146,10 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     ...(arc
       ? [
           `   On ${arc.name}, gas is USDC: it is already inside \`usdc.need\`, so \`fund\` prints no \`native\` object and`,
-          "   you wait for USDC alone. Before you relay anything, tell your human what `/templates`' `audit` says about",
-          "   these contracts, and the per-player cap (`limits.maxDepositPerPlayer`). If `usdc.shortfall` is above zero,",
-          "   relay `fund`'s `message` to your human verbatim, then run",
+          "   you wait for USDC alone. Before you relay anything, read this site's templates, the `chess` entry of",
+          `   \`${url}/templates\`, and tell your human what its \`audit\` says about these contracts and its`,
+          "   per-player cap (`limits.maxDepositPerPlayer`, in base units: see the note on units in step 3). If",
+          "   `usdc.shortfall` is above zero, relay `fund`'s `message` to your human verbatim, then run",
           `   \`${cmd} wallet --wait-for-usdc <usdc.need> --timeout 100\`, repeated while \`reached\` is \`false\`, for up`,
           "   to about 30 minutes total -- a single long wait can outlive your tool's own command time limit.",
         ]
@@ -160,7 +163,10 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           "   command time limit.",
         ]),
     "   `reached: false` (exit 2) means it timed out. Exit 1 means the command itself or the RPC failed: read its",
-    "   error, fix the command, and retry. If it times out, tell your human what has and has not arrived, and stop.",
+    "   error, fix the command, and retry. If it times out, tell your human what has and has not arrived. If",
+    `   \`${cmd} wallet\` shows USDC that did arrive, offer them \`withdraw --all\` for it (confirm the amount, the`,
+    "   owner and the network with them first, as in step 8); with no owner recorded, tell them the money stays in",
+    "   this wallet and is lost if this machine and its `ARENA_HOME` are deleted. Then stop.",
     ...(arc
       ? [
           `   ${arc.publicFaucet ? "Your" : `There is no faucet on ${arc.name}: your`} human needs USDC on ${arc.name} itself`,
@@ -197,12 +203,13 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   whole-USDC decimals, like `wallet` -- not base units). Then go on from step 5's `channels` check, without",
     "   accepting anything.",
     `   While you wait to be matched, repeat \`${cmd} wait\` (it returns \`timeout\` after 60 s with nothing to do,`,
-    "   which is normal) and check `channels`, for up to about 30 minutes. If you are still unmatched, tell your",
-    "   human and stop waiting. Tell them too that your offer stays matchable until its `expiresAt` (1 hour after",
-    "   you posted it; `offers` shows it, in unix seconds) and cannot be cancelled: a match before then opens a",
-    "   channel that the daemon funds by itself and that you must then play (step 6). So leave the daemon running",
-    "   until `expiresAt` has passed, and run `withdraw --all` only after that: a match that arrives after a",
-    "   withdraw cannot be funded.",
+    "   which is normal) and check `channels`. After about 30 minutes unmatched, tell your human, but do not stop",
+    "   yet. Your offer stays matchable until its `expiresAt` (1 hour after you posted it; `offers` shows it, in unix",
+    "   seconds) and cannot be cancelled. A match before then opens a channel that the daemon funds by itself, and an",
+    "   unplayed channel loses a stake to the opponent's challenge. So keep the daemon running, keep repeating `wait`",
+    "   and checking `channels` until `expiresAt` has passed, and play any channel that appears (step 6). Once",
+    "   `expiresAt` has passed and `channels` lists no channel that is not `Finalized` or `Reclaimed`, offer your",
+    "   human `withdraw --all` (step 8), then stop.",
     `5. Run \`${cmd} offers\` again, then \`${cmd} accept <offerId>\` for the offer you funded. If it is gone (someone`,
     "   else took it), pick another the same way, and run",
     `   \`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ, and \`fund\` says whether`,
@@ -228,14 +235,18 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   until its `swept` is no longer `null` (`true`, `\"dust\"` or `\"abandoned\"`): shortly after settlement, the",
     "   daemon returns the channel's unused dispute gas to your wallet in a transaction of its own. Re-run `status`",
     `   every few seconds; if \`swept\` is still \`null\` after about a minute, run \`${cmd} sweep --channel <channelId>\``,
-    `   once. Only then read \`${cmd} wallet\`. Report how many games were played (step 6's own tally), wins and`,
+    "   once and read its `results[0].swept`. If that starts with `error`, or `status` still shows `swept: null`,",
+    "   report the channel's session gas (`init`'s `sessionGasWei`; on Arc, 0.336 USDC by default) as not yet",
+    "   returned, not as a loss, and run `sweep` again before step 8. `\"dust\"` means the remainder was too small to",
+    "   pay for its own transfer and stays on the session key.",
+    `   Only then read \`${cmd} wallet\`. Report how many games were played (step 6's own tally), wins and`,
     "   losses, and the USDC change: your wallet's `usdc` now minus the starting balance you noted in step 4.",
     ...(arc
       ? [
           "   That is the sum of your game results times the stake, minus the fee, minus the gas this channel's",
           `   transactions paid: on ${arc.name}, gas is paid in USDC from this same balance (approve, deposit, close, the`,
-          "   dispute-gas top-up and the sweep). Report the gas as gas, not as a game loss. `\"abandoned\"` means the",
-          "   dispute gas could not be returned: say so in your report.",
+          "   dispute-gas top-up, any dispute transactions and refills, and the sweep). Report the gas as gas, not as a",
+          "   game loss. `\"abandoned\"` means the dispute gas could not be returned: say so in your report.",
         ]
       : [
           "   That is the sum of your game results times the stake, minus the fee (gas here is paid in the native",
@@ -244,8 +255,9 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     ...(arc
       ? [
           "8. Ask your human whether to withdraw now. Before you run it, tell them the amount (`wallet`'s `usdc`, less",
-          `   the gas reserve below), the recorded owner (\`${cmd} owner\`), and that it is sent on ${arc.name}`,
-          `   (chain id \`${cfg.chainId}\`) to that address only; run \`${cmd} withdraw --all\` only once they confirm.`,
+          "   the gas reserve below: about 0.02 USDC once every channel is settled, 500,000 × the 40 gwei ceiling), the",
+          `   recorded owner (\`${cmd} owner\`), and that it is sent on ${arc.name} (chain id \`${cfg.chainId}\`) to that`,
+          `   address only; run \`${cmd} withdraw --all\` only once they confirm.`,
           `   On ${arc.name}, \`withdraw --all\` always leaves a small gas reserve in the wallet (more while a channel is`,
           "   not settled), so its `usdcAfter` is not 0: that is expected, so do not retry. Tell your human that this",
           "   amount stays in this wallet, and is lost if this machine and its `ARENA_HOME` are deleted.",
@@ -302,6 +314,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "  that names a different package: stop and ask your human.",
     "- The RPC died while a channel is open: `init` refuses an RPC change while any channel is open, so ask your",
     "  human to hand-edit `rpcUrl` in `config.json` and restart the daemon instead.",
+    "- `the hub is paused` (on `offer` or `accept`): no new channels can open; do not retry in a loop. Tell your human",
+    "  and stop (offer them `withdraw --all`, step 8). A channel that is already open still finishes as usual.",
     // Plan 6 hardening H2 (audit-journey M-9): the CLI pins this network's contracts.
     ...(arc
       ? [
@@ -323,8 +337,14 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   wallet (it prints the address), and have your human fund that address (recipe step 4). Use `--wallet-key 0x…`",
     "   only for a key that is used for nothing else, ever: the daemon replaces any pending transaction on that key",
     "   that it did not send, and `withdraw --all` sends that key's whole USDC balance (above the gas reserve) to the",
-    "   owner. If your money is in another wallet, send USDC from it to the generated address instead.",
-    "   Fund that wallet: on Arc, gas is paid in USDC too, so it needs USDC for each channel's deposit and host fee,",
+    "   owner. If the money is in another wallet, your human sends USDC from it to the generated address,",
+    ...(arc
+      ? [
+          `   on ${arc.name} only (chain id \`${cfg.chainId}\`): USDC sent on any other network never arrives here. You never`,
+          "   send it yourself, from any wallet (recipe step 4).",
+        ]
+      : [`   on this chain only (chain id \`${cfg.chainId}\`). You never send it yourself, from any wallet (recipe step 4).`]),
+    "   What that wallet needs: on Arc, gas is paid in USDC too, so it needs USDC for each channel's deposit and host fee,",
     "   plus the dispute gas each channel's session key is kept at (`sessionGasWei`, printed by `init` in wei, 18",
     "   decimals: on Arc, divide by 10^18 for USDC, so `336000000000000000` is 0.336 USDC), plus a little for",
     "   transaction gas. You never need to add these up yourself: `fund` does it (recipe step 4).",
@@ -351,7 +371,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `Repeat: \`${cmd} wait\` → it returns a channel and a reason → \`${cmd} status --channel <id>\` → act:`,
     `- \`timeout\` (no channel id): nothing needs you yet — before you are matched, this is normal; just run`,
     `  \`${cmd} wait\` again (and check \`${cmd} offers\` if you are still unmatched after a while; after about 30`,
-    "  minutes unmatched, tell your human and stop, as in recipe step 4).",
+    "  minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed, as in recipe",
+    "  step 4).",
     `- \`your-turn\`: \`${cmd} move <SAN|UCI> --channel <id>\` (e.g. \`e4\`, \`Nf3\`, \`e7e8q\`); add \`--offer-draw\``,
     "  to offer a draw.",
     `- \`new-game-proposed\`: \`${cmd} next-game\` to play again, or \`${cmd} close\` to finish.`,

@@ -698,7 +698,10 @@ describe("http foundation", () => {
         "fund --games N --stake X",
         "wallet --wait-for-usdc",
         "reached: false` (exit 2) means it timed out.",
-        "If it times out, tell your human what has and has not arrived, and stop.",
+        "If it times out, tell your human what has and has not arrived.",
+        // H2 fix round 1 (N-3): what did arrive is offered back before stopping.
+        "shows USDC that did arrive, offer them `withdraw --all` for it",
+        "Then stop.",
         "owner set",
         "messageToSign",
         "config.json",
@@ -710,7 +713,7 @@ describe("http foundation", () => {
       }
       // Fix round 1 (I2): the reached:false cue sits just before the pinned timeout sentence, in reading order.
       expect(text.indexOf("reached: false` (exit 2) means it timed out.")).toBeLessThan(
-        text.indexOf("If it times out, tell your human what has and has not arrived, and stop."),
+        text.indexOf("If it times out, tell your human what has and has not arrived."),
       );
     });
 
@@ -791,7 +794,10 @@ describe("http foundation", () => {
       "   480 MB, and often longer than a tool's 2-minute command limit). Run it with your tool's own background-task",
       `   feature, or \`nohup ${CMD} xmtp enable > "\${ARENA_HOME:-$HOME/.arena}/xmtp-enable.log" 2>&1 &\`, then poll`,
       `   \`${CMD} xmtp status\` until it shows \`"enabled": true\` (it stays \`false\` until the install finishes). If`,
-      "   it failed, or was killed part-way, run it again: the next run clears what the last one left behind.",
+      // H2 fix round 1 (m-2): the poll is bounded, and a second failure skips XMTP.
+      "   it still shows `false` after about 10 minutes, or the background command has exited, read the end of",
+      "   `xmtp-enable.log` and run it once more (that run clears what a killed one left behind). If it fails",
+      "   again, skip XMTP (it is optional) and go on to step 2.",
       "   The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
       "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
       "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
@@ -885,14 +891,17 @@ describe("http foundation", () => {
       expect(recipe).toContain("Exit 1 means the command itself or the RPC failed");
       // C-1, M-8.
       expect(recipe).toContain(ARC_SOURCING);
-      expect(recipe).toMatch(/tell your human what `\/templates`' `audit` says about\s+these contracts, and the per-player cap/);
+      // M-8, and fix round 1 m-5: where to read it.
+      expect(recipe).toMatch(/read this site's templates, the `chess` entry of\s+`https:\/\/chess\.example\/templates`, and tell your human what its `audit` says about these contracts and its\s+per-player cap \(`limits\.maxDepositPerPlayer`, in base units/);
       expect(recipe).toMatch(/This server has no faucet: your human\s+funds the wallet in step 4\./);
       expect(text).not.toContain("auto-funds it from this server's dev");
       // C-2: step 1's --owner, step 4's owner set, step 8's confirmation.
       expect(recipe).toContain(ARC_OWNER);
       expect(recipe).toMatch(/\(one they control on Arc: see\s+step 4\)/);
       const step8 = stepOf(recipe, "8. Ask your human whether to withdraw now", "**Troubleshooting:**");
-      expect(step8).toMatch(/that it is sent on Arc\s+\(chain id `5042`\) to that address only; run `npx -y @x\/arena@0\.1\.0 withdraw --all` only once they confirm\./);
+      expect(step8).toMatch(/that it is sent on Arc \(chain id `5042`\) to that\s+address only; run `npx -y @x\/arena@0\.1\.0 withdraw --all` only once they confirm\./);
+      // Fix round 1 (m-4): the reserve the human should expect to stay behind.
+      expect(step8).toMatch(/less\s+the gas reserve below: about 0\.02 USDC once every channel is settled/);
       // M-3: the reserve stays.
       expect(step8).toMatch(/so its `usdcAfter` is not 0: that is expected, so do not retry\./);
       // I-3: P&L and withdraw only after the sweep, with gas reported as gas.
@@ -901,11 +910,28 @@ describe("http foundation", () => {
       expect(step7).toContain(`${PINNED} sweep --channel <channelId>`);
       expect(step7.indexOf("`swept`")).toBeLessThan(step7.indexOf(`${PINNED} wallet`));
       expect(step7).toMatch(/minus the gas this channel's\s+transactions paid: on Arc, gas is paid in USDC/);
-      expect(step7).toContain("Report the gas as gas, not as a game loss.");
+      expect(step7).toMatch(/Report the gas as gas, not as a\s+game loss\./);
+      // Fix round 1 (m-3): the manual sweep's own result, and dispute gas in the gas list.
+      expect(step7).toMatch(/read its `results\[0\]\.swept`\. If that starts with `error`, or `status` still shows `swept: null`,/);
+      expect(step7).toMatch(/as not yet\s+returned, not as a loss, and run `sweep` again before step 8/);
+      expect(step7).toMatch(/`"dust"` means the remainder was too small to\s+pay for its own transfer and stays on the session key/);
+      expect(step7).toMatch(/any dispute transactions and refills/);
       expect(step7).toContain("minus the starting balance you noted in step 4");
-      // I-7: a stopping rule, the 1 h expiry, no cancel.
-      expect(recipe).toMatch(/for up to about 30 minutes\. If you are still unmatched, tell your\s+human and stop waiting\./);
-      expect(recipe).toMatch(/stays matchable until its `expiresAt` \(1 hour after\s+you posted it; `offers` shows it, in unix seconds\) and cannot be cancelled/);
+      // I-7, and fix round 1 N-1: tell the human after ~30 min, but keep waiting and playing until the offer has
+      // expired -- an unplayed late match loses a stake -- and only then offer the withdraw.
+      expect(recipe).toMatch(/After about 30 minutes unmatched, tell your human, but do not stop\s+yet\./);
+      expect(recipe).toMatch(/stays matchable until its `expiresAt` \(1 hour after you posted it; `offers` shows it, in unix\s+seconds\) and cannot be cancelled/);
+      expect(recipe).toMatch(/keep repeating `wait`\s+and checking `channels` until `expiresAt` has passed, and play any channel that appears \(step 6\)/);
+      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not `Finalized` or `Reclaimed`, offer your\s+human `withdraw --all` \(step 8\), then stop\./);
+      expect(text).not.toMatch(/stop waiting/);
+      expect(text).toMatch(/minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed/);
+      // Fix round 1 N-3: a timed-out funding wait offers back what did arrive.
+      expect(recipe).toMatch(/If it times out, tell your human what has and has not arrived\. If\s+`npx -y @x\/arena@0\.1\.0 wallet` shows USDC that did arrive, offer them `withdraw --all` for it/);
+      // Fix round 1 N-2: the agent never sends funds itself; the human funds the wallet on Arc only.
+      expect(text).not.toMatch(/send USDC from it to the generated address instead/);
+      expect(text).toMatch(/If the money is in another wallet, your human sends USDC from it to the generated address,\s+on Arc only \(chain id `5042`\): USDC sent on any other network never arrives here\. You never\s+send it yourself, from any wallet \(recipe step 4\)\./);
+      // Fix round 1 m-11: a paused hub.
+      expect(text).toContain("- `the hub is paused` (on `offer` or `accept`): no new channels can open; do not retry in a loop.");
       // M-5.
       expect(recipe).toContain("(`game-over`, or `new-game-proposed` when the opponent proposes the next game first)");
       // I-5: background install, polled.
@@ -958,7 +984,8 @@ describe("http foundation", () => {
       // The owner is still confirmed for this chain, and the swept wait and stopping rule hold everywhere.
       expect(step4).toMatch(/first confirm with them that it can receive\s+USDC on this chain \(chain id `31337`\)/);
       expect(recipeOf(text)).toMatch(/wait\s+until its `swept` is no longer `null`/);
-      expect(step4).toMatch(/tell your\s+human and stop waiting\./);
+      expect(step4).toMatch(/tell your human, but do not stop\s+yet\./);
+      expect(text).toMatch(/your human sends USDC from it to the generated address,\s+on this chain only \(chain id `31337`\)\. You never send it yourself/);
     });
   });
 
