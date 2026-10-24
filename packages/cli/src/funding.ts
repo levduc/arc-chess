@@ -1,5 +1,5 @@
 import type { Address } from "viem";
-import { weiToUsdc6Down, weiToUsdc6Up } from "./chains.js";
+import { chainProfile, weiToUsdc6Down, weiToUsdc6Up } from "./chains.js";
 
 /** Plan 5.6 Task 2 (spec §4.1): one channel's dispute-gas reserve plus the gas of the approve/deposit/close
  *  transactions a fund-then-play run makes -- the unit `native.need` is budgeted in, alongside the session key's
@@ -131,9 +131,30 @@ export function formatNativeCeil4(wei: bigint): string {
   return `${whole}.${fracStr}`;
 }
 
+/** Plan 6 hardening H2 (audit-journey C-1): how a human gets USDC onto each built-in network, from
+ *  `docs/superpowers/arc-facts.md`. Mainnet has no faucet; testnet has only Circle's. A profile chain missing here
+ *  still gets the wrong-network warning, just no route. */
+const USDC_ROUTES: Record<number, string> = {
+  5042: "To get USDC onto Arc, use Circle's CCTP bridge from another chain, or an exchange or wallet that supports Arc.",
+  5042002: "Arc Testnet's USDC comes from Circle's faucet (https://faucet.circle.com).",
+};
+
+/** Plan 6 hardening H2 (audit-journey C-2): the cash-out address a human must give on a chain with a built-in profile
+ *  -- one they control on that network. `withdraw` pays it there only, in one irreversible transfer: an exchange
+ *  deposit address that does not credit that network, or a smart wallet deployed only on another chain, loses it. */
+export function ownerAddressAsk(networkName: string): string {
+  return (
+    `an address you control on ${networkName} to return winnings to (not an exchange deposit address unless that ` +
+    `exchange supports USDC deposits on ${networkName}, and not a smart wallet deployed only on another chain)`
+  );
+}
+
 /** Plan 5.6 Task 2 (spec §4.1, Review Focus 1): the exact, ready-to-relay sentence `arena fund` prints. Every
  *  variant is pinned character for character in `funding.test.ts` -- a human sends the wrong amount, chain or
- *  token if this is ever ambiguous. Uses the **shortfall** (what is actually missing), not the full need. */
+ *  token if this is ever ambiguous. Uses the **shortfall** (what is actually missing), not the full need.
+ *  Plan 6 hardening H2 (audit-journey C-1, C-2): on a chain with a built-in profile (Arc), the message names the
+ *  network, warns that USDC sent on any other network never arrives, says how to get USDC onto it, and asks for an
+ *  owner address the human controls on it. Every other chain keeps the text it had, byte for byte. */
 export function fundMessage(
   n: FundingNeed | OneBalanceFundingNeed,
   ctx: { address: Address; chainId: number; ownerSet: boolean; games: bigint; stake: bigint },
@@ -141,17 +162,29 @@ export function fundMessage(
   const usdcShort = n.usdc.shortfall > 0n;
   // Plan 6: a one-balance need has no `native`: the sentence then names USDC only.
   const nativeShort = "native" in n && n.native.shortfall > 0n;
+  const profile = chainProfile(ctx.chainId);
   let body: string;
   if (usdcShort || nativeShort) {
     const parts: string[] = [];
     if (usdcShort) parts.push(`${formatUsdc6(n.usdc.shortfall)} USDC`);
     if (nativeShort && "native" in n) parts.push(`${formatNativeCeil4(n.native.shortfall)} native gas`);
-    body = `Please send ${parts.join(" and ")} to ${ctx.address} on chain ${ctx.chainId}.`;
+    if (profile === undefined) {
+      body = `Please send ${parts.join(" and ")} to ${ctx.address} on chain ${ctx.chainId}.`;
+    } else {
+      const name = profile.name;
+      const route = USDC_ROUTES[ctx.chainId];
+      body =
+        `Please send ${parts.join(" and ")} to ${ctx.address} on ${name} (chain id ${ctx.chainId}), on the ${name} network ` +
+        "only: USDC sent on Ethereum, Base or any other network will not arrive." +
+        (route !== undefined ? ` ${route}` : "") +
+        (profile.nativeIsUsdc ? ` Gas on ${name} is paid in USDC, so nothing else is needed.` : "");
+    }
   } else {
     body = `This wallet already holds enough to play ${ctx.games} games at ${formatUsdc6(ctx.stake)} USDC.`;
   }
   if (!ctx.ownerSet) {
-    body += usdcShort || nativeShort ? " Also tell me the address to return winnings to." : " Tell me the address to return winnings to.";
+    const what = profile === undefined ? "the address to return winnings to" : ownerAddressAsk(profile.name);
+    body += usdcShort || nativeShort ? ` Also tell me ${what}.` : ` Tell me ${what}.`;
   }
   return body;
 }

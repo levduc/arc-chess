@@ -41,7 +41,16 @@ import {
   type OneBalanceFundingNeed,
 } from "./funding.js";
 import { readJson } from "./jsonfile.js";
-import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecordedOwner, setOwner, UsageError } from "./owner.js";
+import {
+  classifyOwner,
+  forbiddenOwners,
+  noOwnerMessage,
+  ownerNetworkNote,
+  ownerNonceOf,
+  readRecordedOwner,
+  setOwner,
+  UsageError,
+} from "./owner.js";
 import { RecordStore } from "./records.js";
 import { startDaemonProcess } from "./run.js";
 import { cliPackage, cliVersion, hostCliVerdict, selfCommand } from "./version.js";
@@ -65,7 +74,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
        [--owner ADDR] [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
        [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false] [--no-faucet]
        (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel;
-        on Arc, 4 x 2.1M gas x 40 gwei = 0.336 USDC)
+        on Arc, 4 x 2.1M gas x Arc's 40 gwei profile ceiling = 0.336 USDC, regardless of --fee-ceiling-wei: use
+        --session-gas-wei to change it)
        (--fee-ceiling-wei defaults to 100 gwei; on Arc, to 40 gwei, and a value under Arc's 20 gwei fee floor is refused)
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
         agent once max(60 s, challengeTimeout / 3) is left)
@@ -94,7 +104,9 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         longer open exits 1. Every amount, in the output and in errors, is in whole USDC.
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
         Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
-        message is a ready-to-relay sentence. On a chain whose gas is USDC, such as Arc, there is no native:
+        message is a ready-to-relay sentence (on Arc it names the network, warns that USDC sent on any other
+        network never arrives, says how to get USDC onto Arc and, with no owner recorded, asks for an address the
+        human controls on Arc). On a chain whose gas is USDC, such as Arc, there is no native:
         the gas is part of usdc.need, and message asks for USDC only; usdc.need also keeps one session gas for
         each channel of this home that is not finalized, shown as usdc.reserved. faucet is present only when a
         faucet call was attempted: on success it is {usdc, native} (the wallet's new balances, formatted like
@@ -109,7 +121,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            changing it needs the CURRENT owner's EIP-191 signature: without --signature it prints {messageToSign,
            signer, command} and exits 1. The signature is checked locally (ECDSA, never through the RPC), so a
            smart-contract owner cannot be changed here -- only by hand-editing config.json. Never the wallet, the
-           hub, the USDC token, the rules contract, a session key or the zero address.)
+           hub, the USDC token, the rules contract, a session key or the zero address. On Arc, it must be an
+           address the human controls on Arc -- withdraw pays it there only -- and stderr says so.)
   withdraw --amount A | --all
           (sends USDC from this wallet to the recorded owner -- it takes no destination -- through the daemon:
            started in-process, and stopped again, if none is running. Refused while a channel still awaits this
@@ -117,7 +130,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            only when the receipt shows the USDC Transfer to the owner. Prints {to, amount, txHash, usdcAfter}
            (usdcAfter null, with a note, if the balance cannot be read after it); a note on stderr if this wallet
            still has open offers. On a chain whose gas is USDC, such as Arc, --all keeps a gas reserve for the
-           unsettled channels and the wallet's own transactions, and --amount never dips into it.)
+           unsettled channels and the wallet's own transactions, and --amount never dips into it, so usdcAfter is
+           not 0 after --all.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -126,7 +140,9 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
        (Plan 5.7: the XMTP fallback transport's SDK -- opt-in, never bundled, loaded only once installed.
         enable installs the pinned @xmtp/node-sdk (about 480 MB, one-time) into <ARENA_HOME>/xmtp/sdk and prints
         {enabled, version, sizeMB}; a running daemon loads it only when it starts, so restart the daemon after
-        enabling. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
+        enabling. It often outlasts a 2-minute tool limit: run it in the background and poll status until enabled
+        is true. A run that was killed part-way is safe to repeat, and the next enable removes its leftover
+        <ARENA_HOME>/xmtp/.sdk-tmp-* directory. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
         installing anything: daemon is what the RUNNING daemon loaded ("xmtp" or "off") or "not running".
         disable removes the installed SDK only -- it never touches <ARENA_HOME>/xmtp/db, so a channel's XMTP
         history survives a disable/enable cycle.
@@ -212,6 +228,55 @@ export function resolveNpmBinary(io: CliIo): string {
   const name = process.platform === "win32" ? "npm.cmd" : "npm";
   const candidate = join(dirname(process.execPath), name);
   return existsSync(candidate) ? candidate : "npm";
+}
+
+/** A throwaway SDK install dir's name: `.sdk-tmp-<pid>-<epoch ms>` (see `xmtp enable`). */
+const SDK_TMP_RE = /^\.sdk-tmp-(\d+)-(\d+)$/;
+
+/** Older than this, a throwaway SDK install dir is stale even if its pid is alive again (a reused pid): no real
+ *  install takes this long. */
+const SDK_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** True while `pid` names a live process (EPERM still means alive); false once it is gone. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Plan 6 hardening H2 (audit-journey I-5): removes the `.sdk-tmp-<pid>-<ms>` dirs under `xmtpDir` that an earlier
+ * `xmtp enable` left behind when it was killed part-way -- by an agent tool's command time limit, say. A kill skips
+ * `enable`'s own cleanup, so each one can leave up to ~480 MB on disk. A dir whose pid is still alive (another
+ * `enable` in progress) is left alone unless it is over a day old. Returns the names it removed; never throws -- a
+ * dir it cannot read or remove is left for the next run. Exported for tests.
+ */
+export function removeStaleSdkTmpDirs(xmtpDir: string, isAlive: (pid: number) => boolean = pidAlive, now = Date.now()): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(xmtpDir);
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const name of names) {
+    const m = SDK_TMP_RE.exec(name);
+    if (m === null) continue;
+    const pid = Number(m[1]);
+    const startedAt = Number(m[2]);
+    if (pid !== process.pid && isAlive(pid) && now - startedAt < SDK_TMP_MAX_AGE_MS) continue;
+    if (pid === process.pid && now - startedAt < SDK_TMP_MAX_AGE_MS) continue;
+    try {
+      rmSync(join(xmtpDir, name), { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+      // left for the next run
+    }
+  }
+  return removed;
 }
 
 /** The total size (bytes) of every regular file under `dir`, recursively. A symlink counts its own link size,
@@ -1264,6 +1329,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (addr === undefined) throw new UsageError("owner set needs an address");
       await setOwner(home, addr, io, CLI_COMMAND, flag("signature"));
       io.out(JSON.stringify({ owner: readRecordedOwner(home) }));
+      // Plan 6 hardening H2 (audit-journey C-2): on Arc, the confirmation says the owner must be an address the human
+      // controls on Arc. On stderr, so stdout stays the same `{owner}` JSON on every chain.
+      const ownerChainId = loadConfig(home).chainId;
+      const ownerProfile = chainProfile(ownerChainId);
+      if (ownerProfile !== undefined) io.err(ownerNetworkNote(ownerProfile.name, ownerChainId));
       return 0;
     }
 
@@ -1485,6 +1555,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         // npm *and* the loader both succeed -- a failed install (npm exits non-zero, or the installed SDK fails
         // to load) then never leaves a half-populated <home>/xmtp/sdk behind; a concurrent `status`, or a retried
         // `enable`, still sees only the last good install (or none at all), never a corrupt partial one.
+        // Plan 6 hardening H2 (audit-journey I-5): a run killed part-way never reached the `catch` below, so its
+        // throwaway dir is cleared here, on the next run.
+        for (const name of removeStaleSdkTmpDirs(xmtpDir)) io.err(`xmtp enable: removed ${name}, left by an earlier run that was stopped part-way`);
         const tmpDir = join(xmtpDir, `.sdk-tmp-${process.pid}-${Date.now()}`);
         mkdirSync(tmpDir, { recursive: true });
         try {

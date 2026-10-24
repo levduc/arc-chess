@@ -754,6 +754,19 @@ function arcIo(
   };
 }
 
+/** Plan 6 hardening H2 (audit-journey C-1, C-2): `fund`'s message on Arc Testnet, as pinned in funding.test.ts. */
+function arcTestnetFundMessage(amount: string, address: string, ownerSet: boolean): string {
+  return (
+    `Please send ${amount} USDC to ${address} on Arc Testnet (chain id 5042002), on the Arc Testnet network only: USDC ` +
+    "sent on Ethereum, Base or any other network will not arrive. Arc Testnet's USDC comes from Circle's faucet " +
+    "(https://faucet.circle.com). Gas on Arc Testnet is paid in USDC, so nothing else is needed." +
+    (ownerSet
+      ? ""
+      : " Also tell me an address you control on Arc Testnet to return winnings to (not an exchange deposit address " +
+        "unless that exchange supports USDC deposits on Arc Testnet, and not a smart wallet deployed only on another chain).")
+  );
+}
+
 describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc chain", () => {
   it("wallet prints {address, chainId, usdc}: the native balance / 10^12, rounded down -- one eth_getBalance, no balanceOf", async () => {
     for (const chainId of [5042, 5042002]) {
@@ -805,9 +818,7 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     expect(printed.feePerPlayer).toBe("0.005000");
     // 3 + 0.005 + ceil((1e16 session gas + 500,000 x 40 gwei) / 10^12) = 3.005 + 0.03; no other channel, nothing reserved
     expect(printed.usdc).toEqual({ have: "0.000000", need: "3.035000", shortfall: "3.035000", reserved: "0.000000" });
-    expect(printed.message).toBe(
-      `Please send 3.035000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`,
-    );
+    expect(printed.message).toBe(arcTestnetFundMessage("3.035000", address, false));
     // The one balance is the native one: no USDC balanceOf (0x70a08231) at all.
     expect(t.rpc.filter((m) => m.startsWith("eth_call 0x70a08231"))).toEqual([]);
     expect(t.rpc.filter((m) => m === "eth_getBalance")).toHaveLength(1);
@@ -816,13 +827,17 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     const part = arcIo(home, { balanceWei: 1_500_000_000_000_000_001n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], part.io)).toBe(0);
     expect(part.json().usdc).toEqual({ have: "1.500000", need: "3.035000", shortfall: "1.535000", reserved: "0.000000" });
-    expect(part.json().message).toBe(`Please send 1.535000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`);
+    expect(part.json().message).toBe(arcTestnetFundMessage("1.535000", address, false));
 
     // Enough: nothing to send.
     const enough = arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], enough.io)).toBe(0);
     expect(enough.json().usdc).toEqual({ have: "3.035000", need: "3.035000", shortfall: "0.000000", reserved: "0.000000" });
-    expect(enough.json().message).toBe("This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me the address to return winnings to.");
+    expect(enough.json().message).toBe(
+      "This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me an address you control on Arc Testnet to " +
+        "return winnings to (not an exchange deposit address unless that exchange supports USDC deposits on Arc Testnet, " +
+        "and not a smart wallet deployed only on another chain).",
+    );
   });
 
   it("fix round 1 (I-5): fund keeps one session gas per unfinalized channel of the home in need, as usdc.reserved; have stays the balance", async () => {
@@ -837,7 +852,31 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     const t = arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io), t.err.join("\n")).toBe(0);
     expect(t.json().usdc).toEqual({ have: "3.035000", need: "3.055000", shortfall: "0.020000", reserved: "0.020000" });
-    expect(t.json().message).toMatch(/^Please send 0\.020000 USDC to 0x[0-9a-fA-F]{40} on chain 5042002\./);
+    expect(t.json().message).toMatch(/^Please send 0\.020000 USDC to 0x[0-9a-fA-F]{40} on Arc Testnet \(chain id 5042002\), on the Arc Testnet network only: /);
+  });
+
+  it("H2 (audit-journey C-2): owner set on Arc says on stderr that the owner must be an address the human controls on Arc; stdout stays {owner}", async () => {
+    const OWNER = "0x00000000000000000000000000000000000000cc";
+    for (const [chainId, name] of [[5042, "Arc"], [5042002, "Arc Testnet"]] as const) {
+      const home = await initArcHome(chainId);
+      const t = arcIo(home, { balanceWei: 0n });
+      expect(await runCli(["owner", "set", OWNER], t.io), t.err.join("\n")).toBe(0);
+      expect(t.out).toHaveLength(1);
+      expect((JSON.parse(t.out[0]) as { owner: string }).owner.toLowerCase()).toBe(OWNER);
+      expect(t.err).toEqual([
+        `owner set: withdraw pays this address on ${name} (chain id ${chainId}) only, in one irreversible transfer. ` +
+          `It must be an address your human controls on ${name}: never an exchange deposit address unless that exchange ` +
+          `supports USDC deposits on ${name}, and never a smart wallet deployed only on another chain. If your human is ` +
+          "not sure, ask them now, before any withdraw.",
+      ]);
+      expect(t.rpc).toEqual([]); // no chain read at all
+    }
+    // A chain without a profile: no note.
+    const dev = await initArcHome(31337);
+    const d = arcIo(dev, { balanceWei: 0n });
+    expect(await runCli(["owner", "set", OWNER], d.io)).toBe(0);
+    expect((JSON.parse(d.out.join("")) as { owner: string }).owner.toLowerCase()).toBe(OWNER);
+    expect(d.err).toEqual([]);
   });
 
   it("fix round 1 (m-6): on a one-balance chain, fund's faucet report is {usdc} only", async () => {

@@ -6,7 +6,7 @@ import type { Address } from "viem";
 import { afterEach, describe, expect, it } from "vitest";
 import { runBot } from "../src/bot.js";
 import type { ArenaDaemon } from "../src/daemon.js";
-import { arenaPaths, loadConfig, resolveNpmBinary, runCli, xmtpBotHint } from "../src/index.js";
+import { arenaPaths, loadConfig, removeStaleSdkTmpDirs, resolveNpmBinary, runCli, xmtpBotHint } from "../src/index.js";
 import { XMTP_SDK_VERSION } from "../src/xmtp/loader.js";
 
 // Plan 5.7 Task 4: `arena xmtp enable|status|disable`, `init`'s xmtp caching, and the house-bot hint.
@@ -244,6 +244,46 @@ describe("arena xmtp enable|status|disable", () => {
     const t2 = io(home, { ARENA_XMTP_NPM: goodScript });
     expect(await runCli(["xmtp", "enable"], t2.io)).toBe(0);
     expect(existsSync(join(home, "xmtp", "sdk", "node_modules", "@xmtp", "node-sdk", "package.json"))).toBe(true);
+  });
+
+  it("Plan 6 H2 (audit-journey I-5): enable removes the .sdk-tmp-* dir a killed earlier run left behind, then installs", async () => {
+    const home = freshDir("arena-xmtp-cli-");
+    const xmtpDir = join(home, "xmtp");
+    // A run killed part-way (a tool's time limit): its pid is gone, and its catch never ran.
+    const stale = `.sdk-tmp-999999999-${Date.now() - 60_000}`;
+    mkdirSync(join(xmtpDir, stale, "node_modules"), { recursive: true });
+    writeFileSync(join(xmtpDir, stale, "node_modules", "partial.bin"), "x".repeat(1024));
+    // The SDK's message history is a sibling and is never touched.
+    mkdirSync(join(xmtpDir, "db"), { recursive: true });
+    writeFileSync(join(xmtpDir, "db", "keep"), "history");
+
+    const npmScript = writeFakeNpm(freshDir("arena-xmtp-npm-"));
+    const t = io(home, { ARENA_XMTP_NPM: npmScript });
+    expect(await runCli(["xmtp", "enable"], t.io), t.err.join("\n")).toBe(0);
+    expect(existsSync(join(xmtpDir, stale))).toBe(false);
+    expect(t.err.join("\n")).toContain(`xmtp enable: removed ${stale}, left by an earlier run that was stopped part-way`);
+    expect(readdirSync(xmtpDir).filter((n) => n.startsWith(".sdk-tmp-"))).toEqual([]);
+    expect(readFileSync(join(xmtpDir, "db", "keep"), "utf8")).toBe("history");
+    expect(existsSync(join(xmtpDir, "sdk", "node_modules", "@xmtp", "node-sdk", "package.json"))).toBe(true);
+  });
+
+  it("Plan 6 H2 (audit-journey I-5): removeStaleSdkTmpDirs keeps a live run's dir, drops a dead or day-old one, ignores other names", () => {
+    const xmtpDir = freshDir("arena-xmtp-tmp-");
+    const now = 1_800_000_000_000;
+    const names = {
+      live: `.sdk-tmp-4242-${now - 5_000}`,
+      dead: `.sdk-tmp-4343-${now - 5_000}`,
+      liveButOld: `.sdk-tmp-4242-${now - 25 * 60 * 60 * 1000}`,
+      mine: `.sdk-tmp-${process.pid}-${now - 1_000}`,
+      other: ".sdk-tmp-notapid",
+      sdk: "sdk",
+    };
+    for (const n of Object.values(names)) mkdirSync(join(xmtpDir, n));
+    const removed = removeStaleSdkTmpDirs(xmtpDir, (pid) => pid === 4242, now);
+    expect(removed.sort()).toEqual([names.dead, names.liveButOld].sort());
+    expect(readdirSync(xmtpDir).sort()).toEqual([names.live, names.mine, names.other, names.sdk].sort());
+    // A missing dir is nothing to clean, never an error.
+    expect(removeStaleSdkTmpDirs(join(xmtpDir, "nope"))).toEqual([]);
   });
 
   it("Fix round 1 (Minor 4): a failed re-install leaves the previous good install untouched", async () => {

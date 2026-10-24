@@ -41,8 +41,23 @@ export type OwnerIo = {
 /** The error `withdraw` gives (CLI and daemon alike) when no owner is recorded. One line, naming `owner set`. */
 export function noOwnerMessage(cmd = "arena"): string {
   return (
-    "no owner is set, so a withdraw has nowhere to go: ask your human for the address to return funds to, then run " +
-    `"${cmd} owner set <address>"`
+    "no owner is set, so a withdraw has nowhere to go: ask your human for an address they control on this wallet's " +
+    `chain to return funds to, then run "${cmd} owner set <address>"`
+  );
+}
+
+/**
+ * Plan 6 hardening H2 (audit-journey C-2): the confirmation `owner set` adds on stderr on a chain with a built-in
+ * profile (Arc). `withdraw` pays the owner there only, in one irreversible transfer, so an exchange deposit address
+ * that does not credit that network, or a smart wallet deployed only on another chain, loses the funds -- and a wrong
+ * owner cannot be undone by the agent.
+ */
+export function ownerNetworkNote(networkName: string, chainId: number): string {
+  return (
+    `owner set: withdraw pays this address on ${networkName} (chain id ${chainId}) only, in one irreversible transfer. ` +
+    `It must be an address your human controls on ${networkName}: never an exchange deposit address unless that ` +
+    `exchange supports USDC deposits on ${networkName}, and never a smart wallet deployed only on another chain. ` +
+    "If your human is not sure, ask them now, before any withdraw."
   );
 }
 

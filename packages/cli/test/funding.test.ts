@@ -190,16 +190,43 @@ describe("computeOneBalanceFundingNeed (nativeIsUsdc)", () => {
     expect(() => computeOneBalanceFundingNeed({ ...ONE, games: 0n })).toThrow(RangeError);
   });
 
-  it("fundMessage names USDC only -- never native gas", () => {
+  // Plan 6 hardening H2 (audit-journey C-1, C-2): pinned character for character. On Arc the message names the network
+  // and its chain id, warns that USDC sent on any other network never arrives, says how to get USDC onto Arc, and
+  // asks for an owner address the human controls on Arc.
+  const ARC_SEND =
+    "Please send 3.065000 USDC to 0x00000000000000000000000000000000000000Aa on Arc (chain id 5042), on the Arc network " +
+    "only: USDC sent on Ethereum, Base or any other network will not arrive. To get USDC onto Arc, use Circle's CCTP " +
+    "bridge from another chain, or an exchange or wallet that supports Arc. Gas on Arc is paid in USDC, so nothing else " +
+    "is needed.";
+  const ARC_OWNER =
+    "an address you control on Arc to return winnings to (not an exchange deposit address unless that exchange " +
+    "supports USDC deposits on Arc, and not a smart wallet deployed only on another chain).";
+
+  it("fundMessage names USDC only -- never native gas -- and, on Arc, the network, the wrong-network warning and the way in", () => {
     const n = computeOneBalanceFundingNeed(ONE);
     const ctx = { address: ADDRESS, chainId: 5042, games: ONE.games, stake: ONE.stake };
-    expect(fundMessage(n, { ...ctx, ownerSet: false })).toBe(
-      "Please send 3.065000 USDC to 0x00000000000000000000000000000000000000Aa on chain 5042. Also tell me the address to return winnings to.",
-    );
-    expect(fundMessage(n, { ...ctx, ownerSet: true })).toBe(
-      "Please send 3.065000 USDC to 0x00000000000000000000000000000000000000Aa on chain 5042.",
-    );
+    expect(fundMessage(n, { ...ctx, ownerSet: false })).toBe(`${ARC_SEND} Also tell me ${ARC_OWNER}`);
+    expect(fundMessage(n, { ...ctx, ownerSet: true })).toBe(ARC_SEND);
     const covered = computeOneBalanceFundingNeed({ ...ONE, balanceWei: 10n * 10n ** 18n }); // 10 USDC
     expect(fundMessage(covered, { ...ctx, ownerSet: true })).toBe("This wallet already holds enough to play 3 games at 1.000000 USDC.");
+    expect(fundMessage(covered, { ...ctx, ownerSet: false })).toBe(
+      `This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me ${ARC_OWNER}`,
+    );
+    // Never "native", never a bare "on chain 5042".
+    for (const m of [fundMessage(n, { ...ctx, ownerSet: false }), fundMessage(covered, { ...ctx, ownerSet: false })]) {
+      expect(m).not.toMatch(/native|on chain 5042/);
+    }
+  });
+
+  it("fundMessage on Arc Testnet names it, and its one way in is Circle's faucet", () => {
+    const n = computeOneBalanceFundingNeed(ONE);
+    expect(fundMessage(n, { address: ADDRESS, chainId: 5042002, ownerSet: false, games: ONE.games, stake: ONE.stake })).toBe(
+      "Please send 3.065000 USDC to 0x00000000000000000000000000000000000000Aa on Arc Testnet (chain id 5042002), on the " +
+        "Arc Testnet network only: USDC sent on Ethereum, Base or any other network will not arrive. Arc Testnet's USDC " +
+        "comes from Circle's faucet (https://faucet.circle.com). Gas on Arc Testnet is paid in USDC, so nothing else is " +
+        "needed. Also tell me an address you control on Arc Testnet to return winnings to (not an exchange deposit " +
+        "address unless that exchange supports USDC deposits on Arc Testnet, and not a smart wallet deployed only on " +
+        "another chain).",
+    );
   });
 });
