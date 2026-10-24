@@ -961,3 +961,76 @@ describe("ChannelSession", () => {
     });
   });
 });
+
+// Plan 6 hardening H1 (audit-contracts I1): the hub checks only the mover's slot of a `hasPrev` proof and re-emits
+// the whole `proof.latest`, so an event's other slot can hold any bytes. A session stores only what it verified.
+describe("H1: ingestOnChain stores only signatures it verified (audit-contracts I1)", () => {
+  /** The audit's scenario: Alice (honest) plays e4 offering a draw and challenges on it; Bob answers on-chain with
+   *  ACCEPT_DRAW and puts `junk` in Alice's slot, which the hub never reads. */
+  async function junkResponse(junk: Hex) {
+    const { a, b, cfgA } = await setup();
+    const s1 = await a.move("e2e4", { offerDraw: true });
+    await b.receive(s1);
+    const s2 = await b.acceptDraw();
+    return { a, cfgA, s1, s2, onChain: { state: s2.state, sigA: junk, sigB: s2.sigB } };
+  }
+
+  it("drops junk in the slot the hub never checks, and builds the proof the hub accepts", async () => {
+    const { a, s1, s2, onChain } = await junkResponse("0x01");
+    expect(await a.ingestOnChain(onChain)).toBe(true);
+    expect(a.latest).toEqual({ state: s2.state, sigA: "0x", sigB: s2.sigB });
+    const proof = a.challengeProof();
+    // Before H1: `{hasPrev: false, latest: {sigA: "0x01", ...}}`, which the hub refuses (Unsupported) every time.
+    expect(proof.hasPrev).toBe(true);
+    expect(proof.prev).toEqual(s1); // Alice's own signature endorses the predecessor
+    expect(proof.latest).toEqual({ state: s2.state, sigA: "0x", sigB: s2.sigB });
+  });
+
+  it("drops large junk too, and never echoes it into a later proof's prev", async () => {
+    const big = `0x${"ab".repeat(200_000)}` as Hex;
+    const { a, b } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    expect(await a.ingestOnChain({ state: e5.state, sigA: big, sigB: e5.sigB })).toBe(true);
+    expect(a.latest.sigA).toBe("0x");
+    await a.move("g1f3");
+    expect(a.challengeProof().prev).toEqual({ state: e5.state, sigA: "0x", sigB: e5.sigB });
+  });
+
+  it("keeps a valid second signature, and still refuses junk in the mover's own slot", async () => {
+    const { a, b } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    // The mover's slot is the one the hub checks: junk there is not a supported state at all.
+    await expect(a.ingestOnChain({ state: e5.state, sigA: "0x", sigB: "0x01" })).rejects.toThrow(/unverifiable/);
+    // A both-signed state keeps both signatures (case ii): each was verified.
+    const { a: c, b: d, keys: keysCD, params: paramsCD } = await setup();
+    await finishGame(c, d);
+    await d.receive(await c.proposeNewGame());
+    const full = await d.countersignNewGame();
+    const fresh = await ChannelSession.create({ params: paramsCD, me: 0, sessionKey: keysCD[0], domain, store: new MemoryStore() });
+    expect(await fresh.ingestOnChain(full)).toBe(true);
+    expect(fresh.latest.sigA).toBe(full.sigA);
+    expect(fresh.latest.sigB).toBe(full.sigB);
+    expect(fresh.challengeProof().hasPrev).toBe(false);
+  });
+
+  it("open() drops an unverified signature a pre-H1 snapshot stored, and saves the result", async () => {
+    const { a, cfgA, s1, s2 } = await junkResponse("0x01");
+    // A snapshot as a pre-H1 session left it: the junk stored verbatim in latest.sigA.
+    const legacy = structuredClone(a.snapshot());
+    legacy.prev = structuredClone(s1);
+    legacy.latest = { state: s2.state, sigA: "0x01", sigB: s2.sigB };
+    const store = new MemoryStore();
+    await store.save(legacy);
+    const restored = await ChannelSession.open({ ...cfgA, store });
+    expect(restored.latest).toEqual({ state: s2.state, sigA: "0x", sigB: s2.sigB });
+    expect(store.snapshots.length).toBe(2); // saved once, with the junk dropped
+    expect(store.last?.latest.sigA).toBe("0x");
+    expect(restored.challengeProof()).toMatchObject({ hasPrev: true, prev: s1 });
+    // A snapshot with nothing to drop is not re-saved.
+    const again = await ChannelSession.open({ ...cfgA, store });
+    expect(store.snapshots.length).toBe(2);
+    expect(again.latest).toEqual(restored.latest);
+  });
+});

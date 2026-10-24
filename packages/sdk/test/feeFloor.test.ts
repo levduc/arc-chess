@@ -339,3 +339,56 @@ describe("Plan 6: no minFeePerGas, no change", () => {
     expectFloored(floored.slice(1) as Sent[]); // all but the earlier run's own send
   });
 });
+
+/**
+ * Plan 6 hardening H1 (Task 2 review Minor-1): two floor call sites are defensively redundant today, so no
+ * black-box test can tell them from a send without the floor -- an entry's `lastFees` is always floored already,
+ * and the underpriced loop's input was floored one line up. These white-box tests pin them anyway, by raising the
+ * sender's floor after a transaction was priced under it (as for an entry whose `lastFees` came from a pre-floor
+ * send): with the `floored` call removed from either site, the emitted fee is under the new floor and the test fails.
+ */
+describe("H1: the two defensive floor sites are pinned (Task 2 review Minor-1)", () => {
+  const raiseFloor = (s: SerialTxSender, floor: bigint) => {
+    (s as unknown as { minFeePerGas: bigint }).minFeePerGas = floor;
+  };
+
+  it("replaceOwn (tracked): a replacement of an entry priced under the floor is floored (tx.ts replaceOwn, tracked branch)", async () => {
+    const n = node({ estimate: { maxFeePerGas: 1n * GWEI, maxPriorityFeePerGas: 1n * GWEI } });
+    const s = new SerialTxSender(n.inner, n.client); // no floor yet: the entry's lastFees is 1 gwei
+    const req: TxRequest = { to: to(1), data: "0x" };
+    const a = await s.send(req);
+    expect(s.tracked()).toMatchObject([{ nonce: 0, state: "waiting", lastFees: { maxFeePerGas: 1n * GWEI } }]);
+    raiseFloor(s, FLOOR);
+    // waitOrReplace's own replacement goes through replaceOwn's tracked branch: bump(1 gwei) would be 1.125 gwei.
+    await waitOrReplace(n.client, s, req, a, { timeoutMs: 5, pollMs: 2, maxReplacements: 1 }).catch(() => undefined);
+    expect(n.attempts).toHaveLength(2);
+    expect(n.attempts[1].nonce).toBe(0);
+    expect(n.attempts[1].maxFeePerGas).toBe(FLOOR);
+    expect(n.attempts[1].maxPriorityFeePerGas!).toBeLessThanOrEqual(FLOOR);
+  });
+
+  it("replaceReleased's underpriced raise loop floors each raise (tx.ts replaceReleased, raise loop)", async () => {
+    const n = node();
+    // A pending transaction at nonce 0, from an earlier run, priced above anything this sender knows.
+    await new SerialTxSender(n.inner, n.client).send({ to: to(1), data: "0xaa", nonce: 0, gas: GAS, maxFeePerGas: 30n * GWEI, maxPriorityFeePerGas: 1n * GWEI });
+    const s = new SerialTxSender(n.inner, n.client, { minFeePerGas: FLOOR });
+    // The node refuses the first replacement as underpriced; meanwhile the floor rises to 100 gwei. The loop's
+    // raise of the 20 gwei attempt is 1.5 x 20 = 30 gwei, under the new floor unless that site floors it.
+    const HIGH = 100n * GWEI;
+    const send = n.inner.send.bind(n.inner);
+    let first = true;
+    n.inner.send = async (tx) => {
+      if (first && tx.nonce === 0) {
+        first = false;
+        raiseFloor(s, HIGH);
+      }
+      return send(tx);
+    };
+    const h = await s.send({ to: to(2), data: "0xbb" });
+    const mine = n.attempts.slice(1);
+    expect(mine.length).toBe(2); // 20 gwei refused as underpriced, then raised
+    expect(mine[0].maxFeePerGas).toBe(FLOOR);
+    expect(mine[1].maxFeePerGas).toBe(HIGH);
+    expect(n.pool.get(0)!.hash).toBe(h);
+  });
+});

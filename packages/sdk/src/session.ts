@@ -189,7 +189,41 @@ export class ChannelSession {
   /** Restores this channel's session from `store` if it has a snapshot, otherwise creates it (crash-safe start). */
   static async open(cfg: SessionConfig & { store: LoadableSessionStore }): Promise<ChannelSession> {
     const snapshot = await cfg.store.load();
-    return snapshot ? ChannelSession.restore(cfg, snapshot) : ChannelSession.create(cfg);
+    if (!snapshot) return ChannelSession.create(cfg);
+    const session = ChannelSession.restore(cfg, snapshot);
+    await session.dropUnverifiedSignatures();
+    return session;
+  }
+
+  /**
+   * Plan 6 hardening H1 (audit-contracts I1): a snapshot written before `verifyOnChainState` stored only verified
+   * signatures may hold an event's unchecked bytes in `latest` or `prev` -- the slots `challengeProof()` reads.
+   * Each non-empty slot there is checked against its signer; one that does not verify is emptied (and the result
+   * saved), so a restored session builds a proof the hub accepts. A snapshot with nothing to drop is left as it is,
+   * unsaved.
+   */
+  private dropUnverifiedSignatures(): Promise<void> {
+    return this.lock(async () => {
+      const draft = structuredClone(this.data);
+      let dropped = false;
+      const clean = async (ss: SignedState): Promise<SignedState> => {
+        const out = { ...ss };
+        if (out.sigA !== NO_SIG && !(await this.signedBy(0, out.state, out.sigA))) {
+          out.sigA = NO_SIG;
+          dropped = true;
+        }
+        if (out.sigB !== NO_SIG && !(await this.signedBy(1, out.state, out.sigB))) {
+          out.sigB = NO_SIG;
+          dropped = true;
+        }
+        return out;
+      };
+      draft.latest = await clean(draft.latest);
+      if (draft.prev) draft.prev = await clean(draft.prev);
+      if (!dropped) return;
+      await this.store.save(draft);
+      this.data = draft;
+    });
   }
 
   static restore(cfg: SessionConfig, snapshot: SessionSnapshot): ChannelSession {
@@ -794,7 +828,18 @@ export class ChannelSession {
     };
   }
 
-  /** I4: accept an on-chain state only if it is independently verifiable; otherwise "unverifiable on-chain state". */
+  /**
+   * I4: accept an on-chain state only if it is independently verifiable; otherwise "unverifiable on-chain state".
+   *
+   * Plan 6 hardening H1 (audit-contracts I1): what is returned carries only signatures this method verified. The hub
+   * checks only the mover's slot of a `hasPrev` proof (and neither slot of the opening state), and re-emits the whole
+   * `proof.latest` in `Challenged`/`Responded` -- so the other slot of an event can hold any bytes a griefer chose.
+   * Stored as-is, a non-empty junk slot made `challengeProof()` take the state for fully signed (`hasPrev: false`),
+   * a proof the hub rejects (`Unsupported`) on every try, leaving this player no exit of its own. So: the opening
+   * state is stored unsigned; a state both of whose signatures verify keeps both; a canonical successor keeps only
+   * its mover's (both, for a checkpoint, where both are verified); R9's adopted move is re-signed by this player.
+   * Unverified bytes are dropped, never stored, so the proof this session builds is always one the hub accepts.
+   */
   private async verifyOnChainState(
     draft: SessionSnapshot,
     msg: SignedState,
@@ -811,8 +856,9 @@ export class ChannelSession {
       throw unverifiable();
     }
 
-    // (i) the opening state is always self-evidently the channel's start.
-    if (canonical.turnNum === 0n) return { signed: { state: canonical, sigA, sigB }, onPending: false };
+    // (i) the opening state is always self-evidently the channel's start. The hub reads neither slot for it, so
+    // neither is kept (H1, audit-contracts I1): the opening needs no signature to be proven.
+    if (canonical.turnNum === 0n) return { signed: unsigned(canonical), onPending: false };
 
     // (ii) any state with both signatures valid is supported regardless of how far ahead it is.
     const bothSigned =
@@ -836,10 +882,15 @@ export class ChannelSession {
         const moverIdx = mover(latest);
         const moverSig = moverIdx === 0 ? sigA : sigB;
         const moverOk = await this.signedBy(moverIdx, expected, moverSig);
+        const checkpoint = isCheckpoint(expected);
         const checkpointOk =
-          !isCheckpoint(expected) ||
-          ((await this.signedBy(0, expected, sigA)) && (await this.signedBy(1, expected, sigB)));
-        if (moverOk && checkpointOk) return { signed: { state: expected, sigA, sigB }, onPending: false };
+          !checkpoint || ((await this.signedBy(0, expected, sigA)) && (await this.signedBy(1, expected, sigB)));
+        if (moverOk && checkpointOk) {
+          // H1 (audit-contracts I1): only what was verified -- both slots for a checkpoint, else the mover's alone.
+          // The other slot of a move is never read by the hub, so the event's bytes there prove nothing.
+          const signed = checkpoint ? { state: expected, sigA, sigB } : this.withOnly(moverIdx, expected, moverSig);
+          return { signed, onPending: false };
+        }
       }
     }
 
