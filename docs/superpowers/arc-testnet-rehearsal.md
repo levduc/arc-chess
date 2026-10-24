@@ -29,9 +29,9 @@ forge script script/Deploy.s.sol \
 required.
 
 A dry run (same command without `--broadcast`) was run first and succeeded, estimating 6,390,739 gas and
-0.1278 USDC at a 20 gwei quote; the real run was cheaper (see below) because the effective price was 21 gwei,
-very close to that estimate, and both contracts were deployed in a single `forge script` invocation (CREATE,
-nonces 0 and 1).
+0.1278 USDC at a 20 gwei quote. The real run cost less than that estimate (0.1032 USDC, below) even though the
+effective price (21 gwei) was higher than the dry run's 20 gwei quote — actual gas used, 4,915,954, came in about
+23% under forge's padded gas estimate.
 
 ### Gas price: observed base fee vs. the floor
 
@@ -52,8 +52,8 @@ safe cap) and `--priority-gas-price 1000000000` (1 gwei tip). The chain charged 
 | `ChannelHub` | `0xbb027d0e6a85a99a67fd84f186f02aa152f6d66b5fa370d5eac8776107cf3d42` | https://explorer.testnet.arc.io/tx/0xbb027d0e6a85a99a67fd84f186f02aa152f6d66b5fa370d5eac8776107cf3d42 | 3,012,611 | 21 gwei | 0.063264831 |
 | **Total** | | | **4,915,954** | | **0.103235034** |
 
-Both transactions landed with `status: 0x1` (success) in the same block window; Arc's instant finality meant no
-meaningful wait for receipts.
+Both transactions landed with `status: 0x1` (success) in the same block, `68820062`; Arc's instant finality meant
+no meaningful wait for receipts.
 
 ### Deployed addresses
 
@@ -103,14 +103,18 @@ Verification was attempted two ways:
 
 To rule out a bytecode mismatch on our side, we diffed forge's local build artifact
 (`out/ChessRules.sol/ChessRules.json` → `deployedBytecode.object`) against `eth_getCode` on-chain: **byte-for-byte
-identical**, 17,116 hex characters including the trailing IPFS metadata CBOR. The deployed code is exactly what
-our Solidity source compiles to with the repo's pinned `solc 0.8.28+commit.7893614a`, `viaIR`, `optimizer runs=200`,
-`evmVersion=cancun` settings — so the verification failure sits on Blockscout's recompilation/matching side
-(possibly a solc-build or queue issue specific to this public testnet instance; we also hit
-`"Too many requests. Increase limits now at https://dev.blockscout.com"` from the API several times while
-polling). We did not chase this further, per the "don't burn time" guidance. **Source is not currently verified
-on the explorer**, but the deployment's correctness is independently established by the bytecode diff and the
-on-chain reads above.
+identical**, 17,116 hex characters including the trailing IPFS metadata CBOR. That proves the *deployed contract*
+is exactly what our Solidity source compiles to with the repo's pinned `solc 0.8.28+commit.7893614a`, `viaIR`,
+`optimizer runs=200`, `evmVersion=cancun` settings. It does not by itself prove that the standard-json input we
+submitted reproduces that same bytecode under Blockscout's own solc invocation — that step is opaque to us: the
+mismatch is between Blockscout's recompile and our (provably correct) deployed code, and the rate-limited API
+(`"Too many requests. Increase limits now at https://dev.blockscout.com"`, hit several times while polling) never
+surfaced a reason, only the generic `Fail - Unable to verify`. We did not chase this further, per the "don't burn
+time" guidance; re-polled `is_verified` on both addresses immediately before filing this report and it is still
+`false` for both. **Source is not currently verified on the explorer**, but the deployment's correctness is
+independently established by the bytecode diff and the on-chain reads above. The explorer's own web UI (rather
+than its API) typically surfaces the specific compile/match error that the API hides, which would be the fastest
+way to actually diagnose this on a retry.
 
 ### Deployer balance
 
@@ -125,12 +129,13 @@ confirming no other transactions were sent from this key. Nonce went from 0 → 
 
 ### Arc-specific surprises
 
-- **`eth_gasPrice`/`eth_maxPriorityFeePerGas` over-suggest.** The node quoted 25 gwei gas price and a 5 gwei
-  priority fee, well above what was actually needed; the real base fee was the flat 20 gwei floor `arc-facts.md`
-  predicted, and a 1 gwei tip was enough. Relying on the RPC's own suggestion would have meant overpaying roughly
-  4-5x; relying on `--with-gas-price` set to exactly the 20 gwei floor (with no tip) would have risked a silent
-  drop the moment the base fee moved. Using the fee ceiling (40 gwei) as the cap and a small explicit tip (1 gwei)
-  was the correct, cheap combination.
+- **`eth_gasPrice`/`eth_maxPriorityFeePerGas` over-suggest.** The node quoted a 25 gwei legacy gas price and a
+  5 gwei priority fee, both above what was actually needed; the real base fee was the flat 20 gwei floor
+  `arc-facts.md` predicted, and a 1 gwei tip was enough, giving an effective price of 21 gwei — about 19% below
+  the RPC's 25 gwei quote. Relying on `--with-gas-price` set to exactly the 20 gwei floor (with no tip) would have
+  risked a silent drop the moment the base fee moved even slightly. Using the fee ceiling (40 gwei) as the cap
+  and a small explicit tip (1 gwei) was the correct, cheap combination: it paid only what the chain actually
+  charged (base + tip), not the cap.
 - **The dry run already writes `deployments/<chainId>.json`.** `vm.writeJson` is a cheatcode and runs during
   simulation too, so the dry run pre-populated `contracts/deployments/5042002.json` with the CREATE-predicted
   addresses before anything was broadcast. Because the deployer's nonce was still 0 at broadcast time, the
