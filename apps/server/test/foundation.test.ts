@@ -530,7 +530,7 @@ describe("http foundation", () => {
 
   it("H3: skill.md says a rate-limited command is retried after a wait, and what chainStale means", () => {
     const text = skillMd(testConfig(), "http://127.0.0.1:3000");
-    expect(text).toMatch(/`the RPC is rate-limiting`: the daemon has already retried; wait a few seconds and retry the command/);
+    expect(text).toMatch(/`the RPC is rate-limiting` or `rate-limited \(RPC or host\)`: wait a few seconds and retry the command/);
     expect(text).toMatch(/`chainStale: true` took effect/);
   });
 

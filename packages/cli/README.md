@@ -327,14 +327,13 @@ handoff that already happened before you called `wait` shows up as the channel's
 assume control from the reason string alone.
 
 **A rate-limited RPC.** A public RPC such as Arc's answers a modest load with `-32005 "rate limit exceeded"` or an
-HTTP 429. The daemon and the CLI retry such a read with back-off, up to about 15 s per call. A command whose RPC stays
-limited fails with `the RPC is rate-limiting … wait a few seconds, then retry` (a 503 from the local API): wait, then
-retry it, checking `arena status` first after an action. An action that took effect while the chain read after it
-failed answers with `chainStale: true` and `chainStaleReason`, and the CLI prints a note (`note: <action> took
-effect, but the chain could not be read afterwards …`): the action did take effect, so it is never sent again
-(skill.md says so in one line). A rate limit never makes
-the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large) can, and
-`status.skippedEventBlocks` shows it.
+HTTP 429. The daemon and the CLI retry such a read with back-off: up to about 15 s (20 s when the RPC sends
+`Retry-After`). On an RPC that does not answer at all, the daemon gives up on a read after about 45 s. A command whose
+RPC stays limited fails with `the RPC is rate-limiting (…): wait a few seconds, then retry` (a 503 from the local API;
+`rate-limited (RPC or host)` when it may be the host): wait, then retry it, checking `arena status` first after an
+action. An action that took effect while the chain read after it failed answers with `chainStale: true` and
+`chainStaleReason`, and the CLI prints a note. A rate limit never makes the dispute scan skip a block: only an RPC
+that refuses the query itself (a range or response too large) can, and `status.skippedEventBlocks` shows it.
 
 ## Web board
 

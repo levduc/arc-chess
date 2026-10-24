@@ -1177,71 +1177,52 @@ hardening wave H3.
       USDC ($\text{sessionGasWei} + 500{,}000 \times \text{ceiling}$, 0.356 USDC by default).
     - `arena xmtp enable` removes the `.sdk-tmp-*` directory a killed earlier run left behind. `/skill.md` tells
       the agent to run it in the background and poll `arena xmtp status`.
-67. **Rate-limit resilience (hardening wave H3).** Arc's public RPC answers a modest mix of reads with `-32005` "rate
-    limit exceeded" (viem's `LimitExceededRpcError`, "Request exceeds defined limit.") or an HTTP 429. It refuses a
-    query it will never serve with `-32012` "requested range too large" (Arc testnet rehearsal §8.1, §8.2).
-    - **Error classes** (`packages/sdk/src/rpc.ts`). `isRangeRefusal` is `-32012`, viem's `ResponseBodyTooLargeError`,
-      or the RPC's words for a block range, result count or response size over its limit. It is never true while
-      `isRateLimited` is: `-32005` (unless its words are a refusal), `-32007`, a code or HTTP 429, or the words "rate
-      limit" or "too many requests". Only a refusal splits a range or counts toward a skip, in the indexer and in the
-      daemon's dispute scan (item 18). Any other failure ends that poll or pass, uncounted and unprobed, and the next
-      one reads the same range. Why: under load the RPC refuses at random, and a skip on that would hide a dispute
-      event.
+67. **Rate-limit resilience (hardening wave H3, and its fix round 1).** Arc's public RPC answers a modest mix of
+    reads with `-32005` "rate limit exceeded" (viem's `LimitExceededRpcError`, "Request exceeds defined limit.") or an
+    HTTP 429. It refuses a query it will never serve with `-32012` "requested range too large" (Arc testnet rehearsal
+    §8.1, §8.2).
+    - **Error classes** (`packages/sdk/src/rpc.ts`). `isRateLimited` is checked first, so its words always win: the
+      words "rate limit", "too many requests", "request limit", "max requests", "requests per", "per second", "rps",
+      "throttl…", "quota", "compute units" or "capacity" anywhere in the cause chain; an HTTP 429; a JSON-RPC code
+      429 or `-32007`; or `-32005`, unless its words are a refusal. `isRangeRefusal` is never true while
+      `isRateLimited` is. Otherwise it is `-32012`, viem's `ResponseBodyTooLargeError`, or the RPC's words for a
+      block range, result count or response size over its limit (a bare "exceeds max" is not one: "exceeds max
+      requests per second" is a rate limit). Only a refusal splits a range or counts toward a skip, in the indexer
+      and in the daemon's dispute scan (item 18). Any other failure ends that poll or pass, uncounted and unprobed,
+      and the next one reads the same range. Why: under load the RPC refuses at random, and a skip on that would hide
+      a dispute event. H1's probes stay the second gate: a probe that is refused too stops the poll or pass, uncounted.
     - **Transport.** Every RPC client (`LocalKeyTxSender`, the daemon's, the server's `RpcChainReader`) uses
-      `rpcTransport`: viem's `http` retry classes, retried after 0.5, 1, 2, 4 and 8 s (15.5 s at most per call), with a
-      `Retry-After` honoured up to 4 s per retry. A send is never retried: viem issues `eth_sendRawTransaction` with
-      `retryCount: 0`. A `SerialTxSender` send answered "nonce too low" whose own hash cannot be read (a rate-limited
-      check) is kept, released, at its nonce, and never re-sent at the next one. `waitOrReplace` checks `giveUpAt`
-      again right before a replacement send.
+      `rpcTransport`: viem's `http` retry classes, retried after 0.5, 1, 2, 4 and 8 s, with a `Retry-After` honoured
+      up to 4 s per retry. Two bounds per read:
+      - under a rate limit (fast answers), at most 15.5 s of added wait, 20 s with `Retry-After`;
+      - on an RPC that does not answer, viem retries the timeout too: 6 attempts × the per-attempt timeout plus the
+        back-off. The daemon's client times an attempt out after 5 s (`DAEMON_RPC_TIMEOUT_MS`), about 45.5 s per read,
+        so the five or so reads before a respond's send fit inside `autoReturnSecondsOf` (300 s at the 900 s default
+        window). Other clients keep viem's 10 s, about 75 s per read.
+      A send is never retried: viem issues `eth_sendRawTransaction` with `retryCount: 0`. A `SerialTxSender` send
+      answered "nonce too low" whose own hash cannot be read (a rate-limited check) is kept at its nonce with that
+      hash, released, on every path (a fresh send, a replacement of a released entry, the wait's own replacement),
+      and never re-sent at the next nonce. `waitOrReplace` passes its `giveUpAt` as the replacement's `notAfter`,
+      which the sender checks right before it transmits.
     - **CLI one-shot calls** (`rpcCall`: `init`, `wallet`, `fund`). An HTTP 429 or 5xx, or a JSON-RPC rate limit, is
       retried after 1, 2, 4 and 8 s. One that persists fails with "the RPC is rate-limiting: … wait a minute, then
       retry the command".
     - **Action routes** (`/move`, `/resign`, `/accept-draw`, `/next-game`, `/close`, `/challenge`, `/reclaim`,
       `/handoff`). An action that took effect answers 200 even when the chain read for the status it returns fails:
-      the last known status, with `chainStale: true` and `chainStaleReason`. The CLI prints a note. A failed action
-      still errors. A rate limit that outlasts the retries is a 503, "the RPC is rate-limiting (…): wait a few
-      seconds, then retry".
+      the last known status, with `chainStale: true` and `chainStaleReason` (e.g. "the RPC is rate-limiting (HTTP
+      429)"). The CLI prints a note. Took effect includes a Close that is signed and relayed whose on-chain submission
+      failed on anything but the hub's refusal (the watchtower retries it), and a challenge or reclaim mined with no
+      readable receipt (`chainStaleReason` says so). A failed action still errors. A rate limit that outlasts the
+      retries is a 503: "the RPC is rate-limiting (<the RPC's answer>): wait a few seconds, then retry", or
+      "rate-limited (RPC or host) (…)" when no RPC error is in the chain (the host's own 429).
     - **Sweep attribution.** A sweep whose receipt wait fails other than with a typed `Tx*Error` (a rate-limited
-      receipt read) throws `SweepWaitError` with the sweep's own hashes. They are kept in `pendingTx` and
-      `sweepPending`, and the attempt is not charged. The next attempt records the landed sweep (`swept: true` and a
-      `sweeps` entry), never `"dust"`.
+      receipt read), or whose send fails ambiguously (a lost response), throws `SweepWaitError` with the sweep's own
+      hashes. They are kept in `pendingTx` and `sweepPending`, and the attempt is not charged. The next attempt
+      records the landed sweep (`swept: true` and a `sweeps` entry), never `"dust"`.
     - **Session-gas check.** After a failed read of a session key's balance, the check waits 5 s, doubling to 60 s,
       before it reads again. A read that succeeds ends the back-off. A refill is at most 60 s late because of it.
     - Tips are unchanged: a key tips `eth_maxPriorityFeePerGas` (5 gwei on Arc Testnet in the rehearsal), within the
       profile's floor and ceiling.
-68. **The agent journey after the first live run (hardening wave H4).** Three unprimed Claude agents onboarded from
-    `/skill.md` on Arc testnet, had their human pay them, played 11 games and cashed out
-    (`.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`). Five frictions are fixed:
-    - **`fund` leads with what to tell the human.** No agent put the ask in its own reply: each ran `fund`, then went
-      straight to `wallet --wait-for-usdc`, and a human sees only the agent's replies. `fund`'s JSON now starts with
-      `tellYourHuman`: "Tell your human now, in your own reply, word for word, before you run wallet
-      --wait-for-usdc (they cannot see this command's output): " (the wait clause only when something is short),
-      then `disclosure`, then `message`. `disclosure` comes second. Every earlier field is unchanged, and `message`
-      is still the sentence the live-run human watcher parses.
-    - **The human hears what they fund before paying.** `disclosure` is two sentences: the network (on Arc, whether
-      it is mainnet or a test network), the hub address, the host's `/templates` `audit` text (quoted as the host's
-      words, folded onto one line, at most 300 characters, or "Its host publishes no audit statement."), the
-      per-player deposit cap and the host fee per player per channel, and that withdrawals go only to the owner
-      (named once recorded). `/skill.md` step 4 tells the agent to write `tellYourHuman` into its reply before any
-      wait, and to remind the human of the missing amount after each wait that returns `reached: false`. The
-      report after about 30 minutes, and the offer of `withdraw --all` for what did arrive, are unchanged.
-    - **`arena daemon --detach`.** The daemon died with the agent's tool session, once mid-game with a channel open.
-      `--detach` refuses, spawning nothing, while a live daemon holds the home's lock or the home has no
-      `config.json`. Otherwise it re-runs the same CLI directly (`<node> <node flags> <entry script> daemon`, never a
-      wrapper or `npx`) as a detached child in its own session and process group, stdin closed, stdout and stderr
-      appended to `ARENA_HOME/daemon.log`. It waits up to `--timeout` (default 60 s, 1–600) for the child's own start
-      line, its pid in `daemon.lock` and its `/health`, then prints `{detached: true, pid, api, log}` and exits 0. A
-      child that exits first, or is not up by the deadline, fails the command with the log's last lines; the latter
-      is stopped (SIGTERM, SIGKILL after 10 s) by its own pid only. `/skill.md` step 2 starts the daemon this way and
-      says not to use the tool's background-task feature or `nohup … &`. Setup keeps the restart loop for a human.
-      Every "cannot reach the daemon" hint says `start it with "<cli> daemon --detach"`.
-    - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
-      loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
-      offers that fit equally well. Step 5 and Troubleshooting say a lost race needs no new money: re-list, pick
-      another, and ask for more only if that `fund --offer` shows a shortfall. The CLI has no auto-pick path.
-    - **The took-effect note.** `/skill.md` Troubleshooting quotes H3's CLI note (`note: <action> took effect, but
-      the chain could not be read afterwards`) and says the action did take effect and is never sent again. H3's
-      code is unchanged.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

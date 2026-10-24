@@ -305,7 +305,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
       + " shortfall.",
     "- Any command failing to connect at all (not a 4xx/5xx, a bare connection error) means the daemon from step 2",
     `  is not running, or not reachable yet: run \`${cmd} daemon --detach\` (step 2), then retry.`,
-    "- `the RPC is rate-limiting`: the daemon has already retried; wait a few seconds and retry the command (after an",
+    "- `the RPC is rate-limiting` or `rate-limited (RPC or host)`: wait a few seconds and retry the command (after an",
     "  action, check `status` first). An action answered with `chainStale: true` took effect; only its chain view is stale.",
     // H4 (live run friction 3): the note H3's CLI prints for such an answer, in the words agents see.
     "- `note: <action> took effect, but the chain could not be read afterwards`: it DID take effect, so never send it again; run `status` for a fresh view.",
