@@ -63,6 +63,15 @@ fi
 CHESS_ADDR="$(jq -r '.chessRules' "$DEPLOYMENTS_FILE")"
 HUB_ADDR="$(jq -r '.channelHub' "$DEPLOYMENTS_FILE")"
 
+# The short solc version (e.g. "0.8.28") pinned in contracts/foundry.toml's [profile.default]. Read from
+# foundry.toml itself, not hardcoded, so a solc bump there doesn't need a matching edit here -- mainnet's
+# foundry.toml is the same file, so this needs no override unless ARENA_SOLC_VERSION is set explicitly.
+SOLC_VERSION="${ARENA_SOLC_VERSION:-$(grep -E '^\s*solc_version\s*=' "$CONTRACTS_DIR/foundry.toml" | head -1 | sed -E 's/^[^"]*"([^"]+)".*/\1/')}"
+if [[ -z "$SOLC_VERSION" ]]; then
+  echo "FATAL: could not read solc_version from $CONTRACTS_DIR/foundry.toml -- set ARENA_SOLC_VERSION." >&2
+  exit 1
+fi
+
 tx_hash_for() {
   jq -r --arg name "$1" '.transactions[] | select(.contractName == $name) | .hash' "$RUN_LATEST"
 }
@@ -96,7 +105,7 @@ try_blockscout_standard_input() {
   (cd "$CONTRACTS_DIR" && forge verify-contract --show-standard-json-input "$addr" "$contract_path_name") \
     > "$input_file"
   local cv
-  cv="$(blockscout_compiler_version 0.8.28)"
+  cv="$(blockscout_compiler_version "$SOLC_VERSION")"
   echo "    (best-effort) submitting standard-input to Blockscout, compiler_version=$cv"
   if [[ "$autodetect" == "true" ]]; then
     curl -fsS -m 30 -X POST "$EXPLORER_URL/api/v2/smart-contracts/$addr/verification/via/standard-input" \
@@ -119,7 +128,7 @@ sourcify_verify() {
   local addr="$1" contract_id="$2" tx_hash="$3"
   local input_file="$WORKDIR/$addr.std.json"
   local cv
-  cv="$(blockscout_compiler_version 0.8.28 | sed 's/^v//')"
+  cv="$(blockscout_compiler_version "$SOLC_VERSION" | sed 's/^v//')"
   local body_file="$WORKDIR/$addr.sourcify-body.json"
   jq -n --slurpfile std "$input_file" --arg cv "$cv" --arg cid "$contract_id" --arg tx "$tx_hash" \
     '{stdJsonInput: $std[0], compilerVersion: $cv, contractIdentifier: $cid, creationTransactionHash: $tx}' \

@@ -148,13 +148,19 @@ Blockscout/Arc support would be the next step if this needs to be understood rat
 `POST /api/v2/smart-contracts/{address}/verification/via/sourcify` endpoint that takes a `metadata.json` plus the
 exact source files (fetched straight from `GET https://sourcify.dev/server/v2/contract/{chainId}/{address}
 ?fields=metadata,sources`, once Sourcify has a match) and *imports* that already-computed match instead of
-recompiling locally. That succeeded immediately for `ChessRules` (`is_verified_via_sourcify: true`). By the time
-we ran the same import for `ChannelHub`, Blockscout responded `"Already verified"` — it had separately picked
-`ChannelHub` up into its own shared cross-instance match database (`is_verified_via_eth_bytecode_db: true` and
-`is_verified_via_verifier_alliance: true` are both `true`; `is_verified_via_sourcify` is `false` for this one),
-most likely from the same Sourcify submission propagating into that alliance before our import request landed.
-Either way, both contracts now carry `viaIR: true` in their *displayed* `compiler_settings` on Blockscout — proof
-the import path, unlike the local-recompile path, is viaIR-clean.
+recompiling locally. **This was exercised and confirmed working for `ChessRules` only**: calling it returned
+`"Smart-contract verification started"`, and `is_verified` flipped to `true` (`is_verified_via_sourcify: true`)
+moments later. For `ChannelHub`, calling the same endpoint with the same shape of request returned
+`"Already verified"` — by the time we called it, `is_verified` was already `true`, with `verified_at` timestamped
+*before* our import call, and `is_verified_via_eth_bytecode_db: true` / `is_verified_via_verifier_alliance: true`
+(`is_verified_via_sourcify: false`). So something else verified `ChannelHub` first — plausibly a background sync
+between Blockscout's shared eth-bytecode-db/Verifier-Alliance pool and Sourcify's own match, which landed ~34
+seconds after Sourcify's `verifiedAt` — but we did not confirm that mechanism; we only confirmed the before/after
+state. **Practical consequence for `scripts/verify-arc.sh` and mainnet:** the Sourcify-import step is proven to
+work on a cold contract (`ChessRules`); it was never actually exercised end-to-end on a contract that wasn't
+already verified by something else (`ChannelHub`). Either way, both contracts now carry `viaIR: true` in their
+*displayed* `compiler_settings` on Blockscout — proof the path that got them verified, unlike the local-recompile
+path, is viaIR-clean.
 
 We tried one additional diagnostic: joining Blockscout's Phoenix websocket
 (`wss://explorer.testnet.arc.io/socket/v2/websocket`, topic `addresses:<address>`) to catch a `verification_result`
