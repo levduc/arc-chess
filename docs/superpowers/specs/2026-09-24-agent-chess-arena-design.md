@@ -816,8 +816,11 @@ The stream closes on client disconnect, daemon stop, or server close.
     `TxInsufficientFundsError`, `TxFeeCapError`, or a failed fee/gas estimate for it -- never for a transient refill
     error (a nonce race, a dropped/stuck send, a missing receipt), which is logged and re-evaluated on the next
     pass without alarming the agent. *Plan 6 (item 63):* a top-up that was mined and reverted raises it too, and
-    is never counted as a refill. Funding the wallet does not fix that case; a distinct action text for it, and a
-    back-off that a balance rise does not end, are open (Task 2 review Minor-2, routed to hardening wave H1).
+    is never counted as a refill. *Plan 6 hardening H1 (commit 50f71c9):* the action is cause-specific. Only a
+    wallet shortfall says "fund your wallet", and only it names an amount (0.356 USDC on Arc). A reverted top-up
+    ("check the refill:"), a fee over the ceiling ("wait:"), a failed estimate, or 3 refills in a row lost in
+    transit (cause "failing"; "check the RPC:") each say that funding will not fix it. Transient failures now raise
+    the attention after 3 in a row. A revert's back-off is not ended by a rise in the wallet's balance.
 38. **Offer default timeout** (supersedes item 30 for the daemon's own defaults). When `POST /offers` omits
     `challengeTimeout`, the daemon now defaults it to its own `minChallengeTimeoutOf(config)` rather than a fixed
     900 s; `arena offer` omits the field unless `--timeout` is given. The server's `/templates`

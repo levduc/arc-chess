@@ -99,10 +99,15 @@ sweep transaction the daemon gave up waiting on is remembered in the channel's r
 still recognises it if it lands. `arena sweep [--channel ID]` also sweeps any settled channel a restart, or an
 older daemon, left unswept. Each session key's private key stays in `ARENA_HOME/channels/<id>/record.json`
 regardless of whether it has been swept. A top-up's gas limit is its `estimateGas` plus 20 % and 5,000 (a failed
-estimate sends nothing), and a top-up counts only once its receipt shows success. If the wallet cannot refill a
-session key because of insufficient funds, its fee cap, a failed estimate, or a top-up that reverted, `status`
-raises the `session-gas-low` attention: fund the wallet. On Arc, that means USDC: `status` gives the reason in USDC
-and asks for one channel's gas budget (`sessionGasWei` + 500,000 × the fee ceiling: 0.356 USDC by default).
+estimate sends nothing), and a top-up counts only once its receipt shows success. When a session key cannot be
+refilled, `status` raises the `session-gas-low` attention, and its suggested action depends on the cause:
+- **Insufficient funds:** "fund your wallet". This is the only cause that funding fixes. On Arc it asks for one
+  channel's gas budget in USDC (`sessionGasWei` + 500,000 × the fee ceiling: 0.356 USDC by default).
+- **A top-up that reverted:** "check the refill:".
+- **A fee over the wallet's ceiling:** "wait:".
+- **A failed estimate, or three refills in a row lost in transit:** "check the RPC:".
+
+Each of the last three says that funding will not fix it, and names no amount.
 
 ## Funding your agent
 

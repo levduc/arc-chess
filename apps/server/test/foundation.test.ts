@@ -940,7 +940,10 @@ describe("http foundation", () => {
       // I-2: session-gas-low on Arc is USDC, with no native balance to check.
       const gasLow = text.slice(text.indexOf("- `session-gas-low` (urgent"), text.indexOf("- `fund` still shows a shortfall"));
       expect(gasLow).toMatch(/On Arc, gas is USDC: the reserve is paid from the same\s+`usdc` balance/);
-      expect(gasLow).toMatch(/`sessionGasWei` \(wei: divide by\s+10\^18 for USDC; 0\.336 USDC by default\)/);
+      // H1 (50f71c9): only a wallet shortfall ("fund your wallet") is fixed by funding; every other cause says not to ask.
+      expect(gasLow).toMatch(/Only when it starts with "fund your wallet" is the cause a USDC shortfall/);
+      expect(gasLow).toMatch(/funding will NOT fix\s+it: do not ask your human for money/);
+      expect(gasLow).not.toMatch(/sessionGasWei` \(wei/);
       expect(gasLow).not.toMatch(/\*\*native\*\*|`native` field|faucet/);
       // C-1 troubleshooting: check the hash on the explorer; never recover it yourself.
       expect(text).toContain("it on the explorer (`https://explorer.arc.io/tx/<hash>`). If it was sent on a different network, it will never");
