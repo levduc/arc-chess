@@ -7,7 +7,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
 import { KNOWN_DEPLOYMENTS, arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
-import { computeFundingNeed, fundMessage } from "../src/funding.js";
+import { computeFundingNeed, fundDisclosure, fundMessage } from "../src/funding.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = [], opts: { chainId?: number } = {}) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -53,6 +53,8 @@ describe("arena CLI", () => {
     expect(await runCli(["offers"], t.io)).toBe(1);
     expect(t.err.join("\n")).toMatch(/127\.0\.0\.1:7010/);
     expect(t.err.join("\n")).toMatch(/arena daemon/);
+    // H4 (live run friction 4): the hint starts a daemon that outlives the agent's tool session.
+    expect(t.err.join("\n")).toMatch(/start it with "arena daemon --detach"/);
     // Final fix wave (K1): the daemon starts at step 2 again, before picking an offer and `fund --offer`.
     expect(t.err.join("\n")).toMatch(/recipe step 2\b/);
   });
@@ -136,7 +138,7 @@ describe("arena CLI", () => {
     }) as unknown as typeof fetch;
     expect(await runCli(["board"], down.io)).toBe(1);
     expect(down.out).toEqual([]);
-    expect(down.err.join("\n")).toMatch(/arena daemon/);
+    expect(down.err.join("\n")).toMatch(/start it with "arena daemon --detach"/);
   });
 
   it("Plan 5 Task 2 fix round, CRITICAL 1: the daemon start line never carries the token fragment", () => {
@@ -409,7 +411,7 @@ describe("Plan 5.6 Task 2: arena fund", () => {
 
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
-    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "message"]);
+    expect(Object.keys(printed)).toEqual(["tellYourHuman", "disclosure", "address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "message"]);
     expect(printed.address).toBe(address);
     expect(printed.chainId).toBe(31337);
     expect(printed.deposit).toBe("3.000000"); // 3 x 1 USDC, within the 10 USDC cap
@@ -429,6 +431,30 @@ describe("Plan 5.6 Task 2: arena fund", () => {
       nativeHave: 0n,
     });
     expect(printed.message).toBe(fundMessage(need, { address, chainId: 31337, ownerSet: false, games: 3n, stake: 1_000_000n }));
+    // H4 (live run frictions 1, 2): the output leads with the words for the human, in the agent's own reply -- what
+    // they are funding, then the ask -- and says to do it before the wait. No audit in /templates: it says so.
+    expect(printed.disclosure).toBe(fundDisclosure({ chainId: 31337, hub: env.hub, audit: undefined, cap: 10_000_000n, feePerPlayer: 5_000n, owner: null }));
+    expect(printed.tellYourHuman).toBe(
+      "Tell your human now, in your own reply, word for word, before you run wallet --wait-for-usdc (they cannot see this " +
+        `command's output): ${String(printed.disclosure)} ${String(printed.message)}`,
+    );
+    expect(t.out.join("\n").split("\n")[1]).toMatch(/^  "tellYourHuman": "Tell your human now, in your own reply, word for word/);
+  });
+
+  it("H4: the disclosure quotes the host's /templates audit text, and names a recorded owner", async () => {
+    const env = await deployArena();
+    const { home } = await initEmptyWallet(env);
+    const owner = privateKeyToAccount(generatePrivateKey()).address;
+    expect(await runCli(["owner", "set", owner], fundIo(home).io)).toBe(0);
+    const t = fundIo(home, { templatesBody: CHESS_TEMPLATE({ audit: "unaudited; guarded launch" }) });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
+    const printed = JSON.parse(t.out.join("\n")) as Record<string, string>;
+    expect(printed.disclosure).toBe(
+      `What you are funding: chess games for USDC through the Agent Chess Arena hub ${env.hub} on chain 31337. Its host ` +
+        'says: "unaudited; guarded launch". Each player deposits at most 10.000000 USDC per channel, plus a host fee of ' +
+        `0.005000 USDC per player per channel, and withdrawals go only to the recorded owner, ${owner}.`,
+    );
+    expect(printed.tellYourHuman).toContain(`${printed.disclosure} ${printed.message}`);
   });
 
   it("--deposit overrides the default; an out-of-range one exits 1 (not the usual usage-error 2)", async () => {
@@ -464,7 +490,7 @@ describe("Plan 5.6 Task 2: arena fund", () => {
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
     expect(faucetCalls).toBe(1); // called exactly once, even though both assets were short
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
-    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "faucet", "message"]);
+    expect(Object.keys(printed)).toEqual(["tellYourHuman", "disclosure", "address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "faucet", "message"]);
     expect(printed.faucet).toEqual({ usdc: "20.000000", native: "1.0" }); // formatted as `arena faucet` does
     // Re-read balances after the faucet call: both shortfalls are now gone.
     expect(printed.usdc).toEqual({ have: "20.000000", need: "3.005000", shortfall: "0.000000" });
@@ -517,7 +543,7 @@ describe("Plan 5.6 Task 2: arena fund", () => {
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io)).toBe(0);
     expect(faucetCalls).toBe(1);
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
-    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "faucet", "message"]);
+    expect(Object.keys(printed)).toEqual(["tellYourHuman", "disclosure", "address", "chainId", "deposit", "feePerPlayer", "usdc", "native", "owner", "faucet", "message"]);
     expect(printed.faucet).toMatch(/^skipped:/);
     expect(printed.faucet as string).toMatch(/faucet exploded|500/);
     // The shortfall still reflects the (unchanged) balances -- a failed top-up never fakes success.
@@ -556,7 +582,7 @@ describe("Final fix wave (K1, I2, M10): arena fund --offer, whole-USDC errors, a
     expect(await runCli(["fund", "--offer", chosen.id.toUpperCase().replace("0X", "0x")], t.io)).toBe(0);
     expect(t.calls.map((c) => c.url)).toContain("http://127.0.0.1:3000/offers");
     const printed = JSON.parse(t.out.join("\n")) as Record<string, unknown>;
-    expect(Object.keys(printed)).toEqual(["address", "chainId", "offerId", "stakePerGame", "deposit", "feePerPlayer", "usdc", "native", "owner", "message"]);
+    expect(Object.keys(printed)).toEqual(["tellYourHuman", "disclosure", "address", "chainId", "offerId", "stakePerGame", "deposit", "feePerPlayer", "usdc", "native", "owner", "message"]);
     expect(printed.offerId).toBe(chosen.id);
     expect(printed.stakePerGame).toBe("1.000000");
     expect(printed.deposit).toBe("4.000000"); // the offer's deposit, in whole USDC -- no conversion by the agent
@@ -841,12 +867,19 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     const t = arcIo(home, { balanceWei: 0n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io), t.err.join("\n")).toBe(0);
     const printed = t.json();
-    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "message"]);
+    expect(Object.keys(printed)).toEqual(["tellYourHuman", "disclosure", "address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "message"]);
     expect(printed.deposit).toBe("3.000000");
     expect(printed.feePerPlayer).toBe("0.005000");
     // 3 + 0.005 + ceil((1e16 session gas + 500,000 x 40 gwei) / 10^12) = 3.005 + 0.03; no other channel, nothing reserved
     expect(printed.usdc).toEqual({ have: "0.000000", need: "3.035000", shortfall: "3.035000", reserved: "0.000000" });
     expect(printed.message).toBe(arcTestnetFundMessage("3.035000", address, false));
+    // H4: what is funded on Arc Testnet -- a test network -- then the ask, with its network and Arc-only warning.
+    expect(printed.disclosure).toBe(
+      fundDisclosure({ chainId: 5042002, hub: arcContracts(5042002).hub as Address, audit: undefined, cap: 10_000_000n, feePerPlayer: 5_000n, owner: null }),
+    );
+    expect(printed.disclosure).toContain("on Arc Testnet (chain id 5042002, a test network)");
+    expect(printed.tellYourHuman).toMatch(/^Tell your human now, in your own reply, word for word, before you run wallet --wait-for-usdc /);
+    expect(printed.tellYourHuman).toContain(`${String(printed.disclosure)} Please send 3.035000 USDC to ${address} on Arc Testnet (chain id 5042002), on the Arc Testnet network only`);
     // The one balance is the native one: no USDC balanceOf (0x70a08231) at all.
     expect(t.rpc.filter((m) => m.startsWith("eth_call 0x70a08231"))).toEqual([]);
     expect(t.rpc.filter((m) => m === "eth_getBalance")).toHaveLength(1);
@@ -861,6 +894,8 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     const enough = arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], enough.io)).toBe(0);
     expect(enough.json().usdc).toEqual({ have: "3.035000", need: "3.035000", shortfall: "0.000000", reserved: "0.000000" });
+    // Nothing to wait for: the instruction does not mention the wait.
+    expect(enough.json().tellYourHuman).toMatch(/^Tell your human now, in your own reply, word for word \(they cannot see this command's output\): What you are funding:/);
     expect(enough.json().message).toBe(
       "This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me an address you control on Arc Testnet to " +
         "return winnings to (not an exchange deposit address unless that exchange supports USDC deposits on Arc Testnet, " +
@@ -945,7 +980,7 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io), t.err.join("\n")).toBe(0);
     const printed = t.json();
     expect(printed.faucet).toEqual({ usdc: "10.000000" });
-    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "faucet", "message"]);
+    expect(Object.keys(printed)).toEqual(["tellYourHuman", "disclosure", "address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "faucet", "message"]);
     expect(printed.usdc).toEqual({ have: "10.000000", need: "3.035000", shortfall: "0.000000", reserved: "0.000000" });
   });
 });

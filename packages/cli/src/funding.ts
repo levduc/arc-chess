@@ -188,3 +188,50 @@ export function fundMessage(
   }
   return body;
 }
+
+/** H4 (live run friction 2): whether each built-in network is the real one or a test network, for the disclosure. */
+const NETWORK_KINDS: Record<number, string> = {
+  5042: "mainnet, real USDC",
+  5042002: "a test network",
+};
+
+/** H4: the longest stretch of the host's `audit` text the disclosure quotes. */
+const AUDIT_QUOTE_MAX = 300;
+
+/**
+ * Plan 6 hardening H4 (live run friction 2): what the human is about to fund, in two sentences an agent can quote
+ * before it asks for money -- the network, the hub, the host's own `audit` text from `/templates` (quoted as the
+ * host's words, on one line and at most `AUDIT_QUOTE_MAX` characters), the per-player deposit cap and fee per channel,
+ * and that withdrawals go only to the owner. Pinned character for character in `funding.test.ts`.
+ */
+export function fundDisclosure(ctx: { chainId: number; hub: Address; audit: string | undefined; cap: bigint; feePerPlayer: bigint; owner: Address | null }): string {
+  const profile = chainProfile(ctx.chainId);
+  const kind = NETWORK_KINDS[ctx.chainId];
+  const network =
+    profile === undefined ? `chain ${ctx.chainId}` : `${profile.name} (chain id ${ctx.chainId}${kind !== undefined ? `, ${kind}` : ""})`;
+  const audit = ctx.audit?.replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim();
+  const quoted =
+    audit === undefined || audit === ""
+      ? "Its host publishes no audit statement."
+      : `Its host says: "${audit.length > AUDIT_QUOTE_MAX ? `${audit.slice(0, AUDIT_QUOTE_MAX - 1)}…` : audit}".`;
+  const to = ctx.owner === null ? "the owner address you give me" : `the recorded owner, ${ctx.owner}`;
+  return (
+    `What you are funding: chess games for USDC through the Agent Chess Arena hub ${ctx.hub} on ${network}. ${quoted} ` +
+    `Each player deposits at most ${formatUsdc6(ctx.cap)} USDC per channel, plus a host fee of ${formatUsdc6(ctx.feePerPlayer)} ` +
+    `USDC per player per channel, and withdrawals go only to ${to}.`
+  );
+}
+
+/**
+ * Plan 6 hardening H4 (live run friction 1): `fund`'s first field. In the first live run no agent put the ask in its
+ * own reply: each ran `fund`, then went straight to `wallet --wait-for-usdc`, and a human sees only the agent's
+ * reply, never a command's output. So the output leads with the instruction itself, then the words to relay: the
+ * disclosure, then `message`. `waitFirst` (something is short) adds "before you run wallet --wait-for-usdc".
+ */
+export function tellYourHuman(disclosure: string, message: string, waitFirst: boolean): string {
+  return (
+    "Tell your human now, in your own reply, word for word" +
+    (waitFirst ? ", before you run wallet --wait-for-usdc" : "") +
+    ` (they cannot see this command's output): ${disclosure} ${message}`
+  );
+}

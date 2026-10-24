@@ -34,11 +34,14 @@ import {
   type XmtpConfig,
 } from "./config.js";
 import { chainProfile, weiToUsdc6Down } from "./chains.js";
+import { DETACH_WAIT_DEFAULT_S, startDetachedDaemon } from "./detach.js";
 import {
   computeFundingNeed,
   computeOneBalanceFundingNeed,
   formatUsdc6,
+  fundDisclosure,
   fundMessage,
+  tellYourHuman,
   type FundingNeed,
   type OneBalanceFundingNeed,
 } from "./funding.js";
@@ -91,7 +94,12 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         --no-faucet turns this off)
        (--owner records a first owner, or repeats the recorded one; it never changes one -- that takes "owner set"
         with the current owner's signature. Re-running init keeps the recorded owner)
-  daemon [start]
+  daemon [start] [--detach [--timeout SECONDS]]
+          (--detach: starts the daemon in the background, in its own session, so it outlives this command and the
+           shell or agent tool session that ran it; it logs to <ARENA_HOME>/daemon.log. Waits until it answers
+           (--timeout, default ${DETACH_WAIT_DEFAULT_S} s), then prints {detached, pid, api, log} and exits 0. Refused
+           while a daemon already runs on this home; exit 1, with the log's last lines, if it does not come up --
+           one still starting is then stopped.)
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed;
            on a chain whose gas is USDC, such as Arc, one balance: {address, chainId, usdc}, and no --wait-for-native)
@@ -107,12 +115,15 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         combined with --deposit or --stake), and adds {offerId, stakePerGame} to the output; an offer that is no
         longer open exits 1. Every amount, in the output and in errors, is in whole USDC.
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
-        Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
-        message is a ready-to-relay sentence (on Arc it names the network, warns that USDC sent on any other
-        network never arrives, says how to get USDC onto Arc and, with no owner recorded, asks for an address the
-        human controls on Arc). On a chain whose gas is USDC, such as Arc, there is no native:
-        the gas is part of usdc.need, and message asks for USDC only; usdc.need also keeps one session gas for
-        each channel of this home that is not finalized, shown as usdc.reserved. faucet is present only when a
+        Prints {tellYourHuman, disclosure, address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?,
+        message}, where message is a ready-to-relay sentence (on Arc it names the network, warns that USDC sent on
+        any other network never arrives, says how to get USDC onto Arc and, with no owner recorded, asks for an
+        address the human controls on Arc); disclosure says what the human is funding (the network, the hub, the
+        host's /templates audit text, the per-player deposit cap and fee per channel, and that withdrawals go only
+        to the owner); and tellYourHuman, first, tells the agent to put both in its own reply, word for word.
+        On a chain whose gas is USDC, such as Arc, there is no native: the gas is part of usdc.need, and message
+        asks for USDC only; usdc.need also keeps one session gas for each channel of this home that is not
+        finalized, shown as usdc.reserved. faucet is present only when a
         faucet call was attempted: on success it is {usdc, native} (the wallet's new balances, formatted like
         "arena faucet"; {usdc} alone where gas is USDC); on failure (unreachable, rate-limited, wrong origin, ...)
         it is the string "skipped: <reason>" instead, and the
@@ -579,6 +590,7 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
     if (a === "--offer-draw") flags.set("offer-draw", true);
     else if (a === "--no-faucet") flags.set("no-faucet", true);
     else if (a === "--allow-real-chain") flags.set("allow-real-chain", true);
+    else if (a === "--detach") flags.set("detach", true);
     // Plan 5.6 Task 3 (fix round 1, M5): `--all` is a boolean for every command, not only `withdraw` -- a future
     // command that wants `--all <value>` must special-case it here, or it will silently get `true`.
     else if (a === "--all") flags.set("all", true);
@@ -972,6 +984,17 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
     if (cmd === "daemon") {
       if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
+      // Plan 6 hardening H4 (live run friction 4): a daemon that outlives the agent's tool session -- see
+      // startDetachedDaemon. The child it starts is this same branch without --detach.
+      if (flags.has("detach")) {
+        const waitRaw = flag("timeout") ?? String(DETACH_WAIT_DEFAULT_S);
+        if (!/^[0-9]+$/.test(waitRaw) || Number(waitRaw) < 1 || Number(waitRaw) > 600) {
+          throw new UsageError("--timeout must be a whole number of seconds from 1 to 600");
+        }
+        const started = await startDetachedDaemon(home, { env: io.env, fetch: io.fetch, waitMs: Number(waitRaw) * 1000, command: CLI_COMMAND });
+        io.out(JSON.stringify(started));
+        return 0;
+      }
       const proc = await startDaemonProcess(home, { log: io.err });
       // Plan 5 Task 2 fix round, CRITICAL 1: no token anywhere in this line -- see daemonStartLine's own
       // docstring. Run `arena board` for a board link with a one-time code.
@@ -1004,7 +1027,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         });
       } catch {
-        throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon", then run "${CLI_COMMAND} board" again`);
+        throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach", then run "${CLI_COMMAND} board" again`);
       }
       const payload = (await res.json().catch(() => ({}))) as { code?: unknown; error?: string };
       if (!res.ok || typeof payload.code !== "string") {
@@ -1213,6 +1236,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       const cap = BigInt(limits.maxDepositPerPlayer);
       const faucetUrl = typeof chess.faucet === "string" ? chess.faucet : undefined;
+      // H4: quoted in `disclosure` as the host's own words; an older host may publish none.
+      const audit = typeof chess.audit === "string" ? chess.audit : undefined;
 
       // Final fix wave (K1): the chosen offer, from the server's public lobby (the same list the daemon's `offers`
       // shows, in the server's own {"$bigint": ...} wire format). Only its deposit and stake are used, to size the
@@ -1341,8 +1366,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // Plan 5.6 Task 3: the owner recorded in config.json (`arena owner set` / `init --owner`), or null.
       const owner = cfg.owner ?? null;
       const message = fundMessage(funding, { address, chainId: cfg.chainId, ownerSet: owner !== null, games: fundGames, stake: fundStake });
+      // Plan 6 hardening H4 (live run frictions 1, 2): the output leads with what the agent must say to its human, in
+      // its own reply -- what they are funding, then the ask. Every field after these two is unchanged for scripts.
+      const disclosure = fundDisclosure({ chainId: cfg.chainId, hub: cfg.hub, audit, cap, feePerPlayer, owner });
+      const short = funding.usdc.shortfall > 0n || ("native" in funding && funding.native.shortfall > 0n);
 
       const body: Record<string, unknown> = {
+        tellYourHuman: tellYourHuman(disclosure, message, short),
+        disclosure,
         address,
         chainId: cfg.chainId,
         // Final fix wave (K1): only with --offer -- the offer sized for, and its stake in whole USDC.
@@ -1749,7 +1780,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // own wording (skill.md's recipe step 2 starts the daemon -- the final fix wave moved it back ahead of
       // picking an offer and `fund --offer`).
       throw new Error(
-        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon" (skill.md's recipe step 2), ` +
+        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach" (skill.md's recipe step 2), ` +
           `then retry: ${err instanceof Error ? err.message : String(err)}`,
       );
     }

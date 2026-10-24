@@ -4,7 +4,9 @@ import {
   computeOneBalanceFundingNeed,
   formatNativeCeil4,
   oneBalanceOpenNeed,
+  fundDisclosure,
   fundMessage,
+  tellYourHuman,
   FUND_TX_GAS_UNITS,
   type FundingInput,
   type OneBalanceFundingInput,
@@ -227,6 +229,48 @@ describe("computeOneBalanceFundingNeed (nativeIsUsdc)", () => {
         "needed. Also tell me an address you control on Arc Testnet to return winnings to (not an exchange deposit " +
         "address unless that exchange supports USDC deposits on Arc Testnet, and not a smart wallet deployed only on " +
         "another chain).",
+    );
+  });
+});
+
+describe("H4: fundDisclosure and tellYourHuman (live run frictions 1 and 2)", () => {
+  const HUB = "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41" as const;
+  const OWNER = "0x840d6f90dd12A713CC5F1fb6EAbBF99e0E74A7E0" as const;
+  const AUDIT = "unaudited; Arc TESTNET test stack, faucet USDC only";
+  const base = { hub: HUB, audit: AUDIT, cap: 2_000_000n, feePerPlayer: 5_000n, owner: null };
+
+  it("names the network and whether it is real, the hub, the host's audit text, the cap, the fee and the owner rule", () => {
+    expect(fundDisclosure({ ...base, chainId: 5042002 })).toBe(
+      "What you are funding: chess games for USDC through the Agent Chess Arena hub 0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41 " +
+        'on Arc Testnet (chain id 5042002, a test network). Its host says: "unaudited; Arc TESTNET test stack, faucet USDC only". ' +
+        "Each player deposits at most 2.000000 USDC per channel, plus a host fee of 0.005000 USDC per player per channel, " +
+        "and withdrawals go only to the owner address you give me.",
+    );
+    expect(fundDisclosure({ ...base, chainId: 5042, owner: OWNER })).toContain(
+      "on Arc (chain id 5042, mainnet, real USDC). Its host says:",
+    );
+    expect(fundDisclosure({ ...base, chainId: 5042, owner: OWNER })).toMatch(
+      /and withdrawals go only to the recorded owner, 0x840d6f90dd12A713CC5F1fb6EAbBF99e0E74A7E0\.$/,
+    );
+    expect(fundDisclosure({ ...base, chainId: 31337 })).toContain("hub 0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41 on chain 31337. Its host says:");
+  });
+
+  it("an absent or blank audit says so; the host's text is folded onto one line and capped at 300 characters", () => {
+    expect(fundDisclosure({ ...base, chainId: 5042002, audit: undefined })).toContain("Its host publishes no audit statement. Each player");
+    expect(fundDisclosure({ ...base, chainId: 5042002, audit: " \n " })).toContain("Its host publishes no audit statement.");
+    expect(fundDisclosure({ ...base, chainId: 5042002, audit: "line one\n\tline\u0007two " })).toContain('Its host says: "line one line two".');
+    const long = fundDisclosure({ ...base, chainId: 5042002, audit: "x".repeat(400) });
+    expect(long).toContain(`Its host says: "${"x".repeat(299)}…".`);
+    expect(long).not.toContain("x".repeat(300));
+  });
+
+  it("tellYourHuman leads with the instruction, then the disclosure and the ask; with a shortfall it comes before the wait", () => {
+    expect(tellYourHuman("D.", "Please send 1 USDC.", true)).toBe(
+      "Tell your human now, in your own reply, word for word, before you run wallet --wait-for-usdc " +
+        "(they cannot see this command's output): D. Please send 1 USDC.",
+    );
+    expect(tellYourHuman("D.", "This wallet already holds enough.", false)).toBe(
+      "Tell your human now, in your own reply, word for word (they cannot see this command's output): D. This wallet already holds enough.",
     );
   });
 });
