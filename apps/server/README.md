@@ -151,6 +151,13 @@ An optional `cli: {package, version, minVersion?}` pins the `arena` CLI this hos
   --version` is 24 or newer, then run the pinned `npx` command) — a host that leaves `cli` unset keeps today's
   page unchanged, with `cliCommand` still defaulting to (or explicitly) `arena`. With `cli` set, the recipe tells
   the agent to use that exact pinned command for every step, never `@latest`.
+- **`/skill.md` on Arc** (Plan 6 hardening H2). When `chainId` is 5042 (Arc) or 5042002 (Arc Testnet), the recipe
+  is worded for that network, from a local id→name map in `src/docs.ts` (the server has no runtime dependency on the
+  CLI): USDC on that network only, with no `native` object and no `--wait-for-native`; how a human gets USDC there
+  (Circle's CCTP bridge or an exchange or wallet that supports Arc; Circle's faucet on testnet) and the explorer to
+  check a payment on; an owner the human controls on that network, confirmed before `owner set` and again before
+  `withdraw --all`; the profit and loss read only after the channel's session gas is swept back, counting the USDC
+  spent on gas. Any other chain gets the dev wording, which also states the Arc variant.
 - **The `init` version gate.** `arena init` checks `/templates`' `cli` only after every other refusal (a changed
   chain/hub/USDC/rules, the RPC pin, the code checks). It validates the entry locally first: a `cli.package` that
   is not a valid npm name, or a version that is not a plain `x.y.z`, is refused without echoing the raw value. In

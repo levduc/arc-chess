@@ -62,7 +62,8 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
 4. **Session gas.** The profile's `feeCeilingWei` (40 gwei) is the default fee ceiling on Arc. On profile chains,
    `sessionGasWei` defaults to `SESSION_GAS_RESPONDS × RESPOND_GAS_BUDGET × profile.feeCeilingWei`
    = 4 × 2.1M × 40 gwei = **0.336 USDC** per channel, returned by the sweep. This replaces the
-   `max(ceiling, 4 × gasPrice)` term there, which gives 0.84 on Arc. Refills cover any fee spike, and
+   `max(ceiling, 4 × gasPrice)` term there, which gives at least 0.672 USDC on Arc (4 × the 20 gwei floor) and 0.84 at
+   the 25 gwei `eth_gasPrice` seen on 2026-10-23. Refills cover any fee spike, and
    `--session-gas-wei` still overrides the default. Profile-less chains keep today's formula.
 5. **Pinned deployments.** `KNOWN_DEPLOYMENTS[5042]` and `[5042002]` hold the deployed hub, rules and USDC
    addresses, filled in after each deploy. On a chain listed there, `init` **refuses** a mismatch. Today it only
@@ -84,7 +85,8 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   - the SDK and daemon tests that move money: deposit, close, dispute, sweep, top-up, withdraw;
   - the system dispute e2e.
 
-  Assert the Arc-specific behaviours: one balance; a top-up gas estimate above 21,000; a transaction below the
+  Assert the Arc-specific behaviours: one balance; a top-up gas limit of at least its own estimate (a plain transfer
+  costs 21,000 on Arc, so the estimate is not above it; audit-daemon I-2); a transaction below the
   20 gwei floor dropped; a blocklisted payout lands in `owed`, if arc-anvil can model the blocklist; otherwise say
   so explicitly.
 - The existing suites stay on standard anvil, unchanged.
@@ -133,6 +135,6 @@ mainnet (a policy decision; off by default); auditing.
 ## 7. Spec and gate updates
 
 - Parent spec §12: add a "Plan 6 refinements" block for the chain profiles, one-balance accounting, the fee floor,
-  top-up gas, pinned deployments, and the Arc test subset.
+  top-up gas, pinned deployments, and the Arc test subset. *Done 2026-10-24 (hardening wave H2): items 60–66, with items 22.4, 29, 31 and 37 amended.*
 - `mainnet-gates.md`: tick items 1, 2, 3 and 4 as they are completed, with evidence (transaction hashes, explorer
   links).

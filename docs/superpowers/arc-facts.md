@@ -23,7 +23,7 @@ The validator set is permissioned at launch. The network itself is public.
 
 ## Fees, blocks and finality
 
-- **EIP-1559.** The base fee has a **20 gwei floor**, and was observed flat at 20 gwei. The priority fee is tiny (about 1.15M wei). The base fee is paid to the proposer, not burned.
+- **EIP-1559.** The base fee has a **20 gwei floor**, and was observed flat at 20 gwei. The priority fee varies: about 1.15M wei on 2026-10-19, but `eth_maxPriorityFeePerGas` was 5 gwei and `eth_gasPrice` 25 gwei on 2026-10-23 (block 27,584,886, read-only calls; audit-journey I-4). The base fee is paid to the proposer, not burned.
 - The mempool **silently drops** any transaction with `maxFeePerGas` below 20 gwei. There is no error, and the transaction never appears.
 - The **block gas limit is 30M**. Our `challenge`, at 2.02M gas, fits; it costs about 0.04 USDC at 20 gwei.
 - A plain value transfer costs **21,000 gas**, the same as Ethereum, even though Arc also emits an EIP-7708 log. *Correction, 2026-10-24:* this file first said 21,225. That came from an estimate whose recipient was `0x…02`, the SHA-256 precompile. Twelve real transfers on mainnet and testnet show 21,000 gas limit and 21,000 gas used, and `eth_estimateGas` returns 21,000.
@@ -55,9 +55,15 @@ The validator set is permissioned at launch. The network itself is public.
 2. **Session-key top-ups** hard-code `gas: 21_000` (`daemon.ts`). That is *correct* on Arc; see the correction above. Estimating it is still good hardening, and the top-up must check the receipt status.
 3. **Fee floor.** Clamp every `maxFeePerGas` to at least 20 gwei on Arc. A lower `--fee-ceiling-wei` would make transactions vanish silently.
 4. **Receipts.** A blocklist revert may produce no receipt. The bounded waits already exist; confirm the hub's payout path treats a reverting USDC `transfer` as `owed`.
-5. **Session gas sizing.** The default formula is 4 × 2.1M × max(fee ceiling, 4 × eth_gasPrice). On Arc, `eth_gasPrice` is 20–25 gwei, so the second term is at least 80 gwei, giving 0.84 USDC per channel. The ruling for Plan 6 is that on profile chains `sessionGasWei` = 4 × 2.1M × the profile ceiling (40 gwei), which is 0.336 USDC; refills cover fee spikes.
+5. **Session gas sizing.** The default formula is 4 × 2.1M × max(fee ceiling, 4 × eth_gasPrice). On Arc, `eth_gasPrice` is 20–25 gwei, so the second term is at least 80 gwei, giving at least 0.672 USDC per channel, and 0.84 USDC at 25 gwei. The ruling for Plan 6 is that on profile chains `sessionGasWei` = 4 × 2.1M × the profile ceiling (40 gwei), which is 0.336 USDC; refills cover fee spikes.
 6. **Tests.** Run the contract and daemon suites against `arc-anvil --network arc` as well as standard anvil.
 7. **Circle agent wallets on mainnet.** The CLI reference uses `--chain ARC`, and third-party reports show mainnet runs through Circle ARC wallets. Circle's Agent Stack marketing page still says "Arc testnet (mainnet coming soon)". Confirm with `circle blockchain list` once logged in.
+
+## Funding an agent on Arc (added 2026-10-24, audit-journey C-1 and C-2)
+
+- There is no faucet on mainnet. The agent's address is a plain EVM address, valid on every EVM chain, so USDC sent to it on Ethereum, Base or any other network does not arrive on Arc.
+- A human brings USDC onto Arc with Circle's CCTP V2 (TokenMessengerV2 above) from another chain, or from an exchange or wallet that supports Arc. On testnet, Circle's faucet.
+- The owner (cash-out) address must likewise be one the human controls on Arc. `fund`'s message, `owner set` and `/skill.md` say so (hardening wave H2).
 
 Sources:
 - `https://docs.arc.io/arc/references/connect-to-arc`

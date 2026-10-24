@@ -727,8 +727,11 @@ The stream closes on client disconnect, daemon stop, or server close.
        replaces N with raised fees instead of queueing behind it. A fresh sender that finds pending nonces it does
        not track (a restart, or a lost response) adopts the lowest one as released and replaces it.
     4. **Bounded fees.** The wallet never pays more per gas than max(4 × the node's estimate, `feeCeilingWei`,
-       default 100 gwei), nor more than its balance can cover. Session keys have no fee ceiling (a dispute must
-       never be refused by one); only their balance bounds them, which is why item 29 exists.
+       default 100 gwei; 40 gwei on Arc, item 60), nor more than its balance can cover. Session keys have no fee
+       ceiling (a dispute must never be refused by one); only their balance bounds them, which is why item 29
+       exists. *Plan 6 (item 62):* on a chain with a fee floor (Arc, 20 gwei), the floor is applied last, after the
+       balance clamp. It can beat the ceiling, but never the balance: a send the balance cannot pay at the floor is
+       refused (`TxInsufficientFundsError`), never sent under it.
     5. **Every wait is bounded** by its give-up time, its replacement count or the daemon's stop signal.
 
     It assumes instant finality (Arc): after a reorg that un-mines one of our transactions, that nonce is not
@@ -771,14 +774,19 @@ The stream closes on client disconnect, daemon stop, or server close.
       $$\text{sessionGasWei} = k \cdot G_{\text{respond}} \cdot F_{\text{cap}}$$
       with $k = 4$, $G_{\text{respond}} = 2{,}100{,}000$ (the heaviest measured respond, about 1.86M, plus a
       margin) and $F_{\text{cap}} = \max(\text{fee ceiling}, 4 \times \text{the RPC's gas price})$.
-      `--session-gas-wei` overrides it. Arc's real fee level decides the final values (Plan 6).
+      `--session-gas-wei` overrides it. *Plan 6 (item 61):* on a chain with a built-in profile,
+      $F_{\text{cap}}$ is the profile's own fee ceiling, with no gas-price read and whatever `--fee-ceiling-wei`
+      says: $4 \times 2{,}100{,}000 \times 40\,\text{gwei} = 0.336$ USDC per channel on Arc. On Arc,
+      $4 \times$ `eth_gasPrice` is at least 80 gwei (20 gwei floor), so the old term would always lock at least
+      0.672 USDC (0.84 at a 25 gwei gas price); refills cover a fee spike instead.
 30. **Minimum challenge timeout (final review I4).** Daemons refuse a `challengeTimeout` under `minChallengeTimeout`
     (default 900 s): `createOffer` and `acceptOffer` answer 400, and a match under it is ignored. The offer defaults
     (`arena offer`, the API, the server's `defaults.challengeTimeout`) are 900 s. The hub's own minimum stays 60 s.
 31. **Bounded approval (final review I2).** The daemon approves exactly `deposit + feePerPlayer` before a deposit,
     and only when the current allowance is short; never an unlimited allowance. `arena init` warns loudly when the
-    hub, rules or USDC address differs from the canonical deployment for a known chain id (`KNOWN_DEPLOYMENTS`,
-    empty until Plan 6 adds Arc mainnet).
+    hub, rules or USDC address differs from the canonical deployment for a known chain id (`KNOWN_DEPLOYMENTS`).
+    *Plan 6 (item 64):* on a chain with a built-in profile it refuses instead; Arc's entries are added after each
+    deploy.
 32. **Flat daemon memory (final review I3).** A settled channel (Finalized, Reclaimed, or retired without our
     deposit) is dropped from the daemon's live set 10 minutes of chain time after the main pass first sees it
     settled. `status` still serves it from its cached final status (the latest 1,000) or from disk, and `channels`
@@ -807,7 +815,9 @@ The stream closes on client disconnect, daemon stop, or server close.
 37. **`session-gas-low` precision.** Raised only when the wallet itself cannot pay for a refill --
     `TxInsufficientFundsError`, `TxFeeCapError`, or a failed fee/gas estimate for it -- never for a transient refill
     error (a nonce race, a dropped/stuck send, a missing receipt), which is logged and re-evaluated on the next
-    pass without alarming the agent.
+    pass without alarming the agent. *Plan 6 (item 63):* a top-up that was mined and reverted raises it too, and
+    is never counted as a refill. Funding the wallet does not fix that case; a distinct action text for it, and a
+    back-off that a balance rise does not end, are open (Task 2 review Minor-2, routed to hardening wave H1).
 38. **Offer default timeout** (supersedes item 30 for the daemon's own defaults). When `POST /offers` omits
     `challengeTimeout`, the daemon now defaults it to its own `minChallengeTimeoutOf(config)` rather than a fixed
     900 s; `arena offer` omits the field unless `--timeout` is given. The server's `/templates`
@@ -1084,6 +1094,66 @@ with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch 
     file with every image pinned by `@sha256:` digest and host ports parameterized
     (`${XMTP_GRPC_PORT:-5555}`/`${XMTP_API_PORT:-5556}`/`${XMTP_HISTORY_PORT:-5558}`), brought up under a unique
     compose project name per run and always torn down with `down -v`, even on failure.
+
+### Plan 6 refinements (Arc launch, 2026-10-24)
+
+See `docs/superpowers/specs/2026-10-23-arc-launch-design.md` for the design and `docs/superpowers/arc-facts.md` for
+the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2.
+
+60. **Chain profiles.** `CHAIN_PROFILES` (`packages/cli/src/chains.ts`) is built into the CLI and keyed by chain id;
+    nothing in it is ever taken from the host. Arc (5042) and Arc Testnet (5042002) each have `usdc`
+    `0x3600…0000`, `nativeIsUsdc: true`, `minFeePerGas` 20 gwei and `feeCeilingWei` 40 gwei. The profile's ceiling
+    is the wallet's default fee ceiling there (`feeCeilingOf`). A chain without a profile (anvil, 31337) behaves
+    exactly as before.
+61. **One balance and reserve gating.** On a `nativeIsUsdc` chain, USDC and gas are one balance:
+    - `wallet` prints one `usdc`, the native balance (18 decimals) shown with 6, rounded down, and no `native`;
+      `--wait-for-native` exits 1.
+    - `fund` folds the gas into `usdc.need`, rounded up, and prints no `native` object. `usdc.need` also keeps one
+      `sessionGasWei` for each of the home's channels that is not finalized, shown as `usdc.reserved`; `usdc.have`
+      stays the whole balance.
+    - `withdrawReserve()` = unsettled channels × `sessionGasWei` + 500,000 × the fee ceiling, rounded up.
+      `withdraw --all` keeps it, so `usdcAfter` is not 0, and `withdraw --amount` never dips into it.
+    - The other unsettled channels' reserve also gates every opening path (`createOffer`, `acceptOffer`, `fund()`'s
+      top-up and deposit; `oneBalanceOpenNeed`), so a new channel never spends a live channel's refill money.
+    - The default `sessionGasWei` is $4 \times 2{,}100{,}000 \times$ the profile's ceiling = 0.336 USDC (item 29).
+62. **Fee floor.** `SerialTxSender` takes `minFeePerGas` from the profile, for the wallet and every session key.
+    Every send and replacement has `maxFeePerGas` ≥ the floor and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. The
+    floor is applied after the balance clamp: a fee is raised to it, or the send is refused when the balance cannot
+    pay it, never sent below it (Arc's mempool drops such a transaction silently). `init` refuses a
+    `--fee-ceiling-wei` below the floor (item 22.4).
+63. **Top-up gas and receipts.** A session-key top-up's gas limit is its `estimateGas` plus 20 % and 5,000 (a
+    plain transfer costs 21,000 on Arc). A failed estimate sends nothing and raises `session-gas-low`. Every
+    top-up checks its receipt: a reverted one never counts as a refill, raises `session-gas-low`, and backs off
+    (item 37). Arc may give no receipt for a gas-consuming blocklist revert, so every receipt wait stays bounded
+    (item 25), and a wait that times out must never be reported as success on the deposit, close, dispute, sweep
+    or withdraw path (Arc launch spec §2.6).
+64. **Pinned deployments.** On a chain with a profile, `init` always refuses a USDC other than the profile's and,
+    once `KNOWN_DEPLOYMENTS` pins that chain, any other hub or rules, whether from `/templates` or from flags. The
+    daemon re-checks the pin when it starts. Other chains keep item 31's warning. The entries for 5042 and 5042002
+    are added after each deploy.
+65. **Arc test subset.** `pnpm test:arc` (`scripts/test-arc.sh`) runs the contract suite, the SDK and CLI
+    money-moving tests (deposit, close, dispute, sweep, top-up, withdraw) and the system dispute e2e against
+    Arc Foundry's `arc-anvil --network arc`, pinned at `v0.8.0-2` with verified checksums (`tools/arc-foundry.md`).
+    Each step uses its own port, so the subset can run alongside the standard suites, which stay on standard anvil.
+    `arc-anvil` answers a below-floor send with an error (`-32003`, at chain ids 31337 and 5042) instead of
+    dropping it silently, so the silent drop itself is asserted at sender level.
+66. **The agent journey on Arc (hardening wave H2, audit-journey).**
+    - `fund`'s message on a profile chain names the network and its chain id, says the USDC must be sent on that
+      network only, warns that USDC sent on Ethereum, Base or any other network will not arrive, and says how to
+      get USDC there: Circle's CCTP bridge from another chain, or an exchange or wallet that supports Arc; Circle's
+      faucet on Arc Testnet.
+    - The owner must be an address the human controls on Arc: not an exchange deposit address unless that
+      exchange supports USDC deposits on Arc, and not a smart wallet deployed only on another chain. `fund`'s
+      owner question, `owner set`'s stderr note and `/skill.md` all say so.
+    - `/skill.md` on 5042 and 5042002 uses only `usdc.*` and `--wait-for-usdc`; reads the profit and loss only
+      once `status.swept` is set, or after a bounded wait and `arena sweep`, and counts the USDC spent on gas;
+      confirms the amount, owner and network before `withdraw --all`; and stops after about 30 minutes unmatched,
+      noting the offer's 1 h expiry and that there is no cancel.
+    - `buildStatus` takes optional `gasFunding` `{chainId, sessionGasWei, feeCeilingWei}`. With it, on Arc,
+      `session-gas-low`'s reason is shown in USDC and gwei, and its action asks for one channel's gas budget in
+      USDC ($\text{sessionGasWei} + 500{,}000 \times \text{ceiling}$, 0.356 USDC by default).
+    - `arena xmtp enable` removes the `.sdk-tmp-*` directory a killed earlier run left behind. `/skill.md` tells
+      the agent to run it in the background and poll `arena xmtp status`.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

@@ -57,8 +57,10 @@ Other `init` settings:
 
 - `--session-gas-wei N`: the native balance (wei; on Arc, native gas is USDC) each channel's session key is kept at
   for dispute transactions. By default `init` derives it from the chain: 4 × 2.1M gas × max(the fee ceiling, 4 × the
-  RPC's `eth_gasPrice`), and prints it. `--session-gas-floor N` (default half of it) is the balance below which the
-  daemon refills a key while its channel is Open or Challenged.
+  RPC's `eth_gasPrice`), and prints it. On a chain with a built-in profile (Arc), the default is instead 4 × 2.1M gas
+  × the profile's 40 gwei ceiling = 0.336 USDC per channel, with no `eth_gasPrice` read, regardless of
+  `--fee-ceiling-wei`: refills cover a fee spike. `--session-gas-wei` overrides either default. `--session-gas-floor N`
+  (default half of it) is the balance below which the daemon refills a key while its channel is Open or Challenged.
 - `--min-challenge-timeout SECONDS` (default 900): the daemon refuses to offer, accept or fund a channel with a
   shorter `challengeTimeout`. A missed challenge deadline can cost more than one stake, and a restart or an RPC
   outage can take longer than the hub's 60 s minimum.
@@ -76,9 +78,13 @@ Other `init` settings:
 **The daemon's wallet key (`--wallet-key`, or the one `init` generates) must not be used anywhere else.** The
 daemon manages that key's nonces itself: on start, and whenever it finds a pending transaction on the key that it
 did not send, it adopts that nonce and replaces the transaction with its own (Plan 4.5 Task 10). A transfer you send
-from the same key with another wallet can be replaced and never land. `--fee-ceiling-wei` sets the most the wallet
-pays per gas for a replacement (at least 4x the node's estimate; default 100 gwei); session keys have no ceiling
-and are bounded only by their balance.
+from the same key with another wallet can be replaced and never land. And `withdraw --all` sends the key's whole
+USDC balance, above the gas reserve, to the owner. `--fee-ceiling-wei` sets the most the wallet pays per gas for a
+replacement (at least 4x the node's estimate; default 100 gwei, and on Arc 40 gwei); session keys have no ceiling
+and are bounded only by their balance. On Arc, every fee the daemon sends, from the wallet or a session key, is at
+least the 20 gwei base-fee floor (the mempool silently drops anything lower). The floor is applied last: it can lift
+a fee above the ceiling, never above what the balance can pay, and a send the balance cannot pay at the floor is
+refused rather than sent under it. `init` refuses a `--fee-ceiling-wei` below the floor.
 
 **What the wallet pays for.** On Arc, native gas is USDC, so the wallet needs USDC for, per channel: the deposit
 and the host fee; `sessionGasWei` for the session key (topped up at funding, and refilled whenever an opponent's
@@ -91,16 +97,22 @@ automatic sweep waits at most 20 s for its receipt, and at most 3 queued settled
 sweep transaction the daemon gave up waiting on is remembered in the channel's record (`sweepPending`), so a restart
 still recognises it if it lands. `arena sweep [--channel ID]` also sweeps any settled channel a restart, or an
 older daemon, left unswept. Each session key's private key stays in `ARENA_HOME/channels/<id>/record.json`
-regardless of whether it has been swept. If the wallet cannot refill a session key because of insufficient funds,
-its fee cap, or a failed estimate, `status` raises the `session-gas-low` attention: fund the wallet.
+regardless of whether it has been swept. A top-up's gas limit is its `estimateGas` plus 20 % and 5,000 (a failed
+estimate sends nothing), and a top-up counts only once its receipt shows success. If the wallet cannot refill a
+session key because of insufficient funds, its fee cap, a failed estimate, or a top-up that reverted, `status`
+raises the `session-gas-low` attention: fund the wallet. On Arc, that means USDC: `status` gives the reason in USDC
+and asks for one channel's gas budget (`sessionGasWei` + 500,000 × the fee ceiling: 0.356 USDC by default) when the
+daemon passes it the chain's gas numbers.
 
 ## Funding your agent
 
-The human is the agent's bank: there is no faucet outside a local dev chain (31337 + Anvil). Work out what to ask
-for, then wait for it:
+The human is the agent's bank: there is no server faucet outside a local dev chain (31337 + Anvil). Work out what to
+ask for, then wait for it:
 
     arena fund --games 3 --stake 1
-    arena wallet --wait-for-usdc <usdc.need> --wait-for-native <native.need> --timeout 1800
+    arena wallet --wait-for-usdc <usdc.need> --timeout 100   # repeat while reached is false
+
+Add `--wait-for-native <native.need>` only on a chain where `fund` prints a `native` object; never on Arc.
 
 `fund --games N --stake X [--deposit D]` reads the host's deposit cap and (dev only) faucet, the hub's
 `feePerPlayer`, and this wallet's own balances — no daemon needed. `deposit` defaults to `min(N × X, cap)`, or
@@ -113,8 +125,17 @@ ready-to-relay sentence naming the exact USDC amount (6 decimals), the native am
 plus a reminder to give the owner address if none is recorded yet. Relay `message` to your human verbatim; exit 0
 here just means the arithmetic succeeded, not that nothing is owed.
 
+On Arc (gas is USDC, one balance) there is no `native` object: the gas is part of `usdc.need`, which also keeps one
+`sessionGasWei` for each of the home's channels that is not finalized (`usdc.reserved`). There, `message` names USDC
+only and names the network: "on Arc (chain id 5042), on the Arc network only", with a warning that USDC sent on
+Ethereum, Base or any other network will not arrive, and the way in (Circle's CCTP bridge from another chain, or an
+exchange or wallet that supports Arc; Circle's faucet on Arc Testnet). Its owner reminder asks for an address the
+human controls on Arc, not an exchange deposit address unless that exchange supports USDC deposits on Arc, and not a
+smart wallet deployed only on another chain.
+
 `wallet --wait-for-usdc A [--wait-for-native B] [--timeout SECONDS]` then polls the chain (every 5 s, `--timeout`
-default 1800, max 3600) until both thresholds hold, and prints `wallet`'s usual JSON plus `{reached,
+default 1800, max 3600; an agent whose tool has a 2-minute command limit should pass `--timeout 100` and repeat)
+until both thresholds hold, and prints `wallet`'s usual JSON plus `{reached,
 waitedSeconds}`. It exits 0 once reached, 2 on an actual timeout, and 1 on a read error or a malformed amount or
 `--timeout` (never 2, so exit 2 here means a timeout). Only a flag given with no value at all is the CLI's usual
 usage error, which exits 2 too; the recipe's commands always give one. On a timeout, tell your human what has and has not arrived, and stop — do not loop
@@ -138,14 +159,21 @@ zero address, this wallet, the hub, the USDC token, the rules contract, or any s
 Re-running `init` never resets the owner (and never resets `chainId`/`hub`/`usdc`/`rules` either — a fresh
 `ARENA_HOME` is the only way to point a home at a different deployment).
 
+`withdraw` pays the owner on this home's chain only, in one irreversible transfer. On Arc, the owner must be an
+address the human controls on Arc: an exchange deposit address that does not credit USDC deposits on Arc, or a smart
+wallet deployed only on another chain, loses the funds. `owner set` says so on stderr on Arc; its stdout stays
+`{owner}`.
+
     arena withdraw --amount 5   # or: arena withdraw --all
 
 `withdraw` takes **no destination** — `--to`, a bare address, anything like that is a usage error, on purpose.
 It goes through the daemon (started in-process, and stopped again, if none is already running), because the
 daemon owns this wallet's one transaction-nonce sequence. It is refused with a `409` while any channel still
 awaits this wallet's own deposit, so it never starves a deposit the daemon is about to make — retry once that
-channel is funded or its funding window has closed. `--all` sends everything above the reserve (`0` on every
-chain this daemon runs on today, since gas here is native, not USDC — Plan 6 defines Arc's USDC-as-gas reserve).
+channel is funded or its funding window has closed. `--all` sends everything above the reserve: `0` on a chain whose
+gas is a separate native asset; on Arc, where gas is USDC, the session gas of every unsettled channel plus 500,000 ×
+the fee ceiling (0.02 USDC at Arc's 40 gwei), rounded up. So on Arc `usdcAfter` is not 0 after `--all`, and
+`--amount` never dips into the reserve.
 Success means the transaction's receipt shows the USDC `Transfer` to the owner, never a balance delta (a same-
 block inflow, or Arc's USDC gas, can skew a delta either way); `usdcAfter` can be `null`, with a note, if the
 balance can't be re-read right after a confirmed send. Funds escrowed in open channels are not in the wallet:

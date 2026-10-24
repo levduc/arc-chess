@@ -6,8 +6,9 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **Session-gas sweep** (spec §3.1) — **done in Plan 5** (spec §12 item 35). The main pass sweeps a
   Finalized/Reclaimed channel's session key back to the wallet, with per-record back-off and an `"abandoned"`
   outcome after `SWEEP_ABANDON_ATTEMPTS`; `arena sweep` / `POST /sweep` sweep settled-but-unswept records too,
-  including legacy ones from before this feature. Still open: pin Arc's real fee ceiling and re-derive
-  `sessionGasWei` with k = 2..4 once Arc's fee data is known (Plan 6).
+  including legacy ones from before this feature. Arc's fee ceiling and `sessionGasWei` — **done in Plan 6**
+  (Task 2, `dc0d0ed`; spec §12 items 60–61): a 40 gwei profile ceiling, and on profile chains `sessionGasWei` =
+  4 × 2.1M × 40 gwei = 0.336 USDC (k stays 4; refills cover a fee spike).
 - **Refill retries** — **done in Plan 5** (spec §12 item 36). Empty-wallet refill retries back off per channel
   (`refillBlockedUntil`: 30 s doubling to 5 min), with one log line per episode.
 - **`session-gas-low`** — **done in Plan 5** (spec §12 item 37). Raised only on insufficient funds, the fee cap, or
@@ -77,7 +78,7 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   records from a previous chain are never acted on (ghost channels after a dev-up restart).
 
 ### Plan 5.6
-- Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC and set feeCeilingWei for Arc in Plan 6.
+- Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC. (`feeCeilingWei` for Arc: done in Plan 6, 40 gwei by default, with the 20 gwei floor applied last; spec §12 items 60, 62.)
 - **Before the first real publish** (owner's own steps, not automated — spec §6):
   - choose the npm package name/scope and set `ARENA_CLI_PACKAGE`;
   - choose a license, add a `LICENSE` file, and set `ARENA_CLI_LICENSE`; make `scripts/build-cli.ts` copy that
@@ -89,11 +90,10 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **Host `cli` config set to a provenance-published version.** Only after a real `cli-v*` tag has gone through
   `.github/workflows/release-cli.yml` (build → the clean-room test → `npm publish --provenance`) should the
   host's `cli: {package, version, minVersion?}` point at that version — never at a version only built locally.
-- **Plan 6: Arc's USDC-as-gas reserve.** `fund`'s native line (`native.need = sessionGasWei + 500_000n ×
-  feeCeilingWei`) assumes native gas; on Arc, gas is paid in USDC, so this line needs its own Arc-specific
-  accounting. `withdraw --all`'s `withdrawReserve()` currently returns `0n` (correct on every chain this daemon
-  runs on today, whose gas is native) — Plan 6 must give it Arc's real reserve so `--all` never drains the USDC
-  a live channel's session key needs to keep paying its own gas.
+- **Plan 6: Arc's USDC-as-gas reserve** — **done in Plan 6** (Task 1, `4b822e3`, `4bc5e13`; spec §12 item 61).
+  On Arc, `fund` folds the gas into `usdc.need` (plus one `sessionGasWei` per unsettled channel, `usdc.reserved`),
+  and `withdrawReserve()` keeps unsettled channels × `sessionGasWei` + 500,000 × the fee ceiling, which also gates
+  every opening path.
 - **The host can pin only a version of the CLI's own package.** `init` validates `/templates.cli` locally and,
   in the published bundle, refuses a different package name (final review C1: a host-supplied package used to
   reach an install command the recipe told the agent to run). Re-check this whenever the gate or the install
@@ -148,7 +148,7 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
    - `sessionGasWei` is derived from item 1.
    - There is a re-top-up while Open/Challenged, and a low-gas attention.
    - The new system test passes.
-   - The wallet's `--fee-ceiling-wei` default is set for Arc.
+   - The wallet's `--fee-ceiling-wei` default is set for Arc. (Done in Plan 6 Task 2, `dc0d0ed`: 40 gwei, and `init` refuses a value under the 20 gwei floor.)
 3. **Daemon safety policy.**
    - A `minChallengeTimeout` floor (I4).
    - Bounded USDC approval (I2).
@@ -179,7 +179,8 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
    - Key custody. Never renounce ownership (m15).
 8. **Docs.**
    - The spec's Plan 4.5 refinement block and the `TxSender` contract (I1).
-   - skill.md's Arc gas wording (m11) and the settle/`wait` guidance (m4).
+   - skill.md's Arc gas wording (m11) and the settle/`wait` guidance (m4). (Arc wording: done in hardening wave H2, `2bbdf58`; spec §12 item 66. Still to do: read it back from the deployed mainnet host before launch.)
+   - The spec's Plan 6 refinement block (spec §12 items 60–66). (Done in H2.)
    - The admin-surface caveats (m13, m14).
 9. **A final test gate on the release commit.**
    - `test:contracts`, plus the deep profile, mutants 18/18, Slither 0 High/Medium, and Echidna.
