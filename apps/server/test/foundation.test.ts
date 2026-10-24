@@ -1043,6 +1043,14 @@ describe("http foundation", () => {
       expect(step2).toMatch(/If `--detach` says another daemon is already using this\s+home, that one is running: go on\./);
       expect(step2).toContain(`then \`${PINNED} daemon --detach\` again`);
       expect(step2).not.toMatch(/nohup npx/);
+      // H4 add-on: restart is daemon stop, then --detach; never a bare kill.
+      expect(step2).toContain(`To restart it, run \`${PINNED} daemon stop\`, then \`${PINNED} daemon --detach\` again.`);
+      expect(step2).not.toContain("kill <pid>");
+      // ...and the recipe ends by stopping it, once everything is settled, swept and withdrawn.
+      const step8 = stepOf(recipeOf(text), "8. Ask your human whether to withdraw now", "**Troubleshooting:**");
+      expect(step8).toMatch(new RegExp(`Last, once every channel is \`Finalized\` or \`Reclaimed\` with \`swept\` set, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
+      expect(step8.indexOf("daemon stop")).toBeGreaterThan(step8.indexOf("withdraw --all"));
+      expect(step8).toMatch(/Never pass `--yes-i-understand` yourself: stopping a daemon that guards\s+a live channel is your human's decision\./);
       const setup = stepOf(text, "## Setup (once)", "## Find an opponent");
       expect(setup).toContain(`2. \`${PINNED} daemon --detach\` — start it so it keeps running while you play`);
       expect(setup).toContain(`\`nohup sh -c 'while true; do ${PINNED} daemon; sleep 5; done' >> "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\``);

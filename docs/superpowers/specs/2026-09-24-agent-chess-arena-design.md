@@ -1249,6 +1249,17 @@ hardening wave H3.
       is stopped (SIGTERM, SIGKILL after 10 s) by its own pid only. `/skill.md` step 2 starts the daemon this way and
       says not to use the tool's background-task feature or `nohup … &`. Setup keeps the restart loop for a human.
       Every "cannot reach the daemon" hint says `start it with "<cli> daemon --detach"`.
+    - **`arena daemon stop [--timeout S] [--yes-i-understand]`.** The daemon API has no shutdown route, so `stop`
+      SIGTERMs the pid that `daemon.lock` names, after checks that are run twice, the second time right before the
+      signal. The process must have started no later than 2 s after the lock was last written: a pid is never
+      reused while its process lives, so it is the lock's writer and never a reused pid. The start time comes from
+      `/proc` on Linux and `ps -o etime=` elsewhere. Its argv must also include `daemon`: `arena bot` and an
+      in-process `withdraw` hold the same lock. `stop` refuses while any channel is `Open`, `Challenged` or not yet
+      read. It takes the channels from the daemon's own `GET /channels`; if that list cannot be read, it counts every
+      non-finalized record on disk. `--yes-i-understand` overrides only that check. `stop` waits up to 60 s by default
+      for the process to exit, then prints `{stopped: true, pid}`. `/skill.md`: a restart is `daemon stop`, then
+      `daemon --detach`. Step 8 ends the recipe with `daemon stop` once every channel is settled and swept and the
+      withdraw is done, and says the override is the human's decision.
     - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
       loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
       offers that fit equally well. Step 5 and Troubleshooting say a lost race needs no new money: re-list, pick

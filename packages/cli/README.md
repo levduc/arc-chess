@@ -243,8 +243,30 @@ tool kills its process group). `arena daemon --detach [--timeout SECONDS]`:
 - otherwise exits 1 with the log's last lines: the child exited during startup, or it was still not up at the
   deadline, in which case it is stopped (SIGTERM, then SIGKILL after 10 s) — by its own pid, and nothing else.
 
-To stop or restart a detached daemon, `kill <pid>` (SIGTERM: a clean shutdown), then run `--detach` again. The
-"cannot reach the daemon" hints of every other command now say `start it with "arena daemon --detach"`.
+The "cannot reach the daemon" hints of every other command now say `start it with "arena daemon --detach"`.
+
+**`arena daemon stop [--timeout SECONDS] [--yes-i-understand]` (H4).** Stops this home's running daemon, however
+it was started, and waits until it has exited (`--timeout`, default 60 s, 1–600). Then it prints
+`{"stopped":true,"pid":…}`. A restart is `arena daemon stop`, then `arena daemon --detach`. The daemon API has no
+shutdown route, so it signals the pid that `daemon.lock` names, with SIGTERM (a clean shutdown), and only after it
+checks that pid:
+
+- the process must have started before `daemon.lock` was last written (2 s of slack). A pid cannot be reused while
+  its process lives, so this proves it is the process that wrote the lock, never a reused pid. The start time comes
+  from `/proc` on Linux, and from `ps -o etime=` elsewhere;
+- its argv must include `daemon`, so it is not `arena bot`, and not a `withdraw` running its own in-process daemon
+  (both hold the same lock);
+- the check runs again right before the signal.
+
+Any check that fails refuses with exit 1 and signals nothing. If no daemon holds the lock, it exits 1 with
+`nothing to stop`. It also refuses while a channel is `Open` or `Challenged`, or its phase is not read yet
+(`Unknown`): with no daemon running, nothing answers a challenge before its deadline. The message is "channels are
+live (…): settle first (arena close --channel <id>, then wait for Finalized) or run the daemon elsewhere". The
+channels come from the daemon's own `GET /channels`. If that cannot be read, every channel record on disk that is
+not finalized counts. `--yes-i-understand` overrides this check only, and prints a note naming the live channels;
+skill.md tells the agent that this is its human's decision. The recipe ends with `daemon stop`, once every channel
+is settled and swept and the withdraw is done. A daemon run under the restart loop below is started again by the
+loop.
 
 The connection to the server survives drops. The client:
 
