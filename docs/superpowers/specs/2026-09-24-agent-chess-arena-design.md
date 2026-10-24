@@ -685,8 +685,9 @@ The stream closes on client disconnect, daemon stop, or server close.
     `ingestOnChain` ignores states it already holds, so the overlap is harmless. The server indexer uses the same
     pattern over all hub events: chunked cursor plus a trailing 32-block rescan, with `apply` idempotent through
     each row's `lastEvent`. A rescanned chunk never moves the indexer's cursor back.
-    *Plan 6 hardening H1:* when the RPC refuses a chunk, the scan splits it. A single block it refuses even on its
-    own, while the RPC is otherwise up, is skipped, so later events stay readable. The skip is recorded per channel
+    *Plan 6 hardening H1:* when the RPC refuses a chunk, the scan splits it (only a refusal of the query itself, never
+    a rate limit or a transient failure: item 67). A single block it refuses even on its own, while the RPC is
+    otherwise up, is skipped, so later events stay readable. The skip is recorded per channel
     (`skippedEventBlocks`), shown in `status`, and the skipped blocks are retried in turn every few minutes; a block
     that reads again resets its count. The dispute pass reads the phase and the registered state from the hub's
     storage, not from events, so a skip cannot hide a challenge.
@@ -1116,7 +1117,8 @@ with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch 
 ### Plan 6 refinements (Arc launch, 2026-10-24)
 
 See `docs/superpowers/specs/2026-10-23-arc-launch-design.md` for the design and `docs/superpowers/arc-facts.md` for
-the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2.
+the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2; item 67,
+hardening wave H3.
 
 60. **Chain profiles.** `CHAIN_PROFILES` (`packages/cli/src/chains.ts`) is built into the CLI and keyed by chain id;
     nothing in it is ever taken from the host. Arc (5042) and Arc Testnet (5042002) each have `usdc`
@@ -1175,6 +1177,38 @@ the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Task
       USDC ($\text{sessionGasWei} + 500{,}000 \times \text{ceiling}$, 0.356 USDC by default).
     - `arena xmtp enable` removes the `.sdk-tmp-*` directory a killed earlier run left behind. `/skill.md` tells
       the agent to run it in the background and poll `arena xmtp status`.
+67. **Rate-limit resilience (hardening wave H3).** Arc's public RPC answers a modest mix of reads with `-32005` "rate
+    limit exceeded" (viem's `LimitExceededRpcError`, "Request exceeds defined limit.") or an HTTP 429. It refuses a
+    query it will never serve with `-32012` "requested range too large" (Arc testnet rehearsal §8.1, §8.2).
+    - **Error classes** (`packages/sdk/src/rpc.ts`). `isRangeRefusal` is `-32012`, viem's `ResponseBodyTooLargeError`,
+      or the RPC's words for a block range, result count or response size over its limit. It is never true while
+      `isRateLimited` is: `-32005` (unless its words are a refusal), `-32007`, a code or HTTP 429, or the words "rate
+      limit" or "too many requests". Only a refusal splits a range or counts toward a skip, in the indexer and in the
+      daemon's dispute scan (item 18). Any other failure ends that poll or pass, uncounted and unprobed, and the next
+      one reads the same range. Why: under load the RPC refuses at random, and a skip on that would hide a dispute
+      event.
+    - **Transport.** Every RPC client (`LocalKeyTxSender`, the daemon's, the server's `RpcChainReader`) uses
+      `rpcTransport`: viem's `http` retry classes, retried after 0.5, 1, 2, 4 and 8 s (15.5 s at most per call), with a
+      `Retry-After` honoured up to 4 s per retry. A send is never retried: viem issues `eth_sendRawTransaction` with
+      `retryCount: 0`. A `SerialTxSender` send answered "nonce too low" whose own hash cannot be read (a rate-limited
+      check) is kept, released, at its nonce, and never re-sent at the next one. `waitOrReplace` checks `giveUpAt`
+      again right before a replacement send.
+    - **CLI one-shot calls** (`rpcCall`: `init`, `wallet`, `fund`). An HTTP 429 or 5xx, or a JSON-RPC rate limit, is
+      retried after 1, 2, 4 and 8 s. One that persists fails with "the RPC is rate-limiting: … wait a minute, then
+      retry the command".
+    - **Action routes** (`/move`, `/resign`, `/accept-draw`, `/next-game`, `/close`, `/challenge`, `/reclaim`,
+      `/handoff`). An action that took effect answers 200 even when the chain read for the status it returns fails:
+      the last known status, with `chainStale: true` and `chainStaleReason`. The CLI prints a note. A failed action
+      still errors. A rate limit that outlasts the retries is a 503, "the RPC is rate-limiting (…): wait a few
+      seconds, then retry".
+    - **Sweep attribution.** A sweep whose receipt wait fails other than with a typed `Tx*Error` (a rate-limited
+      receipt read) throws `SweepWaitError` with the sweep's own hashes. They are kept in `pendingTx` and
+      `sweepPending`, and the attempt is not charged. The next attempt records the landed sweep (`swept: true` and a
+      `sweeps` entry), never `"dust"`.
+    - **Session-gas check.** After a failed read of a session key's balance, the check waits 5 s, doubling to 60 s,
+      before it reads again. A read that succeeds ends the back-off. A refill is at most 60 s late because of it.
+    - Tips are unchanged: a key tips `eth_maxPriorityFeePerGas` (5 gwei on Arc Testnet in the rehearsal), within the
+      profile's floor and ceiling.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

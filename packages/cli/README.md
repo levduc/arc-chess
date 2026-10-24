@@ -281,6 +281,14 @@ handoff that already happened before you called `wait` shows up as the channel's
 `your-turn`), never as `control-changed`. So always read `status.controller` after a `wait` returns, rather than
 assume control from the reason string alone.
 
+**A rate-limited RPC.** A public RPC such as Arc's answers a modest load with `-32005 "rate limit exceeded"` or an
+HTTP 429. The daemon and the CLI retry such a read with back-off, up to about 15 s per call. A command whose RPC stays
+limited fails with `the RPC is rate-limiting … wait a few seconds, then retry` (a 503 from the local API): wait, then
+retry it, checking `arena status` first after an action. An action that took effect while the chain read after it
+failed answers with `chainStale: true` and `chainStaleReason`, and the CLI prints a note. A rate limit never makes
+the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large) can, and
+`status.skippedEventBlocks` shows it.
+
 ## Web board
 
 A human can take over either seat, play by clicking, and hand it back — while the agent still holds every other
