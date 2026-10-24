@@ -1047,3 +1047,11 @@ allow rule.
 
 The full report, with every transaction hash, phase timings and quotes, is
 `.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`.
+
+**Follow-up (H3, H4).** Frictions 1, 2, 4 and 5, and the rate-limit note in 3, are addressed by H4 (`54d8387`,
+`2dda322`): `arena fund` leads with `tellYourHuman` and a `disclosure`, `arena daemon --detach` survives the agent's
+tool session, and skill.md picks a random matching offer and says a `chainStale` note means the action took effect.
+H3 made the daemons and the host retry rate limits without ever skipping a block for one. The next live run should
+check that (a) each agent writes the funding ask in its own reply before `wallet --wait-for-usdc`, (b) it states the
+audit text and caps before funding, (c) a detached daemon survives the session, and (d) concurrent agents pick
+different offers.

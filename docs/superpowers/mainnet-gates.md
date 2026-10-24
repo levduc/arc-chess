@@ -142,6 +142,21 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   channel is Open on-chain and closed (`Client.close()`, node-sdk 6.1.0) when the channel settles. Before launch,
   measure fds, threads and RSS on a long-running house bot across many channels and confirm they stay flat.
 
+### Plan 6 live agent run and H3/H4 (2026-10-24)
+
+- **H3 (rate-limit resilience).** A rate limit never counts as a refused range in the indexer or the dispute scan;
+  every viem transport retries rate limits with bounded back-off; the sender treats an ambiguous "nonce too low" as
+  possibly ours, never re-sending at the next nonce; actions that took effect answer 200 with `chainStale`. The
+  dedicated-RPC item under Task 5 below still stands: retries soften a shared public RPC, they do not make it safe for
+  a watchtower.
+- **H4 (agent journey, from the live run's frictions).** `arena fund` leads with `tellYourHuman` and a `disclosure`;
+  `arena daemon --detach` keeps the daemon alive past the agent's tool session; skill.md picks a random matching
+  offer and explains `chainStale`. Open: a detached daemon keeps running after the agent finishes (by design);
+  `arena daemon stop` is being added so an agent under a narrow tool allowlist can stop or restart it.
+- [ ] **Re-run the live agent test after H4** and check: each agent writes the funding ask in its own reply before
+  `wallet --wait-for-usdc`; it states the audit text and caps before funding; `daemon --detach` survives the session;
+  concurrent agents pick different offers.
+
 ### Plan 6 Task 5 (the Arc testnet rehearsal, 2026-10-24)
 
 See `docs/superpowers/arc-testnet-rehearsal.md` §2–§10. The scripted rehearsal used real faucet USDC on Arc testnet:
@@ -162,12 +177,12 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
 
   Measure the mainnet RPC's limits under the expected load; do not run the watchtower on a shared public endpoint.
   (This makes item 5's "`publicRpcUrl` is an RPC you run or trust" concrete.)
-- **Pre-mainnet: an action route must not report failure for an action that happened.** `POST /move` (and every route
+- **Fixed (H3, `7d151b8`): an action route must not report failure for an action that happened.** `POST /move` (and every route
   that returns `status()`: `/close`, `/challenge`, `/next-game`, `/accept-draw`, `/resign`) answered 500 when only
   the status read after the action was rate-limited. The move had been signed and relayed. An agent that trusts the
   500 may retry, or give up on a move it already made (report 8.2).
-- **`arena init` has no retry on a 429.** One rate-limited `eth_getCode` failed the command (report 8.3).
-- **A sweep whose receipt wait hits a plain RPC error is recorded as `"dust"`.** The swept amount is then missing from
+- **Fixed (H3, `c0e07d7`): `arena init` had no retry on a 429.** One rate-limited `eth_getCode` failed the command (report 8.3). The CLI's one-shot RPC calls now retry 429/-32005/5xx for up to about 15 s.
+- **Fixed (H3, `abde97a`): a sweep whose receipt wait hits a plain RPC error was recorded as `"dust"`.** The swept amount is then missing from
   `sweeps`; the funds are safe in the wallet. This is a new path into the parked "Other" item above (report 8.4).
 - **Each sweep leaves about 0.00027 USDC on its session key:** the fee reserve it did not spend (report 8.5).
 - **Closing over XMTP `dev`.** The rerun timed every sub-step and measured 5.8 s, against 2.8 s over the relay. About
