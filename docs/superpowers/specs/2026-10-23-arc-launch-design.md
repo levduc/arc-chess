@@ -50,9 +50,11 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
    - `withdrawReserve()` = (live channels × `sessionGasWei`) + 500,000 × `feeCeilingWei`, converted and rounded
      up. `withdraw --all` keeps that much, and `withdraw --amount` refuses to dip into it.
 2. **Gas for session-key top-ups.** Today the daemon hard-codes `gas: 21_000n` for these value transfers. They are
-   now estimated with `estimateGas`, plus a margin of +20 % and +5,000. A native transfer costs 21,225 gas on Arc.
+   now estimated with `estimateGas`, plus a margin of +20 % and +5,000. This is hardening: a native transfer costs 21,000 gas on Arc, as the 2026-10-24 correction to `arc-facts.md` shows. Every top-up must check its receipt status (audit-daemon I-1).
 3. **Fee floor.** `SerialTxSender` gains a `minFeePerGas` option, set from the profile. Every send and replacement
-   uses `maxFeePerGas` ≥ `minFeePerGas`, and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. A `--fee-ceiling-wei` below
+   uses `maxFeePerGas` ≥ `minFeePerGas`, and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. The floor is applied after
+   the balance clamp. A fee is clamped up, or the send is refused when the balance cannot pay the floor; it is
+   never clamped down below it (audit-daemon I-6). A `--fee-ceiling-wei` below
    the floor is refused at `init`.
 4. **Session gas.** The profile's `feeCeilingWei` (40 gwei) is the default fee ceiling on Arc. `sessionGasWei`
    comes from the existing formula, 4 × 2.1M × max(ceiling, 4 × gasPrice). That is about 0.34 USDC locked per
