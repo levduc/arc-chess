@@ -3354,6 +3354,9 @@ export class ArenaDaemon {
           skipped = r.fromBlock;
           events = [];
         }
+        // H1 fix round 1 (review m-3): "passes in a row" -- a block that reads is no longer counted toward a skip.
+        const u = l.unreadableBlock;
+        if (u !== null && skipped !== u.block && u.block >= r.fromBlock && u.block <= r.toBlock) l.unreadableBlock = null;
         for (const e of events) {
           try {
             await l.session.ingestOnChain(e.signed);

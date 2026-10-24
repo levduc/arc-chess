@@ -172,3 +172,45 @@ async function griefedDrawOn(m: Awaited<ReturnType<typeof matched>>, junk: Hex) 
   expect(events.find((e) => e.kind === "Responded")?.signed.sigA).toBe(junk); // the hub took the junk and re-emitted it
   return { ...m, junkBlock: junkBlock!, bobSender, bobDrawProof };
 }
+
+/** Stops `daemon`'s periodic passes, so every scan below is one the test drives. */
+async function parked(daemon: ArenaDaemon) {
+  clearInterval((daemon as unknown as { timer?: NodeJS.Timeout }).timer);
+  await daemon.idle();
+}
+
+describe("H1 fix round 1 (review m-3): only refusals in a row skip a block", () => {
+  it("a block that reads between two refusals starts its count again", async () => {
+    const m = await matched();
+    const { alice, id } = m;
+    await parked(alice.daemon);
+    const l = alice.daemon.handle(id);
+    const target = await alice.daemon.hub.blockNumber();
+    const refuse = { on: true };
+    const hub = alice.daemon.hub;
+    const real = hub.disputeEvents.bind(hub);
+    hub.disputeEvents = async (cid: Hex, from?: bigint, to?: bigint) => {
+      if (refuse.on && cid === id && from !== undefined && to !== undefined && from <= target && target <= to) {
+        throw new Error("query returned more than the maximum response size");
+      }
+      return real(cid, from, to);
+    };
+    const scan = () => (alice.daemon as unknown as { scanDisputes(l: unknown): Promise<void> }).scanDisputes(l);
+    const rewind = () => {
+      l.record = { ...l.record, scannedBlock: target - 1n };
+    };
+    rewind();
+    await scan();
+    await scan();
+    expect(l.unreadableBlock).toEqual({ block: target, tries: 2 });
+    refuse.on = false;
+    await scan(); // it reads
+    expect(l.unreadableBlock).toBeNull();
+    refuse.on = true;
+    rewind();
+    await scan();
+    // Before the fix the count went on from 2: this third refusal skipped a block that had been read in between.
+    expect(l.unreadableBlock).toEqual({ block: target, tries: 1 });
+    expect(l.record.skippedEventBlocks).toBeUndefined();
+  });
+});
