@@ -204,6 +204,13 @@ export const NO_FEE_CEILING = 2n ** 128n;
 export type SerialTxSenderOptions = {
   /** The cap is max(FEE_CAP_MULTIPLIER x the current estimate, feeCeiling) per gas, on both fee fields. */
   feeCeiling?: bigint;
+  /** Plan 6 (spec §2.3, audit-daemon I-6): the chain's fee floor per gas -- on Arc the mempool silently drops a
+   *  transaction whose `maxFeePerGas` is below 20 gwei. Every fee this sender emits (a fresh send, every same-nonce
+   *  replacement) is raised to at least this as its LAST step, after the cap and the balance clamp: the floor beats
+   *  the cap (a transaction under the floor never lands, so a cap under it is no reason to send one), but never the
+   *  balance -- a key that cannot pay the floor is refused with `TxInsufficientFundsError` rather than sent a
+   *  transaction that would vanish. Default 0: no floor, and every fee is exactly as without this option. */
+  minFeePerGas?: bigint;
 };
 
 type Entry = { nonce: number; lastFees: Fees; hashes: Set<Hex>; state: "waiting" | "released"; gas?: bigint };
@@ -220,6 +227,8 @@ type Entry = { nonce: number; lastFees: Fees; hashes: Set<Hex>; state: "waiting"
  *   fresh nonce: whatever was at that nonce landed, and the caller re-reads the chain first.
  * - **Bounded fees.** No transaction goes over max(4 x the current estimate, `feeCeiling`) per gas, nor over what
  *   the balance can pay (`(balance - value) / gas`). A replacement that would need more is not sent.
+ * - **Fee floor** (Plan 6, `minFeePerGas`). No transaction goes under it either: it is applied last, after the cap
+ *   and the balance clamp, and a transaction whose balance cannot pay it is not sent (`TxInsufficientFundsError`).
  * - **Restart.** A fresh sender that finds a pending transaction on its key (none tracked, pending count above the
  *   confirmed one) adopts the lowest such nonce as released and replaces it.
  *
@@ -232,6 +241,8 @@ export class SerialTxSender implements TxSender, TxTracker {
   private readonly reader: TrackerClient | undefined;
   /** max(4 x the estimate, this) caps every fee this sender pays (see SerialTxSenderOptions). */
   readonly feeCeiling: bigint;
+  /** Plan 6: no fee this sender pays is under this per gas (0 = no floor; see SerialTxSenderOptions). */
+  readonly minFeePerGas: bigint;
 
   constructor(
     private readonly inner: TxSender,
@@ -240,6 +251,7 @@ export class SerialTxSender implements TxSender, TxTracker {
   ) {
     this.reader = reader ?? (inner as { reader?: TrackerClient }).reader;
     this.feeCeiling = opts.feeCeiling ?? DEFAULT_FEE_CEILING_WEI;
+    this.minFeePerGas = opts.minFeePerGas ?? 0n;
   }
 
   get address(): Address {
@@ -390,7 +402,8 @@ export class SerialTxSender implements TxSender, TxTracker {
     const estimate = this.noted(await estimateFees(reader));
     const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
     if (feeOf(estimate) > room.balance) throw new TxInsufficientFundsError(this.address);
-    const fees = clampFees(estimate, room.cap);
+    // Plan 6: the floor last -- before an entry is recorded, so a refusal leaves nothing behind.
+    const fees = this.floored(clampFees(estimate, room.cap), room);
     for (let attempt = 0; ; attempt++) {
       // Round 5 (m2): a wait may have released an entry while this send was being prepared (its release runs outside
       // this mutex): replace that one instead of going fresh behind it.
@@ -453,7 +466,7 @@ export class SerialTxSender implements TxSender, TxTracker {
     let fees = known ? replacementFees(e.lastFees, estimate) : doubled(estimate!);
     if (known) this.affordable(e.nonce, bumpFees(e.lastFees), room);
     else this.affordable(e.nonce, estimate!, room);
-    fees = clampFees(fees, bigMin(room.cap, room.balance));
+    fees = this.floored(clampFees(fees, bigMin(room.cap, room.balance)), room);
     for (;;) {
       const r = await this.transmit(reader, { ...tx, nonce: e.nonce, gas, ...fees });
       if (r.err === undefined) {
@@ -479,7 +492,7 @@ export class SerialTxSender implements TxSender, TxTracker {
       if (!isUnderpriced(err)) throw this.classify(err);
       // The pool holds a transaction priced above what we know: +50 %, up to the cap.
       const limit = bigMin(room.cap, room.balance);
-      const raised = clampFees(raise(fees, 3n, 2n), limit);
+      const raised = this.floored(clampFees(raise(fees, 3n, 2n), limit), room);
       if (feeOf(raised) <= feeOf(fees)) {
         throw limit < room.cap ? new TxInsufficientFundsError(this.address, err) : new TxFeeCapError(e.nonce, room.cap, undefined, err);
       }
@@ -491,12 +504,14 @@ export class SerialTxSender implements TxSender, TxTracker {
   private async replaceOwn(reader: TrackerClient, tx: TxRequest, nonce: number): Promise<Hex> {
     const e = this.entries.get(nonce);
     if (!e) {
-      // A nonce nobody tracks: sent as asked, but capped too (round 5, m4).
+      // A nonce nobody tracks: sent as asked, but capped too (round 5, m4). Plan 6 (audit-daemon I-6): and floored,
+      // after that clamp -- before, a balance under the floor was clamped into a fee the chain silently drops; now
+      // it is refused, nothing sent (the wait goes on).
       const est = this.noted(await estimateLike(reader, feesOf(tx)));
       const g = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
       const r = await this.room(reader, est, g, tx.value ?? 0n);
       const asked = hasFees(feesOf(tx)) ? feesOf(tx) : (est ?? {});
-      return this.inner.send({ ...tx, gas: g, ...clampFees(asked, bigMin(r.cap, r.balance)) });
+      return this.inner.send({ ...tx, gas: g, ...this.floored(clampFees(asked, bigMin(r.cap, r.balance)), r) });
     }
     const estimate = this.noted(await estimateLike(reader, e.lastFees));
     const gas = tx.gas ?? e.gas ?? (await this.estimateGas(reader, tx, "latest"));
@@ -505,7 +520,7 @@ export class SerialTxSender implements TxSender, TxTracker {
     // Round 5 (m5): never below bump(lastFees), whatever the wait asked for -- the pool would refuse it.
     const wanted = hasFees(e.lastFees) ? maxFees(asked, bumpFees(e.lastFees)) : asked;
     if (hasFees(e.lastFees)) this.affordable(nonce, bumpFees(e.lastFees), room);
-    const fees = clampFees(wanted, bigMin(room.cap, room.balance));
+    const fees = this.floored(clampFees(wanted, bigMin(room.cap, room.balance)), room);
     const r = await this.transmit(reader, { ...tx, gas, ...fees });
     if (r.err === undefined || !isDefinitive(r.err)) {
       // Sent -- or maybe sent (round 5, I2): either way the wait polls it from now on.
@@ -541,6 +556,30 @@ export class SerialTxSender implements TxSender, TxTracker {
     const fee = feeOf(needed);
     if (fee > room.cap) throw new TxFeeCapError(nonce, room.cap, fee);
     if (fee > room.balance) throw new TxInsufficientFundsError(this.address);
+  }
+
+  /**
+   * Plan 6 (spec §2.3, audit-daemon I-6): `fees` with the max fee (or legacy gas price) raised to `minFeePerGas`.
+   * Always the last step, after the cap and the balance clamp: it clamps up, never down. A balance that cannot pay
+   * the floor (`room.balance`, the most per gas it pays for this transaction) is refused here, so nothing is sent:
+   * on Arc a transaction under the floor is dropped without an error and never lands. The priority fee is left as
+   * is -- it is already at most the old max fee, so at most the new one. No floor (0), or no fee named at all (the
+   * inner sender then prices it from the node), leaves `fees` untouched.
+   */
+  private floored(fees: Fees, room: { balance: bigint }): Fees {
+    const min = this.minFeePerGas;
+    if (min === 0n || !hasFees(fees)) return fees;
+    if (min > room.balance) {
+      throw new TxInsufficientFundsError(
+        this.address,
+        new Error(`the balance pays at most ${room.balance} wei per gas, under this chain's fee floor of ${min}`),
+      );
+    }
+    if (fees.maxFeePerGas !== undefined) {
+      const m = bigMax(fees.maxFeePerGas, min);
+      return { maxFeePerGas: m, maxPriorityFeePerGas: bigMin(fees.maxPriorityFeePerGas ?? 0n, m) };
+    }
+    return { gasPrice: bigMax(fees.gasPrice!, min) };
   }
 
   private estimateGas(reader: TrackerClient, tx: TxRequest, blockTag: "latest" | "pending"): Promise<bigint> {
