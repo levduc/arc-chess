@@ -1040,7 +1040,12 @@ describe("http foundation", () => {
       const step2 = stepOf(recipeOf(text), "2. Start the daemon", "3. Pick an opponent's offer");
       expect(step2).toContain(`2. Start the daemon so it keeps running while you play: \`${PINNED} daemon --detach\`.`);
       expect(step2).toMatch(/Do not start it with your tool's own background-task feature or `nohup … &` instead: a daemon started that\s+way stops when your session does, even mid-game\./);
-      expect(step2).toMatch(/If `--detach` says another daemon is already using this\s+home, that one is running: go on\./);
+      // Fix round 1 (I1, I2): each outcome of --detach says what to do next; none loops back to --detach as is.
+      expect(step2).toContain("- `\"alreadyRunning\": true`: this home's daemon was already running and answering. Go on.");
+      expect(step2).toMatch(/- `"healthy": false`: it is running but still starting \(a slow or rate-limited RPC\), and it keeps running\. Do\s+not start another: check `channels` again in a minute\. \(Next time, `--timeout 100` waits longer\.\)/);
+      expect(step2).toMatch(/- an error: do what it says\. It names the way out -- for a daemon that does not answer, `daemon stop`, then\s+`--detach` -- and the log to read\. If the same error comes back, tell your human\./);
+      expect(step2).toMatch(/until every channel is `Finalized` or `Reclaimed` and any offer you posted has passed its `expiresAt`/);
+      expect(step2).not.toMatch(/that one is running: go on/);
       expect(step2).toContain(`then \`${PINNED} daemon --detach\` again`);
       expect(step2).not.toMatch(/nohup npx/);
       // H4 add-on: restart is daemon stop, then --detach; never a bare kill.
@@ -1048,9 +1053,10 @@ describe("http foundation", () => {
       expect(step2).not.toContain("kill <pid>");
       // ...and the recipe ends by stopping it, once everything is settled, swept and withdrawn.
       const step8 = stepOf(recipeOf(text), "8. Ask your human whether to withdraw now", "**Troubleshooting:**");
-      expect(step8).toMatch(new RegExp(`Last, once every channel is \`Finalized\` or \`Reclaimed\` with \`swept\` set, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
+      // Fix round 1 (M5): and once any offer you posted has expired.
+      expect(step8).toMatch(new RegExp(`Last, once every channel is \`Finalized\` or \`Reclaimed\` with \`swept\` set, any offer you posted has passed its\\s+\`expiresAt\`, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
       expect(step8.indexOf("daemon stop")).toBeGreaterThan(step8.indexOf("withdraw --all"));
-      expect(step8).toMatch(/Never pass `--yes-i-understand` yourself: stopping a daemon that guards\s+a live channel is your human's decision\./);
+      expect(step8).toMatch(/Never pass\s+`--yes-i-understand` yourself: stopping a daemon that guards a live channel is your human's decision\./);
       const setup = stepOf(text, "## Setup (once)", "## Find an opponent");
       expect(setup).toContain(`2. \`${PINNED} daemon --detach\` — start it so it keeps running while you play`);
       expect(setup).toContain(`\`nohup sh -c 'while true; do ${PINNED} daemon; sleep 5; done' >> "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\``);
@@ -1068,6 +1074,18 @@ describe("http foundation", () => {
       expect(step5).toMatch(/`accept` failing with `offer … not found` or `offer already matched` is this case\s+too\./);
       expect(step5).toMatch(/The USDC that already arrived still counts: ask your human for more \(as in step 4\) only if that `fund`\s+shows a shortfall above zero\./);
       expect(text).toContain("pick another (at random among those that fit), and run `fund --offer` for it (step 5). The USDC already in your wallet still counts");
+    });
+
+    it.each(variants)("%s: fix round 1 (M2, M3, M4, M7) -- an existing home skips init, a dying daemon's log, no relay, a final-message human", (_label, cfg) => {
+      const text = skillMd(cfg, URL);
+      const recipe = recipeOf(text);
+      const step1 = stepOf(recipe, "1. `", "2. Start the daemon");
+      expect(step1).toMatch(/if this home is already set up for this server, skip init: go to step 2, which will say its daemon is\s+already running/);
+      expect(step1).toContain(`to re-run init anyway, run\n   \`${PINNED} daemon stop\` first, or use another \`ARENA_HOME\``);
+      expect(recipe).toMatch(/If your human sees only your final message,\s+not what you write while you work, end your turn with that text instead, and run the wait once they reply\./);
+      expect(text).toMatch(/If it keeps stopping,\s+read the end of `daemon\.log` in your `ARENA_HOME` \(the `log` path `--detach` printed\) and tell your human\./);
+      expect(text).not.toContain("Relay it as in step 4");
+      if (cfg.chainId !== 31337) expect(text).toContain("Write that amount into your reply to your human, as in step 4, then wait with");
     });
 
     it.each(variants)("%s: friction 3 -- the CLI's took-effect note means the action took effect: never resend it", (_label, cfg) => {

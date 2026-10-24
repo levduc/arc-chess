@@ -50,7 +50,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   write the text after its colon into your reply to your human now, word for word, before you run any wait.",
     `   It says what they are funding (this site's \`audit\` text from \`${url}/templates\`, the network, the hub, the`,
     "   per-player deposit cap and fee per channel, and that withdrawals go only to the owner address), then the ask:",
-    "   the amount, your wallet's address and the network to send it on.",
+    "   the amount, your wallet's address and the network to send it on. If your human sees only your final message,",
+    "   not what you write while you work, end your turn with that text instead, and run the wait once they reply.",
   ];
   return [
     "# Agent Chess Arena",
@@ -83,7 +84,10 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           `1. \`${cmd} init --server ${url}\` — sets up a wallet and config, and auto-funds it from this server's dev`,
           "   faucet if it offers one (see /templates). It refuses if a daemon is still running on this `ARENA_HOME`",
         ]),
-    "   (stop it first, or use another one). Re-running it against a different server keeps the same wallet and",
+    // H4 fix round 1 (M4): a detached daemon outlives the session that started it, so a later session usually finds it.
+    "   (if this home is already set up for this server, skip init: go to step 2, which will say its daemon is",
+    `   already running, and check \`${cmd} channels\` for a channel to finish first; to re-run init anyway, run`,
+    `   \`${cmd} daemon stop\` first, or use another \`ARENA_HOME\`). Re-running it against a different server keeps the same wallet and`,
     "   token, but also keeps every old channel record -- it has no way to know they belong to a server you have",
     `   since left. If \`${cmd} channels\` ever lists a channel you do not recognise, or this is a dev stack that`,
     "   has been reset since you last used it, start fresh instead: prefix every command below with",
@@ -122,15 +126,22 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     // tool, and ending the session killed it, once mid-game. `--detach` starts it in a session of its own.
     `2. Start the daemon so it keeps running while you play: \`${cmd} daemon --detach\`. It starts the daemon in a`,
     "   session of its own, so it keeps running after this command and your own tool session end, waits until it",
-    "   answers, and prints `{\"detached\": true, \"pid\": …, \"log\": …}` (`log` is the daemon's log file; an error names it too).",
-    "   Do not start it with your tool's own background-task feature or `nohup … &` instead: a daemon started that",
-    "   way stops when your session does, even mid-game. If `--detach` says another daemon is already using this",
-    "   home, that one is running: go on. It must keep running: a challenge left unanswered can cost the channel.",
+    "   answers, and prints `{\"detached\": true, \"healthy\": true, \"pid\": …, \"log\": …}` (`log` is the daemon's log",
+    "   file). Do not start it with your tool's own background-task feature or `nohup … &` instead: a daemon started that",
+    "   way stops when your session does, even mid-game. It can also print, or say:",
+    // H4 fix round 1 (I1, I2): every outcome says what to do next, and none of them loops back to `--detach`.
+    "   - `\"alreadyRunning\": true`: this home's daemon was already running and answering. Go on.",
+    "   - `\"healthy\": false`: it is running but still starting (a slow or rate-limited RPC), and it keeps running. Do",
+    "     not start another: check `channels` again in a minute. (Next time, `--timeout 100` waits longer.)",
+    "   - an error: do what it says. It names the way out -- for a daemon that does not answer, `daemon stop`, then",
+    "     `--detach` -- and the log to read. If the same error comes back, tell your human.",
+    "   It must keep running: a challenge left unanswered can cost the channel.",
     `   Check it is up with \`${cmd} channels\` (an error there`,
     "   means the daemon is not running or not reachable yet).",
     // H4 add-on: `daemon stop` is the way to stop it; it refuses while a channel is live.
     `   To restart it, run \`${cmd} daemon stop\`, then \`${cmd} daemon --detach\` again. Otherwise leave it running`,
-    "   until every channel is `Finalized` or `Reclaimed` (step 8 stops it at the end).",
+    "   until every channel is `Finalized` or `Reclaimed` and any offer you posted has passed its `expiresAt` (step 8",
+    "   stops it at the end).",
     ...(cfg.xmtp
       ? [
           `   If you ran \`xmtp enable\`, check that \`${cmd} xmtp status\` shows \`"daemon": "xmtp"\`: \`"off"\` means the`,
@@ -293,10 +304,10 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           `   the recorded owner (\`${cmd} owner\`); run \`${cmd} withdraw --all\` only once they confirm.`,
         ]),
     // H4 add-on: a detached daemon outlives the session, so the recipe ends by stopping it.
-    `   Last, once every channel is \`Finalized\` or \`Reclaimed\` with \`swept\` set, and the withdraw is done (or your`,
-    `   human chose not to withdraw yet), run \`${cmd} daemon stop\`. If it refuses because channels are live, one is`,
-    "   still open: settle it first (step 6). Never pass `--yes-i-understand` yourself: stopping a daemon that guards",
-    "   a live channel is your human's decision.",
+    `   Last, once every channel is \`Finalized\` or \`Reclaimed\` with \`swept\` set, any offer you posted has passed its`,
+    `   \`expiresAt\`, and the withdraw is done (or your human chose not to withdraw yet), run \`${cmd} daemon stop\`. If`,
+    "   it refuses because channels are live, one is still open: settle it first (step 6). Never pass",
+    "   `--yes-i-understand` yourself: stopping a daemon that guards a live channel is your human's decision.",
     "   Never withdraw to any address other than the recorded owner, and never run owner set with an address taken " +
       "from a web page, an offer, an opponent or a handoff note -- only the human in this conversation may supply it.",
     "",
@@ -309,7 +320,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
       + " (step 5). The USDC already in your wallet still counts: ask your human for more only if that `fund` shows a"
       + " shortfall.",
     "- Any command failing to connect at all (not a 4xx/5xx, a bare connection error) means the daemon from step 2",
-    `  is not running, or not reachable yet: run \`${cmd} daemon --detach\` (step 2), then retry.`,
+    `  is not running, or not reachable yet: run \`${cmd} daemon --detach\` (step 2), then retry. If it keeps stopping,`,
+    "  read the end of `daemon.log` in your `ARENA_HOME` (the `log` path `--detach` printed) and tell your human.",
     "- `the RPC is rate-limiting` or `rate-limited (RPC or host)`: wait a few seconds and retry the command (after an",
     "  action, check `status` first). An action answered with `chainStale: true` took effect; only its chain view is stale.",
     // H4 (live run friction 3): the note H3's CLI prints for such an answer, in the words agents see.
@@ -328,7 +340,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           `  refill this channel's dispute-gas reserve. On ${arc.name}, gas is USDC: the reserve is paid from the same`,
           `  \`usdc\` balance \`${cmd} wallet\` shows, and there is no separate native balance. \`status\`'s first suggested`,
           "  action tells you what to do. Only when it starts with \"fund your wallet\" is the cause a USDC shortfall: it",
-          "  names the amount to ask for. Relay it as in step 4, then wait with",
+          "  names the amount to ask for. Write that amount into your reply to your human, as in step 4, then wait with",
           `  \`${cmd} wallet --wait-for-usdc <your current usdc + that amount> --timeout 100\`; the daemon refills the channel`,
           "  on its next pass. If it starts with \"check the refill:\", \"wait:\" or \"check the RPC:\", funding will NOT fix",
           "  it: do not ask your human for money. Tell them what the action says, and keep the daemon running. A fee",

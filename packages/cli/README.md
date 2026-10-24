@@ -138,10 +138,11 @@ command output. So `fund`'s output leads with two fields:
   (they cannot see this command's output): " (the "before you run" clause only when something is short), then
   `disclosure`, then `message`. The agent writes the text after the colon into its reply before any wait, and
   reminds the human of the missing amount after each wait that returns `reached: false`.
-- `disclosure`: what the human is funding, in two sentences — the network (and on Arc whether it is mainnet or a
-  test network), the hub address, the host's own `/templates` `audit` text (quoted, folded onto one line, at most
-  300 characters; "Its host publishes no audit statement." when there is none), the per-player deposit cap and the
-  host fee per player per channel, and that withdrawals go only to the owner (named, once recorded).
+- `disclosure`: what the human is funding — the network (and on Arc whether it is mainnet or a test network), the
+  hub address, the host's own `/templates` `audit` text (quoted, folded onto one line, with Unicode format
+  characters such as bidi overrides removed, at most 300 characters; "Its host publishes no audit statement." when
+  there is none), the per-player deposit cap as the host's own figure ("The host says each player may deposit at
+  most …"), the hub's fee per player per channel, and that withdrawals go only to the owner (named, once recorded).
 
 Every other field is unchanged, so scripts that read `message` or `usdc` (the live-run human watcher does) keep
 working.
@@ -230,20 +231,38 @@ holds the lock, over its local API.
 and ending the session killed it — once mid-game with a channel open (a `nohup … &` dies the same way when the
 tool kills its process group). `arena daemon --detach [--timeout SECONDS]`:
 
-- refuses at once, spawning nothing, while a live daemon holds the home's lock (`another arena daemon (pid …) is
-  using …: it is already running, so there is nothing to start`), and when the home has no `config.json`;
+- refuses at once, spawning nothing, when the home has no `config.json`;
+- when a live pid already holds the home's lock, starts nothing and says what that pid is (fix round 1, I2): this
+  home's daemon answering `/health` on the configured port prints `{"alreadyRunning":true,"healthy":true,"pid":…,
+  "api":…,"log":…}` and exits 0 (it is given until the deadline to answer, since it may be starting). One that does
+  not answer, a pid reused by another program (it started after the lock was written: the same check as `daemon
+  stop`), and an `arena bot` or withdraw each exit 1 with what to do next: wait and check `channels`, then `daemon
+  stop` and `--detach`; tell the human; wait until it ends. None of them sends the agent back to `--detach` as is;
 - re-runs this same CLI directly — `<node> <node flags> <entry script> daemon`, never a wrapper or `npx` again:
   the `.arena-dev/bin/arena` and `.arena-testnet/bin/arena` wrappers `exec` node, and under `npx` the entry script
   is the installed bundle — as a detached child (its own session and process group, so a kill aimed at the
   caller's group never reaches it), with stdin closed and stdout and stderr appended to `ARENA_HOME/daemon.log`;
 - waits up to `--timeout` (default 60 s, 1–600; `start()` reads the chain before the API listens, and a
   rate-limited RPC retries each read for up to 15.5 s) for the child's own start line in the log, its pid in
-  `daemon.lock` and its `/health`, then prints one line, `{"detached":true,"pid":…,"api":"http://127.0.0.1:<port>",
-  "log":"…/daemon.log"}`, and exits 0;
-- otherwise exits 1 with the log's last lines: the child exited during startup, or it was still not up at the
-  deadline, in which case it is stopped (SIGTERM, then SIGKILL after 10 s) — by its own pid, and nothing else.
+  `daemon.lock` and its `/health`, then prints one line, `{"detached":true,"healthy":true,"pid":…,
+  "api":"http://127.0.0.1:<port>","log":"…/daemon.log"}`, and exits 0;
+- at the deadline, a child that holds the lock is **never stopped** (fix round 1, I1): `ArenaDaemon.start()` arms its
+  dispute timer before the chain reads that make a start slow, so it may already guard a channel. It prints
+  `{"detached":true,"healthy":false,…,"hint":…}` (exit 0), and the hint says to check `status` in a minute and that
+  `--timeout 100` waits longer;
+- exits 1 with the log's last lines when the child exits during startup (if another daemon won the lock meanwhile,
+  two `--detach` at once, that daemon is reported instead, as above), or never takes the lock by the deadline, in
+  which case it is stopped (SIGTERM, then SIGKILL after 10 s) — by its own pid, and nothing else.
 
-The "cannot reach the daemon" hints of every other command now say `start it with "arena daemon --detach"`.
+What `--detach` cannot escape (fix round 1, M8): a new session and process group survive a process-group kill and a
+terminal hangup, but not the teardown of what contains them — systemd stopping the user's scope or slice (for
+example logind's `KillUserProcesses=yes` at logout), a sandbox that runs each command in its own PID namespace or
+cgroup and kills it afterwards, or a container being stopped. Where the agent's tool works that way, run the daemon
+from somewhere that outlives it (the systemd unit below, or the host).
+
+The "cannot reach the daemon" hints of every other command now say `start it with "arena daemon --detach"`, and
+that if it keeps stopping, the end of `ARENA_HOME/daemon.log` says why. `init` on a home a daemon holds says the
+home may already be set up (skip init), and names `daemon stop` for a re-init.
 
 **`arena daemon stop [--timeout SECONDS] [--yes-i-understand]` (H4).** Stops this home's running daemon, however
 it was started, and waits until it has exited (`--timeout`, default 60 s, 1–600). Then it prints

@@ -1232,23 +1232,39 @@ hardening wave H3.
       --wait-for-usdc (they cannot see this command's output): " (the wait clause only when something is short),
       then `disclosure`, then `message`. `disclosure` comes second. Every earlier field is unchanged, and `message`
       is still the sentence the live-run human watcher parses.
-    - **The human hears what they fund before paying.** `disclosure` is two sentences: the network (on Arc, whether
+    - **The human hears what they fund before paying.** `disclosure` is a few sentences: the network (on Arc, whether
       it is mainnet or a test network), the hub address, the host's `/templates` `audit` text (quoted as the host's
-      words, folded onto one line, at most 300 characters, or "Its host publishes no audit statement."), the
-      per-player deposit cap and the host fee per player per channel, and that withdrawals go only to the owner
+      words, folded onto one line, Unicode format characters such as bidi overrides removed (fix round 1, M6), at
+      most 300 characters, or "Its host publishes no audit statement."), the per-player deposit cap as the host's
+      own figure ("The host says each player may deposit at most …", M6), the hub's fee per player per channel, and
+      that withdrawals go only to the owner
       (named once recorded). `/skill.md` step 4 tells the agent to write `tellYourHuman` into its reply before any
       wait, and to remind the human of the missing amount after each wait that returns `reached: false`. The
       report after about 30 minutes, and the offer of `withdraw --all` for what did arrive, are unchanged.
     - **`arena daemon --detach`.** The daemon died with the agent's tool session, once mid-game with a channel open.
-      `--detach` refuses, spawning nothing, while a live daemon holds the home's lock or the home has no
-      `config.json`. Otherwise it re-runs the same CLI directly (`<node> <node flags> <entry script> daemon`, never a
-      wrapper or `npx`) as a detached child in its own session and process group, stdin closed, stdout and stderr
-      appended to `ARENA_HOME/daemon.log`. It waits up to `--timeout` (default 60 s, 1–600) for the child's own start
-      line, its pid in `daemon.lock` and its `/health`, then prints `{detached: true, pid, api, log}` and exits 0. A
-      child that exits first, or is not up by the deadline, fails the command with the log's last lines; the latter
-      is stopped (SIGTERM, SIGKILL after 10 s) by its own pid only. `/skill.md` step 2 starts the daemon this way and
-      says not to use the tool's background-task feature or `nohup … &`. Setup keeps the restart loop for a human.
-      Every "cannot reach the daemon" hint says `start it with "<cli> daemon --detach"`.
+      `--detach` refuses, spawning nothing, when the home has no `config.json`. It re-runs the same CLI directly
+      (`<node> <node flags> <entry script> daemon`, never a wrapper or `npx`) as a detached child in its own session
+      and process group, stdin closed, stdout and stderr appended to `ARENA_HOME/daemon.log`. It waits up to
+      `--timeout` (default 60 s, 1–600) for the child's own start line, its pid in `daemon.lock` and its `/health`,
+      then prints `{detached: true, healthy: true, pid, api, log}` (exit 0). Fix round 1:
+      - **A lock-holding child is never stopped (I1).** `ArenaDaemon.start()` arms its dispute timer before the chain
+        reads that make a start slow, so at the deadline a child that holds the lock is reported `{detached: true,
+        healthy: false, …, hint}` (exit 0) and left running. Only a child that exits (an error with the log's last
+        lines) or never takes the lock (stopped by its own pid: SIGTERM, SIGKILL after 10 s) fails.
+      - **A live lock holder is named, never looped on (I2, M1).** Before spawning, and when the child loses the lock
+        to another daemon (two `--detach` at once), the holder is checked as `daemon stop` checks it. This home's
+        daemon answering `/health` on the configured port (given until the deadline) prints `{alreadyRunning: true,
+        healthy: true, pid, api, log}` (exit 0). A daemon that does not answer, a pid reused by another program, and
+        an `arena bot` or withdraw exit 1, each with what to do next (wait and check `channels`, then `daemon stop`
+        and `--detach`; tell the human; wait until it ends).
+      - **Its limit (M8).** A new session and process group survive a process-group kill and a terminal hangup, not
+        the teardown of a systemd scope (logind `KillUserProcesses=yes`), a per-command PID namespace or cgroup, or a
+        container stop. The next live run checks survival under its own sandbox.
+      `/skill.md` step 2 starts the daemon this way, says not to use the tool's background-task feature or
+      `nohup … &`, and says what to do on each outcome. Setup keeps the restart loop for a human. Every "cannot reach
+      the daemon" hint says `start it with "<cli> daemon --detach"` and, if it keeps stopping, to read the end of
+      `daemon.log` (M2). `init` on a home a daemon holds says to skip init if the home is set up, and names
+      `daemon stop` for a re-init (I3, M4).
     - **`arena daemon stop [--timeout S] [--yes-i-understand]`.** The daemon API has no shutdown route, so `stop`
       SIGTERMs the pid that `daemon.lock` names, after checks that are run twice, the second time right before the
       signal. The process must have started no later than 2 s after the lock was last written: a pid is never
@@ -1258,8 +1274,8 @@ hardening wave H3.
       read. It takes the channels from the daemon's own `GET /channels`; if that list cannot be read, it counts every
       non-finalized record on disk. `--yes-i-understand` overrides only that check. `stop` waits up to 60 s by default
       for the process to exit, then prints `{stopped: true, pid}`. `/skill.md`: a restart is `daemon stop`, then
-      `daemon --detach`. Step 8 ends the recipe with `daemon stop` once every channel is settled and swept and the
-      withdraw is done, and says the override is the human's decision.
+      `daemon --detach`. Step 8 ends the recipe with `daemon stop` once every channel is settled and swept, any
+      offer the agent posted has expired (M5), and the withdraw is done, and says the override is the human's decision.
     - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
       loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
       offers that fit equally well. Step 5 and Troubleshooting say a lost race needs no new money: re-list, pick
