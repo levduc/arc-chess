@@ -15,19 +15,20 @@ export function esc(s: string): string {
 /** Plan 6 hardening H2 (audit-journey C-1): the Arc networks this page words its funding, owner and gas steps for,
  *  by chain id. Kept here rather than imported: the server has no runtime dependency on the CLI, whose
  *  `CHAIN_PROFILES` (packages/cli/src/chains.ts) holds the same two ids. `route` is how a human gets USDC there,
- *  from docs/superpowers/arc-facts.md: mainnet has no faucet at all (`publicFaucet: false`), testnet only Circle's. */
-const ARC_NETWORKS: Record<number, { name: string; explorer: string; publicFaucet: boolean; route: string }> = {
+ *  from docs/superpowers/arc-facts.md: mainnet has no faucet at all (`publicFaucet: false`), testnet only Circle's.
+ *  It is two lines of the page: the first follows "If they ask how: " on its line. */
+const ARC_NETWORKS: Record<number, { name: string; explorer: string; publicFaucet: boolean; route: [string, string] }> = {
   5042: {
     name: "Arc",
     explorer: "https://explorer.arc.io",
     publicFaucet: false,
-    route: "Circle's CCTP bridge moves USDC to Arc from another chain, or an exchange or wallet that supports Arc can send it.",
+    route: ["Circle's CCTP bridge moves USDC to Arc from another chain, or an exchange or wallet", "that supports Arc can send it."],
   },
   5042002: {
     name: "Arc Testnet",
     explorer: "https://explorer.testnet.arc.io",
     publicFaucet: true,
-    route: "Arc Testnet's USDC comes from Circle's faucet (https://faucet.circle.com).",
+    route: ["Arc Testnet's USDC comes from Circle's faucet", "(https://faucet.circle.com)."],
   },
 };
 
@@ -164,7 +165,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
       ? [
           `   ${arc.publicFaucet ? "Your" : `There is no faucet on ${arc.name}: your`} human needs USDC on ${arc.name} itself`,
           `   (chain id \`${cfg.chainId}\`, explorer ${arc.explorer}), and USDC sent on any other network never arrives`,
-          `   here. If they ask how: ${arc.route}`,
+          `   here. If they ask how: ${arc.route[0]}`,
+          `   ${arc.route[1]}`,
           "   Do not operate a bridge or an exchange yourself, and never send funds anywhere on your human's behalf.",
         ]
       : []),

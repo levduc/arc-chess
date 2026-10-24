@@ -862,7 +862,8 @@ describe("http foundation", () => {
     const ARC_SOURCING = [
       "   There is no faucet on Arc: your human needs USDC on Arc itself",
       "   (chain id `5042`, explorer https://explorer.arc.io), and USDC sent on any other network never arrives",
-      "   here. If they ask how: Circle's CCTP bridge moves USDC to Arc from another chain, or an exchange or wallet that supports Arc can send it.",
+      "   here. If they ask how: Circle's CCTP bridge moves USDC to Arc from another chain, or an exchange or wallet",
+      "   that supports Arc can send it.",
       "   Do not operate a bridge or an exchange yourself, and never send funds anywhere on your human's behalf.",
     ].join("\n");
     // C-2: the owner must be an address the human controls on Arc, confirmed before owner set.
@@ -935,7 +936,8 @@ describe("http foundation", () => {
         [
           "   Your human needs USDC on Arc Testnet itself",
           "   (chain id `5042002`, explorer https://explorer.testnet.arc.io), and USDC sent on any other network never arrives",
-          "   here. If they ask how: Arc Testnet's USDC comes from Circle's faucet (https://faucet.circle.com).",
+          "   here. If they ask how: Arc Testnet's USDC comes from Circle's faucet",
+          "   (https://faucet.circle.com).",
         ].join("\n"),
       );
       expect(text).not.toContain("There is no faucet on Arc Testnet");
