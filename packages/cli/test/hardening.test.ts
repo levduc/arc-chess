@@ -2507,6 +2507,35 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(l.record.sweeps?.[0].tx).toBe(sweepHash);
     expect(l.record.sweepPending).toBeUndefined();
   });
+
+  it("H3 fix round 1 (review M2): a sweep whose send's response is lost, and unverifiable, keeps its hash; not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const inner = (l.sessionSender as unknown as { inner: { sendRawTransaction(raw: Hex): Promise<Hex> } }).inner;
+    const realRaw = inner.sendRawTransaction.bind(inner);
+    const realGet = d.client.getTransaction.bind(d.client);
+    let sweepHash: Hex | undefined;
+    inner.sendRawTransaction = async (raw: Hex) => {
+      inner.sendRawTransaction = realRaw;
+      sweepHash = await realRaw(raw); // the node takes it (and Anvil mines it)...
+      d.client.getTransaction = (async () => {
+        d.client.getTransaction = realGet as typeof d.client.getTransaction;
+        throw new LimitExceededRpcError(new Error("rate limit exceeded")); // ...the sender cannot check its hash...
+      }) as typeof d.client.getTransaction;
+      throw new Error("fetch failed: socket hang up"); // ...and the response is lost
+    };
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx !== undefined, 10_000, "the hash is remembered for the next attempt");
+    // Before: "sweep failed", charged, the hash forgotten -- and the next attempt read the leftover as "dust".
+    expect(l.sweep.pendingTx).toEqual([sweepHash]);
+    expect(l.sweep.attempts).toBe(0);
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptTx).toBe(sweepHash);
+    expect(l.record.sweeps).toHaveLength(1);
+  });
 });
 
 describe("Plan 5 Task 1: settled index", () => {

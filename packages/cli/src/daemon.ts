@@ -138,16 +138,17 @@ export class SweepReadError extends Error {
   }
 }
 
-/** H3 (Arc testnet rehearsal §8.4): a sweep was sent, and its receipt wait then failed in a way that says nothing
- *  about the transaction itself -- a rate-limited receipt read, a failed replacement send. `hashes`, the sweep's own
- *  transaction and every replacement of it, may still land (or have landed): the next attempt checks them before it
- *  reads the key's balance, so a landed sweep is never recorded as `"dust"`. */
+/** H3 (Arc testnet rehearsal §8.4): a sweep may have gone out, and then could not be confirmed in a way that says
+ *  nothing about the transaction itself -- a rate-limited receipt read, a failed replacement send, or (fix round 1,
+ *  review M2) a send whose response was lost. `hashes`, the sweep's own transaction and every replacement of it, may
+ *  still land (or have landed): the next attempt checks them before it reads the key's balance, so a landed sweep is
+ *  never recorded as `"dust"`. */
 export class SweepWaitError extends Error {
   constructor(
     readonly hashes: Hex[],
     cause: unknown,
   ) {
-    super(`sweep ${hashes.at(-1)} was sent, but its receipt wait failed: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
+    super(`sweep ${hashes.at(-1)} may have gone out, but could not be confirmed: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
     this.name = "SweepWaitError";
   }
 }
@@ -2083,6 +2084,14 @@ export class ArenaDaemon {
         hash = await sender.send(req);
       } catch (err) {
         if (err instanceof TxInsufficientFundsError && attempt === 0) continue; // I7: one immediate retry
+        // H3 fix round 1 (review M2): a send that failed ambiguously -- a lost response, a "nonce too low" whose hash
+        // could not be read -- leaves its transaction's hash in the sender's entry (a send the node refused outright
+        // leaves none). It may land: the next attempt checks it first, as after a failed receipt wait.
+        const fresh = sender
+          .tracked()
+          .flatMap((t) => t.hashes)
+          .filter((h) => !earlier.has(h));
+        if (fresh.length > 0) throw new SweepWaitError(fresh, err);
         throw err;
       }
       let receipt: Awaited<ReturnType<typeof waitOrReplace>>;
