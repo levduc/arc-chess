@@ -141,6 +141,8 @@ describe("H4: arena daemon --detach", () => {
       stdio: ["ignore", "pipe", "pipe"],
     });
     children.push(shell);
+    let closed = false;
+    shell.once("close", () => (closed = true));
     let out = "";
     let err = "";
     shell.stdout!.on("data", (d: Buffer) => (out += d.toString()));
@@ -162,7 +164,9 @@ describe("H4: arena daemon --detach", () => {
 
     // Kill the whole process group, as a tool does when its session ends: the shell dies, the daemon does not.
     process.kill(-shell.pid!, "SIGKILL");
-    await until(() => shell.exitCode !== null || shell.signalCode !== null, 10_000);
+    // Its output pipes close with the group: the daemon holds none of them. (A daemon that inherited them would keep
+    // them open, which is what kept `claude -p` alive after its last answer in the live run.)
+    await until(() => closed, 10_000);
     await new Promise((r) => setTimeout(r, 1_000));
     expect(alive(line.pid)).toBe(true);
     expect(livePidHoldingLock(home)).toBe(line.pid);
