@@ -2,6 +2,7 @@ import { request as httpRequest } from "node:http";
 import { connect as netConnect, type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { LimitExceededRpcError, type Hex } from "viem";
+import { TxReceiptMissingError } from "@arena/sdk";
 import { loadToken, startApi } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -169,20 +170,87 @@ describe("local API", () => {
     // Before H3: a 500, although the move had been signed and relayed.
     expect(moved.status).toBe(200);
     expect(moved.body.chainStale).toBe(true);
-    expect(moved.body.chainStaleReason).toMatch(/Request exceeds defined limit/);
+    // Fix round 1 (review M6): the RPC's own answer, not viem's first line.
+    expect(moved.body.chainStaleReason).toBe('the RPC is rate-limiting (-32005 "rate limit exceeded")');
     expect(moved.body.turnNum).toBe("1");
     expect(moved.body.lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
     expect((await call(bobApi.url, bobToken, "GET", "/wait?timeout=10")).body.reason).toBe("your-turn"); // it took effect
     // A read-only route has nothing to fall back on: it fails, but as a rate limit, with what to do.
     const st = await call(url, token, "GET", "/status");
     expect(st.status).toBe(503);
-    expect(st.body.error).toMatch(/^the RPC is rate-limiting \(Request exceeds defined limit\.\): wait a few seconds/);
+    expect(st.body.error).toMatch(/^the RPC is rate-limiting \(-32005 "rate limit exceeded"\): wait a few seconds/);
     // An action that fails is still an error.
     expect((await call(url, token, "POST", "/move", { move: "d4" })).status).toBe(409);
     limit.on = false;
     const fresh = await call(url, token, "GET", "/status");
     expect(fresh.status).toBe(200);
     expect(fresh.body.chainStale).toBeUndefined();
+  });
+
+  it("H3 fix round 1 (review M4, M5): a close whose submission is rate-limited, and a mined challenge with no receipt, took effect", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const call = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+      const res = await fetch(`${url}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 30_000, "open");
+
+    // M4, challenge: mined, its receipt unreadable -- a 200 that says so, never a 500.
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    const realChallenge = alice.daemon.hub.challenge.bind(alice.daemon.hub);
+    alice.daemon.hub.challenge = async (...args: Parameters<typeof realChallenge>) => {
+      const r = await realChallenge(...args);
+      throw new TxReceiptMissingError(r.transactionHash, r.blockNumber);
+    };
+    const ch = await call("POST", "/challenge");
+    expect(ch.status).toBe(200);
+    expect(ch.body.phase).toBe("Challenged");
+    expect(ch.body.chainStale).toBe(true);
+    expect(ch.body.chainStaleReason).toMatch(/^the challenge transaction 0x[0-9a-f]{64} was mined \(block \d+\), but its receipt could not be read$/);
+    alice.daemon.hub.challenge = realChallenge;
+
+    // M4, close: Bob accepts the draw (answering the challenge) and closes; Alice's close is signed and relayed, and
+    // only its on-chain submission is rate-limited.
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 20_000, "draw seen");
+    await bob.daemon.close(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "close-requested", 10_000, "close requested");
+    const limit = { on: true };
+    const realInfo = alice.daemon.hub.channelInfo.bind(alice.daemon.hub);
+    alice.daemon.hub.channelInfo = async (cid: Hex) => {
+      if (limit.on) throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      return realInfo(cid);
+    };
+    const closed = await call("POST", "/close");
+    // Before: a 503 for a Close that had been signed and relayed.
+    expect(closed.status).toBe(200);
+    expect(closed.body.chainStale).toBe(true);
+    expect(closed.body.lastError).toMatch(/^close: Request exceeds defined limit/);
+    limit.on = false;
+    await waitFor(async () => (await realInfo(id)).phase === "Finalized", 30_000, "settled by the watchtower's retry (or Bob's)");
+
+    // M5: the host's own 429 is no RPC error: named as either.
+    alice.daemon.listOffers = async () => {
+      throw new Error("rate limited"); // as host.ts throws the host's 429
+    };
+    const offers = await call("GET", "/offers");
+    expect(offers.status).toBe(503);
+    expect(offers.body.error).toMatch(/^rate-limited \(RPC or host\) \(rate limited\): wait a few seconds/);
   });
 
   it("Plan 5 Task 1: POST /offers without challengeTimeout defaults to minChallengeTimeoutOf(config)", async () => {

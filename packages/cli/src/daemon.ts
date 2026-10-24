@@ -38,9 +38,11 @@ import {
   isGameOver,
   isInsufficientFundsError,
   isRangeRefusal,
+  isRateLimited,
   mover,
   offerId as computeOfferId,
   outcome,
+  rpcErrorSummary,
   rpcTransport,
   signAcceptance,
   signOffer,
@@ -151,6 +153,17 @@ export class SweepWaitError extends Error {
     super(`sweep ${hashes.at(-1)} may have gone out, but could not be confirmed: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
     this.name = "SweepWaitError";
   }
+}
+
+/** H3 fix round 1 (review M4): what an action adds to the status its route answers with -- `unconfirmed` when its
+ *  transaction was mined but its receipt could not be read (the status then carries `chainStale`). */
+export type ActionOutcome = { unconfirmed?: string };
+
+/** H3 fix round 1 (review M4): a `TxReceiptMissingError` -- the node reports the transaction mined, its receipt
+ *  unreadable -- is an action that went through, unconfirmed; any other error is rethrown. */
+function minedUnconfirmed(what: string, err: unknown): ActionOutcome {
+  if (!(err instanceof TxReceiptMissingError)) throw err;
+  return { unconfirmed: `the ${what} transaction ${err.hash} was mined (block ${err.blockNumber}), but its receipt could not be read` };
 }
 
 export type ChainView = {
@@ -481,6 +494,12 @@ export const BACKOFF_START_MS = 30_000;
 /** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
 export const BACKOFF_MAX_MS = 300_000;
 
+/** H3 fix round 1 (review M8): the daemon's per-attempt RPC timeout (viem's default is 10 s). viem retries a timeout
+ *  too, so one read on a hung RPC fails after 6 x 5 s plus the 15.5 s back-off, about 45 s (it was about 75 s): the
+ *  five or so reads a respond makes before its send then fit inside `autoReturnSecondsOf` (300 s at the 900 s
+ *  default window). Under a plain rate limit a read takes at most about 20 s (`rpcTransport`). */
+export const DAEMON_RPC_TIMEOUT_MS = 5_000;
+
 /** H3 (Arc testnet rehearsal §8.2): after a failed read of a session key's balance, the session-gas check waits this
  *  long (wall-clock ms) before it reads again -- doubled on each further failure, up to `GAS_CHECK_BACKOFF_MAX_MS`.
  *  Before, it re-read on every pass, from three call sites per pass: 208 failures in 24 minutes from two daemons on
@@ -714,7 +733,8 @@ export class ArenaDaemon {
       rpcUrls: { default: { http: [c.rpcUrl] } },
     });
     // H3: a rate-limited read is retried with back-off (`rpcTransport`; Arc testnet rehearsal §8.2). Sends never are.
-    this.client = createPublicClient({ chain: this.chain, transport: rpcTransport(c.rpcUrl) });
+    // Fix round 1 (review M8): with a per-attempt timeout of DAEMON_RPC_TIMEOUT_MS.
+    this.client = createPublicClient({ chain: this.chain, transport: rpcTransport(c.rpcUrl, { timeout: DAEMON_RPC_TIMEOUT_MS }) });
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
@@ -2945,18 +2965,27 @@ export class ArenaDaemon {
     await this.opts.relay.send({ type: "close", channelId: l.record.channelId, close: cs }).catch((err) => {
       l.lastError = `relay: ${errorText(err)}`;
     });
-    await this.guard(() => this.trySubmitClose(l));
+    // H3 fix round 1 (review M4): the Close is signed and relayed -- the action took effect. A submission that fails
+    // on anything but the hub's own refusal (a rate-limited read, a lost receipt) is the watchtower's to retry, on
+    // every pass, and is shown as the channel's `close:` lastError (trySubmitClose): not answered as a failure.
+    await this.guard(() => this.trySubmitClose(l)).catch((err: unknown) => {
+      if (err instanceof DaemonError) throw err;
+    });
     this.notify();
   }
 
-  async challenge(ref: string | undefined, actor: Actor): Promise<void> {
+  async challenge(ref: string | undefined, actor: Actor): Promise<ActionOutcome> {
     const l = this.pick(ref);
     this.requireController(l, actor);
-    await this.guard(() => this.hub.challenge(l.sessionSender, l.session.challengeProof()));
+    const outcome = await this.guard(() => this.hub.challenge(l.sessionSender, l.session.challengeProof())).then(
+      () => ({}),
+      (err: unknown) => minedUnconfirmed("challenge", err),
+    );
     this.notify();
+    return outcome;
   }
 
-  async reclaim(ref: string | undefined): Promise<void> {
+  async reclaim(ref: string | undefined): Promise<ActionOutcome> {
     const l = this.pick(ref);
     // Plan 4.5 Task 10 round 4: never beside the main pass (which reclaims after the funding deadline itself). A main
     // pass visits every channel briefly, so the API waits for it a little before refusing.
@@ -2964,14 +2993,19 @@ export class ArenaDaemon {
     while (l.mainBusy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
     if (l.mainBusy) throw new DaemonError(409, "the watchtower is working on this channel: retry shortly");
     l.mainBusy = true;
+    let outcome: ActionOutcome;
     try {
       // R9/I1: dispute operations go through the session key (spec §3.1), so they keep working after the
       // Circle session backing the wallet key has expired.
-      await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId));
+      outcome = await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId)).then(
+        () => ({}),
+        (err: unknown) => minedUnconfirmed("reclaim", err),
+      );
     } finally {
       l.mainBusy = false;
     }
     this.notify();
+    return outcome;
   }
 
   async handoff(ref: string | undefined, to: Controller, note: string): Promise<void> {
@@ -3658,9 +3692,10 @@ export class ArenaDaemon {
    * must not turn a move that was signed and relayed into an error the agent may act on: the last known status is
    * returned instead, with `chainStale` and the reason. A `DaemonError` (no such channel) is thrown as by `status`.
    */
-  async statusAfterAction(ref?: string): Promise<ChannelStatus> {
+  async statusAfterAction(ref?: string, outcome: ActionOutcome = {}): Promise<ChannelStatus> {
+    let st: ChannelStatus;
     try {
-      return await this.status(ref);
+      st = await this.status(ref);
     } catch (err) {
       if (err instanceof DaemonError) throw err;
       let l: ChannelHandle;
@@ -3669,8 +3704,15 @@ export class ArenaDaemon {
       } catch {
         throw err;
       }
-      return { ...this.statusOf(l), chainStale: true, chainStaleReason: errorText(err) };
+      // Fix round 1 (review M6): the RPC's own answer ("HTTP 429"), not viem's first line ("HTTP request failed.").
+      const reason = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
+      st = { ...this.statusOf(l), chainStale: true, chainStaleReason: reason };
     }
+    // Fix round 1 (review M4): a transaction mined with no readable receipt went through, but is unconfirmed.
+    if (outcome.unconfirmed !== undefined) {
+      st = { ...st, chainStale: true, chainStaleReason: [outcome.unconfirmed, st.chainStaleReason].filter(Boolean).join("; ") };
+    }
+    return st;
   }
 
   /** Every live channel's status, followed by the channels that could not be loaded (I1). Plan 4.5 Task 11 fix

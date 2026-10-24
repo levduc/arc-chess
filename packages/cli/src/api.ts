@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
-import { isRateLimited } from "@arena/sdk";
+import { isRateLimited, isRpcError, rpcErrorSummary } from "@arena/sdk";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
 import { selfCommand } from "./version.js";
 
@@ -419,11 +419,9 @@ export async function startApi(
             await daemon.close(ch, actor);
             return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /challenge":
-            await daemon.challenge(ch, actor);
-            return send(res, 200, await daemon.statusAfterAction(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.challenge(ch, actor)));
           case "POST /reclaim":
-            await daemon.reclaim(ch);
-            return send(res, 200, await daemon.statusAfterAction(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.reclaim(ch)));
           case "POST /sweep":
             // Plan 5 Task 1: a daemon-wide sweep (no `channel`) has no single channel's status to return.
             return send(res, 200, await daemon.sweep(ch));
@@ -463,8 +461,10 @@ export async function startApi(
         const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
         // H3 (Arc testnet rehearsal §8.2, §8.3): a rate limit that outlasted the daemon's own retries is named as one,
         // so the agent knows the fix is to wait -- viem's own words ("HTTP request failed.") do not say so.
+        // Fix round 1 (review M5): the host's own 429 ("rate limited", host.ts) is no viem error: named as either.
         if (isRateLimited(err)) {
-          return send(res, 503, { error: `the RPC is rate-limiting (${message}): wait a few seconds, then retry (check status first after an action)` });
+          const who = isRpcError(err) ? "the RPC is rate-limiting" : "rate-limited (RPC or host)";
+          return send(res, 503, { error: `${who} (${rpcErrorSummary(err)}): wait a few seconds, then retry (check status first after an action)` });
         }
         return send(res, 500, { error: message });
       }

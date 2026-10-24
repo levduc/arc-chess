@@ -6,9 +6,10 @@
  */
 import { LimitExceededRpcError, createPublicClient, type Hex, type PublicClient } from "viem";
 import { afterEach, describe, expect, it } from "vitest";
-import { HubClient, ZERO_HASH, rpcTransport } from "@arena/sdk";
+import { HubClient, RPC_RETRY_COUNT, RPC_RETRY_DELAY_MS, TxReceiptMissingError, ZERO_HASH, rpcTransport } from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
-import { GAS_CHECK_BACKOFF_MAX_MS, GAS_CHECK_BACKOFF_START_MS, UNREADABLE_BLOCK_PASSES } from "../src/daemon.js";
+import { DAEMON_RPC_TIMEOUT_MS, GAS_CHECK_BACKOFF_MAX_MS, GAS_CHECK_BACKOFF_START_MS, UNREADABLE_BLOCK_PASSES } from "../src/daemon.js";
+import { autoReturnSecondsOf } from "../src/config.js";
 import { RPC } from "../../sdk/test/helpers/chain.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -136,5 +137,38 @@ describe("H3: a rate-limited session-gas check backs off", () => {
     expect(l.gasCheckRetryAt).toBe(0);
     await check();
     expect(state.reads).toBe(9); // no back-off once a read succeeds
+  });
+});
+
+describe("H3 fix round 1 (review M8): the daemon's reads fail well inside the auto-return window on a hung RPC", () => {
+  it("its client times an attempt out after 5 s, so a read fails within ~45 s and a respond's reads within 300 s", async () => {
+    const { alice } = await matched();
+    const t = alice.daemon.client.transport as { timeout?: number; retryCount?: number; retryDelay?: number };
+    expect(t.timeout).toBe(DAEMON_RPC_TIMEOUT_MS); // before: viem's 10 s default
+    expect([t.retryCount, t.retryDelay]).toEqual([RPC_RETRY_COUNT, RPC_RETRY_DELAY_MS]);
+    const perRead = (RPC_RETRY_COUNT + 1) * DAEMON_RPC_TIMEOUT_MS + RPC_RETRY_DELAY_MS * (2 ** RPC_RETRY_COUNT - 1);
+    expect(perRead).toBe(45_500);
+    expect(5 * perRead).toBeLessThan(autoReturnSecondsOf(900n) * 1000); // about 5 reads before a respond's send
+  });
+});
+
+describe("H3 fix round 1 (review M4): a reclaim mined with no readable receipt went through", () => {
+  it("reclaim() resolves, unconfirmed, instead of failing", async () => {
+    const { alice, id } = await matched();
+    const hash = `0x${"ab".repeat(32)}` as const;
+    alice.daemon.hub.reclaim = async () => {
+      throw new TxReceiptMissingError(hash, 42n);
+    };
+    // Before: the TxReceiptMissingError reached the route, a 500.
+    expect(await alice.daemon.reclaim(id)).toEqual({
+      unconfirmed: `the reclaim transaction ${hash} was mined (block 42), but its receipt could not be read`,
+    });
+    const st = await alice.daemon.statusAfterAction(id, await alice.daemon.reclaim(id));
+    expect(st.chainStale).toBe(true);
+    expect(st.chainStaleReason).toMatch(/^the reclaim transaction 0xab/);
+    alice.daemon.hub.reclaim = async () => {
+      throw new Error("execution reverted");
+    };
+    await expect(alice.daemon.reclaim(id)).rejects.toThrow(/execution reverted/); // any other failure still fails
   });
 });
