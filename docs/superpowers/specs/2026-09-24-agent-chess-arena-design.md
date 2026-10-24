@@ -1260,12 +1260,13 @@ hardening wave H3.
         reads that make a start slow, so at the deadline a child that holds the lock is reported `{detached: true,
         healthy: false, …, hint}` (exit 0) and left running. Only a child that exits (an error with the log's last
         lines) or never takes the lock (stopped by its own pid: SIGTERM, SIGKILL after 10 s) fails.
-      - **A live lock holder is named, never looped on (I2, M1).** Before spawning, and when the child loses the lock
-        to another daemon (two `--detach` at once), the holder is checked as `daemon stop` checks it. This home's
-        daemon answering `/health` on the configured port (given until the deadline) prints `{alreadyRunning: true,
-        healthy: true, pid, api, log}` (exit 0). A daemon that does not answer, a pid reused by another program, and
-        an `arena bot` or withdraw exit 1, each with what to do next (wait and check `channels`, then `daemon stop`
-        and `--detach`; tell the human; wait until it ends).
+      - **A live lock holder is named, never looped on (I2, M1; fix round 2, N3).** Before spawning, and when the
+        child loses the lock to another daemon (two `--detach` at once), the holder is asked who it is through its own
+        API, until the deadline (see the next bullet). This home's `arena daemon` prints `{alreadyRunning: true,
+        healthy: true, pid, api, log}` (exit 0). A lock pid that never answers -- starting, stuck, or a reused pid --
+        exits 1 "not answering" (check `channels` in a minute, then tell the human, with the pid and the log); a bot,
+        a withdraw, or an answer that is not the lock's writer exit 1 with what to do. No lock is called stale while
+        its pid lives.
       - **Its limit (M8).** A new session and process group survive a process-group kill and a terminal hangup, not
         the teardown of a systemd scope (logind `KillUserProcesses=yes`), a per-command PID namespace or cgroup, or a
         container stop. The next live run checks survival under its own sandbox.
@@ -1274,17 +1275,27 @@ hardening wave H3.
       the daemon" hint says `start it with "<cli> daemon --detach"` and, if it keeps stopping, to read the end of
       `daemon.log` (M2). `init` on a home a daemon holds says to skip init if the home is set up, and names
       `daemon stop` for a re-init (I3, M4).
-    - **`arena daemon stop [--timeout S] [--yes-i-understand]`.** The daemon API has no shutdown route, so `stop`
-      SIGTERMs the pid that `daemon.lock` names, after checks that are run twice, the second time right before the
-      signal. The process must have started no later than 2 s after the lock was last written: a pid is never
-      reused while its process lives, so it is the lock's writer and never a reused pid. The start time comes from
-      `/proc` on Linux and `ps -o etime=` elsewhere. Its argv must also include `daemon`: `arena bot` and an
-      in-process `withdraw` hold the same lock. `stop` refuses while any channel is `Open`, `Challenged` or not yet
-      read. It takes the channels from the daemon's own `GET /channels`; if that list cannot be read, it counts every
-      non-finalized record on disk. `--yes-i-understand` overrides only that check. `stop` waits up to 60 s by default
-      for the process to exit, then prints `{stopped: true, pid}`. `/skill.md`: a restart is `daemon stop`, then
-      `daemon --detach`. Step 8 ends the recipe with `daemon stop` once every channel is settled and swept, any
-      offer the agent posted has expired (M5), and the withdraw is done, and says the override is the human's decision.
+    - **Lock identity, with no clock (fix round 2, N1, N3).** `acquireHomeLock` writes `{pid, nonce}` with a fresh
+      random nonce per acquisition. Asked `GET /health` with the home's bearer token, the daemon's API answers
+      `{ok, pid, lock: <nonce>, role: daemon|bot|withdraw}`; without the token, `{ok}` as before. A holder is "this
+      home's daemon" only when that pid and nonce are the lock's (the pid alone for an older CLI's nonce-less lock).
+      This replaces fix round 1's start-time-versus-lock-mtime check, which broke on the `ps` path (a start time
+      derived from `Date.now()` compared for equality, so `stop` never worked off Linux) and under wall-clock steps
+      (a live daemon called a reused pid). `/proc` or `ps` now only shows a stopped process go. A home with port 0
+      (tests only) cannot be asked.
+    - **`arena daemon stop [--timeout S] [--yes-i-understand]`.** `stop` SIGTERMs the pid that `daemon.lock` names
+      only after the daemon's API confirmed it is that pid with that nonce and role `daemon`, in the same call, and
+      again right before the signal. A lock pid that does not answer is never signalled: wait, retry, then tell the
+      human (pid, log). `stop` refuses while any channel record is not `finalized`, whatever its phase (N2): `None`
+      may have our deposit in flight, `Funding` opens by itself on the opponent's deposit, and a deposit past its
+      funding deadline needs this daemon to reclaim it; a retired record is finalized, so it never blocks. The
+      refusal does not print the override (m2). `--yes-i-understand`, documented in the README for a human only,
+      overrides that check alone. `stop` waits up to 60 s by default for the process to exit, then prints
+      `{stopped: true, pid}`. `/skill.md`: a restart is `daemon stop`, then
+      `daemon --detach`; if `stop` refuses, keep the running daemon and tell the human (m3). Step 8 ends the recipe
+      with `daemon stop` once every channel is settled -- `Finalized`, `Reclaimed`, or a `done:` first suggested
+      action, which includes a retired channel (m4) -- and swept, any offer the agent posted has expired (M5), and
+      the withdraw is done, and says overriding a refusal is the human's decision. skill.md never names the flag.
     - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
       loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
       offers that fit equally well. Step 5 and Troubleshooting say a lost race needs no new money: re-list, pick

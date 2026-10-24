@@ -933,7 +933,8 @@ describe("http foundation", () => {
       expect(recipe).toMatch(/offer --deposit <fund's deposit> --stake X --ttl 1800/);
       expect(recipe).toMatch(/cannot be cancelled, but it expires at its `expiresAt`/);
       expect(recipe).toMatch(/keep repeating `wait`\s+and checking `channels` until `expiresAt` has passed, and play any channel that appears\s+\(step 6\)/);
-      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not `Finalized` or `Reclaimed`, tell your human\s+you found no opponent, offer them `withdraw --all` \(step 8\), then stop\./);
+      // H4 fix round 2 (m4): settled includes a channel retired at its funding deadline (a `done:` action).
+      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not settled \(`Finalized`, `Reclaimed`, or a first\s+suggested action starting with `done:`\), tell your human you found no opponent, offer them `withdraw --all`\s+\(step 8\), then stop\./);
       expect(text).not.toMatch(/stop waiting/);
       expect(text).toMatch(/minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed/);
       // Fix round 1 N-3: a timed-out funding wait offers back what did arrive.
@@ -1044,8 +1045,11 @@ describe("http foundation", () => {
       // Fix round 1 (I1, I2): each outcome of --detach says what to do next; none loops back to --detach as is.
       expect(step2).toContain("- `\"alreadyRunning\": true`: this home's daemon was already running and answering. Go on.");
       expect(step2).toMatch(/- `"healthy": false`: it is running but still starting \(a slow or rate-limited RPC\), and it keeps running\. Do\s+not start another: check `channels` again in a minute\. \(Next time, `--timeout 100` waits longer\.\)/);
-      expect(step2).toMatch(/- an error: do what it says\. It names the way out -- for a daemon that does not answer, `daemon stop`, then\s+`--detach` -- and the log to read\. If the same error comes back, tell your human\./);
-      expect(step2).toMatch(/until every channel is `Finalized` or `Reclaimed` and any offer you posted has passed its `expiresAt`/);
+      // Fix round 2: a daemon that does not answer cannot be stopped (stop never signals what it cannot identify).
+      expect(step2).toMatch(/- an error: do what it says\. It names the way out -- for a daemon that does not answer, wait a minute, then\s+tell your human -- and the log to read\. If the same error comes back, tell your human\./);
+      expect(step2).toMatch(/until every channel is settled \(see step 8\) and any offer\s+you posted has passed its `expiresAt`/);
+      // m3: a refused restart keeps the running daemon, and the override is the human's.
+      expect(step2).toMatch(/If `stop` refuses because\s+channels are live, keep the running daemon, carry on, and tell your human: overriding that refusal is their\s+decision, never yours\./);
       expect(step2).not.toMatch(/that one is running: go on/);
       expect(step2).toContain(`then \`${PINNED} daemon --detach\` again`);
       expect(step2).not.toMatch(/nohup npx/);
@@ -1055,9 +1059,12 @@ describe("http foundation", () => {
       // ...and the recipe ends by stopping it, once everything is settled, swept and withdrawn.
       const step8 = stepOf(recipeOf(text), "8. Ask your human whether to withdraw now", "**Troubleshooting:**");
       // Fix round 1 (M5): and once any offer you posted has expired.
-      expect(step8).toMatch(new RegExp(`Last, once every channel is \`Finalized\` or \`Reclaimed\` with \`swept\` set, any offer you posted has passed its\\s+\`expiresAt\`, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
+      // Fix round 2 (m4): settled includes a retired channel (a `done:` first action).
+      expect(step8).toMatch(new RegExp(`Last, once every channel is settled -- \`Finalized\` or \`Reclaimed\`, or its first suggested action starts with\\s+\`done:\` \\(a funding window that closed without it opening\\) -- with \`swept\` set, any offer you posted has passed\\s+its \`expiresAt\`, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
       expect(step8.indexOf("daemon stop")).toBeGreaterThan(step8.indexOf("withdraw --all"));
-      expect(step8).toMatch(/Never pass\s+`--yes-i-understand` yourself: stopping a daemon that guards a live channel is your human's decision\./);
+      expect(step8).toMatch(/Never override that\s+refusal yourself: stopping a daemon that guards a live channel is your human's decision\./);
+      // m2: the override flag is the human's, named in the README only, never on this page.
+      expect(text).not.toContain("--yes-i-understand");
       const setup = stepOf(text, "## Setup (once)", "## Find an opponent");
       expect(setup).toContain(`2. \`${PINNED} daemon --detach\` — start it so it keeps running while you play`);
       expect(setup).toContain(`\`nohup sh -c 'while true; do ${PINNED} daemon; sleep 5; done' >> "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\``);
