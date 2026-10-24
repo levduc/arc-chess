@@ -110,6 +110,18 @@ describe("Plan 6 Task 2: the top-up's gas limit and the profile's session gas (u
     expect(feeCeilingOf({ chainId: 31337 })).toBe(DEFAULT_FEE_CEILING_WEI); // no profile: as before (100 gwei)
     expect(feeCeilingOf({ chainId: 31337, feeCeilingWei: 7n })).toBe(7n);
   });
+
+  it("H1 (Task 2 review Minor-3): a sub-floor feeCeilingWei already in config.json reads as the floor on Arc", () => {
+    for (const chainId of [5042, 5042002]) {
+      // Written before init refused it, or hand-edited: the reserve and fund's ask would keep ~0 for the wallet's gas.
+      expect(feeCeilingOf({ chainId, feeCeilingWei: 1n })).toBe(20n * GWEI);
+      expect(feeCeilingOf({ chainId, feeCeilingWei: 20n * GWEI - 1n })).toBe(20n * GWEI);
+      expect(feeCeilingOf({ chainId, feeCeilingWei: 20n * GWEI })).toBe(20n * GWEI); // at the floor: kept
+      expect(feeCeilingOf({ chainId, feeCeilingWei: 25n * GWEI })).toBe(25n * GWEI); // above it: kept
+      // The withdraw reserve reads it: 500,000 x 20 gwei = 0.01 USDC, not 500,000 x 1 wei.
+      expect(weiToUsdc6Up(500_000n * feeCeilingOf({ chainId, feeCeilingWei: 1n }))).toBe(10_000n);
+    }
+  });
 });
 
 describe("Plan 6 Task 2: the profile reaches every sender the daemon builds", () => {

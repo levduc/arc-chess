@@ -204,9 +204,16 @@ export function profileSessionGasWei(profile: ChainProfile): bigint {
 
 /** Plan 6 (spec §2.4): the wallet sender's fee ceiling per gas -- the config's `feeCeilingWei`, else the chain
  *  profile's (40 gwei on Arc), else the SDK's default (100 gwei). The daemon's wallet sender, `arena fund` and the
- *  withdraw reserve all read this one value, so `fund`'s ask matches the daemon's gates. */
+ *  withdraw reserve all read this one value, so `fund`'s ask matches the daemon's gates.
+ *  H1 (Task 2 review Minor-3): on a chain with a fee floor, never under it. `init` refuses a ceiling under the floor,
+ *  but a home written before that check, or a hand-edited config.json, can still hold one (say `1`) -- and the
+ *  withdraw reserve and `fund`'s ask, sized at 500,000 x the ceiling, would then keep almost nothing for the
+ *  wallet's own gas. Such a value is read as the floor. */
 export function feeCeilingOf(cfg: Pick<ArenaConfig, "chainId" | "feeCeilingWei">): bigint {
-  return cfg.feeCeilingWei ?? chainProfile(cfg.chainId)?.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
+  const profile = chainProfile(cfg.chainId);
+  const ceiling = cfg.feeCeilingWei ?? profile?.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
+  const floor = profile?.minFeePerGas ?? 0n;
+  return ceiling < floor ? floor : ceiling;
 }
 
 /** The config's `sessionGasFloor`, or its default: half of `sessionGasWei`. */
