@@ -13,7 +13,7 @@
  * so racing nonces can be expressed exactly. The rest run on the suite's Anvil with automine off.
  */
 import { describe, expect, it } from "vitest";
-import { TransactionNotFoundError, TransactionReceiptNotFoundError, keccak256, type Hex, type TransactionReceipt } from "viem";
+import { LimitExceededRpcError, TransactionNotFoundError, TransactionReceiptNotFoundError, keccak256, type Hex, type TransactionReceipt } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import * as sdk from "../src/index.js";
 import {
@@ -633,6 +633,32 @@ describe("round 5, I2: a send whose response is lost is still tracked", () => {
     // Before: the "count race" retry re-sent it at nonce 1, and it landed twice.
     expect(n.landed.filter((t) => t.value === 3n)).toHaveLength(1);
     expect(n.byHash(h).nonce).toBe(0);
+  });
+
+  it("H3: that 'nonce too low' while the hash cannot be read (rate-limited) is kept at its nonce, never re-sent at the next", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    const realRaw = n.inner.sendRawTransaction!.bind(n.inner);
+    const realGet = n.rawClient.getTransaction;
+    let first = true;
+    n.inner.sendRawTransaction = async (raw: Hex) => {
+      if (!first) return realRaw(raw);
+      first = false;
+      await realRaw(raw); // went through (an RPC proxy's own retry) and was mined...
+      n.mine();
+      n.rawClient.getTransaction = async () => {
+        n.rawClient.getTransaction = realGet;
+        throw new LimitExceededRpcError(new Error("rate limit exceeded")); // ...and the check of its hash is refused
+      };
+      throw new Error("nonce too low");
+    };
+    await expect(w.send({ to: to(5), data: "0x02", value: 3n })).rejects.toThrow(/nonce too low/);
+    // Before: taken for a count race and re-sent at nonce 1, where it landed a second time.
+    expect(n.attempts.filter((t) => t.value === 3n)).toHaveLength(1);
+    expect(w.tracked()).toMatchObject([{ nonce: 0, state: "released", hashes: [n.attempts[0].hash] }]);
+    const next = await w.send({ to: to(5), data: "0x03" }); // prune finds nonce 0 mined: a fresh nonce
+    expect(n.byHash(next).nonce).toBe(1);
+    expect(n.landed.filter((t) => t.value === 3n)).toHaveLength(1);
   });
 });
 

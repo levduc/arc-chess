@@ -7,7 +7,6 @@ import {
   TransactionReceiptNotFoundError,
   createPublicClient,
   createWalletClient,
-  http,
   keccak256,
   type Address,
   type Chain,
@@ -17,6 +16,7 @@ import {
   type WalletClient,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
+import { rpcTransport } from "./rpc.js";
 
 /** A transaction to send. `nonce`, the fee fields and `gas` are overrides. A `TxSender` MUST honour them; one that
  *  cannot MUST declare `supportsReplacement = false` (see `TxSender`), and is then never asked to replace anything.
@@ -92,10 +92,11 @@ export class LocalKeyTxSender implements TxSender {
   /** A read client on the same RPC (a SerialTxSender around this one uses it to track its transactions). */
   readonly reader: PublicClient;
 
+  /** H3: reads are retried on a rate limit (`rpcTransport`); a send never is (viem issues it with `retryCount: 0`). */
   constructor(privateKey: Hex, rpcUrl: string, private readonly chain: Chain) {
     this.account = privateKeyToAccount(privateKey);
-    this.wallet = createWalletClient({ account: this.account, chain, transport: http(rpcUrl) });
-    this.reader = createPublicClient({ chain, transport: http(rpcUrl) }) as PublicClient;
+    this.wallet = createWalletClient({ account: this.account, chain, transport: rpcTransport(rpcUrl) });
+    this.reader = createPublicClient({ chain, transport: rpcTransport(rpcUrl) }) as PublicClient;
   }
 
   get address(): Address {
@@ -417,14 +418,18 @@ export class SerialTxSender implements TxSender, TxTracker {
       if (r.hash) e.hashes.add(r.hash);
       if (r.err === undefined) return r.hash!;
       const err = r.err;
+      // H3: a "nonce too low" whose own hash the node could not be asked about (a rate-limited read) may be this very
+      // transaction, landed through a retry below us (an RPC proxy re-sending it). It is kept, released: the next send
+      // replaces it at its nonce, and a used nonce there is TxNonceUsedError -- never a second copy at a fresh nonce.
+      const maybeOurs = r.unsure === true && isNonceUsedError(err);
       // A pure count race (another sender on this key, a lagging count): retried once, at the next nonce.
-      if (attempt === 0 && isNonceUsedError(err)) {
+      if (attempt === 0 && isNonceUsedError(err) && !maybeOurs) {
         this.entries.delete(nonce);
         this.markMined(nonce);
         nonce = Math.max(await next(), nonce + 1);
         continue;
       }
-      if (isDefinitive(err)) this.entries.delete(nonce); // refused: nothing is pending at that nonce
+      if (isDefinitive(err) && !maybeOurs) this.entries.delete(nonce); // refused: nothing is pending at that nonce
       else e.state = "released"; // it may be pending: the next send replaces it
       throw this.classify(err);
     }
@@ -433,9 +438,10 @@ export class SerialTxSender implements TxSender, TxTracker {
   /**
    * Sends `req` (nonce, gas and fees set). When the inner sender can sign locally, the hash is known before the send
    * (round 5, I2). A failed send whose transaction the node nevertheless holds (a lost response, or a transport
-   * retry of a send that went through, refused as "nonce too low" / "already known") is a success.
+   * retry of a send that went through, refused as "nonce too low" / "already known") is a success. H3: `unsure` when
+   * that check itself failed (the read was refused, e.g. rate-limited) rather than finding no such transaction.
    */
-  private async transmit(reader: TrackerClient, req: TxRequest): Promise<{ hash?: Hex; err?: unknown }> {
+  private async transmit(reader: TrackerClient, req: TxRequest): Promise<{ hash?: Hex; err?: unknown; unsure?: boolean }> {
     const inner = this.inner;
     let raw: Hex | undefined;
     let hash: Hex | undefined;
@@ -446,8 +452,13 @@ export class SerialTxSender implements TxSender, TxTracker {
     try {
       return { hash: raw ? await inner.sendRawTransaction!(raw) : await inner.send(req) };
     } catch (err) {
-      if (hash && (await reader.getTransaction({ hash }).then(() => true, () => false))) return { hash };
-      return { hash, err };
+      if (!hash) return { err };
+      const known = await reader.getTransaction({ hash }).then(
+        () => true,
+        (e: unknown) => (e instanceof TransactionNotFoundError ? false : "unknown"),
+      );
+      if (known === true) return { hash };
+      return { hash, err, unsure: known === "unknown" };
     }
   }
 
