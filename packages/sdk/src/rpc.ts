@@ -1,4 +1,4 @@
-import { http, type HttpTransport, type HttpTransportConfig } from "viem";
+import { BaseError, http, type HttpTransport, type HttpTransportConfig } from "viem";
 
 /**
  * Plan 6 hardening H3 (rate-limit resilience). Arc's public RPC answers a modest mix of reads with `-32005 "rate limit
@@ -80,26 +80,47 @@ function textOf(e: unknown): string {
 
 /** The RPC's words for a query it will not serve however often it is asked: a block range, a result count or a
  *  response size over its limit (Arc's "requested range too large", Infura's "query returned more than 10000
- *  results", Alchemy's "Log response size exceeded", reth's "query exceeds max block range"/"max results", ...). */
+ *  results", Alchemy's "Log response size exceeded", reth's "query exceeds max block range"/"max results", ...). A
+ *  bare "exceeds max" is not one: "request exceeds max requests per second" is a rate limit (H3 review I1). */
 const REFUSAL_TEXT =
-  /range too large|requested range|block range|too many blocks|exceeds? (the )?max(imum)?\b|query returned more than|more than \d+ (results|logs)|max(imum)? results|response size|response (is )?too (big|large)|too many (results|logs)|response body too large/i;
+  /range too large|requested range|block range|too many blocks|exceeds? (the )?max(imum)? (block|range|results?|logs?|response|size)|query returned more than|more than \d+ (results|logs)|max(imum)? results|response size|response (is )?too (big|large)|too many (results|logs)|response body too large/i;
 
-/** The RPC's words for "too many requests": not about the query at all. */
-const RATE_LIMIT_TEXT = /rate.?limit|too many requests|request limit|throttl|exceeded .*(per second|quota|capacity|compute units)/i;
+/** The RPC's words for "too many requests": not about the query at all. Checked before any refusal wording. */
+const RATE_LIMIT_TEXT =
+  /rate.?limit|too many requests|request limit|max(imum)? requests|requests? per|per second|\brps\b|throttl|quota|compute units|capacity/i;
 
-/** True when the RPC is rate-limiting: `-32005` (Arc's "rate limit exceeded"; viem's `LimitExceededRpcError`) unless
- *  its words are a refusal (some RPCs use it for "query returned more than 10000 results"), `-32007`, a JSON-RPC
- *  code 429, an HTTP 429, or a message saying so. */
+/** True when the RPC is rate-limiting: the words for it anywhere in the cause chain (checked first, so they always
+ *  win), an HTTP 429, a JSON-RPC code 429 or `-32007`, or `-32005` (Arc's "rate limit exceeded"; viem's
+ *  `LimitExceededRpcError`) unless its words are a refusal (some RPCs use it for "query returned more than 10000
+ *  results"). */
 export function isRateLimited(err: unknown): boolean {
   const chain = causes(err);
-  const refusalWords = chain.some((e) => REFUSAL_TEXT.test(textOf(e)));
-  for (const e of chain) {
-    const code = numberField(e, "code");
-    if (numberField(e, "status") === 429 || code === 429 || code === -32007) return true;
-    if (code === -32005 && !refusalWords) return true;
-    if (RATE_LIMIT_TEXT.test(textOf(e))) return true;
+  const texts = chain.map(textOf);
+  if (texts.some((t) => RATE_LIMIT_TEXT.test(t))) return true;
+  if (chain.some((e) => numberField(e, "status") === 429 || numberField(e, "code") === 429 || numberField(e, "code") === -32007)) {
+    return true;
   }
-  return false;
+  return chain.some((e) => numberField(e, "code") === -32005) && !texts.some((t) => REFUSAL_TEXT.test(t));
+}
+
+/** H3 fix round 1 (review M5, M6): whether a viem error is in the chain -- a failure of the RPC, not of the host. */
+export function isRpcError(err: unknown): boolean {
+  return causes(err).some((e) => e instanceof BaseError);
+}
+
+/** H3 fix round 1 (review M6): the RPC's own answer in a few words, for a message to an agent: `HTTP 429`,
+ *  `-32005 "rate limit exceeded"`, else the error's first line. viem's first line alone says nothing for an HTTP 429
+ *  ("HTTP request failed."). */
+export function rpcErrorSummary(err: unknown): string {
+  const chain = causes(err);
+  const status = chain.map((e) => numberField(e, "status")).find((v) => v !== undefined);
+  if (status !== undefined) return `HTTP ${status}`;
+  for (const e of [...chain].reverse()) {
+    const code = numberField(e, "code");
+    const text = textOf(e);
+    if (code !== undefined && code !== -1 && text !== "") return `${code} "${text.split("\n")[0]}"`;
+  }
+  return err instanceof Error ? err.message.split("\n")[0] : String(err);
 }
 
 /**

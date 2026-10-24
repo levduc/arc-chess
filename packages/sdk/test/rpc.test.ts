@@ -12,6 +12,8 @@ import {
   cappedRetryAfter,
   isRangeRefusal,
   isRateLimited,
+  isRpcError,
+  rpcErrorSummary,
   rpcTransport,
 } from "../src/index.js";
 
@@ -110,6 +112,44 @@ describe("H3: isRateLimited / isRangeRefusal on viem's own errors", () => {
       expect(isRangeRefusal(e)).toBe(false);
       expect(isRateLimited(e)).toBe(false);
     }
+  });
+
+  it("fix round 1 (review I1): a -32005 whose words say 'exceeds max requests per second' is a rate limit, never a refusal", async () => {
+    const err = await errorOf({ error: { code: -32005, message: "request exceeds max requests per second (25)" } }, "eth_getLogs");
+    expect((err as Error).name).toBe("LimitExceededRpcError"); // viem's own rate-limit class, which it retries
+    // Before: the refusal branch "exceeds max" matched first, so a rate-limited scan was probed, split and counted.
+    expect(isRateLimited(err)).toBe(true);
+    expect(isRangeRefusal(err)).toBe(false);
+    for (const message of ["exceeds max requests", "100 requests per second allowed", "monthly quota used up", "429: compute units exhausted"]) {
+      const e = await errorOf({ error: { code: -32000, message } }, "eth_getLogs");
+      expect([message, isRateLimited(e), isRangeRefusal(e)]).toEqual([message, true, false]);
+    }
+    // The narrowed refusal branch still knows a range or result limit.
+    for (const message of ["query exceeds max block range 100000", "query exceeds max results 20000", "exceed maximum block range: 5000"]) {
+      const e = await errorOf({ error: { code: -32000, message } }, "eth_getLogs");
+      expect([message, isRateLimited(e), isRangeRefusal(e)]).toEqual([message, false, true]);
+    }
+  });
+
+  it("fix round 1: Arc's real answers, through viem's HTTP stack", async () => {
+    const table: Array<[string, Answer, boolean, boolean]> = [
+      ["-32005 rate limit exceeded", RATE_LIMIT, true, false],
+      ["-32012 requested range too large", { error: { code: -32012, message: "requested range too large" } }, false, true],
+      ["-32014 requested data not available", { error: { code: -32014, message: "requested data not available" } }, false, false],
+      ["HTTP 429", TOO_MANY, true, false],
+    ];
+    for (const [name, answer, limited, refused] of table) {
+      const err = await errorOf(answer, "eth_getLogs");
+      expect([name, isRateLimited(err), isRangeRefusal(err), isRpcError(err)]).toEqual([name, limited, refused, true]);
+    }
+  });
+
+  it("fix round 1 (review M5, M6): rpcErrorSummary names the RPC's own answer; isRpcError tells the RPC from the host", async () => {
+    expect(rpcErrorSummary(await errorOf(TOO_MANY))).toBe("HTTP 429");
+    expect(rpcErrorSummary(await errorOf(RATE_LIMIT))).toBe('-32005 "rate limit exceeded"');
+    expect(rpcErrorSummary(Object.assign(new Error("requested range too large"), { code: -32012 }))).toBe('-32012 "requested range too large"');
+    expect(rpcErrorSummary(new Error("rate limited"))).toBe("rate limited");
+    expect(isRpcError(new Error("rate limited"))).toBe(false); // e.g. the host's own 429, as host.ts throws it
   });
 
   it("the H1 tests' plain refusal stays a refusal; plain 'rpc down' is not", () => {

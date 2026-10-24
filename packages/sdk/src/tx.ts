@@ -35,6 +35,9 @@ export type TxRequest = {
   /** Gas limit. A same-nonce replacement carries its original's (Plan 4.5 Task 10 re-review 2): estimating it
    *  again would run against a pending state that already includes the original, where it can revert. */
   gas?: bigint;
+  /** H3 fix round 1 (review M3): wall-clock ms. A tracking sender sends a same-nonce replacement only before it
+   *  (`waitOrReplace` passes its `giveUpAt`); at or after it, nothing is sent (`TxPastGiveUpError`). */
+  notAfter?: number;
 };
 
 /**
@@ -162,6 +165,15 @@ export class TxNonceUsedError extends Error {
   ) {
     super(`nonce ${nonce} is already used: an earlier transaction at it has landed`, { cause });
     this.name = "TxNonceUsedError";
+  }
+}
+
+/** H3 fix round 1 (review M3): a same-nonce replacement was ready only at or after its `notAfter` (the wait's give-up
+ *  time): nothing was sent. */
+export class TxPastGiveUpError extends Error {
+  constructor(readonly nonce: number) {
+    super(`the replacement at nonce ${nonce} was ready only past its give-up time: not sent`);
+    this.name = "TxPastGiveUpError";
   }
 }
 
@@ -488,12 +500,15 @@ export class SerialTxSender implements TxSender, TxTracker {
         return r.hash!;
       }
       const err = r.err;
-      if (isNonceUsedError(err)) {
+      // H3 fix round 1 (review M1): as in `sendFresh`, a "nonce too low" whose own hash could not be read may be this
+      // very transaction, landed through a retry below us. Kept, with its hash, at its nonce (released): the next send
+      // prunes it once mined, and a caller holding the entry's hashes (a sweep) can still find its receipt.
+      if (isNonceUsedError(err) && !(r.unsure === true && r.hash)) {
         this.entries.delete(e.nonce);
         this.markMined(e.nonce);
         throw new TxNonceUsedError(e.nonce, err);
       }
-      if (!isDefinitive(err)) {
+      if (!isDefinitive(err) || isNonceUsedError(err)) {
         // Round 5 (I2): it may be pending -- still released, now with this attempt's hash and fees.
         if (r.hash) e.hashes.add(r.hash);
         e.lastFees = maxFees(e.lastFees, fees);
@@ -522,6 +537,7 @@ export class SerialTxSender implements TxSender, TxTracker {
       const g = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
       const r = await this.room(reader, est, g, tx.value ?? 0n);
       const asked = hasFees(feesOf(tx)) ? feesOf(tx) : (est ?? {});
+      if (tx.notAfter !== undefined && Date.now() >= tx.notAfter) throw new TxPastGiveUpError(nonce);
       return this.inner.send({ ...tx, gas: g, ...this.floored(clampFees(asked, bigMin(r.cap, r.balance)), r) });
     }
     const estimate = this.noted(await estimateLike(reader, e.lastFees));
@@ -532,8 +548,12 @@ export class SerialTxSender implements TxSender, TxTracker {
     const wanted = hasFees(e.lastFees) ? maxFees(asked, bumpFees(e.lastFees)) : asked;
     if (hasFees(e.lastFees)) this.affordable(nonce, bumpFees(e.lastFees), room);
     const fees = this.floored(clampFees(wanted, bigMin(room.cap, room.balance)), room);
+    // H3 fix round 1 (review M3): the reads above can be slow (a rate-limited read is retried): no replacement goes
+    // out past the wait's give-up time.
+    if (tx.notAfter !== undefined && Date.now() >= tx.notAfter) throw new TxPastGiveUpError(nonce);
     const r = await this.transmit(reader, { ...tx, gas, ...fees });
-    if (r.err === undefined || !isDefinitive(r.err)) {
+    // H3 fix round 1 (review M1): a "nonce too low" whose own hash could not be read may be this replacement, landed.
+    if (r.err === undefined || !isDefinitive(r.err) || (r.unsure === true && isNonceUsedError(r.err))) {
       // Sent -- or maybe sent (round 5, I2): either way the wait polls it from now on.
       if (r.hash) e.hashes.add(r.hash);
       e.lastFees = maxFees(e.lastFees, fees);
@@ -965,6 +985,7 @@ export async function waitOrReplace(
         nonce: pending.nonce,
         gas: (pending as { gas?: bigint }).gas,
         ...replacementFees(base, await estimateLike(client, base)),
+        ...(opts.giveUpAt !== undefined ? { notAfter: opts.giveUpAt } : {}),
       };
       // H3: the estimate is one more read, and a rate-limited read is retried for up to ~20 s (`rpcTransport`): the
       // give-up time is checked again right before the send, so no replacement goes out past it.
@@ -989,6 +1010,8 @@ export async function waitOrReplace(
         }
         // Round 4: the replacement would go over the fee cap or the balance: nothing was sent; keep waiting.
         if (err instanceof TxFeeCapError || err instanceof TxInsufficientFundsError) continue;
+        // H3 fix round 1 (review M3): ready only past the give-up time: nothing was sent, and the wait is over.
+        if (err instanceof TxPastGiveUpError) throw new TxStuckError(hashes, true, nonce, lastFees);
         // e.g. "nonce too low": the original (or an earlier intent at this nonce) was mined after all
         const r = await minedOne();
         if (r) return r;

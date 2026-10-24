@@ -695,6 +695,83 @@ describe("final review m1: an own replacement whose send response is lost is sti
   });
 });
 
+describe("H3 fix round 1 (review M1, M3): the replacement paths", () => {
+  /** Makes the next raw send land and be mined, answer "nonce too low" (a retry below us), and the read of its hash be
+   *  rate-limited once. */
+  function landedThenNonceTooLow(n: ReturnType<typeof mempool>) {
+    const realRaw = n.inner.sendRawTransaction!.bind(n.inner);
+    const realGet = n.rawClient.getTransaction;
+    n.inner.sendRawTransaction = async (raw: Hex) => {
+      n.inner.sendRawTransaction = realRaw;
+      const h = await realRaw(raw);
+      n.mineHash(n.byHash(h));
+      n.rawClient.getTransaction = async () => {
+        n.rawClient.getTransaction = realGet;
+        throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      };
+      throw new Error("nonce too low");
+    };
+  }
+
+  it("M1: the wait's own replacement, landed and answered 'nonce too low' with its hash unreadable, is still ours", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    n.state.market = 10n ** 12n; // nothing is mined on its own
+    const req: TxRequest = { to: to(7), data: "0x07" };
+    const a = await w.send(req);
+    landedThenNonceTooLow(n);
+    const r = await waitOrReplace(n.client, w, req, a, { timeoutMs: 20, pollMs: 5 });
+    const replacement = n.landed[0];
+    expect(replacement.hash).not.toBe(a);
+    // Before: replaceOwn dropped the hash ("nonce too low" is definitive), and the wait reported TxDroppedError.
+    expect(r.transactionHash).toBe(replacement.hash);
+    expect(n.landed).toHaveLength(1);
+  });
+
+  it("M1: a new intent replacing a released entry, landed and answered 'nonce too low' unverifiably, keeps its hash", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    n.state.market = 10n ** 12n;
+    const a = await w.send({ to: to(7), data: "0x07" });
+    await expect(waitOrReplace(n.client, w, { to: to(7), data: "0x07" }, a, { timeoutMs: 5, pollMs: 1, giveUpAt: Date.now() })).rejects.toThrow(
+      TxStuckError,
+    );
+    expect(w.tracked()).toMatchObject([{ nonce: 0, state: "released" }]);
+    landedThenNonceTooLow(n);
+    const err = await w.send({ to: to(8), data: "0x08", value: 5n }).catch((e: unknown) => e);
+    // Before: the entry was deleted and TxNonceUsedError thrown, the landed transaction's hash gone with it.
+    expect(err).not.toBeInstanceOf(TxNonceUsedError);
+    expect(String(err)).toMatch(/nonce too low/);
+    const landed = n.landed.find((t) => t.value === 5n)!;
+    expect(w.tracked()).toMatchObject([{ nonce: 0, state: "released" }]);
+    expect(w.tracked()[0].hashes).toContain(landed.hash);
+    n.state.market = 0n;
+    const next = await w.send({ to: to(9), data: "0x09" }); // prune: nonce 0 is used -- a fresh nonce, nothing re-sent
+    expect(n.byHash(next).nonce).toBe(1);
+    expect(n.attempts.filter((t) => t.value === 5n)).toHaveLength(1);
+  });
+
+  it("M3: a replacement whose reads end past giveUpAt is not sent", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    n.state.market = 10n ** 12n;
+    const req: TxRequest = { to: to(7), data: "0x07" };
+    const a = await w.send(req);
+    const realBalance = n.rawClient.getBalance;
+    n.rawClient.getBalance = async () => {
+      await nap(200); // a rate-limited read, retried by the transport
+      return realBalance();
+    };
+    const t0 = Date.now();
+    const err = await waitOrReplace(n.client, w, req, a, { timeoutMs: 30, pollMs: 5, giveUpAt: t0 + 100 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TxStuckError);
+    expect((err as TxStuckError).atDeadline).toBe(true);
+    // Before: the wait's own check passed at ~30 ms, and replaceOwn transmitted at ~230 ms, past the give-up time.
+    expect(n.attempts).toHaveLength(1);
+    expect(w.tracked()).toMatchObject([{ nonce: 0, state: "released", hashes: [a] }]);
+  });
+});
+
 describe("round 5, minor fixes", () => {
   it("m2: an entry released while a fresh send is being prepared is replaced by that send, not queued behind", async () => {
     const n = mempool();
