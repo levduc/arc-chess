@@ -59,9 +59,11 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
    the balance clamp. A fee is clamped up, or the send is refused when the balance cannot pay the floor; it is
    never clamped down below it (audit-daemon I-6). A `--fee-ceiling-wei` below
    the floor is refused at `init`.
-4. **Session gas.** The profile's `feeCeilingWei` (40 gwei) is the default fee ceiling on Arc. `sessionGasWei`
-   comes from the existing formula, 4 × 2.1M × max(ceiling, 4 × gasPrice). That is about 0.34 USDC locked per
-   channel; it is returned by the sweep.
+4. **Session gas.** The profile's `feeCeilingWei` (40 gwei) is the default fee ceiling on Arc. On profile chains,
+   `sessionGasWei` defaults to `SESSION_GAS_RESPONDS × RESPOND_GAS_BUDGET × profile.feeCeilingWei`
+   = 4 × 2.1M × 40 gwei = **0.336 USDC** per channel, returned by the sweep. This replaces the
+   `max(ceiling, 4 × gasPrice)` term there, which gives 0.84 on Arc. Refills cover any fee spike, and
+   `--session-gas-wei` still overrides the default. Profile-less chains keep today's formula.
 5. **Pinned deployments.** `KNOWN_DEPLOYMENTS[5042]` and `[5042002]` hold the deployed hub, rules and USDC
    addresses, filled in after each deploy. On a chain listed there, `init` **refuses** a mismatch. Today it only
    warns, through `knownDeploymentWarnings`.
