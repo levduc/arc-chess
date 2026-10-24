@@ -243,8 +243,9 @@ describe("H4: fundDisclosure and tellYourHuman (live run frictions 1 and 2)", ()
     expect(fundDisclosure({ ...base, chainId: 5042002 })).toBe(
       "What you are funding: chess games for USDC through the Agent Chess Arena hub 0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41 " +
         'on Arc Testnet (chain id 5042002, a test network). Its host says: "unaudited; Arc TESTNET test stack, faucet USDC only". ' +
-        "Each player deposits at most 2.000000 USDC per channel, plus a host fee of 0.005000 USDC per player per channel, " +
-        "and withdrawals go only to the owner address you give me.",
+        // Fix round 1 (M6): the cap is the host's figure, said as the host's; the fee is the hub's.
+        "The host says each player may deposit at most 2.000000 USDC per channel. The hub charges a fee of 0.005000 USDC " +
+        "per player per channel, and withdrawals go only to the owner address you give me.",
     );
     expect(fundDisclosure({ ...base, chainId: 5042, owner: OWNER })).toContain(
       "on Arc (chain id 5042, mainnet, real USDC). Its host says:",
@@ -256,8 +257,11 @@ describe("H4: fundDisclosure and tellYourHuman (live run frictions 1 and 2)", ()
   });
 
   it("an absent or blank audit says so; the host's text is folded onto one line and capped at 300 characters", () => {
-    expect(fundDisclosure({ ...base, chainId: 5042002, audit: undefined })).toContain("Its host publishes no audit statement. Each player");
+    expect(fundDisclosure({ ...base, chainId: 5042002, audit: undefined })).toContain("Its host publishes no audit statement. The host says each player");
     expect(fundDisclosure({ ...base, chainId: 5042002, audit: " \n " })).toContain("Its host publishes no audit statement.");
+    // Fix round 1 (M6): bidi overrides and other format characters are removed, so the quote cannot reorder what follows.
+    expect(fundDisclosure({ ...base, chainId: 5042002, audit: "safe\u202E\u2066 text\u200B\u0085" })).toContain('Its host says: "safe text".');
+    expect(fundDisclosure({ ...base, chainId: 5042002, audit: "\u202E\u200F" })).toContain("Its host publishes no audit statement.");
     expect(fundDisclosure({ ...base, chainId: 5042002, audit: "line one\n\tline\u0007two " })).toContain('Its host says: "line one line two".');
     const long = fundDisclosure({ ...base, chainId: 5042002, audit: "x".repeat(400) });
     expect(long).toContain(`Its host says: "${"x".repeat(299)}…".`);

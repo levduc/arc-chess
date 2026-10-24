@@ -55,6 +55,8 @@ describe("arena CLI", () => {
     expect(t.err.join("\n")).toMatch(/arena daemon/);
     // H4 (live run friction 4): the hint starts a daemon that outlives the agent's tool session.
     expect(t.err.join("\n")).toMatch(/start it with "arena daemon --detach"/);
+    // H4 fix round 1 (M2): and where a daemon that keeps stopping says why.
+    expect(t.err.join("\n")).toContain(`if it keeps stopping, read the end of ${join(home, "daemon.log")} and tell your human`);
     // Final fix wave (K1): the daemon starts at step 2 again, before picking an offer and `fund --offer`.
     expect(t.err.join("\n")).toMatch(/recipe step 2\b/);
   });
@@ -139,6 +141,7 @@ describe("arena CLI", () => {
     expect(await runCli(["board"], down.io)).toBe(1);
     expect(down.out).toEqual([]);
     expect(down.err.join("\n")).toMatch(/start it with "arena daemon --detach"/);
+    expect(down.err.join("\n")).toContain(`read the end of ${join(home, "daemon.log")}`);
   });
 
   it("Plan 5 Task 2 fix round, CRITICAL 1: the daemon start line never carries the token fragment", () => {
@@ -451,8 +454,8 @@ describe("Plan 5.6 Task 2: arena fund", () => {
     const printed = JSON.parse(t.out.join("\n")) as Record<string, string>;
     expect(printed.disclosure).toBe(
       `What you are funding: chess games for USDC through the Agent Chess Arena hub ${env.hub} on chain 31337. Its host ` +
-        'says: "unaudited; guarded launch". Each player deposits at most 10.000000 USDC per channel, plus a host fee of ' +
-        `0.005000 USDC per player per channel, and withdrawals go only to the recorded owner, ${owner}.`,
+        'says: "unaudited; guarded launch". The host says each player may deposit at most 10.000000 USDC per channel. The ' +
+        `hub charges a fee of 0.005000 USDC per player per channel, and withdrawals go only to the recorded owner, ${owner}.`,
     );
     expect(printed.tellYourHuman).toContain(`${printed.disclosure} ${printed.message}`);
   });

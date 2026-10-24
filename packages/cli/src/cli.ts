@@ -97,9 +97,12 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   daemon [start] [--detach [--timeout SECONDS]]
           (--detach: starts the daemon in the background, in its own session, so it outlives this command and the
            shell or agent tool session that ran it; it logs to <ARENA_HOME>/daemon.log. Waits until it answers
-           (--timeout, default ${DETACH_WAIT_DEFAULT_S} s), then prints {detached, pid, api, log} and exits 0. Refused
-           while a daemon already runs on this home; exit 1, with the log's last lines, if it does not come up --
-           one still starting is then stopped.)
+           (--timeout, default ${DETACH_WAIT_DEFAULT_S} s), then prints {detached, healthy: true, pid, api, log}; one
+           that holds the lock but does not answer in time is left running: {detached, healthy: false, ..., hint}.
+           With this home's daemon already running and answering, starts nothing: {alreadyRunning, healthy: true,
+           pid, api, log}. All exit 0. Exit 1, with what to do, when the lock's pid is not this home's daemon (a
+           reused pid, "bot", a withdraw) or does not answer, or when the child exits or never takes the lock --
+           that child is then stopped.)
   daemon stop [--timeout SECONDS] [--yes-i-understand]
           (stops this home's running daemon with SIGTERM, a clean shutdown, and waits until it has exited (default
            ${STOP_WAIT_DEFAULT_S} s); prints {stopped, pid}. The pid comes from daemon.lock and is signalled only if that process
@@ -647,9 +650,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // pid) never blocks: acquireHomeLock already takes those over the moment a daemon actually starts.
       const livePid = livePidHoldingLock(home);
       if (livePid !== null) {
+        // H4 fix round 1 (I3, M4): a detached daemon outlives the session that started it, so a new session usually
+        // finds the last one's daemon here. It may be guarding a channel: skip init rather than stop it.
         throw new Error(
-          `a live arena daemon (pid ${livePid}) already holds ${home}. Stop it first (kill ${livePid}), or ` +
-            "run init against a different ARENA_HOME.",
+          `a live arena daemon (pid ${livePid}) already holds ${home}. If this home is already set up for this server, ` +
+            `skip init: its daemon is running (check "${CLI_COMMAND} channels" for a channel to finish first). To re-run ` +
+            `init anyway, stop it first with "${CLI_COMMAND} daemon stop" (refused while a channel is live), or run init ` +
+            "against a different ARENA_HOME.",
         );
       }
       // Task 3 fix round 4 (N2, spec §4.3): init holds the home lock for its whole run. Otherwise a daemon could start,
@@ -1050,7 +1057,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         });
       } catch {
-        throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach", then run "${CLI_COMMAND} board" again`);
+        // H4 fix round 1 (M2): a daemon that keeps dying says why in its log.
+        throw new Error(
+          `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach", then run ` +
+            `"${CLI_COMMAND} board" again (if it keeps stopping, read the end of ${join(home, "daemon.log")} and tell your human)`,
+        );
       }
       const payload = (await res.json().catch(() => ({}))) as { code?: unknown; error?: string };
       if (!res.ok || typeof payload.code !== "string") {
@@ -1804,7 +1815,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // picking an offer and `fund --offer`).
       throw new Error(
         `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach" (skill.md's recipe step 2), ` +
-          `then retry: ${err instanceof Error ? err.message : String(err)}`,
+          // H4 fix round 1 (M2): a daemon that keeps dying says why in its log.
+          `then retry (if it keeps stopping, read the end of ${join(home, "daemon.log")} and tell your human): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
       );
     }
     const payload = (await res.json()) as unknown;

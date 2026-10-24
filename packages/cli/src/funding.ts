@@ -199,17 +199,20 @@ const NETWORK_KINDS: Record<number, string> = {
 const AUDIT_QUOTE_MAX = 300;
 
 /**
- * Plan 6 hardening H4 (live run friction 2): what the human is about to fund, in two sentences an agent can quote
+ * Plan 6 hardening H4 (live run friction 2): what the human is about to fund, in a few sentences an agent can quote
  * before it asks for money -- the network, the hub, the host's own `audit` text from `/templates` (quoted as the
  * host's words, on one line and at most `AUDIT_QUOTE_MAX` characters), the per-player deposit cap and fee per channel,
  * and that withdrawals go only to the owner. Pinned character for character in `funding.test.ts`.
+ * Fix round 1 (M6): the cap is the host's figure (`/templates`), so it is said as the host's; the fee is read from the
+ * hub. Unicode format characters (`\p{Cf}`: bidi overrides, zero-width joiners) are removed from the quote, so the host's
+ * text cannot visually reorder the amount and address that follow it.
  */
 export function fundDisclosure(ctx: { chainId: number; hub: Address; audit: string | undefined; cap: bigint; feePerPlayer: bigint; owner: Address | null }): string {
   const profile = chainProfile(ctx.chainId);
   const kind = NETWORK_KINDS[ctx.chainId];
   const network =
     profile === undefined ? `chain ${ctx.chainId}` : `${profile.name} (chain id ${ctx.chainId}${kind !== undefined ? `, ${kind}` : ""})`;
-  const audit = ctx.audit?.replace(/[\u0000-\u001f\u007f\s]+/g, " ").trim();
+  const audit = ctx.audit?.replace(/\p{Cf}/gu, "").replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, " ").trim();
   const quoted =
     audit === undefined || audit === ""
       ? "Its host publishes no audit statement."
@@ -217,8 +220,8 @@ export function fundDisclosure(ctx: { chainId: number; hub: Address; audit: stri
   const to = ctx.owner === null ? "the owner address you give me" : `the recorded owner, ${ctx.owner}`;
   return (
     `What you are funding: chess games for USDC through the Agent Chess Arena hub ${ctx.hub} on ${network}. ${quoted} ` +
-    `Each player deposits at most ${formatUsdc6(ctx.cap)} USDC per channel, plus a host fee of ${formatUsdc6(ctx.feePerPlayer)} ` +
-    `USDC per player per channel, and withdrawals go only to ${to}.`
+    `The host says each player may deposit at most ${formatUsdc6(ctx.cap)} USDC per channel. The hub charges a fee of ` +
+    `${formatUsdc6(ctx.feePerPlayer)} USDC per player per channel, and withdrawals go only to ${to}.`
   );
 }
 

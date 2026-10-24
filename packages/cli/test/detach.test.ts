@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { generatePrivateKey } from "viem/accounts";
 import { afterEach, describe, expect, it } from "vitest";
 import { initHome, livePidHoldingLock, runCli, type ArenaConfig, type CliIo } from "../src/index.js";
-import { parseEtime, processFacts, startDetachedDaemon } from "../src/detach.js";
+import { logAfter, parseEtime, processFacts, startDetachedDaemon } from "../src/detach.js";
 import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
 
 // Plan 6 hardening H4 (live run friction 4): `arena daemon --detach`, through the real `bin/arena.mjs` -- inside vitest
@@ -126,6 +126,29 @@ function runBin(home: string, args: string[]): Promise<{ code: number | null; ou
   });
 }
 
+/** A stand-in for a lock holder: node, with `role` as its last argument ("daemon", "bot"); with `channels`, it also
+ *  answers `GET /channels` on `port` with that body (and every other path, `/health` included, with 200), as a
+ *  daemon's API would. */
+async function standIn(role: string, opts: { port?: number; channels?: unknown } = {}): Promise<ChildProcess> {
+  const script =
+    opts.channels === undefined
+      ? "setInterval(() => {}, 1000)"
+      : 'require("node:http").createServer((q, r) => r.end(q.url === "/channels" ? process.env.FAKE_CHANNELS : "{}"))' +
+        '.listen(Number(process.env.FAKE_PORT), "127.0.0.1")';
+  const child = spawn(process.execPath, ["-e", script, role], {
+    env: { ...process.env, FAKE_PORT: String(opts.port ?? 0), FAKE_CHANNELS: JSON.stringify(opts.channels ?? []) },
+    stdio: "ignore",
+  });
+  children.push(child);
+  await until(() => processFacts(child.pid!)?.argv.at(-1) === role, 10_000);
+  if (opts.channels !== undefined) {
+    await until(async () => (await fetch(`http://127.0.0.1:${opts.port}/channels`).catch(() => null))?.ok === true, 10_000);
+  }
+  return child;
+}
+const holdLock = (home: string, pid: number) => writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid }));
+const running = (c: ChildProcess) => c.exitCode === null && c.signalCode === null;
+
 describe("H4: arena daemon --detach", () => {
   it("survives a kill of the process group that started it, answers, and refuses a second --detach", async () => {
     const { home, port } = await detachHome();
@@ -151,10 +174,10 @@ describe("H4: arena daemon --detach", () => {
       throw new Error(`--detach never returned: ${out} ${err}`);
     });
     expect(out, err).toMatch(/cli-exit 0/);
-    const line = JSON.parse(out.split("\n")[0]!) as { detached: boolean; pid: number; api: string; log: string };
+    const line = JSON.parse(out.split("\n")[0]!) as { detached: boolean; healthy: boolean; pid: number; api: string; log: string };
     daemons.push({ pid: line.pid, home });
-    expect(Object.keys(line)).toEqual(["detached", "pid", "api", "log"]);
-    expect(line).toMatchObject({ detached: true, api: `http://127.0.0.1:${port}`, log: join(home, "daemon.log") });
+    expect(Object.keys(line)).toEqual(["detached", "healthy", "pid", "api", "log"]);
+    expect(line).toMatchObject({ detached: true, healthy: true, api: `http://127.0.0.1:${port}`, log: join(home, "daemon.log") });
     expect(line.pid).not.toBe(shell.pid);
     // The detached process is the daemon itself (node running the CLI's entry), in a session of its own.
     const stat = readFileSync(`/proc/${line.pid}/stat`, "utf8").split(") ")[1]!.split(" ");
@@ -179,11 +202,10 @@ describe("H4: arena daemon --detach", () => {
     expect(log).toContain(`"pid":${line.pid}`);
     expect(log).not.toContain("cli-exit");
 
-    // A second --detach on the same home is refused, before it spawns anything.
+    // A second --detach on the same home starts nothing: this home's daemon is running and answering (fix round 1, I2).
     const second = await runBin(home, ["daemon", "--detach"]);
-    expect(second.code).toBe(1);
-    expect(second.out).toBe("");
-    expect(second.err).toMatch(new RegExp(`another arena daemon \\(pid ${line.pid}\\) is using .*: it is already running, so there is nothing to start`));
+    expect(second.code, second.err).toBe(0);
+    expect(JSON.parse(second.out.trim())).toEqual({ alreadyRunning: true, healthy: true, pid: line.pid, api: line.api, log: line.log });
     expect(livePidHoldingLock(home)).toBe(line.pid);
 
     // H4 add-on: `daemon stop` stops it (no channel is live), waits until it has exited, and its lock is released.
@@ -197,25 +219,150 @@ describe("H4: arena daemon --detach", () => {
     expect(again.err).toMatch(/no arena daemon is running on .*: nothing to stop/);
   });
 
-  it("a daemon that does not come up in time is stopped, by its own pid, and the error carries its log", async () => {
+  it("a child that never takes the home's lock is stopped at the deadline, by its own pid, with its log and --timeout 100", async () => {
     const home = bareHome();
     const self = { cmd: process.execPath, args: ["-e", 'console.log("still starting"); setInterval(() => {}, 1000)'] };
     const before = Date.now();
     const err = await startDetachedDaemon(home, { env: { ARENA_HOME: home }, fetch, waitMs: 1_000, command: "arena", self }).catch((e: Error) => e);
     expect(err).toBeInstanceOf(Error);
     const message = (err as Error).message;
-    const pid = Number(/so it was stopped \(pid (\d+)\)/.exec(message)?.[1]);
-    expect(message).toMatch(/^the daemon did not come up within 1 s, so it was stopped \(pid \d+\): still starting \(its log: .*daemon\.log\)$/);
+    const pid = Number(/^the daemon \(pid (\d+)\)/.exec(message)?.[1]);
+    expect(message).toMatch(
+      /^the daemon \(pid \d+\) did not take this home's lock within 1 s, so it was stopped: still starting \(its log: .*daemon\.log\)\. If this machine or its RPC is slow, run it again with --timeout 100$/,
+    );
     expect(alive(pid)).toBe(false);
     expect(Date.now() - before).toBeLessThan(15_000);
   });
 
-  it("a daemon that exits during startup fails with its exit code and log, and nothing is left running", async () => {
+  it("fix round 1 (M9): one that ignores SIGTERM is SIGKILLed after the 10 s grace", async () => {
+    const home = bareHome();
+    const self = { cmd: process.execPath, args: ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'] };
+    const before = Date.now();
+    const err = await startDetachedDaemon(home, { env: { ARENA_HOME: home }, fetch, waitMs: 1_000, command: "arena", self }).catch((e: Error) => e);
+    const pid = Number(/^the daemon \(pid (\d+)\)/.exec((err as Error).message)?.[1]);
+    expect(pid).toBeGreaterThan(0);
+    await until(() => !alive(pid), 5_000);
+    const took = Date.now() - before;
+    expect(took).toBeGreaterThan(10_000); // it did get the grace
+    expect(took).toBeLessThan(1_000 + 10_000 + 5_000);
+  }, 30_000);
+
+  it("fix round 1 (I1): a child that holds the lock but does not answer in time is left running, reported healthy: false", async () => {
+    const port = await freePort(); // nothing answers there
+    const home = bareHome(port);
+    // A daemon stuck in start(): it took the lock (the first thing startDaemonProcess does), and its API never listens.
+    const takeLock = 'require("node:fs").writeFileSync(process.env.ARENA_HOME + "/daemon.lock", JSON.stringify({ pid: process.pid }))';
+    const self = { cmd: process.execPath, args: ["-e", `${takeLock}; setInterval(() => {}, 1000)`] };
+    const result = await startDetachedDaemon(home, { env: { ARENA_HOME: home }, fetch, waitMs: 1_500, command: "arena", self });
+    expect(result).toMatchObject({ detached: true, healthy: false, api: `http://127.0.0.1:${port}`, log: join(home, "daemon.log") });
+    const pid = result.pid;
+    daemons.push({ pid, home });
+    expect("hint" in result && result.hint).toBe(
+      'the daemon is running but still starting (a slow or rate-limited RPC), and it keeps running: do not start another. ' +
+        'Run "arena status" in a minute; next time, --timeout 100 waits longer',
+    );
+    await new Promise((r) => setTimeout(r, 500));
+    expect(alive(pid)).toBe(true); // never stopped
+    expect(livePidHoldingLock(home)).toBe(pid);
+    // And a second --detach does not start another: it names the one that does not answer, and the way out.
+    const t = cliIo(home);
+    expect(await runCli(["daemon", "--detach", "--timeout", "1"], t.io)).toBe(1);
+    expect(t.err.join("\n")).toMatch(
+      new RegExp(
+        `another arena daemon \\(pid ${pid}\\) is using .* but does not answer on http://127\\.0\\.0\\.1:${port}: it is still ` +
+          `starting .* do not start another\\. Run "arena channels" in a minute; if it still cannot reach the daemon, run "arena ` +
+          `daemon stop", then "arena daemon --detach"; if that happens again, read the end of .*daemon\\.log and tell your human`,
+      ),
+    );
+    expect(alive(pid)).toBe(true);
+  });
+
+  it("a daemon that exits during startup fails with its pid, exit code and log, and nothing is left running", async () => {
     const home = bareHome();
     const self = { cmd: process.execPath, args: ["-e", 'console.error("error: cannot reach the RPC"); process.exit(3)'] };
     const err = await startDetachedDaemon(home, { env: { ARENA_HOME: home }, fetch, waitMs: 30_000, command: "arena", self }).catch((e: Error) => e);
-    expect((err as Error).message).toMatch(/^the daemon exited with code 3 before it came up: error: cannot reach the RPC \(its log: /);
-    expect(livePidHoldingLock(home)).toBeNull();
+    const message = (err as Error).message;
+    expect(message).toMatch(/^the daemon \(pid \d+\) exited with code 3 before it came up: error: cannot reach the RPC \(its log: /);
+    expect(alive(Number(/^the daemon \(pid (\d+)\)/.exec(message)?.[1]))).toBe(false);
+  });
+
+  it("fix round 1 (M9): an earlier run's lines in daemon.log, before the spawn offset, are never read", () => {
+    const home = bareHome();
+    const log = join(home, "daemon.log");
+    writeFileSync(log, '{"api":"http://127.0.0.1:1","pid":4242}\n');
+    const from = readFileSync(log).length;
+    expect(logAfter(log, from)).toBe("");
+    writeFileSync(log, '{"api":"http://127.0.0.1:2","pid":4243}\n', { flag: "a" });
+    expect(logAfter(log, from)).toBe('{"api":"http://127.0.0.1:2","pid":4243}\n');
+    expect(logAfter(join(home, "missing.log"), 0)).toBe("");
+  });
+
+  it("fix round 1 (I2): the lock's live pid is named for what it is -- a reused pid or a bot is refused, nothing spawned", async () => {
+    const reusedHome = bareHome();
+    const reused = await standIn("daemon");
+    holdLock(reusedHome, reused.pid!);
+    const past = new Date(Date.now() - 3_600_000);
+    utimesSync(join(reusedHome, "daemon.lock"), past, past);
+    const r = cliIo(reusedHome);
+    expect(await runCli(["daemon", "--detach"], r.io)).toBe(1);
+    expect(r.err.join("\n")).toMatch(
+      new RegExp(`names pid ${reused.pid}, but that process started after the lock was written: it is another program that reused the pid, not a daemon\\. No daemon can start on this home until that process exits: tell your human`),
+    );
+    expect(existsSync(join(reusedHome, "daemon.log"))).toBe(false);
+
+    const botHome = bareHome();
+    const bot = await standIn("bot");
+    holdLock(botHome, bot.pid!);
+    const b = cliIo(botHome);
+    expect(await runCli(["daemon", "--detach"], b.io)).toBe(1);
+    expect(b.err.join("\n")).toMatch(new RegExp(`pid ${bot.pid} holds .* but is not "arena daemon" .*Wait until it ends \\(a withdraw takes seconds\\), then run "arena daemon --detach"`));
+    expect(existsSync(join(botHome, "daemon.log"))).toBe(false);
+    expect(running(reused) && running(bot)).toBe(true);
+  });
+
+  it("fix round 1 (I3, M4): init on a home a daemon holds says to skip init, and names daemon stop -- never kill", async () => {
+    const home = bareHome();
+    const daemon = await standIn("daemon");
+    holdLock(home, daemon.pid!);
+    const t = cliIo(home);
+    expect(await runCli(["init", "--server", "http://127.0.0.1:3000"], t.io)).toBe(1);
+    const err = t.err.join("\n");
+    expect(err).toContain(`a live arena daemon (pid ${daemon.pid}) already holds ${home}. If this home is already set up for this server, skip init`);
+    expect(err).toContain('To re-run init anyway, stop it first with "arena daemon stop" (refused while a channel is live)');
+    expect(err).not.toMatch(/\bkill\b/);
+  });
+
+  it("fix round 1 (I2): this home's daemon, answering /health, is reported alreadyRunning -- exit 0, nothing spawned", async () => {
+    const port = await freePort();
+    const home = bareHome(port);
+    const daemon = await standIn("daemon", { port, channels: [] });
+    holdLock(home, daemon.pid!);
+    const t = cliIo(home);
+    expect(await runCli(["daemon", "--detach"], t.io), t.err.join("\n")).toBe(0);
+    expect(JSON.parse(t.out.join("\n"))).toEqual({
+      alreadyRunning: true,
+      healthy: true,
+      pid: daemon.pid,
+      api: `http://127.0.0.1:${port}`,
+      log: join(home, "daemon.log"),
+    });
+    expect(existsSync(join(home, "daemon.log"))).toBe(false);
+  });
+
+  it("fix round 1 (M1, M9): two --detach at once leave exactly one daemon; the other reports it alreadyRunning", async () => {
+    const { home } = await detachHome();
+    const [a, b] = await Promise.all([runBin(home, ["daemon", "--detach"]), runBin(home, ["daemon", "--detach"])]);
+    expect([a.code, b.code], `${a.err}\n${b.err}`).toEqual([0, 0]);
+    const lines = [JSON.parse(a.out.trim()), JSON.parse(b.out.trim())] as Array<{ detached?: true; alreadyRunning?: true; healthy: boolean; pid: number }>;
+    const started = lines.filter((l) => l.detached === true);
+    const found = lines.filter((l) => l.alreadyRunning === true);
+    expect([started.length, found.length]).toEqual([1, 1]);
+    expect(started[0]!.healthy && found[0]!.healthy).toBe(true);
+    expect(found[0]!.pid).toBe(started[0]!.pid);
+    daemons.push({ pid: started[0]!.pid, home });
+    expect(livePidHoldingLock(home)).toBe(started[0]!.pid);
+    const stop = await runBin(home, ["daemon", "stop"]);
+    expect(stop.code, stop.err).toBe(0);
   });
 
   it("refuses up front -- no log, no child -- on a home init never wrote, and on a bad --timeout", async () => {
@@ -236,27 +383,6 @@ describe("H4: arena daemon --detach", () => {
 });
 
 describe("H4 add-on: arena daemon stop", () => {
-  /** A stand-in for a lock holder: node, with `role` as its last argument ("daemon", "bot"); with `channels`, it also
-   *  answers `GET /channels` on `port` with that body, as a daemon's API would. */
-  async function standIn(role: string, opts: { port?: number; channels?: unknown } = {}): Promise<ChildProcess> {
-    const script =
-      opts.channels === undefined
-        ? "setInterval(() => {}, 1000)"
-        : 'require("node:http").createServer((q, r) => r.end(q.url === "/channels" ? process.env.FAKE_CHANNELS : "{}"))' +
-          '.listen(Number(process.env.FAKE_PORT), "127.0.0.1")';
-    const child = spawn(process.execPath, ["-e", script, role], {
-      env: { ...process.env, FAKE_PORT: String(opts.port ?? 0), FAKE_CHANNELS: JSON.stringify(opts.channels ?? []) },
-      stdio: "ignore",
-    });
-    children.push(child);
-    await until(() => processFacts(child.pid!)?.argv.at(-1) === role, 10_000);
-    if (opts.channels !== undefined) {
-      await until(async () => (await fetch(`http://127.0.0.1:${opts.port}/channels`).catch(() => null))?.ok === true, 10_000);
-    }
-    return child;
-  }
-  const holdLock = (home: string, pid: number) => writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid }));
-  const running = (c: ChildProcess) => c.exitCode === null && c.signalCode === null;
 
   it("parses ps's etime", () => {
     expect(parseEtime("05:07")).toBe(307);
