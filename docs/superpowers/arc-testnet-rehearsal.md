@@ -55,7 +55,7 @@ safe cap) and `--priority-gas-price 1000000000` (1 gwei tip). The chain charged 
 Both transactions landed with `status: 0x1` (success) in the same block, `68820062`; Arc's instant finality meant
 no meaningful wait for receipts.
 
-### Deployed addresses
+### Deployed addresses (superseded 2026-10-24, pre-hardening: see "Redeploy (hardened hub)" below)
 
 | Contract | Address | Explorer |
 |---|---|---|
@@ -209,9 +209,94 @@ confirming no other transactions were sent from this key. Nonce went from 0 → 
   via `foundryup`) and must be added to `PATH` explicitly, matching how `scripts/dev-up.ts` already does this for
   its own `anvil`/`forge` calls.
 
-## 2. The rehearsal (2026-10-24, 15:18–15:42 UTC)
+### Redeploy (hardened hub), 2026-10-24
 
-`scripts/arc-rehearsal.ts` ran it end to end against the deployment above, with real faucet USDC. Rerun with
+The owner adopted the hub-hardening proposal (merge `750e280`):
+- **I1:** the hub verifies every signature slot it re-emits;
+- **M2:** `renounceOwnership()` always reverts;
+- **M1:** `claim()` takes no recipient and pays `msg.sender`.
+
+So the testnet deployment above was replaced before the rehearsal was rerun on it (§10). The redeploy ran on HEAD
+`e8fa69f` and used the command in "Command" above, unchanged: same env vars, `--with-gas-price 40000000000
+--priority-gas-price 1000000000`.
+
+Steps, in order:
+1. `eth_chainId` was asserted to be 5042002, and the deployer's nonce was asserted to be 4 at both `latest` and
+   `pending` (no transaction of its own pending). No other agent sent from the deployer key during the redeploy.
+2. A dry run without `--broadcast`: 6,407,016 gas estimated, "0.25628064 USDC" at the 40 gwei cap.
+3. The chain id and the nonce were asserted again, then the broadcast.
+
+| Contract | Tx hash | Gas used | Effective price | Cost (USDC) |
+|---|---|---|---|---|
+| `ChessRules` | [`0xea9260d2859489730e946cabcb37b257f55b4f6f21a4938f6c8a0ad05a0952c1`](https://explorer.testnet.arc.io/tx/0xea9260d2859489730e946cabcb37b257f55b4f6f21a4938f6c8a0ad05a0952c1) | 1,903,343 | 21 gwei | 0.039970203 |
+| `ChannelHub` (hardened) | [`0xeae2cb6418255c691183124efe48bf9ce822f6b7d263647949ea148fdcf992e1`](https://explorer.testnet.arc.io/tx/0xeae2cb6418255c691183124efe48bf9ce822f6b7d263647949ea148fdcf992e1) | 3,025,132 | 21 gwei | 0.063527772 |
+| **Total** | | **4,928,475** | | **0.103497975** |
+
+**Result.**
+- Both transactions landed with status `0x1` in block **68,890,564**. The deployer went from 19.774950966 to
+  19.671452991 USDC, exactly the two costs, and its nonce from 4 to 6.
+- The hardened hub uses 12,521 more deploy gas than the old one (3,025,132 against 3,012,611). `ChessRules` is
+  byte-identical, at the same gas.
+
+**New addresses.** These are what `contracts/deployments/5042002.json` and `KNOWN_DEPLOYMENTS[5042002]` now hold:
+
+| Contract | Address | Explorer (source) |
+|---|---|---|
+| `ChessRules` | `0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01` | https://explorer.testnet.arc.io/address/0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01?tab=contract |
+| `ChannelHub` | `0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41` | https://explorer.testnet.arc.io/address/0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41?tab=contract |
+| `USDC` | `0x3600000000000000000000000000000000000000` | (unchanged) |
+
+**Superseded 2026-10-24 (pre-hardening).** The old `ChannelHub` `0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893` and
+`ChessRules` `0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5`, deployed and verified earlier in this section, are
+superseded. Their contracts stay on chain, with no open channel and `committedEscrow` 0 (the §2–§9 run settled
+everything on them). `init` now refuses them, like any other unpinned hub (`packages/cli/test/init.test.ts`).
+
+**Reads of the new hub.** They match the deploy:
+
+| Call | Value |
+|---|---|
+| `owner()` | the deployer |
+| `feeRecipient()` | the deployer |
+| `feePerPlayer()` | 5,000 |
+| `maxFeePerPlayer()` | 1,000,000 |
+| `maxDepositPerPlayer()` | 2,000,000 |
+| `maxCommittedEscrow()` | 50,000,000 |
+| `token()` | `0x3600…0000` |
+| `paused()` | false |
+| `committedEscrow()` | 0 |
+
+Code size: hub 13,026 bytes, rules 8,557 bytes.
+
+**The hardening, checked by `eth_call` from the deployer.** Nothing was sent.
+
+| Call | New hub | Old hub |
+|---|---|---|
+| `renounceOwnership()` | reverts `RenounceDisabled()` (`0x89051165`) | succeeds (`0x`) |
+| `claim()` | reverts `NothingToClaim()` (`0x969bf728`), with nothing owed | — |
+| `claim(address)` | reverts: the selector is gone | — |
+
+A real `claim()` payout needs an owed amount, which only a blocklisted recipient produces. That is not exercised on
+testnet; the contract suite covers it (`ChannelHub.claim.t.sol`).
+
+**Source verification.** `scripts/verify-arc.sh` verified both contracts.
+1. Blockscout's own recompile failed again, as in the first deploy.
+2. Sourcify returned `exact_match` in 5 s each.
+3. The import into Blockscout set `is_verified` and `is_fully_verified` to true for both, via Sourcify, with `viaIR`
+   true, cancun, 200 runs and `v0.8.28+commit.7893614a`.
+
+This time the import was exercised end to end on a **cold `ChannelHub`**, which the first deploy never managed (see
+"Source verification" above).
+
+One fix to the script (`scripts/verify-arc.sh`). Blockscout's import only *starts* verification ("Smart-contract
+verification started"). The script read `is_verified` once, at once, saw `false`, and `set -e` stopped it before
+`ChannelHub`, although `ChessRules` showed verified seconds later. It now polls for up to 90 s; `ChannelHub` verified
+after 5 s. Mainnet runs it the same way. Pass the deploy's own `ARENA_MAX_DEPOSIT_PER_PLAYER` and
+`ARENA_MAX_COMMITTED_ESCROW`: the script's defaults are the mainnet ones, and the constructor args must match.
+
+## 2. The rehearsal, first run on the pre-hardening hub (2026-10-24, 15:18–15:42 UTC)
+
+`scripts/arc-rehearsal.ts` ran it end to end against the first (pre-hardening) deployment above, with real faucet
+USDC. Sections 2–9 are that run; §10 is the rerun on the hardened hub. Rerun with
 `pnpm exec tsx scripts/arc-rehearsal.ts --dir <dir>`. A rerun with the same `--dir` resumes after the last completed
 step. `--collect-only` rebuilds the tables from the chain. It never deploys. Its header lists every safety rule. In short:
 
@@ -633,3 +718,253 @@ deployer, 0.03915386 USDC in all, is what the product keeps by design:
 None of it is at risk. The two wallet reserves could only be withdrawn by signing a transfer with the agent keys
 outside the CLI. That was deliberately not done: the product's custody model is that only the daemon sends from the
 wallet, and only to the owner.
+
+## 10. Rerun on the hardened hub (2026-10-24, 16:48–17:13 UTC)
+
+The same script (`scripts/arc-rehearsal.ts`) ran in a fresh directory against the redeployed hub
+`0x9b8B…bA41` ("Redeploy (hardened hub)" in §1), with the same steps as §2. **Every step passed, and every amount
+reconciles exactly again.**
+
+- **Hub side.** 24 of 24 checks exact.
+- **Wallet reconciliation.** Exact to the wei, both homes.
+- **The whole run.** Exact to the wei.
+- **The hardened surface, by `eth_call`.** `claim()` from the deployer and from both wallets reverts
+  `NothingToClaim`, and `renounceOwnership()` from the owner reverts `RenounceDisabled`.
+
+Gas for the rerun was **0.08436134 USDC**, across 34 transactions. Deployer: 19.671452991 → **19.547937991** USDC.
+
+**Ids.**
+- Wallets: alice `0x213eB0A78b54103A5160969Fa860502943ffE0FA`, bob `0xccf9Cb374eA6B50D26934fE8F977a6c736d09077`.
+- Channels:
+  - `normal` `0xdfc07a456fdec0f8c31489e45082a1261acb7c6762e307ca0a241a3802fc3aec`
+  - `dispute` `0x75d70878b8d41122e7b565b23fa3d26ddd41adae523b36725675cff463c216e4`
+  - `xmtp` `0xe7d2081ee63a98d90ca808da30f6d8d63747f7e8d330c40cc2f38ee90239270f`
+
+**Which code ran.** H3, the rate-limit hardening, was being committed to this checkout during the rerun. The script
+records the checkout at every spawn:
+- **16:48–16:49:** the server and both daemons started on HEAD `e8fa69f`, plus this task's uncommitted pin
+  (`packages/cli/src/config.ts`) and scripts.
+- **16:54:** after the restart below, they started on the same HEAD plus H3's work in progress in
+  `packages/sdk/src/{index,tx,rpc}.ts`, the work that became `e6211cd`/`7f2c60e`.
+
+  None of H3's CLI or server changes were on disk yet at either spawn (`daemon.ts`, `api.ts`, `cli.ts`, `indexer.ts`;
+  committed later as `abde97a`, `a3d74a7`, `7d151b8`, `c0e07d7`, `65194f7`). I did not check which of those SDK edits the
+  unchanged daemon actually used. So this rerun shows the hardened hub, not H3's CLI and server fixes, and the
+  rate-limit symptoms below are consistent with that.
+
+**One restart.** At 16:53:37 the script's own `channelInfo` read gave up: viem's five retries cover about 30 s, and
+the RPC rate-limited for longer. The normal channel was Open, all 3 games were done, and nothing was pending. The
+script's chain reads now retry for up to 3 minutes. The run resumed at 16:54:42 and closed the channel.
+
+### Transactions (hardened hub)
+
+| # | Action | Channel | Sender | Tx (explorer) | Gas used | Price (gwei) | Cost (USDC) |
+|---|---|---|---|---|---|---|---|
+| 1 | fund agent (deployer → wallet, 2 USDC) | — | deployer | [`0x50fde2d155c54c80572b70c98b81946448b0977de53ec9557f74ea36afa88566`](https://explorer.testnet.arc.io/tx/0x50fde2d155c54c80572b70c98b81946448b0977de53ec9557f74ea36afa88566) | 21,000 | 21 | 0.000441 |
+| 2 | fund agent (deployer → wallet, 2 USDC) | — | deployer | [`0xb2dd8169d7bf4e886057c98953d2d4fc7edccbc2724f95fc933747d1ed58800e`](https://explorer.testnet.arc.io/tx/0xb2dd8169d7bf4e886057c98953d2d4fc7edccbc2724f95fc933747d1ed58800e) | 21,000 | 21 | 0.000441 |
+| 3 | approve | — | alice wallet | [`0x9d402dc40cc7178b599e585b11f37c33b71f629fd85d3e1ac43e3e44e5050ddd`](https://explorer.testnet.arc.io/tx/0x9d402dc40cc7178b599e585b11f37c33b71f629fd85d3e1ac43e3e44e5050ddd) | 55,438 | 25 | 0.00138595 |
+| 4 | session top-up (wallet → session key, 0.336) | normal | alice wallet | [`0xc71f4ef68783388edffc7d6318ba3f4979a282a88b9ee6934730811273ffbed3`](https://explorer.testnet.arc.io/tx/0xc71f4ef68783388edffc7d6318ba3f4979a282a88b9ee6934730811273ffbed3) | 21,000 | 25 | 0.000525 |
+| 5 | deposit | normal | alice wallet | [`0xff6e14d37bbde3ea6c495142e0f4aff07de4dab901a51f04b045ce79ef59b706`](https://explorer.testnet.arc.io/tx/0xff6e14d37bbde3ea6c495142e0f4aff07de4dab901a51f04b045ce79ef59b706) | 393,833 | 30 | 0.01181499 |
+| 6 | approve | — | bob wallet | [`0x98edebcec977c72b1d40b5560983a95d97c34e869848267b35d8a145b2b6fe45`](https://explorer.testnet.arc.io/tx/0x98edebcec977c72b1d40b5560983a95d97c34e869848267b35d8a145b2b6fe45) | 55,438 | 25 | 0.00138595 |
+| 7 | session top-up (wallet → session key, 0.336) | normal | bob wallet | [`0x6aaa94dc40fd3dbf6cb89edfba4b7cdaec39f9b222cf2422b4327e5aa20c9307`](https://explorer.testnet.arc.io/tx/0x6aaa94dc40fd3dbf6cb89edfba4b7cdaec39f9b222cf2422b4327e5aa20c9307) | 21,000 | 25 | 0.000525 |
+| 8 | deposit | normal | bob wallet | [`0x03af72b955db85730e119bc1a5cf52c90ac5b9507c37eb2cd2a53973dfc405df`](https://explorer.testnet.arc.io/tx/0x03af72b955db85730e119bc1a5cf52c90ac5b9507c37eb2cd2a53973dfc405df) | 76,417 | 25 | 0.001910425 |
+| 9 | closeCooperative | normal | bob wallet | [`0x4b3949baacbd2576bef4d15c9bc4831a72df1d6a16f60222d488bb06e30ccca7`](https://explorer.testnet.arc.io/tx/0x4b3949baacbd2576bef4d15c9bc4831a72df1d6a16f60222d488bb06e30ccca7) | 142,568 | 25 | 0.0035642 |
+| 10 | session sweep (session key → wallet) | normal | bob session (normal) | [`0x88a9d83d0c3db11e897fb73a4d8870e11543287581529d0fe489ef0c5ac3deff`](https://explorer.testnet.arc.io/tx/0x88a9d83d0c3db11e897fb73a4d8870e11543287581529d0fe489ef0c5ac3deff) | 21,000 | 25 | 0.000525 |
+| 11 | session sweep (session key → wallet) | normal | alice session (normal) | [`0x1406f3fbe2e47e922523983b33ba8b5e54ece281927ed50c8ee4893c5c2207ef`](https://explorer.testnet.arc.io/tx/0x1406f3fbe2e47e922523983b33ba8b5e54ece281927ed50c8ee4893c5c2207ef) | 21,000 | 25 | 0.000525 |
+| 12 | approve | — | alice wallet | [`0x25f34e403a368a7ba2ea9a19e03cfd262123e5201ccde9b2a11bae2fcd0e3cab`](https://explorer.testnet.arc.io/tx/0x25f34e403a368a7ba2ea9a19e03cfd262123e5201ccde9b2a11bae2fcd0e3cab) | 55,438 | 25 | 0.00138595 |
+| 13 | session top-up (wallet → session key, 0.336) | dispute | alice wallet | [`0xa3619e3562d40fd2869330e3c48fbde6f543a43614c67dfde23c9d1893cdc72e`](https://explorer.testnet.arc.io/tx/0xa3619e3562d40fd2869330e3c48fbde6f543a43614c67dfde23c9d1893cdc72e) | 21,000 | 25 | 0.000525 |
+| 14 | deposit | dispute | alice wallet | [`0xbfcbfb680c8f2fc28490d79a01e54c27a5e29761cf599e3e27729ba811d3ad2b`](https://explorer.testnet.arc.io/tx/0xbfcbfb680c8f2fc28490d79a01e54c27a5e29761cf599e3e27729ba811d3ad2b) | 393,833 | 25 | 0.009845825 |
+| 15 | approve | — | bob wallet | [`0x85e8adada6c5effe67026ba3d8438c607630d3ae6be7b2090bdb8300037dac3f`](https://explorer.testnet.arc.io/tx/0x85e8adada6c5effe67026ba3d8438c607630d3ae6be7b2090bdb8300037dac3f) | 55,438 | 25 | 0.00138595 |
+| 16 | session top-up (wallet → session key, 0.336) | dispute | bob wallet | [`0x2b295f34558ceeac5e6da283e1f70b97583fe9fd300b27ea6d9c4092586b93e0`](https://explorer.testnet.arc.io/tx/0x2b295f34558ceeac5e6da283e1f70b97583fe9fd300b27ea6d9c4092586b93e0) | 21,000 | 25 | 0.000525 |
+| 17 | deposit | dispute | bob wallet | [`0xaea4cd84d311e090415eb33cf8029f6f278f11c35f662cdf17927c39a41b620d`](https://explorer.testnet.arc.io/tx/0xaea4cd84d311e090415eb33cf8029f6f278f11c35f662cdf17927c39a41b620d) | 76,417 | 25 | 0.001910425 |
+| 18 | challenge | dispute | alice session (dispute) | [`0x85b33bed074a293d8ede380db92a0a6e47da4e626e8a6026b7f9163f88d37cb7`](https://explorer.testnet.arc.io/tx/0x85b33bed074a293d8ede380db92a0a6e47da4e626e8a6026b7f9163f88d37cb7) | 356,050 | 25 | 0.00890125 |
+| 19 | respond | dispute | alice session (dispute) | [`0xdc9845f8cb2d86c9fcd489e149064c12ae1a411d73a35f9166ba2d49a0e4b10c`](https://explorer.testnet.arc.io/tx/0xdc9845f8cb2d86c9fcd489e149064c12ae1a411d73a35f9166ba2d49a0e4b10c) | 200,206 | 25 | 0.00500515 |
+| 20 | challenge | dispute | bob session (dispute) | [`0x6b11c2dc1737bdcc4a96263a8d7e57f8a8bac6a519f98ebddb75a3090603b8a6`](https://explorer.testnet.arc.io/tx/0x6b11c2dc1737bdcc4a96263a8d7e57f8a8bac6a519f98ebddb75a3090603b8a6) | 176,641 | 25 | 0.004416025 |
+| 21 | timeout | dispute | bob session (dispute) | [`0xe53790776ae035d2323eb71cca04c55e7a2cf8137519a1eaebd3133c929889fa`](https://explorer.testnet.arc.io/tx/0xe53790776ae035d2323eb71cca04c55e7a2cf8137519a1eaebd3133c929889fa) | 149,089 | 25 | 0.003727225 |
+| 22 | session sweep (session key → wallet) | dispute | alice session (dispute) | [`0xce6a1645c68d25ae2aab154a54aab2cfe7758a546826bf80e37db9c913e2c864`](https://explorer.testnet.arc.io/tx/0xce6a1645c68d25ae2aab154a54aab2cfe7758a546826bf80e37db9c913e2c864) | 21,000 | 25 | 0.000525 |
+| 23 | session sweep (session key → wallet) | dispute | bob session (dispute) | [`0xbb6ace0c52c4dc94103faf163d101a4223655fe5b0e4b400d3ef09272e52a0b4`](https://explorer.testnet.arc.io/tx/0xbb6ace0c52c4dc94103faf163d101a4223655fe5b0e4b400d3ef09272e52a0b4) | 21,000 | 25 | 0.000525 |
+| 24 | approve | — | alice wallet | [`0x1db1579741d5df38f5c432b3fee30719b3f51234ede2ca761ac4779a171daf28`](https://explorer.testnet.arc.io/tx/0x1db1579741d5df38f5c432b3fee30719b3f51234ede2ca761ac4779a171daf28) | 55,438 | 25 | 0.00138595 |
+| 25 | session top-up (wallet → session key, 0.336) | xmtp | alice wallet | [`0x2b88e6b197f041c4152c27f4a0d0d540355ad47bfa7102ae27d0172a50388634`](https://explorer.testnet.arc.io/tx/0x2b88e6b197f041c4152c27f4a0d0d540355ad47bfa7102ae27d0172a50388634) | 21,000 | 25 | 0.000525 |
+| 26 | deposit | xmtp | alice wallet | [`0xcc9458c0b3007bce578bbf7a92852506db6344cbee7e63dc4afdd8e4f8e5fc5c`](https://explorer.testnet.arc.io/tx/0xcc9458c0b3007bce578bbf7a92852506db6344cbee7e63dc4afdd8e4f8e5fc5c) | 393,833 | 25 | 0.009845825 |
+| 27 | approve | — | bob wallet | [`0xd4d748b5396848df2eb10178ea023c4371ac5dd46da96cdb57a66f6bfb4016c4`](https://explorer.testnet.arc.io/tx/0xd4d748b5396848df2eb10178ea023c4371ac5dd46da96cdb57a66f6bfb4016c4) | 55,438 | 25 | 0.00138595 |
+| 28 | session top-up (wallet → session key, 0.336) | xmtp | bob wallet | [`0xa6bdad78a039dd60d93e07438f25558c25b206fd462b6de50c02c057e751da18`](https://explorer.testnet.arc.io/tx/0xa6bdad78a039dd60d93e07438f25558c25b206fd462b6de50c02c057e751da18) | 21,000 | 25 | 0.000525 |
+| 29 | deposit | xmtp | bob wallet | [`0x3fd0e913a666bafd6644ecd4fe67f01df45f10c09dddcb22ac0dabda6291df9b`](https://explorer.testnet.arc.io/tx/0x3fd0e913a666bafd6644ecd4fe67f01df45f10c09dddcb22ac0dabda6291df9b) | 76,417 | 25 | 0.001910425 |
+| 30 | closeCooperative | xmtp | bob wallet | [`0x3dd53b0ff8098f70ae27fdf979c1700e19afe9bc58abb5c2968b142452baa120`](https://explorer.testnet.arc.io/tx/0x3dd53b0ff8098f70ae27fdf979c1700e19afe9bc58abb5c2968b142452baa120) | 142,575 | 25 | 0.003564375 |
+| 31 | session sweep (session key → wallet) | xmtp | bob session (xmtp) | [`0x9dcebafeb58729132fa2b426721c2117bc3a69caff6be668655011a5402b9426`](https://explorer.testnet.arc.io/tx/0x9dcebafeb58729132fa2b426721c2117bc3a69caff6be668655011a5402b9426) | 21,000 | 25 | 0.000525 |
+| 32 | session sweep (session key → wallet) | xmtp | alice session (xmtp) | [`0x45cee952e41205be37a82b1b70b19e6db404189df71ae29e1fd1099a2685be60`](https://explorer.testnet.arc.io/tx/0x45cee952e41205be37a82b1b70b19e6db404189df71ae29e1fd1099a2685be60) | 21,000 | 25 | 0.000525 |
+| 33 | withdraw --all (USDC transfer to the owner) | — | alice wallet | [`0xb6728304a850f5d577cf8c2820c756860c1ccacdb43e880445e6a1e50ef05b98`](https://explorer.testnet.arc.io/tx/0xb6728304a850f5d577cf8c2820c756860c1ccacdb43e880445e6a1e50ef05b98) | 48,950 | 25 | 0.00122375 |
+| 34 | withdraw --all (USDC transfer to the owner) | — | bob wallet | [`0x605eb4840a227007d361a76e5b0b9aa9615d9afba32bea5355d78834f6782350`](https://explorer.testnet.arc.io/tx/0x605eb4840a227007d361a76e5b0b9aa9615d9afba32bea5355d78834f6782350) | 48,950 | 25 | 0.00122375 |
+
+**Prices.** 25 gwei throughout, except alice's first deposit at 30 gwei. One difference from §3: Alice's watchtower
+sent the `respond` this time, not Bob's daemon. It held Bob's newer state and raced him. Both outcomes are correct.
+
+### Cost per action, with the pre-hardening gas for comparison
+
+The I1 check (the hub verifies every signature slot it re-emits) costs about 90–130 gas per dispute call:
+- `challenge` +90 / +129;
+- `respond` +102.
+
+Everything else is the same, within ±24 gas from differences in calldata. The hardened `ChannelHub` costs 12,521 more gas to deploy.
+
+| Action | Count | Gas used, hardened hub | Gas used, pre-hardening hub (§3) | Cost per action (USDC) | Total (USDC) |
+|---|---|---|---|---|---|
+| deploy `ChessRules` | 1 | 1,903,343 | 1,903,343 | 0.039970203 (21 gwei) | 0.039970203 |
+| deploy `ChannelHub` | 1 | 3,025,132 | 3,012,611 | 0.063527772 (21 gwei) | 0.063527772 |
+| deposit | 6 | 76,417–393,833 | 76,393–393,833 | 0.001910425–0.01181499 | 0.037237915 |
+| closeCooperative | 2 | 142,568–142,575 | 142,568–142,575 | 0.0035642–0.003564375 | 0.007128575 |
+| challenge | 2 | 176,641–356,050 | 176,512–355,960 | 0.004416025–0.00890125 | 0.013317275 |
+| respond | 1 | 200,206 | 200,104 | 0.00500515 | 0.00500515 |
+| timeout | 1 | 149,089 | 149,089 | 0.003727225 | 0.003727225 |
+| session sweep (session key → wallet) | 6 | 21,000 | 21,000 | 0.000525 | 0.00315 |
+| session top-up (wallet → session key, 0.336) | 6 | 21,000 | 21,000 | 0.000525 | 0.00315 |
+| withdraw --all (USDC transfer to the owner) | 2 | 48,950 | 48,950 | 0.00122375 | 0.0024475 |
+| approve | 6 | 55,438 | 55,438 | 0.00138595 | 0.0083157 |
+| fund agent (deployer → wallet, 2 USDC) | 2 | 21,000 | 21,000 | 0.000441 | 0.000882 |
+| **rerun total (34 txs, deploy excluded)** | 34 | | | | **0.08436134** |
+
+### Balances (hardened hub)
+
+### Hub-side checks (6-decimal base units)
+
+| Channel | Check | Expected | Got | OK |
+|---|---|---|---|---|
+| normal | deposits | 2 x 1005000 | 2 x 1005000 | yes |
+| normal | Finalized.balanceA (participant 0) | 1200000 | 1200000 | yes |
+| normal | Finalized.balanceB (participant 1) | 800000 | 800000 | yes |
+| normal | Finalized.fee | 10000 | 10000 | yes |
+| normal | USDC transfer hub -> participant 0 | 1200000 | 1200000 | yes |
+| normal | USDC transfer hub -> participant 1 | 800000 | 800000 | yes |
+| normal | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
+| normal | PayoutDeferred events | 0 | 0 | yes |
+| dispute | deposits | 2 x 1005000 | 2 x 1005000 | yes |
+| dispute | Finalized.balanceA (participant 0) | 900000 | 900000 | yes |
+| dispute | Finalized.balanceB (participant 1) | 1100000 | 1100000 | yes |
+| dispute | Finalized.fee | 10000 | 10000 | yes |
+| dispute | USDC transfer hub -> participant 0 | 900000 | 900000 | yes |
+| dispute | USDC transfer hub -> participant 1 | 1100000 | 1100000 | yes |
+| dispute | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
+| dispute | PayoutDeferred events | 0 | 0 | yes |
+| xmtp | deposits | 2 x 1005000 | 2 x 1005000 | yes |
+| xmtp | Finalized.balanceA (participant 0) | 1100000 | 1100000 | yes |
+| xmtp | Finalized.balanceB (participant 1) | 900000 | 900000 | yes |
+| xmtp | Finalized.fee | 10000 | 10000 | yes |
+| xmtp | USDC transfer hub -> participant 0 | 1100000 | 1100000 | yes |
+| xmtp | USDC transfer hub -> participant 1 | 900000 | 900000 | yes |
+| xmtp | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
+| xmtp | PayoutDeferred events | 0 | 0 | yes |
+
+### Hardened-hub surface (eth_call simulations, nothing sent)
+
+| Check | Got | OK |
+|---|---|---|
+| claim() from deployer | reverted NothingToClaim | yes |
+| claim() from alice wallet | reverted NothingToClaim | yes |
+| claim() from bob wallet | reverted NothingToClaim | yes |
+| renounceOwnership() from the owner (deployer) | reverted RenounceDisabled | yes |
+
+### Wallet-side reconciliation (wei, 18 decimals)
+
+| Home | Funded | Payouts in | Deposits out | Withdrawn | Gas paid | Expected held | Held | OK |
+|---|---|---|---|---|---|---|---|---|
+| alice | 2000000000000000000 | 3200000000000000000 | 3015000000000000000 | 2111479000000000000 | 53944640000000000 | 19576360000000000 | 19576360000000000 | yes |
+| bob | 2000000000000000000 | 2800000000000000000 | 3015000000000000000 | 1735888000000000000 | 29534700000000000 | 19577300000000000 | 19577300000000000 | yes |
+
+System: deployer before 19.671452991 = deployer after 19.547937991 + held by agents 0.03915366 + gas 0.08436134 → exact.
+
+### Balances after (native, 18 decimals)
+
+| Address | Balance (USDC) |
+|---|---|
+| deployer | 19.547937991 |
+| alice wallet | 0.01877626 |
+| alice session (dispute) | 0.0002667 |
+| alice session (normal) | 0.0002667 |
+| alice session (xmtp) | 0.0002667 |
+| bob wallet | 0.0187772 |
+| bob session (dispute) | 0.0002667 |
+| bob session (normal) | 0.0002667 |
+| bob session (xmtp) | 0.0002667 |
+
+### Sender nonce check (Blockscout listing vs nonce)
+
+| Sender | Listed | Nonce delta |
+|---|---|---|
+| deployer | 2 | 2 |
+| alice wallet | 10 | 10 |
+| alice session (dispute) | 3 | 3 |
+| alice session (normal) | 1 | 1 |
+| alice session (xmtp) | 1 | 1 |
+| bob wallet | 12 | 12 |
+| bob session (dispute) | 3 | 3 |
+| bob session (normal) | 1 | 1 |
+| bob session (xmtp) | 1 | 1 |
+
+Reading the reconciliation:
+- Alice +0.2 and Bob −0.2, as in §5; the three channels' 0.03 USDC of fees went back to the deployer.
+- What the agents hold afterwards is the same design residue as §9: the two wallet reserves (0.0188 USDC each) and
+  6 × 0.0002667 USDC of sweep fee reserve. That is 0.03915366 USDC; none of it is at risk.
+
+| Deployer | USDC |
+|---|---|
+| Before the redeploy (block 68,890,519) | 19.774950966 |
+| After the redeploy | 19.671452991 |
+| After the rerun (block 68,893,770) | 19.547937991 |
+| Change across redeploy + rerun | −0.226992975 = deploy 0.103497975 + rerun gas 0.08436134 + held by the agents 0.03915366 |
+
+All six sweeps of the rerun were recorded as real sweeps: the 8.4 "dust" misrecording did not recur. Blockscout's
+listing matched the nonce of all 9 senders again.
+
+### XMTP close timing, explained
+
+The first run's close took 48.9 s over XMTP. This time the close records each sub-step's offset from Alice's
+`/close` request:
+
+| Sub-step | Relay (`normal`) | XMTP `dev` (`xmtp`) |
+|---|---|---|
+| Alice's `/close` answered | +0.7 s | +1.7 s |
+| Bob sees `opponentWantsToClose` (Alice's Close signature delivered) | +0.8 s | +4.8 s |
+| Bob's `/close` answered (his daemon submits `closeCooperative`) | +2.7 s | +5.7 s |
+| `Finalized` on chain (polled every 1 s) | +2.7 s | +5.7 s |
+| Both daemons report `Finalized` | +2.8 s | **+5.8 s** |
+
+**Over XMTP `dev` the close took 5.8 s.** About 3 s of that is delivering Alice's Close signature over XMTP, against
+0.1 s over the relay. The rest matches the relay.
+
+So the first run's 48.9 s was not XMTP's. The likely cause, though not proven for that run, is the observation path:
+every `GET /status` the script polls with refreshes the chain, and a rate-limited one is retried every 3 s for up to
+a minute.
+
+The same applies to this rerun's **host SIGKILL → `transport: xmtp` seen on both daemons: 45.5 s**, against 4.4 s in
+the first run. That too is measured through rate-limited `/status` polls: 91 `GET /status` retries in this run,
+against 46 in the first. The daemons do not timestamp the switch itself. The moves right after it ran over XMTP in
+192, 3,213, 200 and 163 ms.
+
+### Rerun timings
+
+| Step | Time |
+|---|---|
+| Offer → Open on both daemons | 65.8 s (normal), 33.7 s (dispute), 56.4 s (xmtp) |
+| One move over the relay | 145–1,375 ms, except two moves of game 1: 50.9 s and 6.1 s. Each was a rate-limited `POST /move` that had taken effect, and the script waited before re-checking it. |
+| NEW_GAME handshake | 6.7 s (0 → 1; Bob's countersign `POST` rate-limited) and 51.7 s (1 → 2; no `POST` was refused, so the time went to rate-limited `GET /status` retries) |
+| Cooperative close, request → Finalized | 2.8 s (relay), 5.8 s (XMTP `dev`) |
+| Finalized → both session keys swept | 100.1 s (normal), 6.0 s (dispute), 6.0 s (xmtp) |
+| Bob's answering move → `respond` mined | 54.9 s, sent by Alice's watchtower |
+| Challenge deadline → `timeout` mined | Deadline 17:10:06 UTC; `timeout` in a block at 17:10:08, **2 s after** (55 s in the first run) |
+| XMTP `dev` registration after Open | 0.8 s |
+| Whole rerun | 16:48:44–17:13:03 UTC, including the one restart |
+
+### What the rerun says about §8
+
+- **8.1, the getLogs topic limit.** It stays fixed: the indexer caught up from the new deploy block and relayed all
+  three channels.
+- **8.2, rate limiting.** It was heavier this time:
+  - 91 `GET /status` retries;
+  - 2 `POST /move` and 1 `POST /next-game` answered with an error after they had taken effect;
+  - one script read that outlasted viem's retries.
+
+  The daemons' own `lastError` showed "watch: Request exceeds defined limit." once.
+
+  H3's "an action that took effect is never answered as a failure" (`7d151b8`) landed after this rerun's daemons were
+  spawned, so the POST symptom is expected here. Rerun once more on current HEAD to see H3's effect.
+- **8.4, the sweep recorded as dust.** It did not recur. H3's `abde97a` ("a sent sweep keeps its hash") also was not
+  yet in the daemons that ran.

@@ -141,9 +141,11 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 
 ### Plan 6 Task 5 (the Arc testnet rehearsal, 2026-10-24)
 
-See `docs/superpowers/arc-testnet-rehearsal.md` §2–§9. The scripted rehearsal used real faucet USDC on Arc testnet:
-3 games then a close, a challenge → respond → timeout dispute, and a host kill finished over XMTP `dev`. Payouts and
-balances reconciled exactly; gas for the whole run was 0.0827 USDC.
+See `docs/superpowers/arc-testnet-rehearsal.md` §2–§10. The scripted rehearsal used real faucet USDC on Arc testnet:
+3 games then a close, a challenge → respond → timeout dispute, and a host kill finished over XMTP `dev`. It ran
+twice: first on the pre-hardening hub (§2–§9), then on the hardened-hub redeploy (§10). Both times, payouts and
+balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened hub, `claim()` and
+`renounceOwnership()` behave as M1/M2 require (`eth_call`).
 
 - **Fixed: Arc's RPC refuses an `eth_getLogs` with more than 10 topics** (testnet and mainnet, -32012). The host's
   indexer read all 15 hub events in one query and could never index a channel, so the relay could serve no game. The
@@ -165,8 +167,9 @@ balances reconciled exactly; gas for the whole run was 0.0827 USDC.
 - **A sweep whose receipt wait hits a plain RPC error is recorded as `"dust"`.** The swept amount is then missing from
   `sweeps`; the funds are safe in the wallet. This is a new path into the parked "Other" item above (report 8.4).
 - **Each sweep leaves about 0.00027 USDC on its session key:** the fee reserve it did not spend (report 8.5).
-- **Closing over XMTP `dev` took 48.9 s, against 2.7 s over the relay.** Not isolated (report §7). Measure it again
-  before relying on the fallback for time-critical closes.
+- **Closing over XMTP `dev`.** It took 48.9 s in the first run, against 2.7 s over the relay. The rerun timed every
+  sub-step and measured 5.8 s, about 3 s of it the Close signature's XMTP delivery (report §10). The first run's 48.9 s
+  is put down to rate-limited status polling, not to XMTP. Done, unless it recurs.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
@@ -195,7 +198,9 @@ balances reconciled exactly; gas for the whole run was 0.0827 USDC.
    - The fee and max fee, and the launch limits (10 USDC / 1,000 USDC suggested), are signed off.
    - Source is verified on the explorer, and `deployments/<chainId>.json` is committed. (Testnet done in Plan 6 Task
      5: both contracts are verified on `explorer.testnet.arc.io`, and `contracts/deployments/5042002.json` is committed
-     (rehearsal report §1); `scripts/verify-arc.sh` is ready for mainnet. Mainnet is still to do.)
+     (rehearsal report §1). That includes the hardened-hub redeploy (`0x9b8B…bA41`, I1/M1/M2), whose `ChannelHub`
+     verified cold through `scripts/verify-arc.sh`'s Sourcify import; the script is ready for mainnet. Mainnet is
+     still to do.)
    - Ownership acceptance (`Ownable2Step`) is completed and tested.
 5. **Host production config.**
    - WS and HTTP limits come from load data (m8).
