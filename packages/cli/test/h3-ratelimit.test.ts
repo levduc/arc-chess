@@ -8,7 +8,14 @@ import { LimitExceededRpcError, createPublicClient, type Hex, type PublicClient 
 import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, RPC_RETRY_COUNT, RPC_RETRY_DELAY_MS, TxReceiptMissingError, ZERO_HASH, rpcTransport } from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
-import { DAEMON_RPC_TIMEOUT_MS, GAS_CHECK_BACKOFF_MAX_MS, GAS_CHECK_BACKOFF_START_MS, UNREADABLE_BLOCK_PASSES } from "../src/daemon.js";
+import {
+  DAEMON_RPC_TIMEOUT_MS,
+  DAEMON_RPC_TOTAL_TIMEOUT_MS,
+  GAS_CHECK_BACKOFF_MAX_MS,
+  GAS_CHECK_BACKOFF_START_MS,
+  RESPOND_SEND_MARGIN_MS,
+  UNREADABLE_BLOCK_PASSES,
+} from "../src/daemon.js";
 import { autoReturnSecondsOf } from "../src/config.js";
 import { RPC } from "../../sdk/test/helpers/chain.js";
 import { startPair, waitFor } from "./helpers/harness.js";
@@ -140,15 +147,97 @@ describe("H3: a rate-limited session-gas check backs off", () => {
   });
 });
 
-describe("H3 fix round 1 (review M8): the daemon's reads fail well inside the auto-return window on a hung RPC", () => {
-  it("its client times an attempt out after 5 s, so a read fails within ~45 s and a respond's reads within 300 s", async () => {
+/** Bob (black) answers e4 with e5 and challenges on it, so Alice must move to answer. Alice's daemon is parked (the
+ *  test drives her) and Bob's relay is cut (only Alice's respond can answer). Returns Alice's raw-send hook. */
+async function challengedAlice() {
+  const m = await matched();
+  const { alice, bob, id } = m;
+  await alice.daemon.move(id, "e4", { actor: "agent" });
+  await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+  await bob.daemon.move(id, "e5", { actor: "agent" });
+  await waitFor(() => alice.daemon.handle(id).session.isMyTurn(), 10_000, "alice's turn");
+  await parked(alice.daemon);
+  bob.client.disconnect();
+  await bob.daemon.challenge(id, "agent");
+  await parked(bob.daemon); // from here on, every RPC request in this process is Alice's
+  expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+  const l = alice.daemon.handle(id);
+  const inner = (l.sessionSender as unknown as { inner: { sendRawTransaction(raw: Hex): Promise<Hex> } }).inner;
+  const realRaw = inner.sendRawTransaction.bind(inner);
+  const sent: { at?: number } = {};
+  inner.sendRawTransaction = async (raw: Hex) => {
+    sent.at ??= Date.now();
+    return realRaw(raw);
+  };
+  return { ...m, l, sent };
+}
+
+describe("H3 fix round 2 (re-review I-a): a respond is broadcast inside the auto-return window, whatever the RPC does", () => {
+  it("the daemon's client caps one request at 20 s, retries included, and attempts at 5 s", async () => {
     const { alice } = await matched();
-    const t = alice.daemon.client.transport as { timeout?: number; retryCount?: number; retryDelay?: number };
-    expect(t.timeout).toBe(DAEMON_RPC_TIMEOUT_MS); // before: viem's 10 s default
+    const t = alice.daemon.client.transport as { timeout?: number; retryCount?: number; retryDelay?: number; totalTimeoutMs?: number };
+    expect(t.timeout).toBe(DAEMON_RPC_TIMEOUT_MS);
+    expect(t.totalTimeoutMs).toBe(DAEMON_RPC_TOTAL_TIMEOUT_MS); // before: none -- 6 x 5 s + 15.5 s = 45.5 s a request
     expect([t.retryCount, t.retryDelay]).toEqual([RPC_RETRY_COUNT, RPC_RETRY_DELAY_MS]);
-    const perRead = (RPC_RETRY_COUNT + 1) * DAEMON_RPC_TIMEOUT_MS + RPC_RETRY_DELAY_MS * (2 ** RPC_RETRY_COUNT - 1);
-    expect(perRead).toBe(45_500);
-    expect(5 * perRead).toBeLessThan(autoReturnSecondsOf(900n) * 1000); // about 5 reads before a respond's send
+  });
+
+  it("the real respond path (move -> respondIfChallenged -> hub.respond): its requests x 20 s + the send fit in 300 s", async () => {
+    const { alice, id, sent } = await challengedAlice();
+    const d = alice.daemon;
+    // Counted at fetch: viem's actions are bound to the client it was built from, not to a patched `request`.
+    const methods: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).startsWith(RPC) && sent.at === undefined) methods.push((JSON.parse(String(init?.body)) as { method: string }).method);
+      return realFetch(input, init);
+    }) as typeof fetch;
+    try {
+      await d.move(id, "Nf3", { actor: "agent" }); // the move answers the challenge
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(sent.at).toBeDefined();
+    expect((await d.hub.channelInfo(id)).phase).toBe("Open");
+    // Every request before the broadcast is one after another: at most DAEMON_RPC_TOTAL_TIMEOUT_MS each, and the send
+    // itself is one attempt on LocalKeyTxSender's own client (viem's 10 s timeout, never retried).
+    expect(methods.length).toBeGreaterThanOrEqual(8);
+    const worstMs = methods.length * DAEMON_RPC_TOTAL_TIMEOUT_MS + 10_000;
+    expect(worstMs).toBeLessThan(autoReturnSecondsOf(900n) * 1000);
+    // Before the cap: each request up to 45.5 s.
+    expect(methods.length * 45_500 + 10_000).toBeGreaterThan(autoReturnSecondsOf(900n) * 1000);
+  });
+});
+
+describe("H3 fix round 2 (re-review M-g): a respond is never broadcast past its deadline, and never held back before it", () => {
+  /** Makes the latest block read `secondsLeft` before the challenge deadline, and the respond's simulate take `ms`. */
+  function skew(d: ArenaDaemon, deadline: bigint, secondsLeft: bigint, ms: number) {
+    const realBlock = d.client.getBlock.bind(d.client);
+    d.client.getBlock = (async (...args: Parameters<typeof realBlock>) => ({ ...(await realBlock(...args)), timestamp: deadline - secondsLeft })) as typeof realBlock;
+    const realCall = d.client.call.bind(d.client);
+    d.client.call = (async (...args: Parameters<typeof realCall>) => {
+      await new Promise((r) => setTimeout(r, ms));
+      return realCall(...args);
+    }) as typeof realCall;
+  }
+
+  it("reads that end past the deadline (plus the margin): nothing is sent, and the respond error says so", async () => {
+    const { alice, id, l, sent } = await challengedAlice();
+    const { deadline } = await alice.daemon.hub.channelInfo(id);
+    skew(alice.daemon, deadline, 1n, 1_000 + RESPOND_SEND_MARGIN_MS + 500); // give-up in 1 s, notAfter in 4 s
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    // Before: the respond went out regardless, to revert on-chain and burn gas.
+    expect(sent.at).toBeUndefined();
+    expect(l.lastError).toBe("respond: the transaction was ready only past its give-up time: not sent");
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+  });
+
+  it("reads that end before the deadline: the respond is sent and answers the challenge", async () => {
+    const { alice, id, sent } = await challengedAlice();
+    const { deadline } = await alice.daemon.hub.channelInfo(id);
+    skew(alice.daemon, deadline, 30n, 1_000 + RESPOND_SEND_MARGIN_MS + 500); // the same delay, 30 s left
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    expect(sent.at).toBeDefined();
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Open");
   });
 });
 

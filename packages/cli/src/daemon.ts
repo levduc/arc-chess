@@ -494,11 +494,22 @@ export const BACKOFF_START_MS = 30_000;
 /** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
 export const BACKOFF_MAX_MS = 300_000;
 
-/** H3 fix round 1 (review M8): the daemon's per-attempt RPC timeout (viem's default is 10 s). viem retries a timeout
- *  too, so one read on a hung RPC fails after 6 x 5 s plus the 15.5 s back-off, about 45 s (it was about 75 s): the
- *  five or so reads a respond makes before its send then fit inside `autoReturnSecondsOf` (300 s at the 900 s
- *  default window). Under a plain rate limit a read takes at most about 20 s (`rpcTransport`). */
+/** H3 fix round 1 (review M8): the daemon's per-attempt RPC timeout (viem's default is 10 s). */
 export const DAEMON_RPC_TIMEOUT_MS = 5_000;
+
+/** H3 fix round 2 (re-review I-a): the most one request on the daemon's client takes, every attempt and back-off
+ *  included (`rpcTransport`'s `totalTimeoutMs`). A respond makes about 11 requests one after another before its send
+ *  (`h3-ratelimit.test.ts` counts them), and the send is one attempt of at most 10 s: 11 x 20 s + 10 s = 230 s, inside
+ *  `autoReturnSecondsOf` (300 s at the 900 s default window). Before, a request could take 6 x 5 s + 15.5 s = 45.5 s,
+ *  about 510 s for the respond. A plain rate limit still gets its full 15.5 s back-off (20 s with `Retry-After`). */
+export const DAEMON_RPC_TOTAL_TIMEOUT_MS = 20_000;
+
+/** H3 fix round 2 (re-review M-g): a respond is not sent at or after its give-up time plus this. Why it never holds back
+ *  a respond that can still land: the give-up time is the read time plus (deadline - the latest block's timestamp),
+ *  and that block is no newer than the chain's clock at the read, so the give-up time is no earlier than the last
+ *  moment a block could still take the respond (the hub needs `block.timestamp < deadline`). The margin covers Arc's
+ *  1 s timestamps and a proposer clock running ahead by up to 2 s. A send past it could only revert, paying gas. */
+export const RESPOND_SEND_MARGIN_MS = 3_000;
 
 /** H3 (Arc testnet rehearsal §8.2): after a failed read of a session key's balance, the session-gas check waits this
  *  long (wall-clock ms) before it reads again -- doubled on each further failure, up to `GAS_CHECK_BACKOFF_MAX_MS`.
@@ -733,8 +744,12 @@ export class ArenaDaemon {
       rpcUrls: { default: { http: [c.rpcUrl] } },
     });
     // H3: a rate-limited read is retried with back-off (`rpcTransport`; Arc testnet rehearsal §8.2). Sends never are.
-    // Fix round 1 (review M8): with a per-attempt timeout of DAEMON_RPC_TIMEOUT_MS.
-    this.client = createPublicClient({ chain: this.chain, transport: rpcTransport(c.rpcUrl, { timeout: DAEMON_RPC_TIMEOUT_MS }) });
+    // Fix round 1 (review M8): a per-attempt timeout of DAEMON_RPC_TIMEOUT_MS; fix round 2 (re-review I-a): and at most
+    // DAEMON_RPC_TOTAL_TIMEOUT_MS per request, retries included.
+    this.client = createPublicClient({
+      chain: this.chain,
+      transport: rpcTransport(c.rpcUrl, { timeout: DAEMON_RPC_TIMEOUT_MS, totalTimeoutMs: DAEMON_RPC_TOTAL_TIMEOUT_MS }),
+    });
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
@@ -2837,6 +2852,8 @@ export class ArenaDaemon {
       await this.hub.respond(l.sessionSender, l.session.challengeProof(), {
         receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
         giveUpAt,
+        // H3 fix round 2 (re-review M-g): nor is it sent past then -- after its pre-send reads -- since it would revert.
+        notAfter: giveUpAt + RESPOND_SEND_MARGIN_MS,
       });
     } catch (err) {
       // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
