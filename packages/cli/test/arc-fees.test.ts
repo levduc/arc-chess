@@ -13,7 +13,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createTestClient, http, type Hex } from "viem";
+import { createPublicClient, createTestClient, http, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { DEFAULT_FEE_CEILING_WEI, NO_FEE_CEILING, type SerialTxSender, type TxRequest } from "@arena/sdk";
 import { CHAIN, RPC, setEthBalance } from "../../sdk/test/helpers/chain.js";
@@ -35,6 +35,7 @@ import { RecordStore } from "../src/records.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
 const GWEI = 10n ** 9n;
+const bigMax = (a: bigint, b: bigint) => (a > b ? a : b);
 const anvil = createTestClient({ mode: "anvil", chain: CHAIN, transport: http(RPC) });
 /** PUSH1 0 PUSH1 0 REVERT: any call -- a value transfer included -- reverts. */
 const REVERTS = "0x60006000fd" as const;
@@ -158,20 +159,25 @@ describe("Plan 6 Task 2: the profile reaches every sender the daemon builds", ()
   });
 
   it("on a real node: a floor above the market raises what the wallet and a session key actually send, and the sweep reserves for it", async () => {
-    // A test-only profile for 31337 with a 10 gwei floor (anvil's own estimate is about 1-2 gwei) and native gas.
-    CHAIN_PROFILES[31337] = { name: "Local floor", usdc: "0x3600000000000000000000000000000000000000", nativeIsUsdc: false, minFeePerGas: 10n * GWEI, feeCeilingWei: 40n * GWEI };
+    // A test-only profile for 31337 with native gas and a floor well above the node's own estimate (anvil's is about
+    // 1-2 gwei, arc-anvil's 25): at least 10 gwei, in whole gwei, over 2 x the market.
+    const pub = createPublicClient({ chain: CHAIN, transport: http(RPC) });
+    const marketBefore = ((await pub.estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
+    const floor = bigMax(10n * GWEI, ((2n * marketBefore) / GWEI + 1n) * GWEI);
+    CHAIN_PROFILES[31337] = { name: "Local floor", usdc: "0x3600000000000000000000000000000000000000", nativeIsUsdc: false, minFeePerGas: floor, feeCeilingWei: 40n * GWEI };
     try {
       const walletKey = generatePrivateKey();
       const wallet = privateKeyToAccount(walletKey).address;
       await setEthBalance(wallet, 10n ** 18n);
       const d = daemonOn(config(31337), walletKey);
       const market = ((await d.client.estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
-      expect(market).toBeLessThan(10n * GWEI); // the floor binds here
+      expect(market).toBeLessThan(floor); // the floor binds here
+      expect(d.wallet.minFeePerGas).toBe(floor);
       expect(d.wallet.feeCeiling).toBe(40n * GWEI);
 
       const h = await d.wallet.send({ to: privateKeyToAccount(generatePrivateKey()).address, data: "0x", value: 1n });
       const sent = await d.client.waitForTransactionReceipt({ hash: h }).then(() => d.client.getTransaction({ hash: h }));
-      expect(sent.maxFeePerGas).toBe(10n * GWEI);
+      expect(sent.maxFeePerGas).toBe(floor);
       expect(sent.maxPriorityFeePerGas!).toBeLessThanOrEqual(sent.maxFeePerGas!);
 
       // A settled channel's session key: the sweep reserves gas x ceil(1.3 x the floor), not 1.3 x the market,
@@ -184,9 +190,9 @@ describe("Plan 6 Task 2: the profile reaches every sender the daemon builds", ()
         performSweep(s: SerialTxSender): Promise<{ status: string; amount?: bigint; hash?: Hex }>;
       }).performSweep(session);
       expect(swept.status).toBe("swept");
-      expect(swept.amount).toBe(start - 21_000n * 13n * GWEI); // ceil(1.3 x 10 gwei) = 13 gwei per gas reserved
+      expect(swept.amount).toBe(start - 21_000n * ((floor * 13n + 9n) / 10n)); // ceil(1.3 x the floor) per gas reserved
       const tx = await d.client.getTransaction({ hash: swept.hash! });
-      expect(tx.maxFeePerGas).toBe(10n * GWEI);
+      expect(tx.maxFeePerGas).toBe(floor);
       expect(await d.client.getBalance({ address: wallet })).toBeGreaterThan(10n ** 18n - 10n ** 15n);
     } finally {
       delete CHAIN_PROFILES[31337];
@@ -203,10 +209,11 @@ describe("Plan 6 Task 2: the session-key top-up's gas comes from the node's esti
     const target = config.sessionGasWei;
     const sends = spySends(d, session);
     const asked: EstimateArgs[] = [];
+    const answered: bigint[] = [];
     const restore = stubEstimate(d, session, async (args, real) => {
       asked.push(args);
-      const gas = await real(args); // anvil's own estimate, recorded on the way
-      expect(gas).toBe(21_000n);
+      const gas = await real(args); // anvil's own estimate, recorded on the way (asserted below, not in here)
+      answered.push(gas);
       return gas;
     });
     try {
@@ -216,8 +223,9 @@ describe("Plan 6 Task 2: the session-key top-up's gas comes from the node's esti
       await d.idle();
       expect(sends).toHaveLength(1);
       expect((await d.client.getTransaction({ hash: sends[0] })).gas).toBe(30_200n);
-      // The estimate was asked for this very transfer: the wallet, the key, and the shortfall.
+      // The estimate was asked for this very transfer: the wallet, the key, and the shortfall; anvil answered 21,000.
       expect(asked.at(-1)).toMatchObject({ account: alice.address, to: session, value: target - target / 10n });
+      expect(answered.at(-1)).toBe(21_000n);
     } finally {
       restore();
     }
