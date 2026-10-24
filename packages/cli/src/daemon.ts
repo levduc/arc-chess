@@ -230,6 +230,10 @@ export type ChannelHandle = {
    *  to at least this. Null for every other cause -- a reverted top-up, a fee cap, a failed estimate, a send lost in
    *  transit -- which funding the wallet does not fix. */
   refillNeedWei: bigint | null;
+  /** H3 (Arc testnet rehearsal §8.2): wall-clock ms before which `ensureSessionGas` does not read the session key's
+   *  balance again after that read failed (0 = now), and the back-off it waited last (0 = no episode). */
+  gasCheckRetryAt: number;
+  gasCheckBackoffMs: number;
   /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
    *  woken for it yet: drives the one-shot `settled` attention. */
   settledWake: boolean;
@@ -475,6 +479,14 @@ export const REFILL_TRANSIENT_FAILURES_ALERT = 3;
 export const BACKOFF_START_MS = 30_000;
 /** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
 export const BACKOFF_MAX_MS = 300_000;
+
+/** H3 (Arc testnet rehearsal §8.2): after a failed read of a session key's balance, the session-gas check waits this
+ *  long (wall-clock ms) before it reads again -- doubled on each further failure, up to `GAS_CHECK_BACKOFF_MAX_MS`.
+ *  Before, it re-read on every pass, from three call sites per pass: 208 failures in 24 minutes from two daemons on
+ *  a rate-limited RPC, every one of them adding to the load that limited it. */
+export const GAS_CHECK_BACKOFF_START_MS = 5_000;
+/** H3: the session-gas check's back-off never grows past this. A refill is at most this late. */
+export const GAS_CHECK_BACKOFF_MAX_MS = 60_000;
 
 /** Plan 5 fix round (I8): after this many failed sweep attempts (the back-off has long since reached its cap by
  *  then), the channel's session gas is written off -- `swept: "abandoned"` -- so eviction can proceed instead of
@@ -1588,6 +1600,8 @@ export class ArenaDaemon {
       sessionGasLowCause: null,
       refillTransientFailures: 0,
       refillNeedWei: null,
+      gasCheckRetryAt: 0,
+      gasCheckBackoffMs: 0,
       settledWake: false,
       humanMustMoveWoken: null,
       settledAt: null,
@@ -1797,6 +1811,8 @@ export class ArenaDaemon {
     // Plan 5 Task 1 (mainnet gates: refill back-off): back off retrying a channel whose refills keep failing,
     // unless the wallet's own balance has just risen (it may have just been funded) -- checked before the shared
     // top-up below so a blocked channel costs nothing beyond one balance read per pass.
+    // H3: a balance read that failed is not retried before its back-off is over.
+    if (Date.now() < l.gasCheckRetryAt) return;
     if (!(await this.refillBackoffGate(l))) return;
     // (A funding top-up in flight that fails is fund()'s to report, not this caller's.)
     await this.sharedTopUp(l, async () => {
@@ -1805,9 +1821,19 @@ export class ArenaDaemon {
       try {
         balance = await this.client.getBalance({ address: l.sessionSender.address });
       } catch (err) {
-        this.log(`channel ${l.record.channelId}: session gas check failed (retried on the next pass): ${errorText(err)}`);
+        const starting = l.gasCheckBackoffMs === 0;
+        l.gasCheckBackoffMs = starting ? GAS_CHECK_BACKOFF_START_MS : Math.min(l.gasCheckBackoffMs * 2, GAS_CHECK_BACKOFF_MAX_MS);
+        l.gasCheckRetryAt = Date.now() + l.gasCheckBackoffMs;
+        if (starting || l.gasCheckBackoffMs === GAS_CHECK_BACKOFF_MAX_MS) {
+          this.log(
+            `channel ${l.record.channelId}: session gas check failed (retried in ${l.gasCheckBackoffMs / 1000}s): ${errorText(err)}`,
+          );
+        }
         return;
       }
+      if (l.gasCheckBackoffMs !== 0) this.log(`channel ${l.record.channelId}: session gas check read the balance again`);
+      l.gasCheckBackoffMs = 0;
+      l.gasCheckRetryAt = 0;
       if (balance >= floor) {
         l.refillTransientFailures = 0;
         this.clearSessionGasLow(l);

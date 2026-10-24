@@ -4,11 +4,11 @@
  * anything else -- above all, never for a refused range (spec §12 item 18): a skip on a rate limit would hide a
  * dispute event.
  */
-import { createPublicClient, type Hex, type PublicClient } from "viem";
+import { LimitExceededRpcError, createPublicClient, type Hex, type PublicClient } from "viem";
 import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, ZERO_HASH, rpcTransport } from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
-import { UNREADABLE_BLOCK_PASSES } from "../src/daemon.js";
+import { GAS_CHECK_BACKOFF_MAX_MS, GAS_CHECK_BACKOFF_START_MS, UNREADABLE_BLOCK_PASSES } from "../src/daemon.js";
 import { RPC } from "../../sdk/test/helpers/chain.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -96,4 +96,45 @@ describe("H3: a rate-limited dispute scan never splits a range nor skips a block
       expect(l.record.skippedEventBlocks).toBeUndefined();
     });
   }
+});
+
+describe("H3: a rate-limited session-gas check backs off", () => {
+  it("a failed balance read is not repeated before its back-off (5 s, doubling to 60 s); a read that succeeds ends it", async () => {
+    const { alice, id } = await matched();
+    await parked(alice.daemon);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const key = l.sessionSender.address;
+    const state = { limited: true, reads: 0 };
+    const realBalance = d.client.getBalance.bind(d.client);
+    d.client.getBalance = (async (args: { address: Hex }) => {
+      if (args.address === key) {
+        state.reads++;
+        if (state.limited) throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      }
+      return realBalance(args);
+    }) as typeof d.client.getBalance;
+    const check = () => (d as unknown as { ensureSessionGas(l: unknown): Promise<void> }).ensureSessionGas(l);
+    // Before H3 every call read again: the main pass, the dispute pass and funding each call it, every pass.
+    for (let i = 0; i < 10; i++) await check();
+    expect(state.reads).toBe(1);
+    expect(l.gasCheckBackoffMs).toBe(GAS_CHECK_BACKOFF_START_MS);
+    expect(l.gasCheckRetryAt).toBeGreaterThan(Date.now());
+    const backoffs: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      l.gasCheckRetryAt = 0; // its back-off is over
+      await check();
+      backoffs.push(l.gasCheckBackoffMs);
+    }
+    expect(state.reads).toBe(7);
+    expect(backoffs).toEqual([10_000, 20_000, 40_000, GAS_CHECK_BACKOFF_MAX_MS, GAS_CHECK_BACKOFF_MAX_MS, GAS_CHECK_BACKOFF_MAX_MS]);
+    state.limited = false;
+    l.gasCheckRetryAt = 0;
+    await check();
+    expect(state.reads).toBe(8);
+    expect(l.gasCheckBackoffMs).toBe(0);
+    expect(l.gasCheckRetryAt).toBe(0);
+    await check();
+    expect(state.reads).toBe(9); // no back-off once a read succeeds
+  });
 });
