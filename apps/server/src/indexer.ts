@@ -22,6 +22,19 @@ export type PlayerStats = {
 // into an unbounded amount of RPC work; the next poll (on the same interval) picks up where this one left off.
 const MAX_CHUNKS_PER_POLL = 50;
 
+/** Plan 6 hardening H1 (review m-11): the most `hubEvents` reads one poll makes -- its chunks plus the halves of any
+ *  range the RPC refused (each split adds one). */
+export const INDEXER_READS_PER_POLL = 64;
+
+/** H1 (review m-11): the only hub events whose size a caller controls -- a proof's signature bytes, which the hub
+ *  re-emits unchecked -- and every other kind, which is read on its own when a range is refused. */
+const DISPUTE_KINDS: readonly HubEvent["kind"][] = ["Challenged", "Responded"];
+const OTHER_KINDS: readonly HubEvent["kind"][] = ["ChannelCreated", "Deposited", "Opened", "Finalized", "Reclaimed"];
+
+/** H1 (review m-11): a block whose events the RPC refuses on this many polls in a row, while it serves the block's
+ *  other events alone, has its `Challenged`/`Responded` events skipped (see `Indexer.poll`). */
+export const INDEXER_UNREADABLE_POLLS = 3;
+
 /** Every poll re-reads this many blocks behind the cursor, as the daemons' dispute scan does: a lagging or
  *  load-balanced RPC can report a head its `getLogs` index has not caught up with yet. `apply` is idempotent
  *  (`lastEvent`), so re-reading is harmless. */
@@ -73,6 +86,10 @@ function isNewer(e: HubEvent, last: { block: bigint; logIndex: number } | undefi
 export class Indexer {
   private timer: ReturnType<typeof setInterval> | undefined;
   private polling = false;
+  /** H1 (review m-11): the one block whose events the RPC refused on consecutive polls, and how many in a row. */
+  private unreadable: { block: bigint; tries: number } | null = null;
+  /** H1 (review m-11): blocks whose `Challenged`/`Responded` events were skipped (in memory, oldest first). */
+  private readonly skipped: bigint[] = [];
 
   constructor(
     private readonly repo: Repo,
@@ -105,23 +122,91 @@ export class Indexer {
       const from = rescan > this.cfg.indexer.startBlock ? rescan : this.cfg.indexer.startBlock;
       // Undo entries behind the window are final: this poll never re-reads their blocks.
       this.pruneUndo(from);
-      const ranges = chunkRanges(from, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL);
-      for (const r of ranges) {
+      // A stack, so a split range's halves are read next, in chain order.
+      const pending = chunkRanges(from, head, BigInt(this.cfg.indexer.chunkBlocks)).slice(0, MAX_CHUNKS_PER_POLL).reverse();
+      let contentRefused = false;
+      for (let reads = 0; pending.length > 0 && reads < INDEXER_READS_PER_POLL; reads++) {
+        const r = pending.pop()!;
         let events: HubEvent[];
+        let partial = false;
         try {
           events = await this.chain.hubEvents(r.fromBlock, r.toBlock);
+          this.readable(r.fromBlock, r.toBlock);
         } catch (err) {
-          this.log(`indexer: ${err instanceof Error ? err.message : String(err)}`);
-          return;
+          // H1 (review m-11): the hub re-emits a proof's unchecked signature bytes, so a griefer can make a range's
+          // response larger than an RPC serves -- and before this, that one range stopped the indexer for good. If
+          // the RPC serves the range's other events (so it is up, and the dispute events are what it refuses), the
+          // range is split down to one block; a block refused on INDEXER_UNREADABLE_POLLS polls in a row then has
+          // its dispute events skipped, and its other events (creations, deposits, settlements) are applied. An RPC
+          // that refuses those too is down, or caps the range itself: the poll stops, as before.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (r.fromBlock < r.toBlock) {
+            if (!contentRefused) {
+              try {
+                await this.chain.hubEvents(r.fromBlock, r.toBlock, { kinds: OTHER_KINDS });
+              } catch {
+                this.log(`indexer: ${msg}`);
+                return;
+              }
+              contentRefused = true;
+            }
+            const mid = r.fromBlock + (r.toBlock - r.fromBlock) / 2n;
+            pending.push({ fromBlock: mid + 1n, toBlock: r.toBlock }, { fromBlock: r.fromBlock, toBlock: mid });
+            continue;
+          }
+          const b = r.fromBlock;
+          let others: HubEvent[];
+          try {
+            others = await this.chain.hubEvents(b, b, { kinds: OTHER_KINDS });
+          } catch {
+            this.log(`indexer: ${msg}`);
+            return;
+          }
+          if (!this.skipped.includes(b)) {
+            const tries = this.unreadable?.block === b ? this.unreadable.tries + 1 : 1;
+            if (tries < INDEXER_UNREADABLE_POLLS) {
+              this.unreadable = { block: b, tries };
+              this.log(`indexer: block ${b}: the RPC refuses its events (${msg}) but serves the block's others; retried next poll`);
+              return;
+            }
+            this.unreadable = null;
+            this.skipped.push(b);
+            this.log(
+              `indexer: skipping the ${DISPUTE_KINDS.join("/")} events of block ${b}: the RPC refused its events ${tries} ` +
+                `polls in a row (${msg}) while serving its other events, which are applied. Its channels' challenge counters ` +
+                "and registered states may be stale until a later event; use an RPC that serves larger getLogs responses",
+            );
+          }
+          events = others;
+          partial = true;
         }
         // Before folding in this chunk, unwind any row whose already-applied events in these (already indexed)
-        // blocks are gone -- reorged out -- so the events the chain has now are applied to the row as it was.
-        if (r.fromBlock <= cursor) await this.unwind(events, r.fromBlock, r.toBlock < cursor ? r.toBlock : cursor);
+        // blocks are gone -- reorged out -- so the events the chain has now are applied to the row as it was. Not for
+        // a block read without its dispute events: their absence there is the RPC's refusal, not a reorg.
+        if (!partial && r.fromBlock <= cursor) await this.unwind(events, r.fromBlock, r.toBlock < cursor ? r.toBlock : cursor);
         for (const e of events) this.apply(e);
         if (r.toBlock > cursor) this.repo.setCursor(r.toBlock); // a rescanned chunk never moves the cursor back
       }
     } catch (err) {
       this.log(`indexer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** H1 (review m-11): the blocks whose `Challenged`/`Responded` events the indexer skipped because the RPC refused
+   *  to serve them (oldest first), for operators and `/metrics`. A block leaves the list once a later read of it
+   *  succeeds (within the rescan window). */
+  skippedBlocks(): readonly bigint[] {
+    return [...this.skipped];
+  }
+
+  /** H1 (review m-11): `[from, to]` read in full: a block in it is neither counting toward a skip nor skipped. */
+  private readable(from: bigint, to: bigint): void {
+    if (this.unreadable !== null && this.unreadable.block >= from && this.unreadable.block <= to) this.unreadable = null;
+    for (let i = this.skipped.length - 1; i >= 0; i--) {
+      const b = this.skipped[i];
+      if (b < from || b > to) continue;
+      this.skipped.splice(i, 1);
+      this.log(`indexer: block ${b}, skipped earlier, was read in full`);
     }
   }
 

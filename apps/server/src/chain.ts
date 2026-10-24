@@ -25,7 +25,8 @@ export interface ChainReader {
   feeConfig(): Promise<{ feePerPlayer: bigint; feeRecipient: Address }>;
   timeoutBounds(): Promise<{ min: bigint; max: bigint }>;
   head(): Promise<bigint>;
-  hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]>;
+  /** Plan 6 hardening H1 (review m-11): `kinds`, when given, reads only those events (see `HubClient.hubEvents`). */
+  hubEvents(fromBlock: bigint, toBlock: bigint, opts?: { kinds?: readonly HubEvent["kind"][] }): Promise<HubEvent[]>;
   /** The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause
    *  flag. `RpcChainReader` caches this for `LIMITS_CACHE_MS`. */
   limits(): Promise<Limits>;
@@ -110,8 +111,8 @@ export class RpcChainReader implements ChainReader {
     return value;
   }
 
-  hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
-    return this.hub.hubEvents(fromBlock, toBlock);
+  hubEvents(fromBlock: bigint, toBlock: bigint, opts?: { kinds?: readonly HubEvent["kind"][] }): Promise<HubEvent[]> {
+    return this.hub.hubEvents(fromBlock, toBlock, opts);
   }
 
   async blockHash(block: bigint): Promise<Hex | null> {

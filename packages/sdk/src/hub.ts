@@ -306,9 +306,21 @@ export class HubClient {
    * whole hub rather than one channel at a time, since it may not know every channel to poll for ahead of time.
    * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, LimitsUpdated, PausedSet,
    * EIP712DomainChanged, OZ Ownership*) are skipped.
+   *
+   * Plan 6 hardening H1 (review m-11): `kinds` reads only those events (one query per kind). An indexer whose RPC
+   * refuses a range because of a griefer's oversized `Challenged`/`Responded` can still read the range's other events.
    */
-  async hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
-    const logs = await this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, fromBlock, toBlock });
+  async hubEvents(fromBlock: bigint, toBlock: bigint, opts: { kinds?: readonly HubEvent["kind"][] } = {}): Promise<HubEvent[]> {
+    const logs =
+      opts.kinds === undefined
+        ? await this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, fromBlock, toBlock })
+        : (
+            await Promise.all(
+              opts.kinds.map((eventName) =>
+                this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName, fromBlock, toBlock }),
+              ),
+            )
+          ).flat();
     const events: HubEvent[] = [];
     for (const log of logs) {
       const args = log.args as Record<string, unknown>;

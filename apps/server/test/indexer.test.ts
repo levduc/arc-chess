@@ -16,7 +16,7 @@ import {
 } from "@arena/sdk";
 import type { HubEvent, Params, State } from "@arena/sdk";
 import { watchHtml } from "../src/docs.js";
-import { Indexer, playerStats } from "../src/indexer.js";
+import { INDEXER_UNREADABLE_POLLS, Indexer, playerStats } from "../src/indexer.js";
 import { Relay } from "../src/relay.js";
 import { SqliteRepo, type ChannelRow, type Repo } from "../src/repo.js";
 import { startServer, type ArenaServer, type Metrics } from "../src/server.js";
@@ -76,11 +76,13 @@ describe("Indexer.poll and Indexer.apply", () => {
     const repo = new SqliteRepo(":memory:");
     const chain = new FakeChain();
     chain.block = 25n;
-    let failNext = true;
+    // H1 (review m-11): two failures -- the read and the indexer's own probe of the range's other events. An RPC that
+    // refuses both is down, so the poll stops; one that served the probe would have the range split instead (below).
+    let failures = 2;
     const realHubEvents = chain.hubEvents.bind(chain);
     chain.hubEvents = async (from: bigint, to: bigint) => {
-      if (from === 10n && failNext) {
-        failNext = false;
+      if (from === 10n && failures > 0) {
+        failures--;
         throw new Error("rpc down");
       }
       return realHubEvents(from, to);
@@ -374,6 +376,88 @@ describe("Indexer.poll and Indexer.apply", () => {
 
     expect(logs.some((l) => /ahead of the chain head/i.test(l))).toBe(false);
     repo.close();
+  });
+});
+
+describe("H1 (review m-11): the indexer never wedges on one oversized event", () => {
+  /** A channel opened at blocks 5-7, challenged at block 15 with a 100 KB junk signature, and finalized at block 40;
+   *  `extra` lands in the challenge's own block. The chain's RPC refuses any response holding that signature for a
+   *  range of more than one block -- or, with `alone`, for any range that does not exclude the dispute events. */
+  function oversized(opts: { alone: boolean }) {
+    const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks: 10, startBlock: 0n } });
+    const repo = new SqliteRepo(":memory:");
+    const chain = new FakeChain();
+    const fx = makeChannelFixture(cfg);
+    const other = makeChannelFixture(cfg);
+    const at = (id: Hex, block: bigint, logIndex = 0) => ({ blockNumber: block, logIndex, channelId: id });
+    const junk = `0x${"01".repeat(100_000)}` as Hex;
+    chain.events = [
+      { ...at(fx.id, 5n), kind: "ChannelCreated", params: fx.params },
+      { ...at(fx.id, 6n), kind: "Deposited", player: 0, amount: fx.params.deposit },
+      { ...at(fx.id, 7n), kind: "Deposited", player: 1, amount: fx.params.deposit },
+      { ...at(fx.id, 7n, 1), kind: "Opened" },
+      {
+        ...at(fx.id, 15n), kind: "Challenged", challenger: 1, turnNum: 1n, deadline: 1_000n,
+        signed: { state: rawStateAt(fx, 1n), sigA: junk, sigB: "0x" },
+      },
+      // Another channel created in the challenge's own block: its row must not be lost with the junk.
+      { ...at(other.id, 15n, 1), kind: "ChannelCreated", params: other.params },
+      { ...at(fx.id, 40n), kind: "Finalized", balanceA: 900_000n, balanceB: 1_100_000n, fee: 10_000n },
+    ] as HubEvent[];
+    chain.block = 45n;
+    const refused: Array<[bigint, bigint]> = [];
+    const realHubEvents = chain.hubEvents.bind(chain);
+    chain.hubEvents = async (from: bigint, to: bigint, o?: { kinds?: readonly HubEvent["kind"][] }) => {
+      const events = (await realHubEvents(from, to)).filter((e) => o?.kinds === undefined || o.kinds.includes(e.kind));
+      const big = events.some((e) => (e.kind === "Challenged" || e.kind === "Responded") && e.signed.sigA.length > 10_000);
+      if (big && (opts.alone || to > from)) {
+        refused.push([from, to]);
+        throw new Error("query returned more than the maximum response size");
+      }
+      return events;
+    };
+    const logs: string[] = [];
+    return { cfg, repo, chain, fx, other, refused, logs, indexer: new Indexer(repo, chain, cfg, (l) => logs.push(l)) };
+  }
+
+  it("a chunk refused for one large event is split; the event is read alone and indexed", async () => {
+    const { repo, fx, refused, indexer } = oversized({ alone: false });
+    await indexer.poll();
+    expect(refused.length).toBeGreaterThan(0); // [10,19] came back too large at first
+    expect(repo.channelRow(fx.id)?.challenges).toEqual([0, 1]); // read on its own
+    expect(repo.channelRow(fx.id)?.phase).toBe("Finalized");
+    expect(repo.cursor()).toBe(45n);
+    expect(indexer.skippedBlocks()).toEqual([]);
+  });
+
+  it("a block refused even alone has only its dispute events skipped, after INDEXER_UNREADABLE_POLLS polls; the rest is indexed", async () => {
+    const { repo, fx, other, logs, indexer } = oversized({ alone: true });
+    for (let i = 1; i < INDEXER_UNREADABLE_POLLS; i++) {
+      await indexer.poll();
+      expect(repo.cursor()).toBe(14n); // [0,14] read; held before block 15
+      expect(indexer.skippedBlocks()).toEqual([]);
+    }
+    // Before H1 the cursor stayed at 9 for good: the creation in block 15 and the settlement at 40 were never seen.
+    await indexer.poll();
+    expect(indexer.skippedBlocks()).toEqual([15n]);
+    expect(logs.some((l) => /skipping the Challenged\/Responded events of block 15/.test(l))).toBe(true);
+    expect(repo.channelRow(other.id)).not.toBeNull(); // the block's other events were applied
+    expect(repo.channelRow(fx.id)?.challenges).toEqual([0, 0]); // only the dispute event is lost
+    expect(repo.channelRow(fx.id)?.phase).toBe("Finalized");
+    expect(repo.cursor()).toBe(45n);
+  });
+
+  it("an RPC that refuses every read (down) never skips a block, and keeps the cursor", async () => {
+    const { repo, chain, indexer } = oversized({ alone: false });
+    await indexer.poll();
+    const cursor = repo.cursor();
+    chain.block = 60n;
+    chain.hubEvents = async () => {
+      throw new Error("fetch failed");
+    };
+    for (let i = 0; i < INDEXER_UNREADABLE_POLLS + 2; i++) await indexer.poll();
+    expect(indexer.skippedBlocks()).toEqual([]);
+    expect(repo.cursor()).toBe(cursor);
   });
 });
 
