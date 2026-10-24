@@ -19,6 +19,8 @@
     "llm-games": "tsx tests/system/llm-games.ts",
     "dev:up": "tsx scripts/dev-up.ts",
     "dev:claude-opponent": "tsx scripts/claude-opponent.ts",
+    "testnet:up": "tsx scripts/testnet-up.ts",
+    "testnet:down": "tsx scripts/testnet-up.ts down",
     "build:cli": "tsx scripts/build-cli.ts"
   },
   "devDependencies": {
