@@ -124,6 +124,9 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   (Docker); nothing in this repo exercises XMTP's real `dev` or production network. Before mainnet, run the
   manual smoke script (spec §7) against XMTP's public `dev` network, and confirm the fallback actually works
   against production XMTP, not just the local-node fixture.
+  - **`dev`: done in Plan 6 Task 5** (`docs/superpowers/arc-testnet-rehearsal.md` §7). On Arc testnet, the host was
+    SIGKILLed mid-game. Both daemons switched to XMTP `dev` in 4.4 s, finished the game and closed over it, and the
+    payouts were exact; nothing reached the chain's dispute path. **Production XMTP is still open.**
 - **Supply-chain note for the pinned native SDK.** `@xmtp/node-sdk@6.1.0` is installed at runtime (`arena xmtp
   enable`), never bundled into the published CLI, and pinned by exact version (`--save-exact`). It is a native
   module (not pure JS) fetched from npm outside the workspace's own lockfile/audit surface — confirm its
@@ -135,6 +138,35 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 - **XMTP resource bound.** A daemon runs at most 64 XMTP clients (`XMTP_MAX_CLIENTS`), each one opened only once its
   channel is Open on-chain and closed (`Client.close()`, node-sdk 6.1.0) when the channel settles. Before launch,
   measure fds, threads and RSS on a long-running house bot across many channels and confirm they stay flat.
+
+### Plan 6 Task 5 (the Arc testnet rehearsal, 2026-10-24)
+
+See `docs/superpowers/arc-testnet-rehearsal.md` §2–§9. The scripted rehearsal used real faucet USDC on Arc testnet:
+3 games then a close, a challenge → respond → timeout dispute, and a host kill finished over XMTP `dev`. Payouts and
+balances reconciled exactly; gas for the whole run was 0.0827 USDC.
+
+- **Fixed: Arc's RPC refuses an `eth_getLogs` with more than 10 topics** (testnet and mainnet, -32012). The host's
+  indexer read all 15 hub events in one query and could never index a channel, so the relay could serve no game. The
+  SDK's `hubEvents` now asks for the 7 channel events only (report 8.1).
+- **Pre-mainnet: a dedicated, rate-limit-free RPC for the host and every daemon.** The public testnet RPC rate-limited
+  the run constantly (report 8.2):
+  - 264 indexer errors and over 200 daemon read failures were logged;
+  - a `respond` landed 53 s after the move that answered the challenge;
+  - a `timeout` landed 55 s after the deadline;
+  - the session-gas check, which triggers refills, failed 208 times.
+
+  Measure the mainnet RPC's limits under the expected load; do not run the watchtower on a shared public endpoint.
+  (This makes item 5's "`publicRpcUrl` is an RPC you run or trust" concrete.)
+- **Pre-mainnet: an action route must not report failure for an action that happened.** `POST /move` (and every route
+  that returns `status()`: `/close`, `/challenge`, `/next-game`, `/accept-draw`, `/resign`) answered 500 when only
+  the status read after the action was rate-limited. The move had been signed and relayed. An agent that trusts the
+  500 may retry, or give up on a move it already made (report 8.2).
+- **`arena init` has no retry on a 429.** One rate-limited `eth_getCode` failed the command (report 8.3).
+- **A sweep whose receipt wait hits a plain RPC error is recorded as `"dust"`.** The swept amount is then missing from
+  `sweeps`; the funds are safe in the wallet. This is a new path into the parked "Other" item above (report 8.4).
+- **Each sweep leaves about 0.00027 USDC on its session key:** the fee reserve it did not spend (report 8.5).
+- **Closing over XMTP `dev` took 48.9 s, against 2.7 s over the relay.** Not isolated (report §7). Measure it again
+  before relying on the fallback for time-critical closes.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
@@ -152,14 +184,18 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 3. **Daemon safety policy.**
    - A `minChallengeTimeout` floor (I4).
    - Bounded USDC approval (I2).
-   - Pinned canonical mainnet addresses in the CLI.
+   - Pinned canonical mainnet addresses in the CLI. (Arc testnet 5042002 pinned in Plan 6 Task 5, with tests: `init`
+     refuses another hub or rules there, and the pin is checked against `contracts/deployments/5042002.json`. The
+     mainnet 5042 pin is Task 6's, after the mainnet deploy.)
    - Offer signature verified on accept (m6).
    - A supervisor or auto-restart is documented, and memory stays flat over 60 min (I3).
 4. **Deployment and ownership.**
    - `ARENA_TOKEN` is set explicitly to Arc USDC (the script reverts on non-local chains without it; confirm the value).
    - `ARENA_OWNER` is a multisig. `ARENA_FEE_RECIPIENT` is set.
    - The fee and max fee, and the launch limits (10 USDC / 1,000 USDC suggested), are signed off.
-   - Source is verified on the explorer, and `deployments/<chainId>.json` is committed.
+   - Source is verified on the explorer, and `deployments/<chainId>.json` is committed. (Testnet done in Plan 6 Task
+     5: both contracts are verified on `explorer.testnet.arc.io`, and `contracts/deployments/5042002.json` is committed
+     (rehearsal report §1); `scripts/verify-arc.sh` is ready for mainnet. Mainnet is still to do.)
    - Ownership acceptance (`Ownable2Step`) is completed and tested.
 5. **Host production config.**
    - WS and HTTP limits come from load data (m8).

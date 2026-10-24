@@ -31,6 +31,26 @@ The validator set is permissioned at launch. The network itself is public.
 - Blocks are sub-second. `block.timestamp` is non-decreasing at 1 s granularity, so several blocks can share a timestamp.
 - `eth_getTransactionCount(…, "pending")` and `eth_estimateGas(…, "pending")` both work.
 
+## RPC limits (added 2026-10-24, Plan 6 Task 5 rehearsal)
+
+- **`eth_getLogs` refuses a topic-0 OR list of more than 10 entries**, even for one block: `-32012 "requested range
+  too large"`. Probed on testnet and, read-only, on `rpc.mainnet.arc.io`; 10 is served, 11 is refused. A
+  10,000-block range with no topic filter is served on testnet.
+- **The public testnet RPC rate-limits**: `-32005 "rate limit exceeded"` in the body, or an HTTP 429. Five seconds of
+  `eth_blockNumber` at 20 per second passed. Two daemons, a host indexer and status polling hit the limit
+  constantly. Details are in `arc-testnet-rehearsal.md` §8.
+- Measured gas on Arc testnet:
+
+  | Call | Gas |
+  |---|---|
+  | `challenge` | 176k–356k |
+  | `respond` | 200k |
+  | `timeout` | 149k |
+  | `closeCooperative` | 143k |
+  | `deposit` | 394k (first) / 76k (second) |
+
+  The 2.02M figure above is the worst-case budget.
+
 ## Other differences
 
 - `PREVRANDAO` = 0. We use no on-chain randomness.
