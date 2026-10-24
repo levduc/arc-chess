@@ -214,3 +214,28 @@ describe("H1 fix round 1 (review m-3): only refusals in a row skip a block", () 
     expect(l.record.skippedEventBlocks).toBeUndefined();
   });
 });
+
+describe("H1 fix round 1 (review m-1): skipped blocks are retried in turn", () => {
+  it("a skipped block that never reads does not keep the others from being re-read", async () => {
+    const m = await matched();
+    const { alice, id } = m;
+    await parked(alice.daemon);
+    const l = alice.daemon.handle(id);
+    const head = await alice.daemon.hub.blockNumber();
+    const [bad, good] = [head - 1n, head];
+    const hub = alice.daemon.hub;
+    const real = hub.disputeEvents.bind(hub);
+    hub.disputeEvents = async (cid: Hex, from?: bigint, to?: bigint) => {
+      if (cid === id && from === bad && to === bad) throw new Error("query returned more than the maximum response size");
+      return real(cid, from, to);
+    };
+    l.record = { ...l.record, skippedEventBlocks: [bad, good] };
+    const retry = () => (alice.daemon as unknown as { retrySkippedEventBlock(l: unknown): Promise<void> }).retrySkippedEventBlock(l);
+    l.skippedRetryAt = 0;
+    await retry(); // the oldest: still refused
+    expect(l.record.skippedEventBlocks).toEqual([bad, good]);
+    l.skippedRetryAt = 0;
+    await retry(); // before the fix, the oldest again; now the next one, which reads
+    expect(l.record.skippedEventBlocks).toEqual([bad]);
+  });
+});

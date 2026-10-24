@@ -237,6 +237,8 @@ export type ChannelHandle = {
   unreadableBlock: { block: bigint; tries: number } | null;
   /** H1: wall-clock ms before which `retrySkippedEventBlock` does not re-read a skipped block. 0 = now. */
   skippedRetryAt: number;
+  /** H1 fix round 1 (review m-1): which skipped block `retrySkippedEventBlock` tries next (rotating). */
+  skippedRetryIndex: number;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -1565,6 +1567,7 @@ export class ArenaDaemon {
       sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
       unreadableBlock: null,
       skippedRetryAt: 0,
+      skippedRetryIndex: 0,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -3427,12 +3430,16 @@ export class ArenaDaemon {
     return true;
   }
 
-  /** H1: re-reads the oldest block the scan skipped (`skipUnreadableBlock`), at most one per pass and once per
-   *  `BACKOFF_MAX_MS`. Its events are ingested in order (an older state is simply not adopted); once it reads and
-   *  ingests, it is no longer skipped. Never throws. */
+  /** H1: re-reads a block the scan skipped (`skipUnreadableBlock`), at most one per pass and once per
+   *  `BACKOFF_MAX_MS`. H1 fix round 1 (review m-1): the blocks are tried in turn, so a block that never reads (a
+   *  griefer's) does not keep one refused only transiently from ever being re-read. Its events are ingested in order
+   *  (an older state is not adopted, but a signature it carries for a state this session holds is: `ingestOnChain`);
+   *  once it reads and ingests, it is no longer skipped. Never throws. */
   private async retrySkippedEventBlock(l: ChannelHandle): Promise<void> {
-    const block = l.record.skippedEventBlocks?.[0];
-    if (block === undefined || Date.now() < l.skippedRetryAt) return;
+    const blocks = l.record.skippedEventBlocks ?? [];
+    if (blocks.length === 0 || Date.now() < l.skippedRetryAt) return;
+    const block = blocks[l.skippedRetryIndex % blocks.length];
+    l.skippedRetryIndex++;
     l.skippedRetryAt = Date.now() + BACKOFF_MAX_MS;
     let events: Awaited<ReturnType<HubClient["disputeEvents"]>>;
     try {
