@@ -28,6 +28,25 @@ forge script script/Deploy.s.sol \
 `ARENA_FEE_PER_PLAYER` (5,000) and `ARENA_MAX_FEE_PER_PLAYER` (1,000,000) were left at the script's defaults, as
 required.
 
+**How the testnet key was passed, and why mainnet must not copy it.** Both testnet deploys gave forge the key as
+`--private-key`: the first as in the command above, and the redeploy (below) the same way. For the redeploy, `jq` read
+the key from its 0600 file into a shell variable inside the one command that ran forge; it was never exported or
+written anywhere. Even so, for as long as forge runs, a key on argv can be read by any local process of the same
+user, through `ps` or `/proc/<pid>/cmdline`.
+
+**For mainnet (Task 6):** use the same script and the same env vars, but never `--private-key` on argv, and never an
+exported environment variable. Use a Foundry encrypted keystore instead, or a hardware wallet:
+
+```
+cast wallet import arena-mainnet-deployer --interactive          # once: prompts for the key and a password
+forge script script/Deploy.s.sol --rpc-url <mainnet RPC> \
+  --account arena-mainnet-deployer --sender <deployer address> \
+  --broadcast --with-gas-price 40000000000 --priority-gas-price 1000000000 --timeout 120
+```
+
+forge then prompts for the keystore password. The only non-interactive alternative is `--password-file <file>`, with
+the file at mode 0600. This is a checkbox in `mainnet-gates.md`, item 4.
+
 A dry run (same command without `--broadcast`) was run first and succeeded, estimating 6,390,739 gas and
 0.1278 USDC at a 20 gwei quote. The real run cost less than that estimate (0.1032 USDC, below) even though the
 effective price (21 gwei) was higher than the dry run's 20 gwei quote — actual gas used, 4,915,954, came in about
@@ -218,7 +237,9 @@ The owner adopted the hub-hardening proposal (merge `750e280`):
 
 So the testnet deployment above was replaced before the rehearsal was rerun on it (§10). The redeploy ran on HEAD
 `e8fa69f` and used the command in "Command" above, unchanged: same env vars, `--with-gas-price 40000000000
---priority-gas-price 1000000000`.
+--priority-gas-price 1000000000`. The key was passed as before: read from its file inside the one forge command, and
+given to it as `--private-key`. That is acceptable for this testnet key only; see "For mainnet (Task 6)" under
+"Command".
 
 Steps, in order:
 1. `eth_chainId` was asserted to be 5042002, and the deployer's nonce was asserted to be 4 at both `latest` and
@@ -298,7 +319,10 @@ after 5 s. Mainnet runs it the same way. Pass the deploy's own `ARENA_MAX_DEPOSI
 `scripts/arc-rehearsal.ts` ran it end to end against the first (pre-hardening) deployment above, with real faucet
 USDC. Sections 2–9 are that run; §10 is the rerun on the hardened hub. Rerun with
 `pnpm exec tsx scripts/arc-rehearsal.ts --dir <dir>`. A rerun with the same `--dir` resumes after the last completed
-step. `--collect-only` rebuilds the tables from the chain. It never deploys. Its header lists every safety rule. In short:
+step. A run that stopped leaves its server and daemons running on purpose, so the watchtowers keep watching. Before
+resuming, stop them by the pids in `<dir>/state.json` (`kill <pid>`, once no channel needs them). The script refuses
+to start over one that is still running, and says which pid. It recognises its own processes by pid, start time and
+command line, and never signals anything else. `--collect-only` rebuilds the tables from the chain. It never deploys. Its header lists every safety rule. In short:
 
 - The RPC is hard-coded to `https://rpc.testnet.arc.io`. `eth_chainId == 0x4cef52` is asserted before every deployer
   transaction.
@@ -824,7 +848,7 @@ Everything else is the same, within ±24 gas from differences in calldata. The h
 
 ### Balances (hardened hub)
 
-### Hub-side checks (6-decimal base units)
+#### Hub-side checks (6-decimal base units)
 
 | Channel | Check | Expected | Got | OK |
 |---|---|---|---|---|
@@ -853,7 +877,7 @@ Everything else is the same, within ±24 gas from differences in calldata. The h
 | xmtp | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
 | xmtp | PayoutDeferred events | 0 | 0 | yes |
 
-### Hardened-hub surface (eth_call simulations, nothing sent)
+#### Hardened-hub surface (eth_call simulations, nothing sent)
 
 | Check | Got | OK |
 |---|---|---|
@@ -862,7 +886,7 @@ Everything else is the same, within ±24 gas from differences in calldata. The h
 | claim() from bob wallet | reverted NothingToClaim | yes |
 | renounceOwnership() from the owner (deployer) | reverted RenounceDisabled | yes |
 
-### Wallet-side reconciliation (wei, 18 decimals)
+#### Wallet-side reconciliation (wei, 18 decimals)
 
 | Home | Funded | Payouts in | Deposits out | Withdrawn | Gas paid | Expected held | Held | OK |
 |---|---|---|---|---|---|---|---|---|
@@ -871,7 +895,7 @@ Everything else is the same, within ±24 gas from differences in calldata. The h
 
 System: deployer before 19.671452991 = deployer after 19.547937991 + held by agents 0.03915366 + gas 0.08436134 → exact.
 
-### Balances after (native, 18 decimals)
+#### Balances after (native, 18 decimals)
 
 | Address | Balance (USDC) |
 |---|---|
@@ -885,7 +909,7 @@ System: deployer before 19.671452991 = deployer after 19.547937991 + held by age
 | bob session (normal) | 0.0002667 |
 | bob session (xmtp) | 0.0002667 |
 
-### Sender nonce check (Blockscout listing vs nonce)
+#### Sender nonce check (Blockscout listing vs nonce)
 
 | Sender | Listed | Nonce delta |
 |---|---|---|

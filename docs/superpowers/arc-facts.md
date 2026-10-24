@@ -34,8 +34,11 @@ The validator set is permissioned at launch. The network itself is public.
 ## RPC limits (added 2026-10-24, Plan 6 Task 5 rehearsal)
 
 - **`eth_getLogs` refuses a topic-0 OR list of more than 10 entries**, even for one block: `-32012 "requested range
-  too large"`. Probed on testnet and, read-only, on `rpc.mainnet.arc.io`; 10 is served, 11 is refused. A
-  10,000-block range with no topic filter is served on testnet.
+  too large"`. Probed on testnet, and with two read-only calls (10 topics, then 11) on `rpc.mainnet.arc.io`: 10 is
+  served, 11 is refused. A 10,000-block range with no topic filter is served on testnet.
+- **A `getLogs` whose `toBlock` is past the head answers `-32014 "requested data not available"`.** Seen in the T5
+  review, on testnet. A load-balanced head can run ahead of the log index, so this is transient. The SDK treats it
+  that way: `isRangeRefusal` is false for it, so it is retried and not counted as a refusal.
 - **The public testnet RPC rate-limits**: `-32005 "rate limit exceeded"` in the body, or an HTTP 429. Five seconds of
   `eth_blockNumber` at 20 per second passed. Two daemons, a host indexer and status polling hit the limit
   constantly. Details are in `arc-testnet-rehearsal.md` §8.
@@ -43,7 +46,7 @@ The validator set is permissioned at launch. The network itself is public.
 
   | Call | Gas |
   |---|---|
-  | `challenge` | 176k–356k |
+  | `challenge` | 177k–356k |
   | `respond` | 200k |
   | `timeout` | 149k |
   | `closeCooperative` | 143k |

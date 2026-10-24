@@ -119,7 +119,8 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   - a funded deployer: the owner's own wallet or a fresh key, holding a few USDC on Arc;
   - an explicit "go".
 - **Then:**
-  - deploy with the same script;
+  - deploy with the same script, with the key in a Foundry encrypted keystore (`--account`) or a hardware wallet:
+    never `--private-key` on argv, never an exported variable (mainnet-gates item 4);
   - verify the source;
   - commit `contracts/deployments/5042.json`;
   - pin `KNOWN_DEPLOYMENTS[5042]`;

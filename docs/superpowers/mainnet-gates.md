@@ -125,8 +125,11 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   manual smoke script (spec §7) against XMTP's public `dev` network, and confirm the fallback actually works
   against production XMTP, not just the local-node fixture.
   - **`dev`: done in Plan 6 Task 5** (`docs/superpowers/arc-testnet-rehearsal.md` §7). On Arc testnet, the host was
-    SIGKILLed mid-game. Both daemons switched to XMTP `dev` in 4.4 s, finished the game and closed over it, and the
-    payouts were exact; nothing reached the chain's dispute path. **Production XMTP is still open.**
+    SIGKILLed mid-game, twice (once per hub). Both daemons were seen on XMTP `dev` 4.4 s after the kill in the first
+    run, and 45.5 s after it in the rerun. Both figures are as observed through the script's own `/status` polling,
+    which was rate-limited in the rerun; the daemons do not timestamp the switch itself. Both times they finished the
+    game and closed over XMTP, the payouts were exact, and nothing reached the chain's dispute path. **Production
+    XMTP is still open.**
 - **Supply-chain note for the pinned native SDK.** `@xmtp/node-sdk@6.1.0` is installed at runtime (`arena xmtp
   enable`), never bundled into the published CLI, and pinned by exact version (`--save-exact`). It is a native
   module (not pure JS) fetched from npm outside the workspace's own lockfile/audit surface — confirm its
@@ -167,9 +170,9 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
 - **A sweep whose receipt wait hits a plain RPC error is recorded as `"dust"`.** The swept amount is then missing from
   `sweeps`; the funds are safe in the wallet. This is a new path into the parked "Other" item above (report 8.4).
 - **Each sweep leaves about 0.00027 USDC on its session key:** the fee reserve it did not spend (report 8.5).
-- **Closing over XMTP `dev`.** It took 48.9 s in the first run, against 2.7 s over the relay. The rerun timed every
-  sub-step and measured 5.8 s, about 3 s of it the Close signature's XMTP delivery (report §10). The first run's 48.9 s
-  is put down to rate-limited status polling, not to XMTP. Done, unless it recurs.
+- **Closing over XMTP `dev`.** The rerun timed every sub-step and measured 5.8 s, against 2.8 s over the relay. About
+  3 s of it was the Close signature's XMTP delivery (report §10). The first run's 48.9 s was not broken down. Its cause
+  is unproven; rate-limited status polling is likely. Measure it again under load before relying on it.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
@@ -199,8 +202,15 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
    - Source is verified on the explorer, and `deployments/<chainId>.json` is committed. (Testnet done in Plan 6 Task
      5: both contracts are verified on `explorer.testnet.arc.io`, and `contracts/deployments/5042002.json` is committed
      (rehearsal report §1). That includes the hardened-hub redeploy (`0x9b8B…bA41`, I1/M1/M2), whose `ChannelHub`
-     verified cold through `scripts/verify-arc.sh`'s Sourcify import; the script is ready for mainnet. Mainnet is
+     verified cold through `scripts/verify-arc.sh`'s Sourcify import. The script now requires a full match
+     (`is_fully_verified`). It is ready for mainnet pending a check of `explorer.arc.io`'s API: in the T5 review, its
+     `/api/v2/smart-contracts/verification/config` answered 403 to a plain request; Sourcify lists 5042. Mainnet is
      still to do.)
+   - [ ] **The mainnet deploy key never touches argv or the environment.** Use a Foundry encrypted keystore
+     (`cast wallet import <name> --interactive`, then `forge script … --account <name> --sender <address>`, with a
+     password prompt or a 0600 `--password-file`), or a hardware wallet. Never `--private-key` on the command line,
+     never an exported variable. The testnet deploys used `--private-key` (rehearsal report §1, "For mainnet
+     (Task 6)").
    - Ownership acceptance (`Ownable2Step`) is completed and tested.
 5. **Host production config.**
    - WS and HTTP limits come from load data (m8).

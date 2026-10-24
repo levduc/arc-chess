@@ -173,6 +173,9 @@
 
 **Requirements:**
 - Deploy, verify the source, commit `contracts/deployments/5042.json` and pin `KNOWN_DEPLOYMENTS[5042]`.
+  - Deploy the testnet way, with the same script and env vars (`docs/superpowers/arc-testnet-rehearsal.md` §1), but
+    with the key in a Foundry encrypted keystore (`forge script … --account <name> --sender <address>`) or a
+    hardware wallet. Never `--private-key` on argv, never an exported variable (T5 review I-1; mainnet-gates item 4).
 - If the owner is a multisig, the owner completes the `Ownable2Step` acceptance; document the exact transaction for them to run.
 - Write `docs/deploy/arc-mainnet.server.json.example`.
 - Tick the mainnet gates with evidence.
