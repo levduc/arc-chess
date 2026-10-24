@@ -131,6 +131,15 @@ describe("H3: isRateLimited / isRangeRefusal on viem's own errors", () => {
     }
   });
 
+  it("fix round 2 (re-review M-a): the order and the narrowing, each pinned on its own", async () => {
+    // Order: a -32005 carrying both a refusal wording and rate-limit words is a rate limit.
+    const both = await errorOf({ error: { code: -32005, message: "query returned more than 10000 results; limit 25 requests per second" } }, "eth_getLogs");
+    expect([isRateLimited(both), isRangeRefusal(both)]).toEqual([true, false]);
+    // Narrowing: a bare "exceeds max" with no range, result or size noun is not a refusal.
+    const bare = await errorOf({ error: { code: -32000, message: "request exceeds max allowed" } }, "eth_getLogs");
+    expect([isRateLimited(bare), isRangeRefusal(bare)]).toEqual([false, false]);
+  });
+
   it("fix round 1: Arc's real answers, through viem's HTTP stack", async () => {
     const table: Array<[string, Answer, boolean, boolean]> = [
       ["-32005 rate limit exceeded", RATE_LIMIT, true, false],
