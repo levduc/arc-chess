@@ -1,5 +1,5 @@
 import type { Address, Hex } from "viem";
-import { chunkRanges, isGameOver, mover } from "@arena/sdk";
+import { chunkRanges, isGameOver, isRangeRefusal, mover } from "@arena/sdk";
 import type { HubEvent, PlayerIndex, SignedState, State } from "@arena/sdk";
 import type { ChainReader } from "./chain.js";
 import type { ServerConfig } from "./config.js";
@@ -140,6 +140,14 @@ export class Indexer {
           // its dispute events skipped, and its other events (creations, deposits, settlements) are applied. An RPC
           // that refuses those too is down, or caps the range itself: the poll stops, as before.
           const msg = err instanceof Error ? err.message : String(err);
+          // H3: only a refusal of the query itself (`isRangeRefusal`) may split the range or count toward a skip. A
+          // rate limit, a timeout, a 5xx -- anything else -- stops the poll here, uncounted and unprobed: the next poll
+          // reads the same range again. Before, a rate-limited read whose probe slipped through was split, and a block
+          // rate-limited on three polls had its dispute events skipped.
+          if (!isRangeRefusal(err)) {
+            this.log(`indexer: ${msg}`);
+            return;
+          }
           if (r.fromBlock < r.toBlock) {
             if (!contentRefused) {
               try {

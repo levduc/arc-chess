@@ -10,7 +10,7 @@ import {
   type PublicClient,
 } from "viem";
 import { foundry } from "viem/chains";
-import { HubClient, mockUsdcAbi, type HubEvent } from "@arena/sdk";
+import { HubClient, mockUsdcAbi, rpcTransport, type HubEvent } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 
 export type Limits = {
@@ -68,7 +68,8 @@ export class RpcChainReader implements ChainReader {
       nativeCurrency: { name: "Native", symbol: "NATIVE", decimals: 18 },
       rpcUrls: { default: { http: [cfg.rpcUrl] } },
     });
-    this.client = createPublicClient({ chain, transport: http(cfg.rpcUrl) });
+    // H3: a rate-limited read is retried with back-off (Arc's public RPC limits a modest load: rehearsal §8.2).
+    this.client = createPublicClient({ chain, transport: rpcTransport(cfg.rpcUrl) });
     this.hub = hub ?? new HubClient(cfg.hub, this.client);
   }
 

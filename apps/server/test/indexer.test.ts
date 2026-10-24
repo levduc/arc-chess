@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Address, Hex } from "viem";
+import { createPublicClient, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   HubClient,
@@ -11,11 +11,13 @@ import {
   initialState,
   isGameOver,
   mover,
+  rpcTransport,
   statusOf,
   withStatus,
 } from "@arena/sdk";
 import type { HubEvent, Params, State } from "@arena/sdk";
 import { watchHtml } from "../src/docs.js";
+import { RpcChainReader } from "../src/chain.js";
 import { INDEXER_UNREADABLE_POLLS, Indexer, playerStats } from "../src/indexer.js";
 import { Relay } from "../src/relay.js";
 import { SqliteRepo, type ChannelRow, type Repo } from "../src/repo.js";
@@ -76,9 +78,9 @@ describe("Indexer.poll and Indexer.apply", () => {
     const repo = new SqliteRepo(":memory:");
     const chain = new FakeChain();
     chain.block = 25n;
-    // H1 (review m-11): two failures -- the read and the indexer's own probe of the range's other events. An RPC that
-    // refuses both is down, so the poll stops; one that served the probe would have the range split instead (below).
-    let failures = 2;
+    // H3: "rpc down" is no refusal of the range, so the poll stops at once, with no probe of the range's other events
+    // and no split (H1's split is for a refusal only, below).
+    let failures = 1;
     const realHubEvents = chain.hubEvents.bind(chain);
     chain.hubEvents = async (from: bigint, to: bigint) => {
       if (from === 10n && failures > 0) {
@@ -458,6 +460,68 @@ describe("H1 (review m-11): the indexer never wedges on one oversized event", ()
     for (let i = 0; i < INDEXER_UNREADABLE_POLLS + 2; i++) await indexer.poll();
     expect(indexer.skippedBlocks()).toEqual([]);
     expect(repo.cursor()).toBe(cursor);
+  });
+});
+
+describe("H3: a rate-limited RPC never splits a range nor skips a block", () => {
+  /** A fake RPC behind viem's real HTTP transport: head 45, no events. While `limited`, every full read (the 7 hub
+   *  events in one query) is answered `answer`; a single-kind read -- H1's probe of a range's other events -- is
+   *  always served, as an intermittently rate-limited RPC may serve it. */
+  function rateLimitedChain(answer: "-32005" | "429") {
+    const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks: 10, startBlock: 0n } });
+    const state = { limited: true, limitNext: 0 };
+    const fullReads: Array<[bigint, bigint]> = [];
+    let probes = 0;
+    const fetchFn = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const req = JSON.parse(String(init?.body)) as { id: number; method: string; params: Array<{ fromBlock: Hex; toBlock: Hex; topics: unknown[] }> };
+      const reply = (body: object) => new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, ...body }), { headers: { "content-type": "application/json" } });
+      if (req.method === "eth_blockNumber") return reply({ result: "0x2d" });
+      if (req.method !== "eth_getLogs") throw new Error(`unexpected ${req.method}`);
+      const f = req.params[0];
+      if (!Array.isArray(f.topics[0])) {
+        probes++;
+        return reply({ result: [] });
+      }
+      fullReads.push([BigInt(f.fromBlock), BigInt(f.toBlock)]);
+      if (!state.limited && state.limitNext === 0) return reply({ result: [] });
+      if (state.limitNext > 0) state.limitNext--;
+      if (answer === "429") return new Response("Too Many Requests", { status: 429 });
+      return reply({ error: { code: -32005, message: "rate limit exceeded" } });
+    };
+    const client = createPublicClient({ transport: rpcTransport("http://rpc.invalid", { fetchFn, retryDelay: 1 }) }) as PublicClient;
+    const chain = new RpcChainReader(cfg, new HubClient(cfg.hub, client));
+    const repo = new SqliteRepo(":memory:");
+    const logs: string[] = [];
+    return { state, fullReads, probes: () => probes, repo, logs, indexer: new Indexer(repo, chain, cfg, (l) => logs.push(l)) };
+  }
+
+  for (const answer of ["-32005", "429"] as const) {
+    it(`${answer}: retried on the same range, uncounted -- no probe, no split, no skip -- then read once it is served`, async () => {
+      const { state, fullReads, probes, repo, logs, indexer } = rateLimitedChain(answer);
+      for (let i = 0; i <= INDEXER_UNREADABLE_POLLS; i++) await indexer.poll();
+      // Before H3 each poll probed the range, split it down to block 0 and counted it: skipped at the third poll.
+      expect(indexer.skippedBlocks()).toEqual([]);
+      expect(probes()).toBe(0);
+      expect(fullReads.length).toBeGreaterThan(0);
+      expect(fullReads.every(([f, t]) => f === 0n && t === 9n)).toBe(true); // the whole first chunk, every time
+      expect(repo.cursor()).toBeNull();
+      expect(logs.some((l) => l.startsWith("indexer:") && (answer === "429" ? /HTTP request failed/ : /Request exceeds defined limit/).test(l))).toBe(true);
+      state.limited = false;
+      await indexer.poll();
+      expect(repo.cursor()).toBe(45n);
+      expect(indexer.skippedBlocks()).toEqual([]);
+      repo.close();
+    });
+  }
+
+  it("the transport itself rides out a short limit: a read refused on its first attempts is served within the poll", async () => {
+    const { state, fullReads, repo, logs, indexer } = rateLimitedChain("-32005");
+    Object.assign(state, { limited: false, limitNext: 3 });
+    await indexer.poll();
+    expect(fullReads.slice(0, 4)).toEqual(Array(4).fill([0n, 9n])); // retried by rpcTransport, not by the next poll
+    expect(repo.cursor()).toBe(45n);
+    expect(logs).toEqual([]);
+    repo.close();
   });
 });
 
