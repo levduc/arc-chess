@@ -148,7 +148,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         history survives a disable/enable cycle.
         ARENA_XMTP_NPM overrides the npm binary "enable" installs with -- a test hook, never set this normally:
         a stale value left in a shell or CI environment silently swaps the installer)
-  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
+  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)]
+        [--ttl SECONDS (how long the offer stays matchable, 60 to 3600; default 3600)] | accept <offerId>
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
   resign | accept-draw | next-game | close | challenge | reclaim | sweep [--channel ID]
@@ -1636,6 +1637,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             deposit: usdcAmount("deposit"),
             stakePerGame: usdcAmount("stake"),
             ...(flag("timeout") !== undefined ? { challengeTimeout: flag("timeout") } : {}),
+            // H1: omitted unless --ttl is given -- the daemon keeps its default lifetime and checks the range.
+            ...(flag("ttl") !== undefined ? { ttl: flag("ttl") } : {}),
           },
         };
         break;
