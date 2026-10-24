@@ -162,6 +162,11 @@ function amount(v: unknown, name: string): bigint {
   if (typeof v !== "string" || !/^[0-9]+$/.test(v)) throw new DaemonError(400, `${name} must be a decimal string of base units`);
   return BigInt(v);
 }
+/** H1: a whole number of seconds, as a decimal string (like `amount`). */
+function seconds(v: unknown, name: string): bigint {
+  if (typeof v !== "string" || !/^[0-9]+$/.test(v)) throw new DaemonError(400, `${name} must be a decimal string of seconds`);
+  return BigInt(v);
+}
 
 export async function startApi(
   daemon: ArenaDaemon,
@@ -384,6 +389,8 @@ export async function startApi(
                 deposit: amount(b.deposit, "deposit"),
                 stakePerGame: amount(b.stakePerGame, "stakePerGame"),
                 ...(b.challengeTimeout === undefined ? {} : { challengeTimeout: amount(b.challengeTimeout, "challengeTimeout") }),
+                // H1 (`offer --ttl`): the offer's lifetime in seconds; omitted, the daemon's default (createOffer).
+                ...(b.ttl === undefined ? {} : { ttlSeconds: seconds(b.ttl, "ttl") }),
               }),
             );
           case "POST /offers/accept": {

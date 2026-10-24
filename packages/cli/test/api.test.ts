@@ -148,6 +148,42 @@ describe("local API", () => {
     expect(listed.find((o) => o.offerId === body.offerId)!.offer.challengeTimeout).toBe(1800n);
   });
 
+  it("H1: POST /offers takes ttl (seconds) for the offer's signed expiresAt; out of range or malformed is 400", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const post = (body: Record<string, unknown>) =>
+      fetch(`${url}/offers`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ deposit: "1000000", stakePerGame: "100000", ...body }),
+      });
+    const before = (await pair.alice.daemon.client.getBlock()).timestamp;
+    const res = await post({ ttl: "120" });
+    expect(res.status).toBe(200);
+    const { offerId } = (await res.json()) as { offerId: string };
+    const after = (await pair.alice.daemon.client.getBlock()).timestamp;
+    const offer = (await pair.alice.daemon.listOffers()).find((o) => o.offerId === offerId)!.offer;
+    expect(offer.expiresAt >= before + 120n && offer.expiresAt <= after + 120n).toBe(true);
+    for (const ttl of ["59", "3601"]) {
+      const bad = await post({ ttl });
+      expect(bad.status).toBe(400);
+      expect(((await bad.json()) as { error: string }).error).toMatch(/ttl must be between 60 and 3600 seconds/);
+    }
+    // Without ttl, the lifetime is the default, unchanged: an hour.
+    const dflt = (await (await post({})).json()) as { offerId: string };
+    const now = (await pair.alice.daemon.client.getBlock()).timestamp;
+    const d = (await pair.alice.daemon.listOffers()).find((o) => o.offerId === dflt.offerId)!.offer;
+    expect(d.expiresAt > now + 3500n && d.expiresAt <= now + 3600n).toBe(true);
+    const malformed = await post({ ttl: 120 });
+    expect(malformed.status).toBe(400);
+    expect(((await malformed.json()) as { error: string }).error).toBe("ttl must be a decimal string of seconds");
+  });
+
   it("Plan 5 Task 2 fix round, minor 2: a malformed request target is 400, not 500", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);

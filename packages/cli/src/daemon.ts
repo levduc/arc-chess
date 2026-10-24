@@ -378,6 +378,12 @@ export const UNREADABLE_BLOCK_PASSES = 3;
  *  under, the SDK's `MAX_FUNDING_WINDOW` (86400n): the hub's own hard cap on `fundingDeadline`. */
 export const MAX_FUNDING_WINDOW = 7200n;
 
+/** How long an offer stays matchable by default: its signed `expiresAt` is chain time at posting plus this. The most
+ *  `offer --ttl` may ask for, too. */
+export const OFFER_TTL_SECONDS = 3600n;
+/** H1 (`offer --ttl`): the shortest offer lifetime `createOffer` accepts. */
+export const MIN_OFFER_TTL_SECONDS = 60n;
+
 /** Task 2 (spec §13): once `fund()` reverts for one of these reasons, `watch()` backs off funding this channel
  *  for at least this many seconds of chain time, instead of retrying the same revert on every tick. */
 export const FUND_BACKOFF_SECONDS = 30n;
@@ -1105,7 +1111,12 @@ export class ArenaDaemon {
     }
   }
 
-  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout?: bigint }): Promise<{ offerId: Hex }> {
+  /**
+   * Posts an offer. H1 (ledger ruling, `offer --ttl`): `ttlSeconds` sets its signed `expiresAt` to chain time now plus
+   * it, between `MIN_OFFER_TTL_SECONDS` and `OFFER_TTL_SECONDS` (the default, unchanged) -- so an agent that waits a
+   * bounded time for a match can post an offer that cannot be matched after it has stopped waiting.
+   */
+  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout?: bigint; ttlSeconds?: bigint }): Promise<{ offerId: Hex }> {
     // Plan 4.5 Task 11 fix round (C2): once the host has refused a subscribe, this connection's match delivery is
     // broken until restart -- a new offer would post fine (200) and then silently never learn of its match if it
     // is the offerer. Refuse up front instead of returning a false 200.
@@ -1114,6 +1125,10 @@ export class ArenaDaemon {
     // matched channel can never sit unfundable while its deposit reverts on every tick.
     if (o.stakePerGame <= 0n) throw new DaemonError(400, "stakePerGame must be greater than 0");
     if (o.deposit < o.stakePerGame) throw new DaemonError(400, "deposit must be at least stakePerGame");
+    const ttl = o.ttlSeconds ?? OFFER_TTL_SECONDS;
+    if (ttl < MIN_OFFER_TTL_SECONDS || ttl > OFFER_TTL_SECONDS) {
+      throw new DaemonError(400, `ttl must be between ${MIN_OFFER_TTL_SECONDS} and ${OFFER_TTL_SECONDS} seconds (got ${ttl})`);
+    }
     // Plan 5 Task 1 (mainnet gates: offer default timeout): an omitted challengeTimeout takes this daemon's own
     // minChallengeTimeout -- always at or above the floor `checkChallengeTimeout` enforces just below, so this
     // daemon's own default offer is always accepted by itself and by any peer at the same floor.
@@ -1139,7 +1154,7 @@ export class ArenaDaemon {
       deposit: o.deposit,
       stakePerGame: o.stakePerGame,
       challengeTimeout,
-      expiresAt: chainNow + 3600n,
+      expiresAt: chainNow + ttl,
       nonce: `0x${randomBytes(32).toString("hex")}`,
     };
     const id = computeOfferId(offer);

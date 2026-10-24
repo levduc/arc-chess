@@ -102,6 +102,13 @@ describe("arena CLI", () => {
       stakePerGame: "100000",
       challengeTimeout: "1800",
     });
+    // H1: --ttl is passed through as the offer's lifetime; omitted above, so the daemon keeps its default.
+    await runCli(["offer", "--deposit", "1.5", "--stake", "0.1", "--ttl", "900"], t.io);
+    expect(JSON.parse(String(t.calls.at(-1)!.init.body))).toEqual({
+      deposit: "1500000",
+      stakePerGame: "100000",
+      ttl: "900",
+    });
     await runCli(["wait", "--timeout", "30"], t.io);
     expect(t.calls.at(-1)!.url).toBe("http://127.0.0.1:7010/wait?timeout=30");
     await runCli(["handoff", "human", "--note", "look"], t.io);
