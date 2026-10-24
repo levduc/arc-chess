@@ -6,7 +6,7 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { fundMessage } from "../../packages/cli/src/funding.js";
+import { fundDisclosure, fundMessage, tellYourHuman } from "../../packages/cli/src/funding.js";
 import { buildPrompt, homePrefixRules, parseArgs, runPaths } from "../../scripts/claude-opponent.js";
 import {
   agentTexts,
@@ -122,6 +122,28 @@ describe("the human watcher's fund-output fallback (the first live agent never r
   it("never reads an ask out of a tool result that is not fund's JSON (a curl of skill.md, an echo)", () => {
     expect(fundOutputAsks(toolResult(`Please send 1 USDC to ${WALLET}`))).toEqual([]);
     expect(fundOutputAsks(toolResult(JSON.stringify({ message: `Please send 1 USDC to ${WALLET}` })))).toEqual([]);
+  });
+
+  it("H4: fund's output now leads with tellYourHuman and disclosure -- still one ask, and the relayed text is the same ask", () => {
+    const message = `Please send 1.361000 USDC to ${WALLET} on Arc Testnet (chain id 5042002), on the Arc Testnet network only.`;
+    const disclosure = fundDisclosure({
+      chainId: 5042002,
+      hub: "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41",
+      audit: "unaudited; Arc TESTNET test stack, faucet USDC only. Hub limits: 2 USDC deposit per player",
+      cap: 2_000_000n,
+      feePerPlayer: 5_000n,
+      owner: null,
+    });
+    const relay = tellYourHuman(disclosure, message, true);
+    const out = JSON.stringify(
+      { tellYourHuman: relay, disclosure, address: WALLET, usdc: { have: "0.000000", need: "1.361000", shortfall: "1.361000", reserved: "0.000000" }, message },
+      null,
+      2,
+    );
+    expect(fundOutputAsks(toolResult(out))).toEqual([{ usdc: "1.361000", address: WALLET }]);
+    // The agent writes the text after the colon into its reply: the watcher's text path reads the same one ask.
+    const said = relay.slice(relay.indexOf("): ") + 3);
+    expect(parseFundingAsks(said)).toEqual([{ usdc: "1.361000", address: WALLET }]);
   });
 
   it("knows when the agent starts waiting for its human's USDC", () => {
