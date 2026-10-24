@@ -2,11 +2,14 @@
  * Live agent run (Arc testnet): the "human" side of `scripts/claude-opponent.ts --human-pay <pay helper>`.
  *
  * On a testnet stack (`pnpm testnet:up`) there is no faucet: the agent must ask its human for USDC, exactly as a
- * real user's agent would. This watcher plays that human. It tails the session's `stream-json` log, reads only what
- * a human would see -- the agent's own text (assistant text blocks and the final `result`), never the CLI output in
- * tool results -- and, when the agent asks for USDC to be sent to its own wallet, pays exactly that amount once
- * through the stack's pay helper (`<dir>/bin/pay <address> <usdc>`, which signs from the testnet deployer; this
- * file never sees that key).
+ * real user's agent would. This watcher plays that human. It tails the session's `stream-json` log and pays, once,
+ * exactly what the agent asks to be sent to its own wallet, through the stack's pay helper (`<dir>/bin/pay <address>
+ * <usdc>`, which signs from the testnet deployer; this file never sees that key). An ask is either:
+ *  - in the agent's own text (assistant text blocks and the final `result`): "send X USDC to 0x…"; or
+ *  - `arena fund`'s own `message` in a tool result, once the agent goes on to `wallet --wait-for-usdc` -- the agent
+ *    is then waiting for that money, and a human at an interactive session sees that command output in the
+ *    terminal. The first live run's agent never restated the ask in its own words: it ran `fund`, said "I'll relay
+ *    and wait", and waited, so a watcher reading its text alone would have left it waiting for good.
  *
  * The agent's wallet address comes from the CLI's own read-only `arena wallet` in the agent's `ARENA_HOME` -- never
  * from `wallet.json`. An ask naming any other address (the owner's, an opponent's) is logged and never paid.
@@ -23,7 +26,7 @@ export type FundingAsk = { usdc: string; address: string };
 
 /** One line of the ledger. `pay` is written before the helper runs; `paid` after it returns. */
 export type LedgerEntry =
-  | { t: string; kind: "ask"; usdc: string; address: string; text: string }
+  | { t: string; kind: "ask"; usdc: string; address: string; text: string; source?: "text" | "fund-output" }
   | { t: string; kind: "skip"; usdc: string; address: string; why: string }
   | { t: string; kind: "pay"; usdc: string; address: string }
   | { t: string; kind: "paid"; usdc: string; address: string; exit: number | null; stdout: string; stderr: string }
@@ -66,6 +69,53 @@ export function agentTexts(line: string): string[] {
     if (block.type === "text" && typeof block.text === "string") texts.push(block.text);
   }
   return texts;
+}
+
+/** The asks in `arena fund`'s own `message`, inside one `stream-json` tool-result line (`"message": "Please send X
+ *  USDC to 0x… on Arc Testnet …"`). Only a JSON `message` field counts, so a tool result that merely echoes text
+ *  (a `curl` of skill.md, say) is never read as an ask. */
+export function fundOutputAsks(line: string): FundingAsk[] {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return [];
+  let obj: { type?: string; message?: { content?: unknown } };
+  try {
+    obj = JSON.parse(trimmed) as typeof obj;
+  } catch {
+    return [];
+  }
+  if (obj.type !== "user" || !Array.isArray(obj.message?.content)) return [];
+  const out: FundingAsk[] = [];
+  for (const block of obj.message.content as Array<{ type?: string; content?: unknown }>) {
+    if (block.type !== "tool_result") continue;
+    const content = Array.isArray(block.content)
+      ? (block.content as Array<{ text?: unknown }>).map((c) => (typeof c.text === "string" ? c.text : "")).join("")
+      : typeof block.content === "string"
+        ? block.content
+        : "";
+    let parsed: { message?: unknown; usdc?: unknown };
+    try {
+      parsed = JSON.parse(content) as typeof parsed;
+    } catch {
+      continue;
+    }
+    if (typeof parsed.message === "string" && typeof parsed.usdc === "object") out.push(...parseFundingAsks(parsed.message));
+  }
+  return out;
+}
+
+/** True if one `stream-json` line is the agent running `wallet --wait-for-usdc`: it is now waiting for its human. */
+export function waitsForUsdc(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return false;
+  try {
+    const obj = JSON.parse(trimmed) as { type?: string; message?: { content?: unknown } };
+    if (obj.type !== "assistant" || !Array.isArray(obj.message?.content)) return false;
+    return (obj.message.content as Array<{ type?: string; input?: { command?: unknown } }>).some(
+      (b) => b.type === "tool_use" && typeof b.input?.command === "string" && /\bwallet\b[^|;&]*--wait-for-usdc\b/.test(b.input.command),
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** The session id a `stream-json` line carries (the `system/init` and `result` events), for `--resume`. */
@@ -139,7 +189,9 @@ export class HumanWatcher {
   private wallet: string | undefined;
   private readonly seen = new Set<string>();
   /** Asks read from the log but not yet decided (the wallet address was not readable yet): retried every poll. */
-  private pending: Array<{ ask: FundingAsk; text: string }> = [];
+  private pending: Array<{ ask: FundingAsk; text: string; source: "text" | "fund-output" }> = [];
+  /** The asks in the latest `fund` output, paid only once the agent waits for them (`wallet --wait-for-usdc`). */
+  private lastFundAsks: FundingAsk[] = [];
   sessionId: string | undefined;
 
   constructor(private readonly o: WatcherOptions) {}
@@ -179,9 +231,15 @@ export class HumanWatcher {
         this.offset += Buffer.byteLength(chunk.slice(0, lastNl + 1));
         for (const line of chunk.slice(0, lastNl).split("\n")) {
           this.sessionId = sessionIdOf(line) ?? this.sessionId;
+          const fromFund = fundOutputAsks(line);
+          if (fromFund.length > 0) this.lastFundAsks = fromFund;
+          if (waitsForUsdc(line)) {
+            for (const ask of this.lastFundAsks) this.pending.push({ ask, text: "(arena fund's message, then wallet --wait-for-usdc)", source: "fund-output" });
+            this.lastFundAsks = [];
+          }
           for (const text of agentTexts(line)) {
             const asks = parseFundingAsks(text);
-            for (const ask of asks) this.pending.push({ ask, text });
+            for (const ask of asks) this.pending.push({ ask, text, source: "text" });
             // Something that reads like an ask but did not parse is never paid by guesswork: flag it for a person.
             if (asks.length === 0 && /\bsend\b/i.test(text) && /USDC/.test(text) && /0x[0-9a-fA-F]{40}/.test(text)) {
               this.record({ t: new Date().toISOString(), kind: "note", text: `possible ask not parsed: ${text.slice(0, 600)}` });
@@ -191,18 +249,18 @@ export class HumanWatcher {
       }
       const queue = this.pending;
       this.pending = [];
-      for (const { ask, text } of queue) if (!(await this.handle(ask, text))) this.pending.push({ ask, text });
+      for (const item of queue) if (!(await this.handle(item.ask, item.text, item.source))) this.pending.push(item);
     } finally {
       this.busy = false;
     }
   }
 
   /** False when the ask could not be decided yet (no wallet address): the caller keeps it queued. */
-  private async handle(ask: FundingAsk, text: string): Promise<boolean> {
-    const key = `${ask.address.toLowerCase()}:${ask.usdc}`;
+  private async handle(ask: FundingAsk, text: string, source: "text" | "fund-output"): Promise<boolean> {
+    const key = `${ask.address.toLowerCase()}:${microUsdc(ask.usdc)}:${source}`;
     if (!this.seen.has(key)) {
       this.seen.add(key);
-      this.record({ t: new Date().toISOString(), kind: "ask", ...ask, text: text.slice(0, 600) });
+      this.record({ t: new Date().toISOString(), kind: "ask", ...ask, text: text.slice(0, 600), source });
     }
     const wallet = this.walletAddress();
     if (wallet === undefined) return false;

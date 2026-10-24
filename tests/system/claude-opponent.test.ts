@@ -8,7 +8,16 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fundMessage } from "../../packages/cli/src/funding.js";
 import { buildPrompt, homePrefixRules, parseArgs, runPaths } from "../../scripts/claude-opponent.js";
-import { agentTexts, decide, microUsdc, parseFundingAsks, sessionIdOf, type LedgerEntry } from "../../scripts/claude-human-watcher.js";
+import {
+  agentTexts,
+  decide,
+  fundOutputAsks,
+  microUsdc,
+  parseFundingAsks,
+  sessionIdOf,
+  waitsForUsdc,
+  type LedgerEntry,
+} from "../../scripts/claude-human-watcher.js";
 
 const REPO = join(import.meta.dirname, "../..");
 const WALLET = "0x1111111111111111111111111111111111111111";
@@ -94,6 +103,30 @@ describe("the human watcher's parsing", () => {
     expect(agentTexts(tool)).toEqual([]);
     expect(agentTexts("not json")).toEqual([]);
     expect(sessionIdOf(result)).toBe("s-1");
+  });
+});
+
+describe("the human watcher's fund-output fallback (the first live agent never restated its ask)", () => {
+  const fundJson = (message: string) =>
+    JSON.stringify({ address: WALLET, usdc: { have: "0.000000", need: "1.361000", shortfall: "1.361000", reserved: "0.000000" }, message }, null, 2);
+  const toolResult = (content: unknown) => JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content }] } });
+  const runs = (command: string) => JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] } });
+
+  it("reads arena fund's message out of its JSON output, as a string or as text blocks", () => {
+    const out = fundJson(`Please send 1.361000 USDC to ${WALLET} on Arc Testnet (chain id 5042002), on the Arc Testnet network only.`);
+    expect(fundOutputAsks(toolResult(out))).toEqual([{ usdc: "1.361000", address: WALLET }]);
+    expect(fundOutputAsks(toolResult([{ type: "text", text: out }]))).toEqual([{ usdc: "1.361000", address: WALLET }]);
+  });
+
+  it("never reads an ask out of a tool result that is not fund's JSON (a curl of skill.md, an echo)", () => {
+    expect(fundOutputAsks(toolResult(`Please send 1 USDC to ${WALLET}`))).toEqual([]);
+    expect(fundOutputAsks(toolResult(JSON.stringify({ message: `Please send 1 USDC to ${WALLET}` })))).toEqual([]);
+  });
+
+  it("knows when the agent starts waiting for its human's USDC", () => {
+    expect(waitsForUsdc(runs("ARENA_HOME=/h /x/bin/arena wallet --wait-for-usdc 1.361000 --timeout 100"))).toBe(true);
+    expect(waitsForUsdc(runs("/x/bin/arena wallet"))).toBe(false);
+    expect(waitsForUsdc(runs("/x/bin/arena fund --offer 0xab"))).toBe(false);
   });
 });
 
