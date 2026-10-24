@@ -879,6 +879,30 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     expect(d.err).toEqual([]);
   });
 
+  it("H2 fix round 1 (review m-7): init --owner on Arc prints owner set's network note on stderr; not on a chain without a profile", async () => {
+    const OWNER = "0x00000000000000000000000000000000000000cc";
+    const initWithOwner = async (chainId: number) => {
+      const home = mkdtempSync(join(tmpdir(), "arena-cli-arc-owner-"));
+      const t = io(home, [], { chainId });
+      const args = [
+        "init", "--rpc", "http://arc-rpc.test", "--chain-id", String(chainId),
+        "--hub", "0x000000000000000000000000000000000000beef", "--usdc", ARC_USDC,
+        "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
+        "--session-gas-wei", "10000000000000000", "--fee-ceiling-wei", "40000000000", "--owner", OWNER,
+      ];
+      expect(await runCli(args, t.io), t.err.join("\n")).toBe(0);
+      expect((JSON.parse(t.out.join("\n")) as { owner: string }).owner.toLowerCase()).toBe(OWNER);
+      return t.err;
+    };
+    expect(await initWithOwner(5042)).toContain(
+      "owner set: withdraw pays this address on Arc (chain id 5042) only, in one irreversible transfer. It must be an " +
+        "address your human controls on Arc: never an exchange deposit address unless that exchange supports USDC " +
+        "deposits on Arc, and never a smart wallet deployed only on another chain. If your human is not sure, ask them " +
+        "now, before any withdraw.",
+    );
+    expect((await initWithOwner(31337)).filter((l) => l.startsWith("owner set:"))).toEqual([]);
+  });
+
   it("fix round 1 (m-6): on a one-balance chain, fund's faucet report is {usdc} only", async () => {
     const home = await initArcHome();
     let funded = false;

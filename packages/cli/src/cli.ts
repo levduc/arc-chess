@@ -901,6 +901,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           }
         }
         io.out(JSON.stringify(summary, null, 2));
+        // H2 fix round 1 (review m-7): `init --owner` records the owner too, so on Arc it gets `owner set`'s note, on
+        // stderr, with the summary on stdout unchanged.
+        const initProfile = chainProfile(chainId);
+        if (ownerFlag !== undefined && initProfile !== undefined) io.err(ownerNetworkNote(initProfile.name, chainId));
         return 0;
       } finally {
         lock.release();

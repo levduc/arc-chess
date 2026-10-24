@@ -144,14 +144,19 @@ const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"
 
 /**
  * Plan 6 hardening H2 (audit-journey I-2): a `session-gas-low` reason (the daemon's own text, in wei) as an agent on a
- * chain whose gas is USDC should read it. Every native amount (`N wei`) becomes USDC at 18 decimals, as does the
- * session key's floor (the daemon prints it without a unit), and a fee per gas (`N wei per gas`, or a bare fee
- * floor) becomes gwei: on Arc, 10^18 wei is 1 USDC. Anything else in the text is kept as it is.
+ * chain whose gas is USDC should read it: on Arc, 10^18 wei is 1 USDC. The daemon's reason is "the session key holds
+ * N wei, below the floor of M, and the wallet could not refill it: <the first line of the error>". So:
+ * - a fee per gas -- `TxFeeCapError`'s "the cap of N wei per gas (needs M)" -- becomes gwei, its `needs` included;
+ * - every other native amount (`N wei`) becomes USDC at 18 decimals, as does the key's floor (printed without a unit).
+ * Anything else in the text is kept as it is. H2 fix round 1 (review m-1): the rules are pinned against the reasons
+ * the daemon actually emits; the amount to ask the human for never comes from here (see `sessionGasLowAction`).
  */
 export function gasReasonInUsdc(reason: string): string {
+  const gwei = (n: string) => `${formatUnits(BigInt(n), 9)} gwei per gas`;
   return reason
-    .replace(/\b(\d+) wei per gas\b/g, (_m, n: string) => `${formatUnits(BigInt(n), 9)} gwei per gas`)
-    .replace(/\b(fee floor of )(\d+)\b(?! g?wei)/g, (_m, pre: string, n: string) => `${pre}${formatUnits(BigInt(n), 9)} gwei per gas`)
+    .replace(/\b(\d+) wei per gas( \(needs (\d+)\))?/g, (_m, n: string, needs?: string, m?: string) =>
+      needs !== undefined && m !== undefined ? `${gwei(n)} (needs ${gwei(m)})` : gwei(n),
+    )
     .replace(/\b(\d+) wei\b/g, (_m, n: string) => `${formatUnits(BigInt(n), 18)} USDC`)
     .replace(/\b(below the floor of )(\d+)\b(?! (?:g?wei|USDC))/g, (_m, pre: string, n: string) => `${pre}${formatUnits(BigInt(n), 18)} USDC`);
 }
