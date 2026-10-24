@@ -1,20 +1,21 @@
 /**
- * Plan 6 hardening H1 (audit-contracts I1): a griefer who answers the victim's challenge with a finished game can put
- * any bytes in the victim's own signature slot -- the hub checks only the mover's slot of a `hasPrev` proof and
- * re-emits the whole `proof.latest` in `Responded`. Before H1 the victim's daemon stored those bytes, built a
- * `hasPrev: false` proof from them, and the hub refused it (`Unsupported`) on every try: with the griefer gone, the
- * victim had no exit of her own. These tests run the audit's scenario end to end on Anvil and require the victim's
- * daemon to settle the channel by itself.
+ * Plan 6 hardening H1 (audit-contracts I1, "oversized events"): the hub re-emits a proof's signature bytes in its
+ * `Challenged`/`Responded` events, so an event can be larger than an RPC serves in a `getLogs` response. The daemon's
+ * scan must not wedge on such an event, and a challenge whose event cannot be read must never be a silent forfeit.
  *
- * The "oversized events" half: the same unchecked bytes let the griefer make the event too large for an RPC's
- * `getLogs` response. The daemon's scan must not wedge on it.
+ * H3: the owner adopted the hardened hub (I1, `750e280`): it now verifies every signature slot it re-emits, so the
+ * griefer's junk signature these tests used to plant on-chain reverts `BadSignature`. The test of the victim's daemon
+ * dropping a junk signature it read from an event is gone with it: that event can no longer exist. The unreadable
+ * event is now produced by the RPC itself -- a fake fetch in front of Anvil that refuses the block (Arc's -32012
+ * "requested range too large") while every signature on-chain is valid -- and the same block, rate-limited instead
+ * of refused, must be read again later, never skipped (spec §12 items 18 and 67).
  */
-import type { Hex } from "viem";
+import { createPublicClient, encodeEventTopics, type Hex, type PublicClient } from "viem";
 import { afterEach, describe, expect, it } from "vitest";
-import { HubClient, type DisputeEvent } from "@arena/sdk";
+import { HubClient, ZERO_HASH, channelHubAbi, rpcTransport } from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
 import { UNREADABLE_BLOCK_PASSES, UNSEEN_REGISTERED_PASSES } from "../src/daemon.js";
-import { increaseTime, setEthBalance, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { RPC, increaseTime, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 let cleanup: (() => Promise<void>) | undefined;
@@ -40,16 +41,10 @@ async function matched() {
   return { ...pair, id };
 }
 
-/** The audit's scenario, on a fresh pair (see `griefedDrawOn`). */
-async function griefedDraw(junk: Hex) {
-  return griefedDrawOn(await matched(), junk);
-}
-
 /** After Bob is gone, Alice's only exit: challenge on the draw once her cooldown ends, then time it out. */
 async function aliceSettlesAlone(m: Awaited<ReturnType<typeof matched>>) {
   const { alice, env, id } = m;
   await increaseTime(Number(TIMEOUT) + 1); // Alice's cooldown (Bob's respond put her in it) ends
-  // Before H1: HubRevertError Unsupported, every time -- the stored junk made the proof `hasPrev: false`.
   await alice.daemon.challenge(undefined, "agent");
   expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
   await increaseTime(Number(TIMEOUT) + 1);
@@ -58,66 +53,113 @@ async function aliceSettlesAlone(m: Awaited<ReturnType<typeof matched>>) {
   await waitFor(() => alice.daemon.handle(id).record.finalized, 5_000, "record.finalized");
 }
 
-/** Replaces `daemon.hub.disputeEvents` with an RPC that refuses (as a provider's "response size exceeded") any
- *  response carrying an event whose signature bytes are over `limit` -- for any range when `alone` is set, else only
- *  for a range of more than one block. Returns the refusals seen. */
-function capResponses(daemon: ArenaDaemon, opts: { limit: number; alone: boolean }) {
-  const hub = daemon.hub;
-  const real = hub.disputeEvents.bind(hub);
-  const refused: Array<{ from: bigint; to: bigint }> = [];
-  hub.disputeEvents = async (id: Hex, fromBlock?: bigint, toBlock?: bigint): Promise<DisputeEvent[]> => {
-    const events = await real(id, fromBlock, toBlock);
-    const big = events.some((e) => e.signed.sigA.length > opts.limit || e.signed.sigB.length > opts.limit);
-    const span = fromBlock !== undefined && toBlock !== undefined ? toBlock - fromBlock : 1n;
-    if (big && (opts.alone || span > 0n)) {
-      refused.push({ from: fromBlock ?? 0n, to: toBlock ?? 0n });
-      throw new Error("query returned more than the maximum response size");
-    }
-    return events;
+const TOPIC0 = {
+  Challenged: encodeEventTopics({ abi: channelHubAbi, eventName: "Challenged" })[0],
+  Responded: encodeEventTopics({ abi: channelHubAbi, eventName: "Responded" })[0],
+};
+
+/**
+ * H3: routes `daemon`'s dispute-event reads through viem's real HTTP transport (`rpcTransport`, retries shortened)
+ * over a fake fetch in front of Anvil. A read of channel `id`'s `kind` events whose answer would hold one -- for any
+ * range when `alone` is set, else only for a range of more than one block -- is answered as Arc's RPC answers what it
+ * will not serve, `-32012 "requested range too large"`, while `state.refusing`, or rate-limited (`-32005 "rate limit
+ * exceeded"`) while `state.limiting`. Everything else, the scan's zero-id probe included, is served by Anvil.
+ */
+function unreadable(daemon: ArenaDaemon, id: Hex, kind: keyof typeof TOPIC0, opts: { alone: boolean; refusing?: boolean; limiting?: boolean }) {
+  const state = {
+    refusing: opts.refusing ?? true,
+    limiting: opts.limiting ?? false,
+    refused: [] as Array<{ from: bigint; to: bigint }>,
+    limited: [] as Array<{ from: bigint; to: bigint }>,
+    probes: 0,
   };
-  return refused;
+  const rpcError = (reqId: number, code: number, message: string) =>
+    new Response(JSON.stringify({ jsonrpc: "2.0", id: reqId, error: { code, message } }), { headers: { "content-type": "application/json" } });
+  const fetchFn = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const upstream = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: init?.body });
+    const req = JSON.parse(String(init?.body)) as { id: number; method: string; params: Array<{ fromBlock: Hex; toBlock: Hex; topics?: unknown[] }> };
+    if (req.method !== "eth_getLogs") return upstream;
+    const f = req.params[0];
+    const [topic0, topic1] = [String(f.topics?.[0] ?? "").toLowerCase(), String(f.topics?.[1] ?? "").toLowerCase()];
+    if (topic1 === ZERO_HASH) state.probes++;
+    if (topic1 !== id.toLowerCase() || topic0 !== TOPIC0[kind].toLowerCase()) return upstream;
+    const body = (await upstream.json()) as { id: number; result?: unknown[] };
+    const range = { from: BigInt(f.fromBlock), to: BigInt(f.toBlock) };
+    if ((body.result?.length ?? 0) > 0 && (opts.alone || range.to > range.from)) {
+      if (state.limiting) {
+        state.limited.push(range);
+        return rpcError(req.id, -32005, "rate limit exceeded");
+      }
+      if (state.refusing) {
+        state.refused.push(range);
+        return rpcError(req.id, -32012, "requested range too large");
+      }
+    }
+    return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+  };
+  const client = createPublicClient({ transport: rpcTransport(RPC, { fetchFn, retryDelay: 1 }) }) as PublicClient;
+  const fake = new HubClient(daemon.hub.hub, client);
+  daemon.hub.disputeEvents = fake.disputeEvents.bind(fake);
+  return state;
 }
 
-describe("H1 (audit-contracts I1): a junk signature in the victim's slot", () => {
-  it("the victim's daemon drops it, and settles the channel on its own", async () => {
-    const m = await griefedDraw("0x01");
-    const { alice, id } = m;
-    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 2n, 20_000, "alice ingests the draw");
-    expect(alice.daemon.handle(id).session.latest.sigA).toBe("0x"); // the junk was not stored
-    expect(alice.daemon.handle(id).session.challengeProof().hasPrev).toBe(true);
-    await aliceSettlesAlone(m);
-  });
-});
+/**
+ * Alice (honest, white) plays e4 offering a draw; Bob stalls, so she challenges on it. Bob answers on-chain with
+ * ACCEPT_DRAW, validly signed. His relay is cut first, so the draw reaches Alice only through the `Responded` event.
+ * Then Bob walks away for good. On an already-matched pair, so a test can patch Alice's RPC first. Returns the
+ * respond's block, Bob's session sender and his proof of the registered draw, for a later, readable event.
+ */
+async function drawByRespondOn(m: Awaited<ReturnType<typeof matched>>) {
+  const { alice, bob, id } = m;
+  await alice.daemon.move(undefined, "e4", { offerDraw: true, actor: "agent" });
+  await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+  bob.client.disconnect();
+  await alice.daemon.challenge(undefined, "agent");
+  const hub = bob.daemon.hub;
+  const real = hub.respond.bind(hub);
+  let block: bigint | undefined;
+  hub.respond = async (sender, proof, opts) => {
+    const r = await real(sender, proof, opts);
+    block = r.blockNumber;
+    return r;
+  };
+  await bob.daemon.acceptDraw(undefined, "agent");
+  await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open" && block !== undefined, 20_000, "bob's respond");
+  const bobSender = bob.daemon.handle(id).sessionSender;
+  const bobDrawProof = bob.daemon.handle(id).session.challengeProof();
+  await bob.daemon.stop();
+  return { ...m, block: block!, bobSender, bobDrawProof };
+}
 
 describe("H1 (audit-contracts I1, oversized events): the dispute scan never wedges on a large event", () => {
   it("a range the RPC refuses because of one large event is split; the event is read alone and the victim settles", async () => {
     const m = await matched();
-    // Alice's RPC serves no response holding a large signature for more than one block.
-    const refused = capResponses(m.alice.daemon, { limit: 10_000, alone: false });
-    const g = await griefedDrawOn(m, `0x${"01".repeat(100_000)}`);
+    // Alice's RPC refuses any range of more than one block that holds Bob's Responded.
+    const rpc = unreadable(m.alice.daemon, m.id, "Responded", { alone: false });
+    const g = await drawByRespondOn(m);
     const { alice, id } = g;
     await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 2n, 20_000, "alice ingests the draw");
-    expect(refused.length).toBeGreaterThan(0); // the large event did come back in a multi-block range at first
-    expect(alice.daemon.handle(id).session.latest.sigA).toBe("0x");
+    expect(rpc.refused.length).toBeGreaterThan(0); // the event did come back refused in a multi-block range at first
+    expect(rpc.refused.every((r) => r.from <= g.block && g.block <= r.to && r.to > r.from)).toBe(true);
     expect(alice.daemon.handle(id).record.skippedEventBlocks).toBeUndefined(); // read, not skipped
-    await waitFor(() => (alice.daemon.handle(id).record.scannedBlock ?? 0n) >= g.junkBlock, 10_000, "cursor past the event");
+    await waitFor(() => (alice.daemon.handle(id).record.scannedBlock ?? 0n) >= g.block, 10_000, "cursor past the event");
     await aliceSettlesAlone(g);
   });
 
   it("a block the RPC refuses even alone, while it is up, is skipped after a few passes; later events are still read", async () => {
     const m = await matched();
-    const refused = capResponses(m.alice.daemon, { limit: 10_000, alone: true });
-    const g = await griefedDrawOn(m, `0x${"01".repeat(100_000)}`);
+    const rpc = unreadable(m.alice.daemon, m.id, "Responded", { alone: true });
+    const g = await drawByRespondOn(m);
     const { alice, id } = g;
-    await waitFor(() => alice.daemon.handle(id).record.skippedEventBlocks?.includes(g.junkBlock) === true, 20_000, "the block is skipped");
-    expect(refused.filter((r) => r.from === g.junkBlock && r.to === g.junkBlock).length).toBeGreaterThanOrEqual(UNREADABLE_BLOCK_PASSES);
+    await waitFor(() => alice.daemon.handle(id).record.skippedEventBlocks?.includes(g.block) === true, 20_000, "the block is skipped");
+    expect(rpc.refused.filter((r) => r.from === g.block && r.to === g.block).length).toBeGreaterThanOrEqual(UNREADABLE_BLOCK_PASSES);
     expect(alice.daemon.handle(id).session.latest.state.turnNum).toBe(1n); // the draw itself is unreadable here
-    await waitFor(() => (alice.daemon.handle(id).record.scannedBlock ?? 0n) >= g.junkBlock, 10_000, "cursor past the block");
+    await waitFor(() => (alice.daemon.handle(id).record.scannedBlock ?? 0n) >= g.block, 10_000, "cursor past the block");
     // H1 fix round 1 (review m-2): surfaced from the record, whatever lastError holds.
     alice.daemon.handle(id).lastError = "relay: something else";
     const st = await alice.daemon.status(id);
-    expect(st.skippedEventBlocks).toEqual([g.junkBlock.toString()]);
-    expect(st.suggestedActions.some((a) => a.startsWith(`check the RPC: block(s) ${g.junkBlock} hold dispute events`))).toBe(true);
+    expect(st.skippedEventBlocks).toEqual([g.block.toString()]);
+    expect(st.suggestedActions.some((a) => a.startsWith(`check the RPC: block(s) ${g.block} hold dispute events`))).toBe(true);
     // A later event that carries the same state readably (a challenge on the registered draw) is still ingested.
     // (A client of its own: Bob's stopped daemon aborts its receipt waits.)
     await new HubClient(alice.daemon.hub.hub, alice.daemon.client).challenge(g.bobSender, g.bobDrawProof);
@@ -146,72 +188,37 @@ describe("H1 (audit-contracts I1, oversized events): the dispute scan never wedg
 });
 
 /**
- * The audit's scenario. Alice (honest, white) plays e4 offering a draw; Bob stalls, so she challenges on it. Bob
- * answers on-chain with ACCEPT_DRAW -- terminal, and free for him -- with `junk` in Alice's slot (sigA). His relay is
- * cut first, so the draw reaches Alice only through the `Responded` event. Then Bob walks away for good. On an
- * already-matched pair, so a test can patch Alice's RPC first. Also returns Bob's session sender and a clean proof
- * of the registered draw, for a later, readable event.
+ * H1 fix round 1 (review I-1): the unreadable event is a `Challenged` that registers a move Alice never received. Bob
+ * (white's opponent) signs e5 on Alice's e4 without relaying it and challenges on it, validly signed; a test makes
+ * Alice's RPC refuse (or rate-limit) that block. Before the fix, with the block refused, Alice held nothing newer than
+ * e4, could not answer, and was told nothing: Bob's timeout forfeited her current game at the deadline.
  */
-async function griefedDrawOn(m: Awaited<ReturnType<typeof matched>>, junk: Hex) {
-  const { alice, bob, id } = m;
-  await alice.daemon.move(undefined, "e4", { offerDraw: true, actor: "agent" });
-  await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
-  bob.client.disconnect();
-  await alice.daemon.challenge(undefined, "agent");
-  const hub = bob.daemon.hub;
-  const real = hub.respond.bind(hub);
-  let junkBlock: bigint | undefined;
-  hub.respond = async (sender, proof, opts) => {
-    const r = await real(sender, { ...proof, latest: { ...proof.latest, sigA: junk } }, opts);
-    junkBlock = r.blockNumber;
-    return r;
-  };
-  // The griefer pays for his own junk: 100 KB costs about 3M gas, over the test's session gas at arc-anvil's 25 gwei.
-  await setEthBalance(bob.daemon.handle(id).sessionSender.address, 10n ** 18n);
-  await bob.daemon.acceptDraw(undefined, "agent");
-  await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open" && junkBlock !== undefined, 20_000, "bob's respond");
-  const bobSender = bob.daemon.handle(id).sessionSender;
-  const bobDrawProof = bob.daemon.handle(id).session.challengeProof();
-  await bob.daemon.stop();
-  // (Read through a client of its own: a test may have capped Alice's.)
-  const events = await new HubClient(alice.daemon.hub.hub, alice.daemon.client).disputeEvents(id);
-  expect(events.find((e) => e.kind === "Responded")?.signed.sigA).toBe(junk); // the hub took the junk and re-emitted it
-  return { ...m, junkBlock: junkBlock!, bobSender, bobDrawProof };
-}
-
-/**
- * H1 fix round 1 (review I-1): the oversized event is a `Challenged` that registers a move Alice never received. Bob
- * (white's opponent) signs e5 on Alice's e4 without relaying it and challenges on it, with junk in Alice's slot; Alice's
- * RPC refuses that block even alone. Before the fix Alice held nothing newer than e4, could not answer, and was told
- * nothing: Bob's timeout forfeited her current game at the deadline.
- */
-async function griefedChallengeOn(m: Awaited<ReturnType<typeof matched>>, junk: Hex) {
+async function challengeOn(m: Awaited<ReturnType<typeof matched>>) {
   const { alice, bob, id } = m;
   await alice.daemon.move(undefined, "e4", { actor: "agent" });
   await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
   bob.client.disconnect(); // his e5 reaches Alice only through the chain
   const hub = bob.daemon.hub;
   const real = hub.challenge.bind(hub);
-  let junkBlock: bigint | undefined;
+  let block: bigint | undefined;
   hub.challenge = async (sender, proof, opts) => {
-    const r = await real(sender, { ...proof, latest: { ...proof.latest, sigA: junk } }, opts);
-    junkBlock = r.blockNumber;
+    const r = await real(sender, proof, opts);
+    block = r.blockNumber;
     return r;
   };
   await bob.daemon.move(undefined, "e5", { actor: "agent" }); // signed, never relayed
-  await setEthBalance(bob.daemon.handle(id).sessionSender.address, 10n ** 18n); // he pays for his own junk
   await bob.daemon.challenge(undefined, "agent");
   expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
   const bobSigned = bob.daemon.handle(id).session.latest;
   await bob.daemon.stop();
-  return { ...m, junkBlock: junkBlock!, bobSigned };
+  return { ...m, block: block!, bobSigned };
 }
 
 describe("H1 fix round 1 (review I-1): a challenge whose event cannot be read is never a silent forfeit", () => {
   it("(b) the registered move is adopted from the hub's storage: Alice moves on it and her move answers the challenge", async () => {
     const m = await matched();
-    capResponses(m.alice.daemon, { limit: 10_000, alone: true }); // the challenge's block is unreadable, even alone
-    const g = await griefedChallengeOn(m, `0x${"01".repeat(100_000)}`);
+    unreadable(m.alice.daemon, m.id, "Challenged", { alone: true }); // the challenge's block is refused, even alone
+    const g = await challengeOn(m);
     const { alice, id } = g;
     const l = alice.daemon.handle(id);
     // Before the fix: Alice stayed at turn 1 -- "not your turn" -- until Bob's timeout took her current game.
@@ -236,10 +243,10 @@ describe("H1 fix round 1 (review I-1): a challenge whose event cannot be read is
 
   it("(c) when the registered state cannot be adopted: the challenge-unseen attention names the deadline, and wakes wait once", async () => {
     const m = await matched();
-    capResponses(m.alice.daemon, { limit: 10_000, alone: true });
+    unreadable(m.alice.daemon, m.id, "Challenged", { alone: true });
     const l = m.alice.daemon.handle(m.id);
     l.session.adoptRegistered = async () => false; // e.g. a registered state that is not the next turn
-    const g = await griefedChallengeOn(m, `0x${"01".repeat(100_000)}`);
+    const g = await challengeOn(m);
     const { alice, id } = g;
     const st = await waitFor(async () => {
       const s = await alice.daemon.status(id);
@@ -250,7 +257,7 @@ describe("H1 fix round 1 (review I-1): a challenge whose event cannot be read is
       new RegExp(`^switch RPC: channel ${id} is challenged on turn 2, newer than this daemon holds \\(turn 1\\)`),
     );
     expect(st.suggestedActions[0]).toContain(`forfeited at the deadline (${deadline}`);
-    expect(st.suggestedActions[0]).toContain(`block(s) ${g.junkBlock} hold dispute events`);
+    expect(st.suggestedActions[0]).toContain(`block(s) ${g.block} hold dispute events`);
     expect(await alice.daemon.wait({ ref: id, timeoutMs: 1_000 })).toEqual({ channelId: id, reason: "challenge-unseen" });
     expect((await alice.daemon.wait({ ref: id, timeoutMs: 500 })).reason).not.toBe("challenge-unseen"); // once per challenge
   });
@@ -339,5 +346,34 @@ describe("H1 fix round 1 (review m-1): skipped blocks are retried in turn", () =
     l.skippedRetryAt = 0;
     await retry(); // before the fix, the oldest again; now the next one, which reads
     expect(l.record.skippedEventBlocks).toEqual([bad]);
+  });
+});
+
+describe("H3: the challenge's block rate-limited, not refused, is read again -- never skipped", () => {
+  it("rate-limited for more passes than a skip takes, then served: no skip, no probe, and the event is read signed", async () => {
+    const m = await matched();
+    const rpc = unreadable(m.alice.daemon, m.id, "Challenged", { alone: true, refusing: false, limiting: true });
+    await parked(m.alice.daemon); // every scan below is one the test drives, and no dispute pass adopts in between
+    const g = await challengeOn(m);
+    const { alice, id } = g;
+    const l = alice.daemon.handle(id);
+    const scan = () => (alice.daemon as unknown as { scanDisputes(l: unknown): Promise<void> }).scanDisputes(l);
+    for (let i = 0; i <= UNREADABLE_BLOCK_PASSES; i++) await scan();
+    expect(rpc.limited.some((r) => r.from <= g.block && g.block <= r.to)).toBe(true);
+    // Before H3: probed, split down to the block, and skipped at the third pass -- with the move then adopted unsigned.
+    expect(rpc.probes).toBe(0);
+    expect(l.record.skippedEventBlocks).toBeUndefined();
+    expect(l.unreadableBlock).toBeNull();
+    expect(l.session.latest.state.turnNum).toBe(1n);
+    expect(l.lastError).toMatch(/^events: Request exceeds defined limit/);
+    rpc.limiting = false; // served again
+    await scan();
+    expect(l.session.latest.state).toEqual(g.bobSigned.state);
+    expect(l.session.latest.sigB).toBe(g.bobSigned.sigB); // from the event, signed: nothing adopted from storage
+    expect(l.lastError).toBeNull();
+    for (let i = 0; i < UNSEEN_REGISTERED_PASSES; i++) await alice.daemon.tick();
+    expect(l.unseenRegistered).toBeNull();
+    expect(l.record.skippedEventBlocks).toBeUndefined();
+    expect((await alice.daemon.status(id)).attention).toBe("your-turn");
   });
 });
