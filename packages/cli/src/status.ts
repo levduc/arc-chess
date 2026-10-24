@@ -105,6 +105,9 @@ export type ChannelStatus = {
    *  stranger's, an oversized or malformed one, one over the rate limit, or one the session rejected after its sender
    *  could not be determined. 0 when the XMTP fallback is off (or not armed for this channel). */
   xmtpDropped: number;
+  /** H1 fix round 1 (review m-2): blocks whose dispute events for this channel the RPC refused to serve, even alone,
+   *  and the scan skipped (`ChannelRecord.skippedEventBlocks`), as decimal strings; empty when none. */
+  skippedEventBlocks: string[];
 };
 
 export type StatusInput = {
@@ -312,6 +315,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   // Final review C1: first, and whoever controls the channel -- a session key that cannot pay cannot answer a
   // challenge, and an unanswered one can roll the channel back.
   const gasLow = live && input.sessionGasLow ? input.sessionGasLow : null;
+  const skippedBlocks = (record.skippedEventBlocks ?? []).map((b) => b.toString());
   if (gasLow) attention = "session-gas-low";
   else if (live && record.controller === "agent") {
     if (myTurn) attention = "your-turn";
@@ -392,6 +396,18 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
   }
   if (gasLow) suggestedActions.unshift(sessionGasLowAction(record.channelId, gasLow, input.gasFunding, input.sessionGasLowCause));
+  // H1 fix round 1 (review m-2): a skipped block is shown from the record, whatever `lastError` says.
+  const skippedNote =
+    skippedBlocks.length > 0
+      ? `block(s) ${skippedBlocks.join(", ")} hold dispute events for this channel that the RPC refuses to serve, even alone`
+      : null;
+  if (skippedNote && live) {
+    suggestedActions.push(
+      `check the RPC: ${skippedNote}; the daemon skipped them so later events stay readable, and retries them every ` +
+        "few minutes. If a challenge's state is in one of them, set rpcUrl in config.json to an RPC that serves larger " +
+        "getLogs responses, and restart the daemon",
+    );
+  }
 
   return {
     channelId: record.channelId,
@@ -433,5 +449,6 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     sweeps: (record.sweeps ?? []).map((s) => ({ amount: s.amount.toString(), tx: s.tx, at: s.at })),
     transport: input.transport ?? "none",
     xmtpDropped: input.xmtpDropped ?? 0,
+    skippedEventBlocks: skippedBlocks,
   };
 }

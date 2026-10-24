@@ -113,7 +113,11 @@ describe("H1 (audit-contracts I1, oversized events): the dispute scan never wedg
     expect(refused.filter((r) => r.from === g.junkBlock && r.to === g.junkBlock).length).toBeGreaterThanOrEqual(UNREADABLE_BLOCK_PASSES);
     expect(alice.daemon.handle(id).session.latest.state.turnNum).toBe(1n); // the draw itself is unreadable here
     await waitFor(() => (alice.daemon.handle(id).record.scannedBlock ?? 0n) >= g.junkBlock, 10_000, "cursor past the block");
-    expect(alice.daemon.handle(id).lastError).toMatch(/^events-skipped: block /);
+    // H1 fix round 1 (review m-2): surfaced from the record, whatever lastError holds.
+    alice.daemon.handle(id).lastError = "relay: something else";
+    const st = await alice.daemon.status(id);
+    expect(st.skippedEventBlocks).toEqual([g.junkBlock.toString()]);
+    expect(st.suggestedActions.some((a) => a.startsWith(`check the RPC: block(s) ${g.junkBlock} hold dispute events`))).toBe(true);
     // A later event that carries the same state readably (a challenge on the registered draw) is still ingested.
     // (A client of its own: Bob's stopped daemon aborts its receipt waits.)
     await new HubClient(alice.daemon.hub.hub, alice.daemon.client).challenge(g.bobSender, g.bobDrawProof);

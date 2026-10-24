@@ -3150,7 +3150,7 @@ export class ArenaDaemon {
     // Transient failures no longer matter once the channel is settled -- a failed close submission (the other
     // side's went through), a failed pass or dispute scan -- and a settled channel is never watched again, so
     // nothing else would ever clear them.
-    if (/^(close|watch|events|events-skipped):/.test(l.lastError ?? "")) l.lastError = null;
+    if (/^(close|watch|events):/.test(l.lastError ?? "")) l.lastError = null;
     if (l.record.finalized) return;
     // Final review m4: an agent waiting after its close (or on a dispute) is woken once by the settlement. A channel
     // retired without our deposit (None/Funding) never opened: nothing to report.
@@ -3374,12 +3374,8 @@ export class ArenaDaemon {
       }
       this.saveCursor(l, cursor);
       if (l.lastError?.startsWith("events:") || l.lastError?.startsWith("ingest:")) l.lastError = null;
-      if (skipped !== null) {
-        l.lastError =
-          `events-skipped: block ${skipped} holds dispute events for this channel that the RPC refuses to serve, even ` +
-          "alone; it was skipped so later events stay readable, and is retried every few minutes. Use an RPC that " +
-          "serves larger getLogs responses";
-      }
+      // H1 fix round 1 (review m-2): a skip is surfaced from `record.skippedEventBlocks` (status), not `lastError`.
+      if (skipped !== null) this.notify();
     } catch (err) {
       l.lastError = `events: ${errorText(err)}`;
     }
@@ -3461,8 +3457,8 @@ export class ArenaDaemon {
     l.record = { ...l.record, skippedEventBlocks: rest.length > 0 ? rest : undefined };
     this.records.saveChannel(l.record);
     l.skippedRetryAt = 0;
-    if (rest.length === 0 && l.lastError?.startsWith("events-skipped:")) l.lastError = null;
     this.log(`channel ${l.record.channelId}: skipped block ${block} was read and ingested`);
+    this.notify();
   }
 
   private saveCursor(l: ChannelHandle, block: bigint): void {
