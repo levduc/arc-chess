@@ -1055,3 +1055,61 @@ H3 made the daemons and the host retry rate limits without ever skipping a block
 check that (a) each agent writes the funding ask in its own reply before `wallet --wait-for-usdc`, (b) it states the
 audit text and caps before funding, (c) a detached daemon survives the session, and (d) concurrent agents pick
 different offers.
+
+### Live run #2, after H3 and H4 (2026-10-24, 22:47–23:45 UTC)
+
+Two fresh agents ran concurrently: C on port 8103 and D on port 8104, 3 games each at 0.10. Both daemons and the
+stack ran HEAD `a5a9fe9`. The human never gave the withdraw "yes" up front, and the watcher made every payment. No
+session was killed.
+
+| Agent | Games | Funded | Withdrawn (by the agent) | Net |
+|---|---|---|---|---|
+| C (vs house-2) | 3–0 | 1.363189 (1.361 + a 0.002189 top-up) | 1.632916 | +0.288504 |
+| D (vs house-1) | 3–0 | 1.361 | 1.631109 | +0.288886 |
+
+- **Deployer.** 14.441055991 → 14.999568991 (+0.558513). It reconciles to the wei.
+- **Cost.** Claude cost \$6.22: C \$4.41, D \$1.82.
+- **Wall clock.** C took 58.1 min, D 25.9 min.
+
+The checks from the follow-up above:
+
+- **(a) Funding ask in the agent's own reply.**
+  - C: yes, word for word. It ended its turn with the whole `tellYourHuman` ("Please send 1.361000 USDC to 0xD20e…
+    on Arc Testnet (chain id 5042002), on the Arc Testnet network only …") and waited only after the human said
+    "sent".
+  - D: no. It ran `fund`, then went straight to `wallet --wait-for-usdc`. Its thinking says "I've surfaced the
+    arena's funding instructions", but no reply carried them. Only the watcher's `fund`-output fallback paid it.
+- **(b) Audit text, caps and owner-only withdrawals before funding.**
+  - C: yes, the full `disclosure` word for word, plus a request to confirm the cash-out address.
+  - D: no.
+- **(c) Detached daemon.**
+  - Both started it with `daemon --detach` (`{"detached":true,"healthy":true,…}`).
+  - Both daemons survived every session end: C's four, D's two.
+  - Both agents ran `daemon stop` after their withdraw (`{"stopped":true,…}`).
+- **(d) Different offers.** No. Both "randomly" picked the second-listed of two equal offers. C lost the race
+  (`offer … not found`), switched to the other offer with no new ask, and accepted 14 s later.
+- **(e) "took effect" notes.** C saw 42 and D 17 `note: … took effect, but the chain could not be read`, and
+  neither re-sent a move. No `"chainStale": true` field reached the agents, because they grep'd the JSON.
+
+New frictions:
+
+1. **A funding pass interrupted after the dispute-gas top-up comes up short.** C's daemon sent the approve and the
+   0.336 top-up, and then a rate limit stopped the pass before the deposit. The retry's `openingShortfall` wants
+   deposit + fee + the full 0.02 reserve, but the approve and top-up gas already came out of that reserve. The
+   result was "0.002189 USDC short of the 1.025000 USDC this channel needs".
+
+   C diagnosed it, asked its human for 0.002189 (warning about the one-hour funding window), and deposited 60 s after
+   the top-up. D's pass completed uninterrupted and needed nothing more.
+
+   Fix in `daemon.ts` `fund()` / `openingShortfall`, or in `fund`'s need.
+2. **One agent of two still skipped the relay** (D), despite `tellYourHuman`.
+3. **Agent "random" is not random.** Shuffling `offers` (or adding `offers --pick`) in the CLI would fix it.
+4. **Rate limiting still dominates wall clock.**
+   - 54 and 21 rate-limit lines, and 429s on `wallet`.
+   - house-2 deposited 1 min 51 s after C's accept.
+   - A bot's first `closeCooperative` submission failed and was retried.
+5. **Harness.** The pay helper said "no receipt within 180s" after about 33 s, for a top-up that had mined. A
+   rate-limited receipt read looks like a timeout to it. It was never resent.
+
+Full detail, with every hash and quote, is in the "Live run #2" part of
+`.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`.
