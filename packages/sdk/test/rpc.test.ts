@@ -205,3 +205,64 @@ describe("H3: rpcTransport retries a rate-limited read, never a send", () => {
     expect(capped.status).toBe(429);
   });
 });
+
+describe("H3 fix round 2 (re-review I-a): rpcTransport's totalTimeoutMs caps one request, retries included", () => {
+  const hang = (_i: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((_r, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+
+  it("an RPC that never answers: the request fails by its deadline, whatever the per-attempt timeout allows", async () => {
+    let calls = 0;
+    const client = createPublicClient({
+      transport: rpcTransport(URL_, { retryDelay: 1, timeout: 30, totalTimeoutMs: 100, fetchFn: (i, init) => (calls++, hang(i, init)) }),
+    });
+    const t0 = Date.now();
+    const err = await client.getBlockNumber({ cacheTime: 0 }).catch((e: unknown) => e);
+    const took = Date.now() - t0;
+    expect((err as Error).name).toBe("TimeoutError");
+    expect(took).toBeLessThan(160); // 100 ms, plus timer slack
+    expect(took).toBeGreaterThanOrEqual(90);
+    expect(calls).toBeGreaterThanOrEqual(2); // it did retry inside the budget
+    expect(isRateLimited(err) || isRangeRefusal(err)).toBe(false);
+  });
+
+  it("a rate limit keeps its full back-off inside a budget that allows it, and fails as a rate limit", async () => {
+    const rpc = fakeRpc(() => RATE_LIMIT);
+    const client = createPublicClient({ transport: rpcTransport(URL_, { fetchFn: rpc.fetchFn, retryDelay: 1, totalTimeoutMs: 5_000 }) });
+    const err = await client.getBlockNumber({ cacheTime: 0 }).catch((e: unknown) => e);
+    expect(rpc.calls).toHaveLength(RPC_RETRY_COUNT + 1);
+    expect(isRateLimited(err)).toBe(true);
+    expect(isRangeRefusal(err)).toBe(false);
+  });
+
+  it("no retry starts whose wait would end past the deadline; the error is still the rate limit", async () => {
+    const rpc = fakeRpc(() => RATE_LIMIT);
+    const client = createPublicClient({ transport: rpcTransport(URL_, { fetchFn: rpc.fetchFn, retryDelay: 40, totalTimeoutMs: 100 }) });
+    const t0 = Date.now();
+    const err = await client.getBlockNumber({ cacheTime: 0 }).catch((e: unknown) => e);
+    expect(Date.now() - t0).toBeLessThan(100);
+    expect(rpc.calls).toHaveLength(2); // 0 ms, then 40 ms; the next wait (80 ms) would end past 100 ms
+    expect(isRateLimited(err)).toBe(true);
+    // A Retry-After (capped at 4 s) that would end past the deadline: no retry at all.
+    const after = fakeRpc(() => ({ status: 429, headers: { "retry-after": "3600" } }));
+    const c2 = createPublicClient({ transport: rpcTransport(URL_, { fetchFn: after.fetchFn, retryDelay: 1, totalTimeoutMs: 2_000 }) });
+    expect(isRateLimited(await c2.getBlockNumber({ cacheTime: 0 }).catch((e: unknown) => e))).toBe(true);
+    expect(after.calls).toHaveLength(1);
+  });
+
+  it("a read served on its third attempt is returned; a refusal is not retried; a send is attempted once", async () => {
+    const rpc = fakeRpc((_m, call) => (call < 2 ? TOO_MANY : { result: "0x7" }));
+    const client = createPublicClient({ transport: rpcTransport(URL_, { fetchFn: rpc.fetchFn, retryDelay: 1, totalTimeoutMs: 5_000 }) });
+    expect(await client.getBlockNumber({ cacheTime: 0 })).toBe(7n);
+    expect(rpc.calls).toHaveLength(3);
+    const refusal = fakeRpc(() => ({ error: { code: -32012, message: "requested range too large" } }));
+    const c2 = createPublicClient({ transport: rpcTransport(URL_, { fetchFn: refusal.fetchFn, retryDelay: 1, totalTimeoutMs: 5_000 }) });
+    expect(isRangeRefusal(await c2.getLogs({ fromBlock: 1n, toBlock: 2n }).catch((e: unknown) => e))).toBe(true);
+    expect(refusal.calls).toEqual(["eth_getLogs"]);
+    for (const a of [RATE_LIMIT, TOO_MANY, { status: 503 }] as Answer[]) {
+      const send = fakeRpc(() => a);
+      const wallet = createWalletClient({ transport: rpcTransport(URL_, { fetchFn: send.fetchFn, retryDelay: 1, totalTimeoutMs: 5_000 }) });
+      await expect(wallet.sendRawTransaction({ serializedTransaction: "0x02f8" as Hex })).rejects.toThrow();
+      expect(send.calls).toEqual(["eth_sendRawTransaction"]);
+    }
+  });
+});

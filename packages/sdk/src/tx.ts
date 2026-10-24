@@ -35,8 +35,10 @@ export type TxRequest = {
   /** Gas limit. A same-nonce replacement carries its original's (Plan 4.5 Task 10 re-review 2): estimating it
    *  again would run against a pending state that already includes the original, where it can revert. */
   gas?: bigint;
-  /** H3 fix round 1 (review M3): wall-clock ms. A tracking sender sends a same-nonce replacement only before it
-   *  (`waitOrReplace` passes its `giveUpAt`); at or after it, nothing is sent (`TxPastGiveUpError`). */
+  /** H3 fix round 1 (review M3), fix round 2 (re-review M-g): wall-clock ms. A `SerialTxSender` transmits only
+   *  before it -- checked last, after every read the send makes -- and at or after it sends nothing
+   *  (`TxPastGiveUpError`). `waitOrReplace` sets it on its replacements (its `giveUpAt`); `HubClient.write` on a fresh
+   *  send when asked (`WriteOptions.notAfter`: a respond's dispute deadline). */
   notAfter?: number;
 };
 
@@ -168,11 +170,11 @@ export class TxNonceUsedError extends Error {
   }
 }
 
-/** H3 fix round 1 (review M3): a same-nonce replacement was ready only at or after its `notAfter` (the wait's give-up
- *  time): nothing was sent. */
+/** H3 fix round 1 (review M3), fix round 2 (re-review M-g): a transaction was ready only at or after its `notAfter`
+ *  (a dispute deadline, or the wait's give-up time): nothing was sent. `nonce` is undefined for a fresh send. */
 export class TxPastGiveUpError extends Error {
-  constructor(readonly nonce: number) {
-    super(`the replacement at nonce ${nonce} was ready only past its give-up time: not sent`);
+  constructor(readonly nonce?: number) {
+    super(`the transaction${nonce === undefined ? "" : ` at nonce ${nonce}`} was ready only past its give-up time: not sent`);
     this.name = "TxPastGiveUpError";
   }
 }
@@ -337,7 +339,10 @@ export class SerialTxSender implements TxSender, TxTracker {
 
   private async sendNow(tx: TxRequest): Promise<Hex> {
     const reader = this.reader;
-    if (!reader || !this.tracking) return this.inner.send(tx);
+    if (!reader || !this.tracking) {
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError(tx.nonce);
+      return this.inner.send(tx);
+    }
     if (tx.nonce !== undefined) return this.replaceOwn(reader, tx, tx.nonce);
     const { confirmed, pending } = await this.prune(reader);
     // Adoption (round 5, C1): a pending nonce no entry tracks holds a transaction no wait of ours owns -- left by an
@@ -422,6 +427,8 @@ export class SerialTxSender implements TxSender, TxTracker {
       // this mutex): replace that one instead of going fresh behind it.
       const released = this.lowestReleased();
       if (released) return this.replaceReleased(reader, tx, released);
+      // H3 fix round 2 (re-review M-g): after every read above; before the entry, so a refusal leaves nothing behind.
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError();
       // Round 5 (I2): recorded before the send, so a transaction the node took although its response was lost is
       // still tracked (released, at its nonce, with its fees and -- when signed locally -- its hash).
       const e: Entry = { nonce, lastFees: fees, hashes: new Set(), state: "waiting", gas };
@@ -491,6 +498,8 @@ export class SerialTxSender implements TxSender, TxTracker {
     else this.affordable(e.nonce, estimate!, room);
     fees = this.floored(clampFees(fees, bigMin(room.cap, room.balance)), room);
     for (;;) {
+      // H3 fix round 2 (re-review M-g): the entry stays released, as it was; the next send replaces it.
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError(e.nonce);
       const r = await this.transmit(reader, { ...tx, nonce: e.nonce, gas, ...fees });
       if (r.err === undefined) {
         e.hashes.add(r.hash!);
@@ -537,7 +546,7 @@ export class SerialTxSender implements TxSender, TxTracker {
       const g = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
       const r = await this.room(reader, est, g, tx.value ?? 0n);
       const asked = hasFees(feesOf(tx)) ? feesOf(tx) : (est ?? {});
-      if (tx.notAfter !== undefined && Date.now() >= tx.notAfter) throw new TxPastGiveUpError(nonce);
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError(nonce);
       return this.inner.send({ ...tx, gas: g, ...this.floored(clampFees(asked, bigMin(r.cap, r.balance)), r) });
     }
     const estimate = this.noted(await estimateLike(reader, e.lastFees));
@@ -550,7 +559,7 @@ export class SerialTxSender implements TxSender, TxTracker {
     const fees = this.floored(clampFees(wanted, bigMin(room.cap, room.balance)), room);
     // H3 fix round 1 (review M3): the reads above can be slow (a rate-limited read is retried): no replacement goes
     // out past the wait's give-up time.
-    if (tx.notAfter !== undefined && Date.now() >= tx.notAfter) throw new TxPastGiveUpError(nonce);
+    if (pastNotAfter(tx)) throw new TxPastGiveUpError(nonce);
     const r = await this.transmit(reader, { ...tx, gas, ...fees });
     // H3 fix round 1 (review M1): a "nonce too low" whose own hash could not be read may be this replacement, landed.
     if (r.err === undefined || !isDefinitive(r.err) || (r.unsure === true && isNonceUsedError(r.err))) {
@@ -621,6 +630,9 @@ export class SerialTxSender implements TxSender, TxTracker {
     return isInsufficientFundsError(err) ? new TxInsufficientFundsError(this.address, err) : err;
   }
 }
+
+/** H3 fix rounds 1-2: whether `tx` may no longer be sent (its `notAfter` has passed). */
+const pastNotAfter = (tx: TxRequest) => tx.notAfter !== undefined && Date.now() >= tx.notAfter;
 
 // ------------------------------------------------------------------------------------ fee helpers
 

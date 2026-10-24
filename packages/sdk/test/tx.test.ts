@@ -410,6 +410,14 @@ describe("waitOrReplace: a give-up time (Task 10 re-review I2)", () => {
     expect(n.sent).toHaveLength(1); // before: the replacement went out ~80 ms past giveUpAt
   });
 
+  it("H3 fix round 2 (re-review M-g): HubClient.write passes notAfter to the fresh send", async () => {
+    const n = stubNode();
+    const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
+    const notAfter = Date.now() + 60_000;
+    await new HubClient(TO, client).timeout(n.sender, h(1), { receiptTimeoutMs: 50, giveUpAt: Date.now() + 100, notAfter }).catch(() => undefined);
+    expect(n.sent[0].notAfter).toBe(notAfter);
+  });
+
   it("HubClient.write passes giveUpAt through", async () => {
     const n = stubNode();
     const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;

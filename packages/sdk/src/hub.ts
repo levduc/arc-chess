@@ -142,6 +142,9 @@ export type WriteOptions = {
   receiptTimeoutMs?: number;
   /** Wall-clock ms past which the receipt wait neither replaces nor waits (a dispute deadline; see waitOrReplace). */
   giveUpAt?: number;
+  /** H3 fix round 2 (re-review M-g): wall-clock ms at or after which the transaction itself is not sent
+   *  (`TxRequest.notAfter`, `TxPastGiveUpError`): a respond that could only land past its deadline would revert. */
+  notAfter?: number;
   /** Aborts the receipt wait (TxWaitAbortedError). */
   signal?: AbortSignal;
 };
@@ -421,7 +424,7 @@ export class HubClient {
     let hash: Hex;
     try {
       // No nonce: a tracking sender (SerialTxSender) picks it, and replaces its own released transaction if any.
-      hash = await sender.send({ to, data });
+      hash = await sender.send({ to, data, ...(opts.notAfter === undefined ? {} : { notAfter: opts.notAfter }) });
     } catch (err) {
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
       // not a revert (RPC down, a used nonce (TxNonceUsedError), the fee cap or the balance (TxFeeCapError,

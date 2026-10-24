@@ -1,4 +1,4 @@
-import { BaseError, http, type HttpTransport, type HttpTransportConfig } from "viem";
+import { BaseError, HttpRequestError, TimeoutError, http, type HttpTransport, type HttpTransportConfig } from "viem";
 
 /**
  * Plan 6 hardening H3 (rate-limit resilience). Arc's public RPC answers a modest mix of reads with `-32005 "rate limit
@@ -38,17 +38,85 @@ export function cappedRetryAfter(fetchFn: FetchFn = (input, init) => fetch(input
 }
 
 /** The HTTP transport every arena RPC client uses: viem's `http`, with the retry budget above. `overrides` are for
- *  tests (a fake `fetchFn`, a short `retryDelay`). */
+ *  tests (a fake `fetchFn`, a short `retryDelay`), and for the daemon's per-attempt `timeout` and `totalTimeoutMs`.
+ *
+ *  H3 fix round 2 (re-review I-a): with `totalTimeoutMs`, one request -- every attempt and every wait between them --
+ *  never takes longer than that. The retries are this transport's own then (the same classes, back-off and
+ *  `Retry-After` cap as viem's), because viem's cannot be stopped by a deadline: an attempt still in flight at the
+ *  deadline is abandoned (it ends at its own `timeout`), and no retry starts whose wait would end past it. The error
+ *  thrown is the last attempt's, so a rate limit stays a rate limit (`isRateLimited`), never a refusal; a request with
+ *  no answer at all by the deadline is viem's `TimeoutError`. A send is still attempted exactly once: viem passes
+ *  `retryCount: 0` for it, and the send methods are excluded by name as well. */
 export function rpcTransport(
   url: string,
-  overrides: Pick<HttpTransportConfig, "fetchFn" | "retryCount" | "retryDelay" | "timeout"> = {},
+  overrides: Pick<HttpTransportConfig, "fetchFn" | "retryCount" | "retryDelay" | "timeout"> & { totalTimeoutMs?: number } = {},
 ): HttpTransport {
-  return http(url, {
-    retryCount: overrides.retryCount ?? RPC_RETRY_COUNT,
-    retryDelay: overrides.retryDelay ?? RPC_RETRY_DELAY_MS,
+  const retryCount = overrides.retryCount ?? RPC_RETRY_COUNT;
+  const retryDelay = overrides.retryDelay ?? RPC_RETRY_DELAY_MS;
+  const options = {
     ...(overrides.timeout === undefined ? {} : { timeout: overrides.timeout }),
     fetchFn: cappedRetryAfter(overrides.fetchFn),
-  });
+  };
+  const total = overrides.totalTimeoutMs;
+  if (total === undefined) return http(url, { retryCount, retryDelay, ...options });
+  const single = http(url, { retryCount: 0, retryDelay, ...options });
+  return (params) => {
+    const base = single(params);
+    const once = (args: Parameters<typeof base.request>[0], opts: Parameters<typeof base.request>[1]) =>
+      base.request(args, { ...opts, retryCount: 0 });
+    const request = (async (args, opts) => {
+      if (opts?.retryCount === 0 || SEND_METHODS.has(args.method)) return once(args, opts);
+      const deadline = Date.now() + total;
+      let last: unknown;
+      for (let count = 0; ; count++) {
+        const left = deadline - Date.now();
+        const attempt = once(args, opts);
+        attempt.catch(() => undefined); // abandoned at the deadline: it ends at its own timeout, unobserved
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const outcome = await Promise.race([
+          attempt.then(
+            (value: unknown) => ({ value }),
+            (error: unknown) => ({ error }),
+          ),
+          new Promise<{ late: true }>((resolve) => {
+            timer = setTimeout(() => resolve({ late: true }), Math.max(0, left));
+          }),
+        ]);
+        clearTimeout(timer);
+        if ("value" in outcome) return outcome.value;
+        if ("late" in outcome) throw last ?? new TimeoutError({ body: args as unknown as Record<string, unknown>, url });
+        last = outcome.error;
+        if (count >= retryCount || !retryable(last)) throw last;
+        const wait = retryAfterMs(last) ?? (1 << count) * retryDelay;
+        if (Date.now() + wait >= deadline) throw last;
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }) as typeof base.request;
+    // `totalTimeoutMs` shows on the client's `transport`, as `retryCount` and `timeout` do.
+    return { ...base, config: { ...base.config, retryCount, retryDelay, totalTimeoutMs: total } as typeof base.config, request };
+  };
+}
+
+/** The methods that send a transaction: attempted once, whatever the caller asks. */
+const SEND_METHODS = new Set(["eth_sendRawTransaction", "eth_sendTransaction", "wallet_sendTransaction", "eth_sendRawTransactionSync"]);
+
+/** viem's own retry classes (`shouldRetry`, `utils/buildRequest.ts`), plus any `isRateLimited` wording. */
+function retryable(err: unknown): boolean {
+  if (!(err instanceof Error) || err.name === "AbortError") return false;
+  if (isRateLimited(err)) return true;
+  const code = numberField(err, "code");
+  if (code !== undefined) return code === -1 || code === -32005 || code === -32603 || code === 429 || code === -32007;
+  if (err instanceof HttpRequestError && err.status) return [403, 408, 413, 429, 500, 502, 503, 504].includes(err.status);
+  return true; // a timeout, a network failure
+}
+
+/** An HTTP 429's `Retry-After`, in ms, capped at `RPC_RETRY_AFTER_MAX_S`. */
+function retryAfterMs(err: unknown): number | undefined {
+  for (const e of causes(err)) {
+    const after = e instanceof HttpRequestError ? e.headers?.get("retry-after") : null;
+    if (after && /^\s*\d+\s*$/.test(after)) return Math.min(Number(after), RPC_RETRY_AFTER_MAX_S) * 1000;
+  }
+  return undefined;
 }
 
 // ------------------------------------------------------------------------------------ classification

@@ -23,6 +23,7 @@ import {
   TxFeeCapError,
   TxInsufficientFundsError,
   TxNonceUsedError,
+  TxPastGiveUpError,
   TxReceiptMissingError,
   TxStuckError,
   TxWaitAbortedError,
@@ -769,6 +770,40 @@ describe("H3 fix round 1 (review M1, M3): the replacement paths", () => {
     // Before: the wait's own check passed at ~30 ms, and replaceOwn transmitted at ~230 ms, past the give-up time.
     expect(n.attempts).toHaveLength(1);
     expect(w.tracked()).toMatchObject([{ nonce: 0, state: "released", hashes: [a] }]);
+  });
+});
+
+describe("H3 fix round 2 (re-review M-g): notAfter on a fresh send", () => {
+  it("a fresh send whose reads end past notAfter is not sent, and leaves no entry", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    const realBalance = n.rawClient.getBalance;
+    n.rawClient.getBalance = async () => {
+      await nap(150); // a slow read, retried by the transport
+      return realBalance();
+    };
+    const err = await w.send({ to: to(7), data: "0x07", notAfter: Date.now() + 50 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TxPastGiveUpError);
+    expect(n.attempts).toHaveLength(0);
+    expect(w.tracked()).toEqual([]);
+    // Before its notAfter it goes out as always: the check never holds back a send that is still in time.
+    n.rawClient.getBalance = realBalance;
+    const h = await w.send({ to: to(7), data: "0x07", notAfter: Date.now() + 10_000 });
+    expect(n.byHash(h).nonce).toBe(0);
+  });
+
+  it("a send replacing a released entry past notAfter sends nothing; the entry stays released for the next send", async () => {
+    const n = mempool({ signing: true });
+    const w = new SerialTxSender(n.inner, n.client);
+    n.state.market = 10n ** 12n;
+    const a = await w.send({ to: to(7), data: "0x07" });
+    await waitOrReplace(n.client, w, { to: to(7), data: "0x07" }, a, { timeoutMs: 5, pollMs: 1, giveUpAt: Date.now() }).catch(() => undefined);
+    const err = await w.send({ to: to(8), data: "0x08", notAfter: Date.now() - 1 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TxPastGiveUpError);
+    expect(n.attempts).toHaveLength(1);
+    expect(w.tracked()).toMatchObject([{ nonce: 0, state: "released", hashes: [a] }]);
+    const b = await w.send({ to: to(8), data: "0x08" }); // never abandoned: replaced at its nonce
+    expect(n.byHash(b).nonce).toBe(0);
   });
 });
 
