@@ -10,6 +10,7 @@ import { RpcChainReader, type HubLike } from "../src/chain.js";
 import { WebSocket as WsClient } from "ws";
 import { ipKey, RateLimiter } from "../src/limits.js";
 import { SqliteRepo } from "../src/repo.js";
+import { skillMd } from "../src/docs.js";
 import { startServer, type ArenaServer } from "../src/server.js";
 import { FakeChain, testConfig } from "./helpers/fakeChain.js";
 
@@ -620,7 +621,11 @@ describe("http foundation", () => {
   it("Fix round 1, I2: session-gas-low is reworded to point at the native balance, not USDC", async () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const text = await (await fetch(`${server.url}/skill.md`)).text();
-    const line = text.slice(text.indexOf("`session-gas-low`: the channel's"));
+    // Plan 6 H2 (audit-journey I-2): the entry now opens by saying it is urgent; on a dev chain it still names the
+    // native balance (the Arc wording is pinned in the "Plan 6 hardening H2" tests below).
+    const at = text.indexOf("- `session-gas-low` (urgent: without dispute gas the daemon cannot answer a challenge): the channel's");
+    expect(at).toBeGreaterThan(-1);
+    const line = text.slice(at, text.indexOf("\n- `fund` still shows a shortfall", at));
     expect(line).toMatch(/native/);
     expect(line).toMatch(/arena wallet.*`native`/);
     expect(line).toMatch(/arena faucet/);
@@ -779,9 +784,15 @@ describe("http foundation", () => {
     const CMD = "my-arena";
     // Final fix wave (I-2, m-3, m-4): enabled before the daemon starts (it loads the SDK only then), what the
     // fallback actually guarantees, the measured size, and a check of what the RUNNING daemon loaded.
+    // Plan 6 H2 (audit-journey I-5): the install often outlasts a tool's 2-minute limit -- run it in the
+    // background, poll `xmtp status`, and retry a killed run (the next one clears its leftover temp dir).
     const RECIPE_SENTENCE = [
       `   Recommended before playing for real money, and before step 2: \`${CMD} xmtp enable\` (one-time, about`,
-      "   480 MB). The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
+      "   480 MB, and often longer than a tool's 2-minute command limit). Run it with your tool's own background-task",
+      `   feature, or \`nohup ${CMD} xmtp enable > "\${ARENA_HOME:-$HOME/.arena}/xmtp-enable.log" 2>&1 &\`, then poll`,
+      `   \`${CMD} xmtp status\` until it shows \`"enabled": true\` (it stays \`false\` until the install finishes). If`,
+      "   it failed, or was killed part-way, run it again: the next run clears what the last one left behind.",
+      "   The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
       "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
       "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
     ].join("\n");
@@ -827,6 +838,125 @@ describe("http foundation", () => {
       expect(text).not.toContain("xmtp enable");
       expect(text).not.toContain("xmtp status");
       expect(text).not.toContain("transport:");
+    });
+  });
+
+  describe("Plan 6 hardening H2 (audit-journey): skill.md on Arc", () => {
+    const PINNED = "npx -y @x/arena@0.1.0";
+    const URL = "https://chess.example";
+    const arcConfig = (chainId: number) =>
+      testConfig({
+        chainId,
+        rpcUrl: "https://rpc.mainnet.arc.io",
+        publicRpcUrl: "https://rpc.mainnet.arc.io",
+        usdc: "0x3600000000000000000000000000000000000000",
+        cli: { package: "@x/arena", version: "0.1.0" },
+        cliCommand: PINNED,
+        xmtp: { env: "production" },
+        audit: "unaudited",
+      });
+    const recipeOf = (text: string) => text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("## Setup (once)"));
+    const stepOf = (recipe: string, from: string, to: string) => recipe.slice(recipe.indexOf(from), recipe.indexOf(to));
+    // C-1: right after the wait, the facts a human asks for -- the network, the explorer, the way in -- and what the
+    // agent must never do. Pinned line for line.
+    const ARC_SOURCING = [
+      "   There is no faucet on Arc: your human needs USDC on Arc itself",
+      "   (chain id `5042`, explorer https://explorer.arc.io), and USDC sent on any other network never arrives",
+      "   here. If they ask how: Circle's CCTP bridge moves USDC to Arc from another chain, or an exchange or wallet that supports Arc can send it.",
+      "   Do not operate a bridge or an exchange yourself, and never send funds anywhere on your human's behalf.",
+    ].join("\n");
+    // C-2: the owner must be an address the human controls on Arc, confirmed before owner set.
+    const ARC_OWNER = [
+      "   When your human gives you the address to return winnings to, first confirm with them that it is an",
+      "   address they control on Arc -- not an exchange deposit address unless that exchange supports USDC",
+      "   deposits on Arc, and not a smart wallet deployed only on another chain: `withdraw` pays it on",
+      `   Arc only, in one irreversible transfer. Then run \`${PINNED} owner set <address>\` to record it.`,
+    ].join("\n");
+
+    it("mainnet (5042): one balance -- no native object, no --wait-for-native -- and USDC on Arc only", () => {
+      const text = skillMd(arcConfig(5042), URL);
+      const recipe = recipeOf(text);
+      // I-1: on Arc the recipe uses only usdc.* and --wait-for-usdc.
+      expect(text).not.toContain("--wait-for-native");
+      expect(text).not.toMatch(/native\.(need|shortfall|have)/);
+      expect(recipe).toContain(`${PINNED} wallet --wait-for-usdc <usdc.need> --timeout 100\`, repeated while \`reached\` is \`false\``);
+      expect(recipe).toMatch(/On Arc, gas is USDC: it is already inside `usdc.need`, so `fund` prints no `native` object and\s+you wait for USDC alone\./);
+      expect(recipe).toContain("Exit 1 means the command itself or the RPC failed");
+      // C-1, M-8.
+      expect(recipe).toContain(ARC_SOURCING);
+      expect(recipe).toMatch(/tell your human what `\/templates`' `audit` says about\s+these contracts, and the per-player cap/);
+      expect(recipe).toMatch(/This server has no faucet: your human\s+funds the wallet in step 4\./);
+      expect(text).not.toContain("auto-funds it from this server's dev");
+      // C-2: step 1's --owner, step 4's owner set, step 8's confirmation.
+      expect(recipe).toContain(ARC_OWNER);
+      expect(recipe).toMatch(/\(one they control on Arc: see\s+step 4\)/);
+      const step8 = stepOf(recipe, "8. Ask your human whether to withdraw now", "**Troubleshooting:**");
+      expect(step8).toMatch(/that it is sent on Arc\s+\(chain id `5042`\) to that address only; run `npx -y @x\/arena@0\.1\.0 withdraw --all` only once they confirm\./);
+      // M-3: the reserve stays.
+      expect(step8).toMatch(/so its `usdcAfter` is not 0: that is expected, so do not retry\./);
+      // I-3: P&L and withdraw only after the sweep, with gas reported as gas.
+      const step7 = stepOf(recipe, "7. Once", "8. Ask your human");
+      expect(step7).toMatch(/wait\s+until its `swept` is no longer `null`/);
+      expect(step7).toContain(`${PINNED} sweep --channel <channelId>`);
+      expect(step7.indexOf("`swept`")).toBeLessThan(step7.indexOf(`${PINNED} wallet`));
+      expect(step7).toMatch(/minus the gas this channel's\s+transactions paid: on Arc, gas is paid in USDC/);
+      expect(step7).toContain("Report the gas as gas, not as a game loss.");
+      expect(step7).toContain("minus the starting balance you noted in step 4");
+      // I-7: a stopping rule, the 1 h expiry, no cancel.
+      expect(recipe).toMatch(/for up to about 30 minutes\. If you are still unmatched, tell your\s+human and stop waiting\./);
+      expect(recipe).toMatch(/stays matchable until its `expiresAt` \(1 hour after\s+you posted it; `offers` shows it, in unix seconds\) and cannot be cancelled/);
+      // M-5.
+      expect(recipe).toContain("(`game-over`, or `new-game-proposed` when the opponent proposes the next game first)");
+      // I-5: background install, polled.
+      expect(recipe).toMatch(/Run it with your tool's own background-task\s+feature/);
+      expect(recipe).toContain(`\`${PINNED} xmtp status\` until it shows \`"enabled": true\``);
+      // I-2: session-gas-low on Arc is USDC, with no native balance to check.
+      const gasLow = text.slice(text.indexOf("- `session-gas-low` (urgent"), text.indexOf("- `fund` still shows a shortfall"));
+      expect(gasLow).toMatch(/On Arc, gas is USDC: the reserve is paid from the same\s+`usdc` balance/);
+      expect(gasLow).toMatch(/`sessionGasWei` \(wei: divide by\s+10\^18 for USDC; 0\.336 USDC by default\)/);
+      expect(gasLow).not.toMatch(/\*\*native\*\*|`native` field|faucet/);
+      // C-1 troubleshooting: check the hash on the explorer; never recover it yourself.
+      expect(text).toContain("it on the explorer (`https://explorer.arc.io/tx/<hash>`). If it was sent on a different network, it will never");
+      // M-9, I-6, M-1, M-2.
+      expect(text).toContain("- `init` refused with `refusing to init on Arc`: this host's contracts are not the ones this CLI pins.");
+      expect(text).toMatch(/only for a key that is used for nothing else, ever: the daemon replaces any pending transaction on that key/);
+      expect(text).toMatch(/`336000000000000000` is 0\.336 USDC/);
+      expect(text).toMatch(/any amount an error gives\s+in `wei` are native units with 18 decimals; on Arc, where gas is USDC, 10\^18 wei = 1 USDC\./);
+      // I-4 / C-3: no stale figures.
+      expect(text).not.toMatch(/0\.34\b|0\.84|21,225|21225/);
+      // Every command is the pinned one; the bare word is the title alone.
+      expect(text.split("\n").filter((line) => /\barena\b/i.test(line) && !line.includes(PINNED))).toEqual(["# Agent Chess Arena"]);
+    });
+
+    it("testnet (5042002): named Arc Testnet, its explorer, and Circle's faucet as the way in", () => {
+      const text = skillMd(arcConfig(5042002), URL);
+      expect(text).not.toContain("--wait-for-native");
+      expect(text).toContain(
+        [
+          "   Your human needs USDC on Arc Testnet itself",
+          "   (chain id `5042002`, explorer https://explorer.testnet.arc.io), and USDC sent on any other network never arrives",
+          "   here. If they ask how: Arc Testnet's USDC comes from Circle's faucet (https://faucet.circle.com).",
+        ].join("\n"),
+      );
+      expect(text).not.toContain("There is no faucet on Arc Testnet");
+      expect(text).not.toContain("CCTP");
+      expect(text).toContain("https://explorer.testnet.arc.io/tx/<hash>");
+      expect(text).toContain("address they control on Arc Testnet -- not an exchange deposit address");
+      expect(text).toContain("`refusing to init on Arc Testnet`");
+    });
+
+    it("a dev chain (31337): none of the Arc-only lines, and step 4 states both variants", () => {
+      const text = skillMd(testConfig(), "http://127.0.0.1:3000");
+      for (const arcOnly of ["CCTP", "refusing to init on Arc", "usdcAfter", "This server has no faucet", "explorer.arc.io", "Report the gas as gas"]) {
+        expect(text, arcOnly).not.toContain(arcOnly);
+      }
+      const step4 = stepOf(recipeOf(text), "4. `arena fund --offer", "5. Run");
+      expect(step4).toMatch(/`fund` prints it as its own `native` object; on Arc, gas\s+is USDC, already inside `usdc.need`, and there is no `native` object\./);
+      expect(step4).toContain("arena wallet --wait-for-usdc <usdc.need> --wait-for-native <native.need> --timeout 100");
+      // The owner is still confirmed for this chain, and the swept wait and stopping rule hold everywhere.
+      expect(step4).toMatch(/first confirm with them that it can receive\s+USDC on this chain \(chain id `31337`\)/);
+      expect(recipeOf(text)).toMatch(/wait\s+until its `swept` is no longer `null`/);
+      expect(step4).toMatch(/tell your\s+human and stop waiting\./);
     });
   });
 
