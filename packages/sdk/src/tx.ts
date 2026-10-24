@@ -966,6 +966,9 @@ export async function waitOrReplace(
         gas: (pending as { gas?: bigint }).gas,
         ...replacementFees(base, await estimateLike(client, base)),
       };
+      // H3: the estimate is one more read, and a rate-limited read is retried for up to ~20 s (`rpcTransport`): the
+      // give-up time is checked again right before the send, so no replacement goes out past it.
+      if (pastGiveUp()) throw new TxStuckError(hashes, true, nonce, lastFees);
       // Final review m1: the entry's hashes before this send. A send that fails ambiguously (a lost response) may
       // still have added its transaction to the entry; that one is ours too (see the catch below).
       const before = new Set(tracker?.entryOf(hash)?.hashes ?? []);
