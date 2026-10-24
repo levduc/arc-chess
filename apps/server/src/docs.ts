@@ -278,6 +278,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
       + ` more\`: re-run \`${cmd} offers\`, pick another, and run \`fund --offer\` for it (step 5).`,
     "- Any command failing to connect at all (not a 4xx/5xx, a bare connection error) means the daemon from step 2",
     "  is not running, or not reachable yet: check it, then retry.",
+    "- `the RPC is rate-limiting`: the daemon has already retried; wait a few seconds and retry the command (after an",
+    "  action, check `status` first). An action answered with `chainStale: true` took effect; only its chain view is stale.",
     `- \`opponent-silent\`: run \`${cmd} challenge\` to force them to answer on-chain before the deadline, or claim`,
     "  the forfeit once it passes.",
     "- `challenge-unseen`, or a suggested action starting \"check the RPC: block(s) …\": your RPC refuses to serve",

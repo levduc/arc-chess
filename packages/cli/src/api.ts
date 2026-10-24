@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
+import { isRateLimited } from "@arena/sdk";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
 import { selfCommand } from "./version.js";
 
@@ -403,26 +404,26 @@ export async function startApi(
             const m = str(b.move);
             if (!m) throw new DaemonError(400, "move is required");
             await daemon.move(ch, m, { offerDraw: b.offerDraw === true, actor });
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           }
           case "POST /resign":
             await daemon.resign(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /accept-draw":
             await daemon.acceptDraw(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /next-game":
             await daemon.nextGame(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /close":
             await daemon.close(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /challenge":
             await daemon.challenge(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /reclaim":
             await daemon.reclaim(ch);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /sweep":
             // Plan 5 Task 1: a daemon-wide sweep (no `channel`) has no single channel's status to return.
             return send(res, 200, await daemon.sweep(ch));
@@ -433,7 +434,7 @@ export async function startApi(
             // break is not refused as a stray "\r"; a lone "\r" still is.
             const note = typeof b.note === "string" ? b.note.replace(/\r\n/g, "\n") : "";
             await daemon.handoff(ch, to, note);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           }
           case "POST /withdraw": {
             // Plan 5.6 Task 3 (spec §4.4): either actor may ask -- the owner lock, not the actor, is the protection.
@@ -459,7 +460,13 @@ export async function startApi(
         // ERR_HTTP_HEADERS_SENT and crashes this handler instead of just ending the one response.
         if (res.headersSent) return void res.end();
         if (err instanceof DaemonError) return send(res, err.code, { error: err.message });
-        return send(res, 500, { error: err instanceof Error ? err.message.split("\n")[0] : String(err) });
+        const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        // H3 (Arc testnet rehearsal §8.2, §8.3): a rate limit that outlasted the daemon's own retries is named as one,
+        // so the agent knows the fix is to wait -- viem's own words ("HTTP request failed.") do not say so.
+        if (isRateLimited(err)) {
+          return send(res, 503, { error: `the RPC is rate-limiting (${message}): wait a few seconds, then retry (check status first after an action)` });
+        }
+        return send(res, 500, { error: message });
       }
     })();
   });

@@ -1,6 +1,7 @@
 import { request as httpRequest } from "node:http";
 import { connect as netConnect, type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
+import { LimitExceededRpcError, type Hex } from "viem";
 import { loadToken, startApi } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -127,6 +128,61 @@ describe("local API", () => {
     expect(crlf.status).toBe(200);
     expect(crlf.body.handoff.note).toBe("line one\nline two");
     expect((await call(url, token, "POST", "/handoff", { to: "human", note: "lone\rcr" })).status).toBe(400);
+  });
+
+  it("H3: an action that took effect answers 200 with chainStale when only the chain read after it fails; a rate limit is a 503", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    const bobToken = loadToken(pair.bob.home);
+    const bobApi = await startApi(pair.bob.daemon, { port: 0, token: bobToken });
+    stop = async () => {
+      server.close();
+      bobApi.server.close();
+      await pair.cleanup();
+    };
+    const call = async (base: string, tok: string, method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+      const res = await fetch(`${base}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${tok}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const offer = await call(url, token, "POST", "/offers", { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" });
+    await call(bobApi.url, bobToken, "POST", "/offers/accept", { offerId: offer.body.offerId });
+    await waitFor(async () => (await call(url, token, "GET", "/status")).body.phase === "Open", 30_000, "open");
+    // Arc's RPC rate-limits the chain read that follows the move (rehearsal §8.2), and only that read.
+    const d = pair.alice.daemon;
+    const limit = { on: false };
+    const realInfo = d.hub.channelInfo.bind(d.hub);
+    d.hub.channelInfo = async (id: Hex) => {
+      if (limit.on) throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      return realInfo(id);
+    };
+    const realMove = d.move.bind(d);
+    d.move = async (...args: Parameters<typeof d.move>) => {
+      await realMove(...args);
+      limit.on = true;
+    };
+    const moved = await call(url, token, "POST", "/move", { move: "e4" });
+    // Before H3: a 500, although the move had been signed and relayed.
+    expect(moved.status).toBe(200);
+    expect(moved.body.chainStale).toBe(true);
+    expect(moved.body.chainStaleReason).toMatch(/Request exceeds defined limit/);
+    expect(moved.body.turnNum).toBe("1");
+    expect(moved.body.lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    expect((await call(bobApi.url, bobToken, "GET", "/wait?timeout=10")).body.reason).toBe("your-turn"); // it took effect
+    // A read-only route has nothing to fall back on: it fails, but as a rate limit, with what to do.
+    const st = await call(url, token, "GET", "/status");
+    expect(st.status).toBe(503);
+    expect(st.body.error).toMatch(/^the RPC is rate-limiting \(Request exceeds defined limit\.\): wait a few seconds/);
+    // An action that fails is still an error.
+    expect((await call(url, token, "POST", "/move", { move: "d4" })).status).toBe(409);
+    limit.on = false;
+    const fresh = await call(url, token, "GET", "/status");
+    expect(fresh.status).toBe(200);
+    expect(fresh.body.chainStale).toBeUndefined();
   });
 
   it("Plan 5 Task 1: POST /offers without challengeTimeout defaults to minChallengeTimeoutOf(config)", async () => {

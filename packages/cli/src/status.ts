@@ -111,6 +111,11 @@ export type ChannelStatus = {
   /** H1 fix round 1 (review m-2): blocks whose dispute events for this channel the RPC refused to serve, even alone,
    *  and the scan skipped (`ChannelRecord.skippedEventBlocks`), as decimal strings; empty when none. */
   skippedEventBlocks: string[];
+  /** H3 (Arc testnet rehearsal §8.2): set only on an action route's answer (`POST /move`, `/close`, ...) whose action
+   *  took effect but whose chain refresh afterwards failed (a rate-limited RPC): the chain fields are the last ones
+   *  read, and `chainStaleReason` says why they could not be read again. A `GET /status` never sets it. */
+  chainStale?: true;
+  chainStaleReason?: string;
 };
 
 export type StatusInput = {

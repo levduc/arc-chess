@@ -1708,6 +1708,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       return 1;
     }
     io.out(JSON.stringify(payload, null, 2));
+    // H3 (Arc testnet rehearsal §8.2): the action took effect; only the chain read after it failed.
+    const stale = payload as { chainStale?: unknown; chainStaleReason?: unknown };
+    if (stale.chainStale === true) {
+      io.err(
+        `note: ${cmd} took effect, but the chain could not be read afterwards (${String(stale.chainStaleReason)}): ` +
+          `the chain fields above may be stale; run "${CLI_COMMAND} status" for a fresh view`,
+      );
+    }
     // Plan 5 fix round (I5): a daemon-wide sweep may not finish everything within its own time budget.
     if (cmd === "sweep" && typeof (payload as { remaining?: unknown }).remaining === "number") {
       const remaining = (payload as { remaining: number }).remaining;

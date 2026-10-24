@@ -177,6 +177,19 @@ describe("arena CLI", () => {
     expect(t2.err).toEqual([]); // nothing left: no note printed
   });
 
+  it("H3: an action answered with chainStale exits 0 and says the chain fields may be stale", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const body = { channelId: "0xaa", turnNum: "1", chainStale: true, chainStaleReason: "Request exceeds defined limit." };
+    const t = io(home, [{ status: 200, body }]);
+    expect(await runCli(["move", "e4"], t.io)).toBe(0);
+    expect(JSON.parse(t.out.join("\n"))).toEqual(body);
+    expect(t.err.join("\n")).toMatch(/note: move took effect, but the chain could not be read afterwards \(Request exceeds defined limit\.\)/);
+    const fresh = io(home, [{ status: 200, body: { channelId: "0xaa", turnNum: "1" } }]);
+    expect(await runCli(["move", "e4"], fresh.io)).toBe(0);
+    expect(fresh.err).toEqual([]);
+  });
+
   it("reports API errors and usage errors", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     const t = io(home, [{ status: 409, body: { error: "not your turn" } }]);

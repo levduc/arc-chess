@@ -3643,6 +3643,27 @@ export class ArenaDaemon {
     return this.statusOf(l);
   }
 
+  /**
+   * H3 (Arc testnet rehearsal §8.2): the status an action route (`POST /move`, `/close`, `/challenge`, ...) answers
+   * with, once its action has taken effect. Its chain refresh can fail on its own -- a rate-limited RPC -- and that
+   * must not turn a move that was signed and relayed into an error the agent may act on: the last known status is
+   * returned instead, with `chainStale` and the reason. A `DaemonError` (no such channel) is thrown as by `status`.
+   */
+  async statusAfterAction(ref?: string): Promise<ChannelStatus> {
+    try {
+      return await this.status(ref);
+    } catch (err) {
+      if (err instanceof DaemonError) throw err;
+      let l: ChannelHandle;
+      try {
+        l = this.pick(ref);
+      } catch {
+        throw err;
+      }
+      return { ...this.statusOf(l), chainStale: true, chainStaleReason: errorText(err) };
+    }
+  }
+
   /** Every live channel's status, followed by the channels that could not be loaded (I1). Plan 4.5 Task 11 fix
    *  round: skips the chain refresh entirely for Finalized/Reclaimed channels (see `status`'s comment), and reads
    *  the current block once for the whole call rather than once per channel -- both used to make this call's
