@@ -4,7 +4,6 @@ import {
   createPublicClient,
   defineChain,
   erc20Abi,
-  http,
   parseEventLogs,
   TransactionNotFoundError,
   type Address,
@@ -38,9 +37,11 @@ import {
   hashState,
   isGameOver,
   isInsufficientFundsError,
+  isRangeRefusal,
   mover,
   offerId as computeOfferId,
   outcome,
+  rpcTransport,
   signAcceptance,
   signOffer,
   verifyOffer,
@@ -134,6 +135,20 @@ export class SweepReadError extends Error {
   constructor(cause?: unknown) {
     super(`a read failed before anything was sent: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
     this.name = "SweepReadError";
+  }
+}
+
+/** H3 (Arc testnet rehearsal §8.4): a sweep was sent, and its receipt wait then failed in a way that says nothing
+ *  about the transaction itself -- a rate-limited receipt read, a failed replacement send. `hashes`, the sweep's own
+ *  transaction and every replacement of it, may still land (or have landed): the next attempt checks them before it
+ *  reads the key's balance, so a landed sweep is never recorded as `"dust"`. */
+export class SweepWaitError extends Error {
+  constructor(
+    readonly hashes: Hex[],
+    cause: unknown,
+  ) {
+    super(`sweep ${hashes.at(-1)} was sent, but its receipt wait failed: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
+    this.name = "SweepWaitError";
   }
 }
 
@@ -685,7 +700,8 @@ export class ArenaDaemon {
       nativeCurrency: { name: "Native", symbol: "NATIVE", decimals: 18 },
       rpcUrls: { default: { http: [c.rpcUrl] } },
     });
-    this.client = createPublicClient({ chain: this.chain, transport: http(c.rpcUrl) });
+    // H3: a rate-limited read is retried with back-off (`rpcTransport`; Arc testnet rehearsal §8.2). Sends never are.
+    this.client = createPublicClient({ chain: this.chain, transport: rpcTransport(c.rpcUrl) });
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
@@ -2033,6 +2049,9 @@ export class ArenaDaemon {
         );
       }
       const req = { to: this.wallet.address, data: "0x" as Hex, value, gas: gasLimit };
+      // H3: every hash this key's sender already holds -- an earlier intent's -- so a failed wait below names only this
+      // sweep's own transactions (the next attempt records whichever of them landed as the sweep).
+      const earlier = new Set(sender.tracked().flatMap((t) => t.hashes));
       let hash: Hex;
       try {
         hash = await sender.send(req);
@@ -2040,7 +2059,25 @@ export class ArenaDaemon {
         if (err instanceof TxInsufficientFundsError && attempt === 0) continue; // I7: one immediate retry
         throw err;
       }
-      const receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal, giveUpAt });
+      let receipt: Awaited<ReturnType<typeof waitOrReplace>>;
+      try {
+        receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal, giveUpAt });
+      } catch (err) {
+        // These carry their own verdict on the transaction (and the hashes to check, where it may still land).
+        if (
+          err instanceof TxReceiptMissingError ||
+          err instanceof TxDroppedError ||
+          err instanceof TxStuckError ||
+          err instanceof TxWaitAbortedError ||
+          err instanceof TxNonceUsedError
+        ) {
+          throw err;
+        }
+        // H3 (rehearsal §8.4): anything else -- a rate-limited receipt read, most likely -- left the sweep sent and
+        // unconfirmed. Before, its hash was dropped here, and the next attempt read the landed sweep's leftover as dust.
+        const own = (sender.tracker?.entryOf(hash)?.hashes ?? []).filter((h) => h !== hash && !earlier.has(h));
+        throw new SweepWaitError([hash, ...own], err);
+      }
       if (receipt.status !== "success") throw new Error(`sweep transaction ${receipt.transactionHash} reverted`);
       return { status: "swept", amount: value, hash: receipt.transactionHash };
     }
@@ -2196,6 +2233,8 @@ export class ArenaDaemon {
         // H1 (audit-daemon M-12): a reported drop too. A load-balanced RPC can report a transaction dropped that
         // another of its nodes mines later; the next attempt's check records that as the sweep, not as "dust".
         remember([err.hash]);
+      } else if (err instanceof SweepWaitError) {
+        remember(err.hashes); // H3: sent, then its receipt wait failed -- it may have landed
       } else if (err instanceof TxStuckError || err instanceof TxWaitAbortedError) {
         // Fix round 3, I-1(c): probe E3 -- a sweep this wait gave up on (a tight giveUpAt, or stop()) can still
         // land later: any one of the original send or its fee-bumped replacements might mine after this daemon
@@ -2218,6 +2257,13 @@ export class ArenaDaemon {
         // H1 (M-12): not charged here -- the next attempt checks the hash first, and charges the attempt if the
         // transaction is really gone (a "failed" recovery), or records the sweep if it landed after all.
         this.log(`channel ${record.channelId}: sweep transaction ${err.hash} was reported dropped; checked first on the next attempt`);
+        this.bumpSweepBackoff(record.channelId, backoff);
+        return { kind: "error", record, error: err };
+      }
+      if (err instanceof SweepWaitError) {
+        // H3 (rehearsal §8.4): not charged, like a reported drop -- the next attempt checks the hashes first, and
+        // charges the attempt if they are really gone, or records the sweep if one landed.
+        this.log(`channel ${record.channelId}: ${errorText(err)}; its transaction(s) are checked first on the next attempt`);
         this.bumpSweepBackoff(record.channelId, backoff);
         return { kind: "error", record, error: err };
       }
@@ -3409,6 +3455,15 @@ export class ArenaDaemon {
         try {
           events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
         } catch (err) {
+          // H3: only a refusal of the query itself (`isRangeRefusal`) may split the range or count toward a skip. A
+          // rate limit, a timeout, a 5xx -- anything else -- ends this channel's scan for the pass, uncounted and
+          // unprobed: the next pass reads the same range again. Before, a rate-limited read whose probe slipped
+          // through was split, and a block rate-limited on three passes was skipped.
+          if (!isRangeRefusal(err)) {
+            this.saveCursor(l, cursor); // what was read before it stays read
+            l.lastError = `events: ${errorText(err)}`;
+            return;
+          }
           // H1 (audit-contracts I1, "oversized events"): the hub re-emits a proof's unchecked signature bytes, so
           // a griefer can make a range's response larger than an RPC serves. If the RPC serves the same range for no
           // channel (so it is up, and this channel's events are what it refuses), the range is split, down to one

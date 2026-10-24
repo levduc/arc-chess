@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-import { createTestClient, http, TransactionReceiptNotFoundError, type Hex } from "viem";
+import { createTestClient, http, LimitExceededRpcError, TransactionReceiptNotFoundError, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
@@ -2466,6 +2466,46 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     expect(l.record.swept).toBe(true);
     expect(l.record.sweptTx).toBe(hash);
     expect(l.record.sweptAmount).toBe(value);
+  });
+
+  it("H3 (rehearsal §8.4): a sweep whose receipt read is rate-limited keeps its hash; it is recorded as the sweep, not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    // The real sweep runs; the first read of its receipt is refused as Arc's RPC refused it in the rehearsal.
+    let sweepHash: Hex | undefined;
+    const realSend = sender.send.bind(sender);
+    sender.send = async (tx) => {
+      const h = await realSend(tx);
+      sweepHash ??= h;
+      return h;
+    };
+    const realReceipt = d.client.getTransactionReceipt.bind(d.client);
+    let refused = 0;
+    d.client.getTransactionReceipt = (async (args: { hash: Hex }) => {
+      if (args.hash === sweepHash && refused === 0) {
+        refused++;
+        throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      }
+      return realReceipt(args);
+    }) as typeof d.client.getTransactionReceipt;
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx !== undefined, 10_000, "the hash is remembered for the next attempt");
+    expect(refused).toBe(1);
+    expect(l.sweep.pendingTx).toEqual([sweepHash]);
+    expect(l.record.sweepPending).toEqual([sweepHash]); // on disk too: a restart checks it as well
+    expect(l.sweep.attempts).toBe(0); // not charged
+    expect(l.record.swept).toBeUndefined();
+    // Before H3: "sweep failed (retried with back-off)", the hash forgotten, and the next attempt read the leftover
+    // (0.0002667 USDC in the rehearsal) as "dust".
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptTx).toBe(sweepHash);
+    expect(l.record.sweeps).toHaveLength(1);
+    expect(l.record.sweeps?.[0].tx).toBe(sweepHash);
+    expect(l.record.sweepPending).toBeUndefined();
   });
 });
 
