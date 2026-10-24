@@ -178,6 +178,8 @@ type State = {
   notes: string[];
   withdraws: Partial<Record<Name, { txHash: Hex; amount: string; usdcAfter: string | null }>>;
   endBlock?: string;
+  /** How often a daemon API call came back rate-limited, by route. */
+  rateLimited?: Record<string, number>;
 };
 
 function loadState(): State {
@@ -446,7 +448,7 @@ const RATE_LIMITED = /exceeds defined limit|rate limit|status 429|-32005/i;
 
 /** How often the daemons' API answered with a rate-limit error, by route (for the report). */
 function countRateLimit(where: string): void {
-  const rl = ((state as State & { rateLimited?: Record<string, number> }).rateLimited ??= {});
+  const rl = (state.rateLimited ??= {});
   rl[where] = (rl[where] ?? 0) + 1;
   save();
 }
@@ -1220,8 +1222,6 @@ async function blockscoutFrom(address: Address, fromBlock: bigint): Promise<Hex[
   return out;
 }
 
-const SELECTORS_ERC20 = erc20Abi;
-
 async function collect(): Promise<void> {
   if (!state.startBlock || !state.deployerBefore) throw new Error("no run to collect: state.json has no start block");
   const startBlock = BigInt(state.startBlock);
@@ -1318,7 +1318,7 @@ async function collect(): Promise<void> {
       }
     } else if (to === USDC.toLowerCase()) {
       try {
-        kind = decodeFunctionData({ abi: SELECTORS_ERC20, data: tx.input }).functionName;
+        kind = decodeFunctionData({ abi: erc20Abi, data: tx.input }).functionName;
         if (kind === "transfer" && walletOf.has(from)) kind = "withdraw (USDC transfer to the owner)";
       } catch {
         kind = "USDC (undecoded)";
