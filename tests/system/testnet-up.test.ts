@@ -25,6 +25,7 @@ import {
   botHomeProblems,
   buildServerConfig,
   checkPayRequest,
+  hideDirRpcs,
   hideUrl,
   holdingsWei,
   hubPinProblem,
@@ -316,6 +317,19 @@ describe("the chain-id refusal", () => {
     expect(redact(`see ${RPC_URL}`)).toBe(`see ${RPC_URL}`);
   });
 
+  it("follow-up 3: down hides the RPCs its directory's server and bot homes use", () => {
+    const dir = tmpRoot();
+    mkdirSync(join(dir, "house-bots", "house-1"), { recursive: true });
+    mkdirSync(join(dir, "house-bots", "house-2"), { recursive: true });
+    writeFileSync(join(dir, "server.json"), JSON.stringify({ rpcUrl: "https://keyed.example/v2/SERVERKEY" }));
+    writeFileSync(join(dir, "house-bots", "house-1", "config.json"), JSON.stringify({ rpcUrl: "https://other.example/?k=BOTKEY" }));
+    writeFileSync(join(dir, "house-bots", "house-2", "config.json"), "{not json"); // skipped, not fatal
+    hideDirRpcs(dir);
+    const tail = "error: HTTP request failed. URL: https://keyed.example/v2/SERVERKEY ... URL: https://other.example/?k=BOTKEY";
+    expect(redact(tail)).not.toMatch(/SERVERKEY|BOTKEY/);
+    expect(redact(tail)).toContain("URL: https://keyed.example/…");
+  });
+
   it("an unreachable keyed RPC is refused without quoting its key", async () => {
     await expect(assertChain("http://127.0.0.1:1/v2/SECRETKEY")).rejects.toThrow(/^(?!.*SECRETKEY).*cannot read eth_chainId from http:\/\/127\.0\.0\.1:1\/…/s);
   });
@@ -411,24 +425,36 @@ describe("house bots", () => {
     // 2.5 at the start: 1.005 went to the deposit and fee, 0.336 to the session key.
     const wallet = usdc("1.159");
     const midGame = [{ channelId: "0x01", phase: "Open", gameStatus: "playing", balances: { me: "1.000000" }, swept: null }];
-    const held = holdingsWei(wallet, midGame, gas);
+    const held = holdingsWei(wallet, midGame, gas, usdc("1"));
     expect(held).toBe(usdc("2.495"));
     // Counting only the wallet re-paid 1.341; now only the fee that left the system (0.005) is due.
     expect(topUpAmount(wallet, usdc("2.5"))).toBe("1.341");
     expect(topUpAmount(held, usdc("2.5"))).toBe("0.005");
     // A bot up 0.3 in its channel is above target: nothing.
-    expect(topUpAmount(holdingsWei(wallet, [{ ...midGame[0]!, balances: { me: "1.300000" } }], gas), usdc("2.5"))).toBeNull();
+    expect(topUpAmount(holdingsWei(wallet, [{ ...midGame[0]!, balances: { me: "1.300000" } }], gas, usdc("1")), usdc("2.5"))).toBeNull();
   });
 
-  it("I-3: settled channels count only their unswept gas; a channel still matching counts nothing yet", () => {
+  it("I-3: settled channels count only their unswept gas", () => {
     const chans = [
       { phase: "Finalized", balances: { me: "1.200000" }, swept: true }, // paid out to the wallet, gas swept back
       { phase: "Finalized", balances: { me: "0.800000" }, swept: null }, // paid out, gas still on its session key
       { phase: "Reclaimed", balances: { me: "1.000000" }, swept: "dust" },
-      { phase: "None", balances: { me: "1.000000" }, swept: null }, // a match before any deposit: counted, no gas yet
-      { channelId: "0x05", degraded: true },
     ];
-    expect(holdingsWei(usdc("2"), chans, gas)).toBe(usdc("2") + gas + usdc("1"));
+    expect(holdingsWei(usdc("2"), chans, gas, usdc("1"))).toBe(usdc("2") + gas);
+  });
+
+  it("follow-up 1: a channel still in None counts nothing: its deposit is still in the wallet", () => {
+    // Matched, not yet created on chain: the genesis balances say 1.0, but that 1.0 is the wallet's own.
+    const matched = [{ channelId: "0x04", phase: "None", balances: { me: "1.000000" }, swept: null }];
+    expect(holdingsWei(usdc("1.2"), matched, gas, usdc("1"))).toBe(usdc("1.2"));
+    expect(topUpAmount(holdingsWei(usdc("1.2"), matched, gas, usdc("1")), usdc("2.5"))).toBe("1.3");
+  });
+
+  it("follow-up 2: a degraded channel errs upward -- a full deposit and its session gas count as held", () => {
+    const degraded = [{ channelId: "0x05", degraded: true }];
+    expect(holdingsWei(usdc("1.159"), degraded, gas, usdc("1"))).toBe(usdc("1.159") + usdc("1") + gas);
+    // So a restart with a channel the daemon cannot load never pays that channel's deposit again.
+    expect(topUpAmount(holdingsWei(usdc("1.159"), degraded, gas, usdc("1")), usdc("2.5"))).toBe("0.005");
   });
 
   it("m-6: one more offer needs deposit + fee + session gas + the other channels' reserve (the CLI's own math)", () => {

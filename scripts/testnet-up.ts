@@ -1007,17 +1007,26 @@ const SETTLED_PHASES = new Set(["Finalized", "Reclaimed"]);
  * Fix round 1 (I-3): everything a house bot holds, in wei: its wallet, its own balance in every channel that is not
  * settled (`balances.me`, whole USDC), and one `sessionGasWei` for every channel past `None` whose session key has
  * not been swept back yet. Counting only the wallet re-paid a bot's escrow (about 1.34 USDC) on every restart in the
- * middle of a game. A count that errs does so upward (a channel still funding counts its deposit and its gas), so the
- * deployer never pays for money the bot already has.
+ * middle of a game.
+ * - A channel still in `None` (matched, not yet created on chain) counts nothing: its deposit is still in the wallet,
+ *   and counting `balances.me` too would count it twice (follow-up, new minor 1).
+ * - A `degraded` channel (a record the daemon could not load) shows no balance at all, so it counts as holding a full
+ *   `degradedDepositWei` plus its session gas: the count errs upward, and a restart never pays for money the bot may
+ *   already have in that channel (follow-up, new minor 2).
+ * - A channel in `Funding` counts its deposit and gas whether or not this side's deposit has landed yet: upward again.
  */
-export function holdingsWei(walletWei: bigint, channels: ChannelView[], sessionGasWei: bigint): bigint {
+export function holdingsWei(walletWei: bigint, channels: ChannelView[], sessionGasWei: bigint, degradedDepositWei: bigint): bigint {
   let total = walletWei;
   for (const c of channels) {
-    if (c.degraded) continue;
+    if (c.degraded) {
+      total += degradedDepositWei + sessionGasWei;
+      continue;
+    }
+    if (c.phase === "None") continue;
     if (!SETTLED_PHASES.has(c.phase ?? "") && typeof c.balances?.me === "string" && USDC_RE.test(c.balances.me)) {
       total += parseUnits(c.balances.me, 18);
     }
-    if (c.phase !== "None" && (c.swept === null || c.swept === undefined)) total += sessionGasWei;
+    if (c.swept === null || c.swept === undefined) total += sessionGasWei;
   }
   return total;
 }
@@ -1392,7 +1401,7 @@ async function up(args: UpArgs): Promise<void> {
     // Fix round 1 (I-3): top up what it holds overall, not its wallet alone.
     const sessionGasWei = cfg.sessionGasWei;
     const walletWei = await pub.getBalance({ address });
-    const holdings = holdingsWei(walletWei, channels, sessionGasWei);
+    const holdings = holdingsWei(walletWei, channels, sessionGasWei, parseUnits(args.botDeposit, 18));
     const due = target > 0n ? topUpAmount(holdings, target) : null;
     if (due !== null) {
       process.stderr.write(
@@ -1481,9 +1490,32 @@ export function assertTestnetDir(dir: string): void {
   if (state.chainId !== CHAIN_ID) throw new Error(`refusing: ${dir}'s state.json is for chain ${String(state.chainId)}, not Arc testnet (${CHAIN_ID})`);
 }
 
+/** Follow-up (new minor 3): registers the RPCs this directory's server and bot homes use (`--rpc`, possibly keyed),
+ *  so `down`'s messages -- which quote CLI subprocesses' stderr -- hide them exactly as `up` and `pay` do. Reads only
+ *  each file's `rpcUrl` string; a file that cannot be read is skipped. */
+export function hideDirRpcs(dir: string): void {
+  const files = [join(dir, "server.json")];
+  const botsDir = join(dir, "house-bots");
+  if (existsSync(botsDir)) for (const n of readdirSync(botsDir)) files.push(join(botsDir, n, "config.json"));
+  for (const f of files) {
+    try {
+      const { rpcUrl } = JSON.parse(readFileSync(f, "utf8")) as { rpcUrl?: unknown };
+      if (typeof rpcUrl === "string") hideUrl(rpcUrl);
+    } catch {
+      // not there, or not readable: nothing to hide from it
+    }
+  }
+}
+
+/** `down`'s own output: every line through `redact`. */
+function say(line: string): void {
+  process.stderr.write(redact(line));
+}
+
 async function down(args: DownArgs): Promise<void> {
   const { dir } = args;
   assertTestnetDir(dir);
+  hideDirRpcs(dir);
   let p = readPids(dir);
   if (args.withdraw) await settle(dir, p, args.settleSeconds);
   // A testnet:up still in the foreground somewhere: let it stop its own children, in order.
@@ -1491,18 +1523,18 @@ async function down(args: DownArgs): Promise<void> {
     await stopPid("testnet:up", p.up.pid, p.up.startTime, PAY_RECEIPT_TIMEOUT_MS + 120_000);
     p = readPids(dir);
   } else if (p.up && alive(p.up.pid)) {
-    process.stderr.write(`testnet-down: pid ${p.up.pid} is no longer testnet:up: left alone\n`);
+    say(`testnet-down: pid ${p.up.pid} is no longer testnet:up: left alone\n`);
   }
   for (const b of p.bots) {
     if (isOurs("bot", b, dir)) await stopPid(`house bot ${b.name}`, b.pid, b.startTime, 30_000);
-    else if (alive(b.pid)) process.stderr.write(`testnet-down: pid ${b.pid} is no longer house bot ${b.name}: left alone\n`);
+    else if (alive(b.pid)) say(`testnet-down: pid ${b.pid} is no longer house bot ${b.name}: left alone\n`);
   }
   if (p.server) {
     if (isOurs("server", p.server, dir)) await stopPid("server", p.server.pid, p.server.startTime, 10_000);
-    else if (alive(p.server.pid)) process.stderr.write(`testnet-down: pid ${p.server.pid} is no longer the server: left alone\n`);
+    else if (alive(p.server.pid)) say(`testnet-down: pid ${p.server.pid} is no longer the server: left alone\n`);
   }
   rmSync(join(dir, "pids.json"), { force: true });
-  process.stderr.write("testnet-down: stopped.\n");
+  say("testnet-down: stopped.\n");
   if (!args.withdraw) return;
 
   const botsDir = join(dir, "house-bots");
@@ -1511,7 +1543,7 @@ async function down(args: DownArgs): Promise<void> {
     try {
       await withdrawHome(name, join(botsDir, name), join(dir, "logs"));
     } catch (err) {
-      process.stderr.write(`testnet-down: ${name}: ${err instanceof Error ? err.message : String(err)}\n`);
+      say(`testnet-down: ${name}: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
 }
@@ -1540,11 +1572,11 @@ async function settle(dir: string, p: PidsFile, seconds: number): Promise<void> 
       if (c.degraded || c.phase !== "Open" || !over || c.channelId === undefined) continue;
       const close = await arena(b.home, ["close", "--channel", c.channelId], 60_000);
       if (close.code === 0) asked.push({ name: b.name, home: b.home, channelId: c.channelId });
-      else process.stderr.write(`testnet-down: ${b.name}: close ${c.channelId}: ${close.stderr.trim().slice(-300)}\n`);
+      else say(`testnet-down: ${b.name}: close ${c.channelId}: ${close.stderr.trim().slice(-300)}\n`);
     }
   }
   if (asked.length === 0) return;
-  process.stderr.write(`testnet-down: asked for ${asked.length} cooperative close(s); waiting up to ${seconds}s for them to finalize\n`);
+  say(`testnet-down: asked for ${asked.length} cooperative close(s); waiting up to ${seconds}s for them to finalize\n`);
   const end = Date.now() + seconds * 1000;
   let pending = asked;
   while (pending.length > 0 && Date.now() < end) {
@@ -1553,17 +1585,17 @@ async function settle(dir: string, p: PidsFile, seconds: number): Promise<void> 
     for (const a of pending) {
       const r = await arena(a.home, ["status", "--channel", a.channelId], 60_000);
       const phase = r.code === 0 ? (lastJson(r.stdout) as ChannelView).phase : undefined;
-      if (phase === "Finalized") process.stderr.write(`testnet-down: ${a.name}: ${a.channelId} finalized\n`);
+      if (phase === "Finalized") say(`testnet-down: ${a.name}: ${a.channelId} finalized\n`);
       else still.push(a);
     }
     pending = still;
   }
-  for (const a of pending) process.stderr.write(`testnet-down: ${a.name}: ${a.channelId} did not finalize in ${seconds}s (its opponent has not co-signed)\n`);
+  for (const a of pending) say(`testnet-down: ${a.name}: ${a.channelId} did not finalize in ${seconds}s (its opponent has not co-signed)\n`);
 }
 
 /** `down --withdraw` for one bot home: its daemon, a sweep, the channels that still hold escrow, `withdraw --all`. */
 async function withdrawHome(name: string, home: string, logsDir: string): Promise<void> {
-  process.stderr.write(`testnet-down: ${name}: starting its daemon to sweep and withdraw\n`);
+  say(`testnet-down: ${name}: starting its daemon to sweep and withdraw\n`);
   mkdirSync(logsDir, { recursive: true });
   const fd = openSync(join(logsDir, `${name}-withdraw.log`), "a");
   const daemon = spawn(process.execPath, [CLI_BIN, "daemon"], { cwd: REPO_ROOT, env: { ...process.env, ARENA_HOME: home }, stdio: ["ignore", "pipe", fd] });
@@ -1581,28 +1613,28 @@ async function withdrawHome(name: string, home: string, logsDir: string): Promis
     });
     daemon.stdout?.resume(); // never let its pipe fill
     if (!started) {
-      process.stderr.write(`testnet-down: ${name}: its daemon did not start; see ${join(logsDir, `${name}-withdraw.log`)}\n`);
+      say(`testnet-down: ${name}: its daemon did not start; see ${join(logsDir, `${name}-withdraw.log`)}\n`);
       return;
     }
     const sweep = await arena(home, ["sweep"], 300_000);
-    if (sweep.code !== 0) process.stderr.write(`testnet-down: ${name}: sweep: ${sweep.stderr.trim().slice(-400)}\n`);
+    if (sweep.code !== 0) say(`testnet-down: ${name}: sweep: ${sweep.stderr.trim().slice(-400)}\n`);
     const ch = await arena(home, ["channels"]);
     if (ch.code === 0) {
       try {
         const list = lastJson(ch.stdout) as ChannelView[];
         for (const c of Array.isArray(list) ? list : []) {
           if (!c.degraded && SETTLED_PHASES.has(c.phase ?? "")) continue;
-          process.stderr.write(
+          say(
             `testnet-down: ${name}: channel ${c.channelId} is ${c.degraded ? "degraded" : c.phase}: its escrow is not in the wallet yet\n`,
           );
         }
       } catch {
-        process.stderr.write(`testnet-down: ${name}: could not read its channel list\n`);
+        say(`testnet-down: ${name}: could not read its channel list\n`);
       }
     }
     const w = await arena(home, ["withdraw", "--all"], 300_000);
-    if (w.code === 0) process.stderr.write(`testnet-down: ${name}: withdrew to the owner: ${JSON.stringify(lastJson(w.stdout))}\n`);
-    else process.stderr.write(`testnet-down: ${name}: withdraw --all: ${w.stderr.trim().slice(-400)}\n`);
+    if (w.code === 0) say(`testnet-down: ${name}: withdrew to the owner: ${JSON.stringify(lastJson(w.stdout))}\n`);
+    else say(`testnet-down: ${name}: withdraw --all: ${w.stderr.trim().slice(-400)}\n`);
   } finally {
     if (daemon.exitCode === null && daemon.signalCode === null) {
       const exited = new Promise<void>((r) => daemon.once("exit", () => r()));
