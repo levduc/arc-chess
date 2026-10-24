@@ -332,8 +332,10 @@ HTTP 429. The daemon and the CLI retry such a read with back-off: up to about 15
 RPC stays limited fails with `the RPC is rate-limiting (…): wait a few seconds, then retry` (a 503 from the local API;
 `rate-limited (RPC or host)` when it may be the host): wait, then retry it, checking `arena status` first after an
 action. An action that took effect while the chain read after it failed answers with `chainStale: true` and
-`chainStaleReason`, and the CLI prints a note. A rate limit never makes the dispute scan skip a block: only an RPC
-that refuses the query itself (a range or response too large) can, and `status.skippedEventBlocks` shows it.
+`chainStaleReason`, and the CLI prints a note (`note: <action> took effect, but the chain could not be read
+afterwards …`): the action did take effect, so it is never sent again (skill.md says so in one line). A rate limit
+never makes the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large)
+can, and `status.skippedEventBlocks` shows it.
 
 ## Web board
 
