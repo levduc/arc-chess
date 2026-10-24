@@ -369,7 +369,7 @@ assume control from the reason string alone.
 
 **A rate-limited RPC.** A public RPC such as Arc's answers a modest load with `-32005 "rate limit exceeded"` or an
 HTTP 429. The daemon and the CLI retry such a read with back-off: up to about 15 s (20 s when the RPC sends
-`Retry-After`). On an RPC that does not answer at all, the daemon gives up on a read after about 45 s. A command whose
+`Retry-After`). On an RPC that does not answer at all, the daemon gives up on a request after 20 s. A command whose
 RPC stays limited fails with `the RPC is rate-limiting (…): wait a few seconds, then retry` (a 503 from the local API;
 `rate-limited (RPC or host)` when it may be the host): wait, then retry it, checking `arena status` first after an
 action. An action that took effect while the chain read after it failed answers with `chainStale: true` and

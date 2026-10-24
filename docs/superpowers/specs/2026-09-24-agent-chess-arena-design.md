@@ -1193,17 +1193,25 @@ hardening wave H3.
       a dispute event. H1's probes stay the second gate: a probe that is refused too stops the poll or pass, uncounted.
     - **Transport.** Every RPC client (`LocalKeyTxSender`, the daemon's, the server's `RpcChainReader`) uses
       `rpcTransport`: viem's `http` retry classes, retried after 0.5, 1, 2, 4 and 8 s, with a `Retry-After` honoured
-      up to 4 s per retry. Two bounds per read:
-      - under a rate limit (fast answers), at most 15.5 s of added wait, 20 s with `Retry-After`;
-      - on an RPC that does not answer, viem retries the timeout too: 6 attempts × the per-attempt timeout plus the
-        back-off. The daemon's client times an attempt out after 5 s (`DAEMON_RPC_TIMEOUT_MS`), about 45.5 s per read,
-        so the five or so reads before a respond's send fit inside `autoReturnSecondsOf` (300 s at the 900 s default
-        window). Other clients keep viem's 10 s, about 75 s per read.
-      A send is never retried: viem issues `eth_sendRawTransaction` with `retryCount: 0`. A `SerialTxSender` send
-      answered "nonce too low" whose own hash cannot be read (a rate-limited check) is kept at its nonce with that
-      hash, released, on every path (a fresh send, a replacement of a released entry, the wait's own replacement),
-      and never re-sent at the next nonce. `waitOrReplace` passes its `giveUpAt` as the replacement's `notAfter`,
-      which the sender checks right before it transmits.
+      up to 4 s per retry. Under a rate limit (fast answers) a read waits at most 15.5 s in all, 20 s with
+      `Retry-After`. On an RPC that does not answer, the timeout is retried too:
+      - The daemon's client caps each request's **total** time at 20 s (`DAEMON_RPC_TOTAL_TIMEOUT_MS`, the transport's
+        `totalTimeoutMs`), attempts at 5 s (`DAEMON_RPC_TIMEOUT_MS`). An attempt in flight at the deadline is
+        abandoned, no retry starts whose wait would end past it, and the last error is thrown, so a rate limit stays a
+        rate limit. A respond makes 11 requests one after another before its send (counted on the real path by
+        `h3-ratelimit.test.ts`), and the send is one attempt of at most 10 s: 11 × 20 s + 10 s = 230 s, inside
+        `autoReturnSecondsOf` (300 s at the 900 s default window). Each transaction the session key still tracks adds a
+        receipt read.
+      - The server's and `LocalKeyTxSender`'s own clients keep viem's retries and its 10 s: about 75 s per read.
+      A send is never retried: viem issues `eth_sendRawTransaction` with `retryCount: 0`, and the capped transport
+      excludes the send methods by name. A `SerialTxSender` send answered "nonce too low" whose own hash cannot be read
+      (a rate-limited check) is kept at its nonce with that hash, released, on every path (a fresh send, a replacement
+      of a released entry, the wait's own replacement), and never re-sent at the next nonce. Every path checks a
+      request's `notAfter` right before it transmits: `waitOrReplace` sets it to its `giveUpAt` on a replacement, and a
+      respond sets it to its give-up time plus 3 s (`RESPOND_SEND_MARGIN_MS`), so a respond whose reads end past its
+      deadline is not broadcast (it could only revert). The give-up time is never earlier than the last moment a block
+      could still take the respond (it is computed from the latest block's timestamp, which is not ahead of the
+      chain's clock); the margin covers Arc's 1 s timestamps and a proposer clock up to 2 s ahead.
     - **CLI one-shot calls** (`rpcCall`: `init`, `wallet`, `fund`). An HTTP 429 or 5xx, or a JSON-RPC rate limit, is
       retried after 1, 2, 4 and 8 s. One that persists fails with "the RPC is rate-limiting: … wait a minute, then
       retry the command".
@@ -1212,9 +1220,10 @@ hardening wave H3.
       the last known status, with `chainStale: true` and `chainStaleReason` (e.g. "the RPC is rate-limiting (HTTP
       429)"). The CLI prints a note. Took effect includes a Close that is signed and relayed whose on-chain submission
       failed on anything but the hub's refusal (the watchtower retries it), and a challenge or reclaim mined with no
-      readable receipt (`chainStaleReason` says so). A failed action still errors. A rate limit that outlasts the
-      retries is a 503: "the RPC is rate-limiting (<the RPC's answer>): wait a few seconds, then retry", or
-      "rate-limited (RPC or host) (…)" when no RPC error is in the chain (the host's own 429).
+      readable receipt (`chainStaleReason` says so, and that whether it succeeded is not known yet). A failed action
+      still errors. A rate limit that outlasts the retries is a 503: "the RPC is rate-limiting (<the RPC's answer>):
+      wait a few seconds, then retry", or "rate-limited (RPC or host) (…)" when no RPC error is in the chain (the
+      host's own 429).
     - **Sweep attribution.** A sweep whose receipt wait fails other than with a typed `Tx*Error` (a rate-limited
       receipt read), or whose send fails ambiguously (a lost response), throws `SweepWaitError` with the sweep's own
       hashes. They are kept in `pendingTx` and `sweepPending`, and the attempt is not charged. The next attempt
