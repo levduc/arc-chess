@@ -2,7 +2,8 @@
 # Mutation test for ChannelHub.sol (Plan 4.5 Task 3, fix round 2).
 #
 # Applies each of the 18 one-line mutants from the reviewer's mutation pass (task-3-review.md) — the 6
-# already known to be caught plus the 12 that survived the original suite — to a throwaway copy of the
+# already known to be caught plus the 12 that survived the original suite — and the 5 I1 mutants of the
+# hub signature-check proposal (docs/superpowers/proposals/2026-10-24-hub-signature-check.md) to a throwaway copy of the
 # whole contracts/ tree, runs the FULL test suite (every *.t.sol file, not just the invariant one) against
 # each mutant, and asserts every one of them is killed (i.e. the suite fails). Running the full suite
 # matters: nearly every one of these 18 mutants already has a deterministic, non-fuzzed directed unit test
@@ -94,7 +95,25 @@ mutant_F17() { # respond: does not register the new state
   sed -i '294s/_register(c, s, h);/\/\/ MUTATED: _register(c, s, h);/' "$HUB"
 }
 
-MUTANT_IDS=(C1 C2 C3 C4 C5 C6 F1 F2 F3 F4 F5 F7 F9 F10 F11 F12 F13 F17)
+# I1 (2026-10-23 audit): no unchecked signature bytes in proof.latest. These are anchored on patterns, not line
+# numbers, and every line they touch sits after the 18 line-numbered mutants above, inside _supported.
+mutant_I1a() { # _supported: non-mover slot of a move proof no longer checked
+  sed -i 's/^        if (other\.length != 0 \&\& !_signedBy(p\.signers\[1 - m\], h, other)) revert BadSignature();$/        \/\/ MUTATED: non-mover slot check removed/' "$HUB"
+}
+mutant_I1b() { # _supported: non-mover slot verified against the mover's signer
+  sed -i 's/!_signedBy(p\.signers\[1 - m\], h, other)/!_signedBy(p.signers[m], h, other)/' "$HUB"
+}
+mutant_I1c() { # _supported: opening accepted whatever its slots carry (the pre-I1 behaviour)
+  sed -i 's/s\.turnNum == 0 \&\& proof\.latest\.sigA\.length == 0 \&\& proof\.latest\.sigB\.length == 0$/s.turnNum == 0/' "$HUB"
+}
+mutant_I1d() { # _supported: opening requires only sigA empty
+  sed -i 's/ \&\& proof\.latest\.sigB\.length == 0$//' "$HUB"
+}
+mutant_I1e() { # _supported: opening requires only sigB empty
+  sed -i 's/ \&\& proof\.latest\.sigA\.length == 0 \&\& / \&\& /' "$HUB"
+}
+
+MUTANT_IDS=(C1 C2 C3 C4 C5 C6 F1 F2 F3 F4 F5 F7 F9 F10 F11 F12 F13 F17 I1a I1b I1c I1d I1e)
 declare -A DESC=(
   [C1]="claim: pause check at top (previously caught)"
   [C2]="claim: pause check after NothingToClaim (previously caught)"
@@ -114,6 +133,11 @@ declare -A DESC=(
   [F12]="respond: DeadlinePassed check removed"
   [F13]="closeCooperative: signature check removed"
   [F17]="respond: does not register the new state"
+  [I1a]="_supported: non-mover slot of a move proof unchecked"
+  [I1b]="_supported: non-mover slot checked against the mover's signer"
+  [I1c]="_supported: opening accepted with any slot bytes"
+  [I1d]="_supported: opening requires only sigA empty"
+  [I1e]="_supported: opening requires only sigB empty"
 )
 
 declare -A RESULT

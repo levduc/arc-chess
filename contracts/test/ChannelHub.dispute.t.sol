@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {console2} from "forge-std/Test.sol";
-import {Params, State} from "../src/ArenaTypes.sol";
+import {console2, Vm} from "forge-std/Test.sol";
+import {Params, State, SignedState} from "../src/ArenaTypes.sol";
 import {ChannelHub} from "../src/ChannelHub.sol";
 import {ChessBoard as B} from "../src/chess/ChessBoard.sol";
 import {HubFixture} from "./helpers/HubFixture.sol";
@@ -298,5 +298,132 @@ contract ChannelHubDisputeTest is HubFixture {
         assertEq(usdc.balanceOf(alice), 100e6 - FEE + 2 * STAKE);
         assertEq(usdc.balanceOf(bob), 100e6 - FEE - 2 * STAKE);
         assertEq(usdc.balanceOf(address(hub)), 0);
+    }
+
+    // ------------------------------------------------- I1: no unchecked signature bytes are stored or emitted
+    // Regression for audit finding I1 (2026-10-23 arc-launch audit, ArcFindings.t.sol PoC). `challenge` and
+    // `respond` re-emit `proof.latest` verbatim, so every non-empty slot in it must be a valid signature by its
+    // own signer; a slot the support rule does not need may only be empty.
+
+    /// @dev The SignedState that the one `Challenged`/`Responded` log of the last call carried.
+    function _emittedSignedState(Vm.Log[] memory logs) internal pure returns (SignedState memory) {
+        assertEq(logs.length, 1);
+        bytes memory enc;
+        if (logs[0].topics[0] == ChannelHub.Responded.selector) {
+            (, enc) = abi.decode(logs[0].data, (uint64, bytes));
+        } else {
+            assertEq(logs[0].topics[0], ChannelHub.Challenged.selector);
+            (,, enc) = abi.decode(logs[0].data, (uint64, uint64, bytes));
+        }
+        return abi.decode(enc, (SignedState));
+    }
+
+    /// The PoC's scenario: Alice offers a draw and challenges; Bob answers with ACCEPT_DRAW (terminal, free for
+    /// him) and puts bytes in ALICE's slot. Before the fix the hub accepted and emitted them, the shipped SDK
+    /// stored them, and its `hasPrev:false` proof then reverted `Unsupported` forever. Now the junk is refused;
+    /// the clean answer is accepted, its event carries only Bob's signature, and the proof the SDK builds from
+    /// that event settles.
+    function test_I1_respond_rejectsUncheckedBytesInNonMoverSlot() public {
+        State memory d1 = _play(s0, p, uciKind("e2e4", B.KIND_NORMAL_OFFER_DRAW));
+        bytes memory d1SigA = _sign(aliceKey, d1);
+        bytes memory ch = _moveProof(s0, "", "", d1, d1SigA, "");
+        vm.prank(alice);
+        hub.challenge(ch);
+
+        State memory d2 = _play(d1, p, _kind(B.KIND_ACCEPT_DRAW));
+        bytes memory d2SigB = _sign(bobKey, d2);
+        bytes memory big = new bytes(4096);
+        big[0] = 0x01;
+        // One byte; 4 KB; Bob's valid signature, but in Alice's slot; Alice's valid signature, but over d1.
+        bytes[4] memory junk = [bytes(hex"01"), big, d2SigB, d1SigA];
+        for (uint256 i; i < junk.length; ++i) {
+            bytes memory bad = _moveProof(d1, d1SigA, "", d2, junk[i], d2SigB);
+            vm.expectRevert(ChannelHub.BadSignature.selector);
+            hub.respond(bad);
+        }
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Challenged));
+
+        bytes memory clean = _moveProof(d1, d1SigA, "", d2, "", d2SigB);
+        vm.recordLogs();
+        vm.prank(bob);
+        hub.respond(clean);
+        SignedState memory emitted = _emittedSignedState(vm.getRecordedLogs());
+        assertEq(emitted.sigA.length, 0, "the unverified slot is emitted empty");
+        assertEq(keccak256(emitted.sigB), keccak256(d2SigB));
+
+        // Bob walks away. After her cooldown Alice proves the emitted state the way the SDK does: one slot is
+        // empty, so it is `{prev: d1 (her signature), latest: emitted}`.
+        vm.warp(block.timestamp + TIMEOUT);
+        bytes memory sdkProof = _moveProof(d1, d1SigA, "", emitted.state, emitted.sigA, emitted.sigB);
+        vm.prank(alice);
+        hub.challenge(sdkProof);
+        vm.warp(block.timestamp + TIMEOUT);
+        hub.timeout(id);
+        assertEq(usdc.balanceOf(alice), 100e6 - FEE);
+        assertEq(usdc.balanceOf(bob), 100e6 - FEE);
+    }
+
+    /// Same vector through `challenge` (the audit's 200 KB gas-asymmetry case): bytes in the non-mover slot of a
+    /// move proof are refused before anything is registered or emitted.
+    function test_I1_challenge_rejectsUncheckedBytesInNonMoverSlot() public {
+        bytes memory junk = new bytes(200_000);
+        junk[0] = 0x01;
+        bytes memory bad = _moveProof(s0, "", "", s1, _sign(aliceKey, s1), junk);
+        vm.prank(alice);
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.challenge(bad);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Open));
+        assertFalse(hub.channelInfo(id).hasRegistered);
+    }
+
+    /// The opening needs no signatures, so it is supported only with both slots empty (or, through the
+    /// both-signed rule, both valid). Before the fix any bytes rode along unchecked.
+    function test_I1_openingChallenge_rejectsUncheckedBytes() public {
+        bytes memory junk = new bytes(1000);
+        bytes memory sA = _sign(aliceKey, s0);
+        bytes[4] memory bad =
+            [_soloProof(s0, junk, junk), _soloProof(s0, junk, ""), _soloProof(s0, "", junk), _soloProof(s0, sA, junk)];
+        for (uint256 i; i < bad.length; ++i) {
+            vm.prank(bob);
+            vm.expectRevert(ChannelHub.Unsupported.selector);
+            hub.challenge(bad[i]);
+        }
+        bytes memory clean = _soloProof(s0, "", "");
+        vm.recordLogs();
+        vm.prank(bob);
+        hub.challenge(clean);
+        SignedState memory emitted = _emittedSignedState(vm.getRecordedLogs());
+        assertEq(emitted.sigA.length + emitted.sigB.length, 0);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Challenged));
+    }
+
+    /// A co-signed opening is still supported (spec §12 item 11), so the invariant handler's both-signed
+    /// opening proof keeps working.
+    function test_I1_coSignedOpening_stillSupported() public {
+        bytes memory proof = _soloProof(s0, _sign(aliceKey, s0), _sign(bobKey, s0));
+        vm.prank(bob);
+        hub.challenge(proof);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Challenged));
+        assertEq(hub.channelInfo(id).registeredHash, hub.hashState(s0));
+    }
+
+    /// A move proof whose latest also carries the non-mover's VALID co-signature (spec §12 items 11 and 14) is
+    /// still accepted, and the event keeps both signatures, so a client can later prove it with no `prev`.
+    function test_I1_validNonMoverCoSignature_acceptedAndEmitted() public {
+        _challengeS1();
+        bytes memory s2SigA = _sign(aliceKey, s2);
+        bytes memory s2SigB = _sign(bobKey, s2);
+        bytes memory proof = _moveProof(s1, "", "", s2, s2SigA, s2SigB);
+        vm.recordLogs();
+        hub.respond(proof);
+        SignedState memory emitted = _emittedSignedState(vm.getRecordedLogs());
+        assertEq(keccak256(emitted.sigA), keccak256(s2SigA));
+        assertEq(keccak256(emitted.sigB), keccak256(s2SigB));
+
+        vm.warp(block.timestamp + TIMEOUT);
+        bytes memory solo = _soloProof(emitted.state, emitted.sigA, emitted.sigB);
+        vm.prank(bob);
+        hub.challenge(solo);
+        assertEq(hub.registeredState(id).turnNum, 2);
     }
 }

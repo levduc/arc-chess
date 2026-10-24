@@ -421,6 +421,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev Spec §4.3 support rule. Returns the supported latest state and its EIP-712 hash.
+    /// `challenge`/`respond` emit `proof.latest` verbatim, so each of its two slots is either empty or a valid
+    /// signature by that slot's signer; unchecked bytes are never accepted (audit I1).
     function _supported(Channel storage c, Params memory p, bytes32 id, Proof memory proof)
         private
         view
@@ -431,7 +433,12 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         h = hashState(s);
         IGameRules rules = IGameRules(p.rules);
         if (!proof.hasPrev) {
-            if (s.turnNum == 0 && _isOpening(rules, id, p, h)) return (s, h);
+            // The opening needs no signatures: accepted here only with both slots empty. A co-signed opening
+            // falls through to the both-signed check below.
+            if (
+                s.turnNum == 0 && proof.latest.sigA.length == 0 && proof.latest.sigB.length == 0
+                    && _isOpening(rules, id, p, h)
+            ) return (s, h);
             if (_signedBy(p.signers[0], h, proof.latest.sigA) && _signedBy(p.signers[1], h, proof.latest.sigB)) {
                 return (s, h);
             }
@@ -444,6 +451,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (s.prevHash != ph || s.turnNum != prev.turnNum + 1) revert Unsupported();
         uint8 m = rules.mover(prev, p);
         if (!_signedBy(p.signers[m], h, m == 0 ? proof.latest.sigA : proof.latest.sigB)) revert BadSignature();
+        // The non-mover's slot is not needed for support, but it is emitted: empty, or a valid co-signature.
+        bytes memory other = m == 0 ? proof.latest.sigB : proof.latest.sigA;
+        if (other.length != 0 && !_signedBy(p.signers[1 - m], h, other)) revert BadSignature();
         if (!rules.validTransition(prev, s, p)) revert InvalidTransition();
 
         bool prevEndorsed = (c.hasRegistered && ph == c.registeredHash)
