@@ -37,6 +37,7 @@ import {
   checkMatchParams,
   hashState,
   isGameOver,
+  isInsufficientFundsError,
   mover,
   offerId as computeOfferId,
   outcome,
@@ -58,6 +59,7 @@ import {
   autoReturnSecondsOf,
   isCanonicalId,
   minChallengeTimeoutOf,
+  feeCeilingOf,
   pinnedDeploymentRefusals,
   sessionGasFloorOf,
   DEFAULT_LOG_CHUNK_BLOCKS,
@@ -88,10 +90,31 @@ export class DaemonError extends Error {
  *  refill's failed fee estimate surfacing as some other, harder-to-classify error shape from deep inside the
  *  sender's own send path. */
 export class SessionGasEstimateError extends Error {
-  constructor(cause?: unknown) {
-    super(`fee estimate failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  /** Plan 6 Task 2: `what` is `"gas"` when the top-up's own `estimateGas` failed -- the top-up is then not sent at
+   *  all, never with a guessed gas limit. */
+  constructor(cause?: unknown, what: "fee" | "gas" = "fee") {
+    super(`${what} estimate failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     this.name = "SessionGasEstimateError";
   }
+}
+
+/** Plan 6 Task 2 (audit-daemon I-1): a session-key top-up was mined but reverted -- nothing reached the key. It is
+ *  never counted as a refill: the refill raises `session-gas-low` and backs off, and `fund()` backs off funding,
+ *  so a top-up that keeps reverting is not re-sent (and paid for) on every pass. */
+export class TopUpRevertedError extends Error {
+  constructor(readonly hash: Hex) {
+    super(`the session-key top-up ${hash} was mined but reverted: nothing reached the key`);
+    this.name = "TopUpRevertedError";
+  }
+}
+
+/** Plan 6 Task 2 (spec §2.2): a session-key top-up's gas limit is the node's estimate plus 20 % (rounded up) plus
+ *  5,000. A value transfer costs 21,000 on Arc today (arc-facts.md, corrected 2026-10-24) -- this is hardening, and
+ *  the gas a transaction does not use is refunded. */
+export const TOP_UP_GAS_MARGIN_PERCENT = 20n;
+export const TOP_UP_GAS_MARGIN_FIXED = 5_000n;
+export function topUpGasLimit(estimate: bigint): bigint {
+  return estimate + (estimate * TOP_UP_GAS_MARGIN_PERCENT + 99n) / 100n + TOP_UP_GAS_MARGIN_FIXED;
 }
 
 /** Final fix wave (M4): a chain read a sweep attempt makes before it sends anything (the on-chain settled check,
@@ -550,12 +573,25 @@ export class ArenaDaemon {
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
     // Round 4: every fee the wallet pays is capped at max(4 x the node's estimate, feeCeilingWei) and what it can pay.
+    // Plan 6 (spec §2.3, §2.4): on a chain with a profile, the ceiling defaults to the profile's (`feeCeilingOf`), and
+    // every fee is at least the chain's floor -- under it, Arc drops the transaction without a word.
     this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client, {
-      feeCeiling: c.feeCeilingWei,
+      feeCeiling: feeCeilingOf(c),
+      minFeePerGas: chainProfile(c.chainId)?.minFeePerGas,
     });
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
+  }
+
+  /** A tracking sender for one channel's session key. Round 5: dispute transactions are never refused by a fee
+   *  ceiling -- only what the key can pay (its balance) bounds them; the wallet keeps the configured ceiling. Plan 6
+   *  (spec §2.3): but never under the chain profile's fee floor, which a key that cannot pay it is refused at. */
+  private sessionSenderFor(sessionKey: Hex): SerialTxSender {
+    return new SerialTxSender(new LocalKeyTxSender(sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
+      feeCeiling: NO_FEE_CEILING,
+      minFeePerGas: chainProfile(this.opts.config.chainId)?.minFeePerGas,
+    });
   }
 
   /** Plan 5.7 (spec §2): whether this daemon's relay falls back to XMTP -- the start line's `fallback`. */
@@ -661,9 +697,7 @@ export class ArenaDaemon {
       if (record.swept !== undefined) continue;
       this.sweepQueue.set(record.channelId, {
         record,
-        sender: new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
-          feeCeiling: NO_FEE_CEILING,
-        }),
+        sender: this.sessionSenderFor(record.sessionKey),
         // Final fix wave (M5): a sweep transaction the last run gave up on is checked first.
         sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
         busy: false,
@@ -1383,13 +1417,7 @@ export class ArenaDaemon {
     // I3/M1: re-check immediately before mutating `live` — the await above is a window another call (or a
     // stop()) could have used to already open this same channel, or to stop the daemon.
     if (this.stopped || this.live.has(record.channelId)) return;
-    const sessionSender = new SerialTxSender(
-      new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
-      this.client,
-      // Round 5: dispute transactions are never refused by a fee ceiling -- only what the session key can pay
-      // (its balance) bounds them. The wallet keeps the configured ceiling.
-      { feeCeiling: NO_FEE_CEILING },
-    );
+    const sessionSender = this.sessionSenderFor(record.sessionKey);
     const signer = privateKeyToAccount(record.sessionKey);
     const l: ChannelHandle = {
       record,
@@ -1517,7 +1545,21 @@ export class ArenaDaemon {
     // I1: top up only the shortfall, and only while the session key is actually below the target -- otherwise a
     // deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever. Shared
     // with the refill (final review C1), so the two never both send one.
-    await this.sharedTopUp(l, () => this.topUpSession(l));
+    try {
+      await this.sharedTopUp(l, () => this.topUpSession(l));
+    } catch (err) {
+      // Plan 6 Task 2 (audit-daemon I-1): a top-up mined and reverted reached nothing, and the next pass would send
+      // (and pay for) the same revert: funding backs off like a launch-limit revert below, and no deposit goes in
+      // for a channel whose key holds no dispute gas.
+      if (err instanceof TopUpRevertedError) {
+        const message = `funding: ${err.message}`;
+        if (l.lastError !== message) this.log(`channel ${l.record.channelId}: ${message} (retried in ${FUND_BACKOFF_SECONDS}s of chain time)`);
+        l.lastError = message;
+        l.fundBlockedUntil = (await this.client.getBlock()).timestamp + FUND_BACKOFF_SECONDS;
+        return;
+      }
+      throw err;
+    }
     if (this.stopped) return;
     try {
       await this.hub.deposit(this.wallet, p);
@@ -1569,15 +1611,29 @@ export class ArenaDaemon {
     } catch (err) {
       throw new SessionGasEstimateError(err);
     }
-    // The session key is always an EOA (a generated private key, never a contract): the gas is always 21000, so
-    // it never needs estimating either (and never fails alongside the fee estimate above).
-    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance, gas: 21_000n };
+    const value = target - balance;
+    // Plan 6 Task 2 (spec §2.2): the gas limit is the node's estimate plus a margin (`topUpGasLimit`), not a fixed
+    // 21000. A plain value transfer costs 21000 on Arc too, so this is hardening against a chain whose transfer costs
+    // more. A failed estimate sends nothing -- never a guessed limit -- and raises `session-gas-low` like a failed
+    // fee estimate. One whose cause is the wallet's balance is reported as exactly that.
+    let estimated: bigint;
+    try {
+      estimated = await this.client.estimateGas({ account: this.wallet.address, to: l.sessionSender.address, data: "0x", value });
+    } catch (err) {
+      if (isInsufficientFundsError(err)) throw new TxInsufficientFundsError(this.wallet.address, err);
+      throw new SessionGasEstimateError(err, "gas");
+    }
+    if (this.stopped) return false;
+    const req = { to: l.sessionSender.address, data: "0x" as Hex, value, gas: topUpGasLimit(estimated) };
     // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
     // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
     // paid at most once.
     const hash = await this.wallet.send(req);
     // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
-    await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
+    const receipt = await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
+    // Plan 6 Task 2 (audit-daemon I-1): a mined revert moved nothing. Before, it was counted as a refill, cleared the
+    // back-off and was sent again on the next pass. The receipt may be a replacement's: it is named by its own hash.
+    if (receipt.status !== "success") throw new TopUpRevertedError(receipt.transactionHash);
     return true;
   }
 
@@ -1622,10 +1678,14 @@ export class ArenaDaemon {
         // (insufficient funds, over its fee cap) or a gas/fee estimate for the refill failed outright -- every
         // other refill error (a nonce race, a dropped/stuck/aborted send, a missing receipt) is transient and
         // re-evaluated on the next pass without alarming the agent over something the daemon may resolve on its own.
+        // Plan 6 Task 2 (audit-daemon I-1): so is a top-up that was mined and reverted -- it is not a refill (the
+        // count and the back-off are left alone), and sending it again on the next pass would only pay for another
+        // revert, so the back-off below holds it off.
         if (
           err instanceof TxInsufficientFundsError ||
           err instanceof TxFeeCapError ||
-          err instanceof SessionGasEstimateError
+          err instanceof SessionGasEstimateError ||
+          err instanceof TopUpRevertedError
         ) {
           const first = l.sessionGasLow === null;
           l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
@@ -1782,8 +1842,11 @@ export class ArenaDaemon {
       await this.sweepRead(() => sender.refresh());
       const balance = await this.sweepRead(() => this.client.getBalance({ address: sender.address }));
       const gasLimit = await this.gasForSweep(sender);
-      const feePerGas = await this.sweepRead(() => this.currentFeePerGas());
-      if (feePerGas === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
+      // Plan 6 Task 2: never under the session sender's fee floor -- the send below is floored, so a reserve sized on
+      // a lower estimate could not pay its own transaction, and every attempt would be refused until abandoned.
+      const market = await this.sweepRead(() => this.currentFeePerGas());
+      if (market === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
+      const feePerGas = market > sender.minFeePerGas ? market : sender.minFeePerGas;
       const baseReserve = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
       // Fix round 3, I-1(b): dust is decided against the plain reserve first, regardless of any tracked entry --
       // a balance this low has nothing worth sending whether or not there is a dead transaction to answer for
@@ -2246,7 +2309,7 @@ export class ArenaDaemon {
     return (
       this.live.get(id)?.sessionSender ??
       this.sweepQueue.get(id)?.sender ??
-      new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, { feeCeiling: NO_FEE_CEILING })
+      this.sessionSenderFor(record.sessionKey)
     );
   }
 
@@ -2324,9 +2387,7 @@ export class ArenaDaemon {
     const fresh = this.records.channel(id) ?? record;
     if (isSweptDone(fresh.swept) && !recheck) return { channelId: id, swept: "already" };
     const wasAbandoned = fresh.swept === "abandoned";
-    const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
-      feeCeiling: NO_FEE_CEILING,
-    });
+    const sender = this.sessionSenderFor(fresh.sessionKey);
     const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: fresh.sweepPending };
     const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt, recheck });
     // Fix round 3, M-1: this record may already be in the settled-index cache (evicted from `live` some time

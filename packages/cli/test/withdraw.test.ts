@@ -737,8 +737,12 @@ async function asOneBalance<T>(usdc: Address, body: () => Promise<T>): Promise<T
     delete CHAIN_PROFILES[31337];
   }
 }
-// No feeCeilingWei in these configs: the wallet sender's default, 100 gwei. 500,000 x 100 gwei = 0.05 USDC.
+// No feeCeilingWei in these configs. A daemon built before the profile is set (`startPair`, then `asOneBalance`) has
+// the wallet sender's default, 100 gwei: 500,000 x 100 gwei = 0.05 USDC.
 const NO_CHANNEL_RESERVE = 50_000n;
+// Plan 6 Task 2: one built while it is set (the CLI's in-process withdraw) takes the profile's 40 gwei ceiling
+// (`feeCeilingOf`): 500,000 x 40 gwei = 0.02 USDC.
+const PROFILE_NO_CHANNEL_RESERVE = 20_000n;
 
 describe("Plan 6: withdraw keeps the reserve on a nativeIsUsdc chain (a test-only profile for anvil 31337)", () => {
 
@@ -750,26 +754,26 @@ describe("Plan 6: withdraw keeps the reserve on a nativeIsUsdc chain (a test-onl
       const over = cliIo(home);
       expect(await runCli(["withdraw", "--amount", "10"], over.io)).toBe(1);
       const why = over.err.join("\n");
-      expect(why).toContain("10.000000 USDC is more than this wallet can withdraw (9.950000 USDC)");
-      expect(why).toContain("0.050000 USDC of it is the gas reserve, which always stays in the wallet");
+      expect(why).toContain("10.000000 USDC is more than this wallet can withdraw (9.980000 USDC)");
+      expect(why).toContain("0.020000 USDC of it is the gas reserve, which always stays in the wallet");
       expect(why).toContain("gas on Local USDC-gas is paid in USDC, for the session gas of 0 unsettled channel(s)");
       expect(why).toMatch(/close open channels first/);
       expect(await usdcBalance(env.usdc, owner)).toBe(0n);
 
       const all = cliIo(home);
       expect(await runCli(["withdraw", "--all"], all.io), all.err.join("\n")).toBe(0);
-      expect(all.json().amount).toBe("9.950000");
-      expect(all.json().usdcAfter).toBe("0.050000");
-      expect(await usdcBalance(env.usdc, owner)).toBe(10_000_000n - NO_CHANNEL_RESERVE);
-      expect(await usdcBalance(env.usdc, wallet)).toBe(NO_CHANNEL_RESERVE);
+      expect(all.json().amount).toBe("9.980000");
+      expect(all.json().usdcAfter).toBe("0.020000");
+      expect(await usdcBalance(env.usdc, owner)).toBe(10_000_000n - PROFILE_NO_CHANNEL_RESERVE);
+      expect(await usdcBalance(env.usdc, wallet)).toBe(PROFILE_NO_CHANNEL_RESERVE);
 
       // Only the reserve is left: nothing to withdraw, and the message says why.
       const empty = cliIo(home);
       expect(await runCli(["withdraw", "--all"], empty.io)).toBe(1);
-      expect(empty.err.join("\n")).toContain("nothing to withdraw: this wallet holds 0.050000 USDC -- 0.050000 USDC of it is the gas reserve");
+      expect(empty.err.join("\n")).toContain("nothing to withdraw: this wallet holds 0.020000 USDC -- 0.020000 USDC of it is the gas reserve");
       const one = cliIo(home);
       expect(await runCli(["withdraw", "--amount", "0.000001"], one.io)).toBe(1);
-      expect(one.err.join("\n")).toContain("0.000001 USDC is more than this wallet can withdraw (0.000000 USDC) -- 0.050000 USDC");
+      expect(one.err.join("\n")).toContain("0.000001 USDC is more than this wallet can withdraw (0.000000 USDC) -- 0.020000 USDC");
     });
     expect(livePidHoldingLock(home)).toBeNull();
   });

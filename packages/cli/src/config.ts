@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
-import { CHAIN_PROFILES, type ChainProfile } from "./chains.js";
+import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
+import { CHAIN_PROFILES, chainProfile, type ChainProfile } from "./chains.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import { selfCommand } from "./version.js";
 
@@ -32,7 +33,8 @@ export type ArenaConfig = {
   /** I3: max block span per `getLogs` call when scanning dispute events (real RPCs cap the range). */
   logChunkBlocks?: number;
   /** Plan 4.5 Task 10 round 4: the fee ceiling per gas of the wallet's sender (session keys have none: round 5). A replacement
-   *  never pays more than max(4 x the node's estimate, this); default the SDK's DEFAULT_FEE_CEILING_WEI. */
+   *  never pays more than max(4 x the node's estimate, this). Default (`feeCeilingOf`): the chain profile's
+   *  `feeCeilingWei` (Plan 6: 40 gwei on Arc), else the SDK's DEFAULT_FEE_CEILING_WEI. */
   feeCeilingWei?: bigint;
   /** Final review I4: the shortest `challengeTimeout` (seconds) this daemon offers, accepts or funds; default
    *  `DEFAULT_MIN_CHALLENGE_TIMEOUT`. A missed challenge deadline can roll a channel back to an old state, so a
@@ -188,6 +190,23 @@ export function defaultSessionGasWei(feeCeilingWei: bigint, networkGasPrice: big
   const fourX = 4n * networkGasPrice;
   const feeCap = fourX > feeCeilingWei ? fourX : feeCeilingWei;
   return SESSION_GAS_RESPONDS * RESPOND_GAS_BUDGET * feeCap;
+}
+
+/**
+ * Plan 6 (spec §2.4; audit-journey I-4 ruling): the default `sessionGasWei` on a chain with a built-in profile,
+ * k * G_respond * the profile's `feeCeilingWei` -- 4 x 2.1M x 40 gwei = 0.336 USDC on Arc. It replaces
+ * `defaultSessionGasWei` there: Arc's `eth_gasPrice` never falls under its 20 gwei floor, so 4 x it (>= 80 gwei) always
+ * beat the ceiling and locked >= 0.67 USDC per channel. A fee spike is covered by the refills, not by the first fill.
+ */
+export function profileSessionGasWei(profile: ChainProfile): bigint {
+  return SESSION_GAS_RESPONDS * RESPOND_GAS_BUDGET * profile.feeCeilingWei;
+}
+
+/** Plan 6 (spec §2.4): the wallet sender's fee ceiling per gas -- the config's `feeCeilingWei`, else the chain
+ *  profile's (40 gwei on Arc), else the SDK's default (100 gwei). The daemon's wallet sender, `arena fund` and the
+ *  withdraw reserve all read this one value, so `fund`'s ask matches the daemon's gates. */
+export function feeCeilingOf(cfg: Pick<ArenaConfig, "chainId" | "feeCeilingWei">): bigint {
+  return cfg.feeCeilingWei ?? chainProfile(cfg.chainId)?.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
 }
 
 /** The config's `sessionGasFloor`, or its default: half of `sessionGasWei`. */

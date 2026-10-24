@@ -7,6 +7,7 @@ import {
   KNOWN_DEPLOYMENTS,
   RPC_TIMEOUT_MS,
   arenaPaths,
+  feeCeilingOf,
   livePidHoldingLock,
   loadConfig,
   runCli,
@@ -367,6 +368,70 @@ describe("arena init --server", () => {
         expect(r.calls).toEqual([]);
       });
       expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+    });
+
+    describe("Plan 6 Task 2 (spec §2.3, §2.4): the fee ceiling and the session gas on a chain with a profile", () => {
+      const ARC_SESSION_GAS = 336_000_000_000_000_000n; // 4 x 2.1M gas x 40 gwei = 0.336 USDC
+      /** `explicit(...)` without its `--session-gas-wei`, so init derives the default. */
+      const derived = (o: Parameters<typeof explicit>[0] = {}, extra: string[] = []) => {
+        const a = explicit(o);
+        const i = a.indexOf("--session-gas-wei");
+        return [...a.slice(0, i), ...a.slice(i + 2), ...extra];
+      };
+
+      it("the ceiling defaults to the profile's 40 gwei, and sessionGasWei to 4 x 2.1M gas x that, with no eth_gasPrice call", async () => {
+        for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
+          const home = freshHome();
+          const r = await run(home, derived({ chainId }), stubFetch({ ...arcChain(chainId), gasPrice: 25_000_000_000n }));
+          expect(r.code, r.err).toBe(0);
+          const cfg = loadConfig(home);
+          expect(cfg.sessionGasWei, name).toBe(ARC_SESSION_GAS); // before: 4 x 2.1M x 4 x 25 gwei = 0.84
+          expect(cfg.feeCeilingWei, name).toBeUndefined(); // nothing written: the profile's value applies
+          expect(feeCeilingOf(cfg), name).toBe(40_000_000_000n);
+          expect(r.calls.some((c) => c.method === "eth_gasPrice"), name).toBe(false);
+        }
+      });
+
+      it("an explicit ceiling at or over the floor is kept, and sessionGasWei stays the profile's (the ruling); --session-gas-wei still overrides", async () => {
+        const home = freshHome();
+        const r = await run(home, derived({}, ["--fee-ceiling-wei", "60000000000"]), stubFetch(arcChain(5042002)));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home)).toMatchObject({ feeCeilingWei: 60_000_000_000n, sessionGasWei: ARC_SESSION_GAS });
+        const atFloor = freshHome();
+        expect((await run(atFloor, derived({}, ["--fee-ceiling-wei", "20000000000"]), stubFetch(arcChain(5042002)))).code).toBe(0);
+        expect(loadConfig(atFloor).feeCeilingWei).toBe(20_000_000_000n);
+        const explicitGas = freshHome();
+        expect((await run(explicitGas, explicit(), stubFetch(arcChain(5042002)))).code).toBe(0);
+        expect(loadConfig(explicitGas).sessionGasWei).toBe(10n ** 16n);
+      });
+
+      it("--fee-ceiling-wei under the floor is refused -- from flags or with /templates -- before any RPC call, writing nothing", async () => {
+        for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
+          const home = freshHome();
+          const r = await run(home, [...explicit({ chainId }), "--fee-ceiling-wei", "19999999999"], stubFetch(arcChain(chainId)));
+          expect(r.code, name).toBe(2);
+          expect(r.err).toContain(`--fee-ceiling-wei 19999999999 is under ${name}'s fee floor of 20000000000 wei per gas`);
+          expect(r.calls, name).toEqual([]);
+          expect(existsSync(home), name).toBe(false);
+        }
+        const viaTemplates = freshHome();
+        const t = await run(
+          viaTemplates,
+          [...fromServer, "--fee-ceiling-wei", "1"],
+          stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC }), ...arcChain(5042002) }),
+        );
+        expect(t.code).toBe(2);
+        expect(t.calls.map((c) => c.method ?? "templates")).toEqual(["templates"]); // no RPC call at all
+        expect(existsSync(viaTemplates)).toBe(false);
+      });
+
+      it("a chain without a profile is unchanged: any ceiling is accepted, and sessionGasWei follows max(ceiling, 4 x the gas price)", async () => {
+        const home = freshHome();
+        const r = await run(home, ["init", "--server", "https://host.test", "--fee-ceiling-wei", "1"], stubFetch({ gasPrice: 1_000_000_000n }));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home)).toMatchObject({ chainId: 31337, feeCeilingWei: 1n, sessionGasWei: 4n * 2_100_000n * 4_000_000_000n });
+        expect(r.calls.some((c) => c.method === "eth_gasPrice")).toBe(true);
+      });
     });
 
     it("a chain without a profile keeps today's warning-only behaviour, even with a table entry (31337)", async () => {

@@ -22,9 +22,11 @@ import {
   minChallengeTimeoutOf,
   DEFAULT_LOG_CHUNK_BLOCKS,
   defaultSessionGasWei,
+  feeCeilingOf,
   knownDeploymentWarnings,
   parseXmtpConfig,
   pinnedDeploymentRefusals,
+  profileSessionGasWei,
   readConfig,
   type ArenaConfig,
   type XmtpConfig,
@@ -62,7 +64,9 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--owner ADDR] [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
        [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false] [--no-faucet]
-       (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
+       (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel;
+        on Arc, 4 x 2.1M gas x 40 gwei = 0.336 USDC)
+       (--fee-ceiling-wei defaults to 100 gwei; on Arc, to 40 gwei, and a value under Arc's 20 gwei fee floor is refused)
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
         agent once max(60 s, challengeTimeout / 3) is left)
        (missing chain settings are filled from the server's /templates; every chain setting is checked over the RPC;
@@ -600,6 +604,18 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
               `config names, so on ${name} only the CLI's own pinned addresses are accepted, whatever the server publishes`,
           );
         }
+        // Plan 6 (spec §2.3): on a chain with a profile, a fee ceiling under its fee floor is refused -- before any RPC
+        // call and before anything is written. Arc's mempool drops a transaction under the floor without an error.
+        // Absent, the ceiling is the profile's (`feeCeilingOf`), and nothing is written for it.
+        const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
+        const profile = chainProfile(chainId);
+        if (profile !== undefined && feeCeilingWei !== undefined && feeCeilingWei < profile.minFeePerGas) {
+          throw new UsageError(
+            `--fee-ceiling-wei ${feeCeilingWei} is under ${profile.name}'s fee floor of ${profile.minFeePerGas} wei per gas: ` +
+              `a transaction under it is dropped without an error and never lands. Leave it out (default ` +
+              `${profile.feeCeilingWei}), or pass at least ${profile.minFeePerGas}`,
+          );
+        }
         // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
         // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
         // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl may
@@ -661,9 +677,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
         // Final review C1: the session key's dispute gas is derived from the chain unless given. A key that cannot pay
         // for a respond cannot answer a stale challenge, and an unanswered one can roll the channel back.
-        const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
+        // Plan 6 (spec §2.4; the audit-journey I-4 ruling): on a chain with a profile, k x G x the profile's fee ceiling
+        // -- 0.336 USDC on Arc -- with no RPC call. Arc's gas price never falls under its floor, so 4 x it always won.
         let sessionGasWei: bigint;
         if (flag("session-gas-wei") !== undefined) sessionGasWei = BigInt(flag("session-gas-wei")!);
+        else if (profile !== undefined) sessionGasWei = profileSessionGasWei(profile);
         else {
           const price = await rpcCall(io, rpcUrl, "eth_gasPrice", []);
           if (typeof price !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(price)) {
@@ -1178,7 +1196,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         );
       }
       const feePerPlayer = hexToBigIntOrThrow(feePerPlayerRaw, `RPC ${cfg.rpcUrl} eth_call (feePerPlayer)`);
-      const feeCeilingWei = cfg.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
+      // Plan 6 (spec §2.4): the daemon's own wallet ceiling -- the profile's on Arc -- so this ask matches its gates.
+      const feeCeilingWei = feeCeilingOf(cfg);
 
       let funding = await readNeed();
 
