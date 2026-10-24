@@ -824,7 +824,10 @@ describe("minor fixes", () => {
     // A getLogs failure must not stop the rest of the watchtower pass.
     const hub = bob.daemon.hub;
     const real = hub.disputeEvents.bind(hub);
-    let failures = 1;
+    // H1 ("oversized events"): two failures -- the read and the scan's own probe of the RPC (the same range, for no
+    // channel). An RPC that refuses both is down, so the pass stops reading and reports it; one that served the
+    // probe would have had the refused range split and read in the same pass instead (h1-disputes.test.ts).
+    let failures = 2;
     hub.disputeEvents = (...a: Parameters<typeof real>) => (failures-- > 0 ? Promise.reject(new Error("range too large")) : real(...a));
     await bob.daemon.idle();
     await bob.daemon.tick();

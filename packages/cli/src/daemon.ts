@@ -209,6 +209,11 @@ export type ChannelHandle = {
   /** Plan 5.7 (K3): the highest XMTP drop count seen for this channel, so its status keeps it once the relay has
    *  forgotten the channel (at finalization). */
   xmtpDropped?: number;
+  /** H1 ("oversized events"): the one block whose dispute events the RPC refused on consecutive scans while it was up,
+   *  and how many scans in a row -- skipped at `UNREADABLE_BLOCK_PASSES` (see `skipUnreadableBlock`). In memory. */
+  unreadableBlock: { block: bigint; tries: number } | null;
+  /** H1: wall-clock ms before which `retrySkippedEventBlock` does not re-read a skipped block. 0 = now. */
+  skippedRetryAt: number;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -261,6 +266,26 @@ type SweepAttemptResult =
  *  narrowed by TypeScript against the first check -- `l.record`/`queued.record` really can change in between. */
 function isSweptDone(swept: ChannelRecord["swept"]): boolean {
   return swept === true || swept === "dust";
+}
+
+/** H1 ("oversized events"): `ranges` with every block in `skip` left out, each range split around it; in order. */
+export function withoutBlocks(
+  ranges: Array<{ fromBlock: bigint; toBlock: bigint }>,
+  skip: readonly bigint[],
+): Array<{ fromBlock: bigint; toBlock: bigint }> {
+  if (skip.length === 0) return ranges;
+  const sorted = [...new Set(skip)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const out: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+  for (const r of ranges) {
+    let from = r.fromBlock;
+    for (const b of sorted) {
+      if (b < from || b > r.toBlock) continue;
+      if (b > from) out.push({ fromBlock: from, toBlock: b - 1n });
+      from = b + 1n;
+    }
+    if (from <= r.toBlock) out.push({ fromBlock: from, toBlock: r.toBlock });
+  }
+  return out;
 }
 
 /** Fix round 3, M-4: a fresh `ChannelRecord` with `swept: true`, `sweptAmount`/`sweptTx` set to this sweep (kept
@@ -339,6 +364,14 @@ const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\
  * that was there all along. `ingestOnChain` is idempotent for a state it already holds, so re-reading is safe.
  */
 export const DISPUTE_RESCAN_BLOCKS = 32n;
+
+/** H1 (audit-contracts I1, "oversized events"): the most `getLogs` reads one dispute scan of one channel makes -- its
+ *  chunks plus the halves of any range the RPC refused (each split adds one read). */
+export const DISPUTE_SCAN_READS_PER_PASS = 64;
+
+/** H1: a single block whose dispute events for a channel the RPC refuses on this many passes in a row, while it
+ *  serves the same query for no channel, is skipped (see `skipUnreadableBlock`). */
+export const UNREADABLE_BLOCK_PASSES = 3;
 
 /** The furthest out a funding deadline may be set from match time (`checkMatchParams`' `maxFundingWindow`): an
  *  offer this long past its expiry can no longer produce a fundable match. Distinct from, and must stay well
@@ -1447,6 +1480,8 @@ export class ArenaDaemon {
       humanMustMoveWoken: null,
       settledAt: null,
       sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
+      unreadableBlock: null,
+      skippedRetryAt: 0,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -2957,7 +2992,7 @@ export class ArenaDaemon {
     // Transient failures no longer matter once the channel is settled -- a failed close submission (the other
     // side's went through), a failed pass or dispute scan -- and a settled channel is never watched again, so
     // nothing else would ever clear them.
-    if (/^(close|watch|events):/.test(l.lastError ?? "")) l.lastError = null;
+    if (/^(close|watch|events|events-skipped):/.test(l.lastError ?? "")) l.lastError = null;
     if (l.record.finalized) return;
     // Final review m4: an agent waiting after its close (or on a dispute) is woken once by the settlement. A channel
     // retired without our deposit (None/Funding) never opened: nothing to report.
@@ -3117,13 +3152,53 @@ export class ArenaDaemon {
     const scanned = l.record.scannedBlock ?? l.record.createdBlock - 1n;
     const rescanFrom = scanned + 1n - DISPUTE_RESCAN_BLOCKS;
     const start = rescanFrom > l.record.createdBlock ? rescanFrom : l.record.createdBlock;
-    let cursor = scanned; // only moves forward as chunks succeed; a scan with nothing new leaves it unchanged
+    // Only moves forward as ranges succeed (the trailing rescan reads blocks at or below it); a scan with nothing
+    // new leaves it unchanged. Ranges are read in chain order, so every block up to it has been read and ingested.
+    let cursor = scanned;
+    const advance = (to: bigint) => {
+      if (to > cursor) cursor = to;
+    };
+    let skipped: bigint | null = null;
+    /** Set once a probe this pass showed the RPC up while it refused this channel's events in some range. */
+    let contentRefused = false;
     try {
       const head = await this.hub.blockNumber();
-      // At most 50 chunks per tick, so a long-dormant channel catches up over a few ticks without starving the others.
-      for (const r of chunkRanges(start, head, size).slice(0, 50)) {
+      if (this.stopped) return;
+      await this.retrySkippedEventBlock(l);
+      // At most 50 chunks per tick, so a long-dormant channel catches up over a few ticks without starving the
+      // others. A stack, so a split range's halves are read next, in order.
+      // A block skipped earlier (`skipUnreadableBlock`) is left out of every range, not read and refused again.
+      const pending = withoutBlocks(chunkRanges(start, head, size).slice(0, 50), l.record.skippedEventBlocks ?? []).reverse();
+      for (let reads = 0; pending.length > 0 && reads < DISPUTE_SCAN_READS_PER_PASS; reads++) {
         if (this.stopped) break;
-        const events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
+        const r = pending.pop()!;
+        let events: Awaited<ReturnType<HubClient["disputeEvents"]>>;
+        try {
+          events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
+        } catch (err) {
+          // H1 (audit-contracts I1, "oversized events"): the hub re-emits a proof's unchecked signature bytes, so
+          // a griefer can make a range's response larger than an RPC serves. If the RPC serves the same range for no
+          // channel (so it is up, and this channel's events are what it refuses), the range is split, down to one
+          // block: the ranges around a large event are still read, and the event itself is fetched alone. An RPC
+          // that refuses the probe too is down (or caps the range itself): nothing more is read this pass.
+          if (!contentRefused && !(await this.servesEmptyQuery(r.fromBlock, r.toBlock))) {
+            this.saveCursor(l, cursor); // what was read before it stays read
+            l.lastError = `events: ${errorText(err)}`;
+            return;
+          }
+          contentRefused = true;
+          if (r.fromBlock < r.toBlock) {
+            const mid = r.fromBlock + (r.toBlock - r.fromBlock) / 2n;
+            pending.push({ fromBlock: mid + 1n, toBlock: r.toBlock }, { fromBlock: r.fromBlock, toBlock: mid });
+            continue;
+          }
+          if (!(await this.skipUnreadableBlock(l, r.fromBlock, err))) {
+            this.saveCursor(l, cursor);
+            return;
+          }
+          skipped = r.fromBlock;
+          events = [];
+        }
         for (const e of events) {
           try {
             await l.session.ingestOnChain(e.signed);
@@ -3134,15 +3209,95 @@ export class ArenaDaemon {
             return;
           }
         }
-        cursor = r.toBlock;
+        advance(r.toBlock);
       }
-      // Saved once for the whole pass (not per chunk): every ingest above already succeeded (or the loop
-      // returned early on the first failure), so this is the real, fully-ingested scanned head.
       this.saveCursor(l, cursor);
       if (l.lastError?.startsWith("events:") || l.lastError?.startsWith("ingest:")) l.lastError = null;
+      if (skipped !== null) {
+        l.lastError =
+          `events-skipped: block ${skipped} holds dispute events for this channel that the RPC refuses to serve, even ` +
+          "alone; it was skipped so later events stay readable, and is retried every few minutes. Use an RPC that " +
+          "serves larger getLogs responses";
+      }
     } catch (err) {
       l.lastError = `events: ${errorText(err)}`;
     }
+  }
+
+  /** H1: whether the RPC serves the dispute-event query on `[fromBlock, toBlock]` for a channel id that has no
+   *  events (the zero hash) -- an empty response. Tells an RPC that is up but refuses one channel's (large) events
+   *  apart from one that is down, or that caps the range itself. */
+  private servesEmptyQuery(fromBlock: bigint, toBlock: bigint): Promise<boolean> {
+    return this.hub.disputeEvents(ZERO_HASH, fromBlock, toBlock).then(
+      () => true,
+      () => false,
+    );
+  }
+
+  /**
+   * H1 (audit-contracts I1, "oversized events"): decides what the scan does with block `block`, whose dispute events
+   * for this channel the RPC refused even on their own. A block it refuses while it serves the same query for no
+   * channel -- the RPC is up, and this channel's events in that block are what it will not return (a griefer's
+   * oversized proof) -- is retried for `UNREADABLE_BLOCK_PASSES` passes, then skipped: recorded in
+   * `record.skippedEventBlocks`, logged, and retried later (`retrySkippedEventBlock`), so one block can never stop
+   * every later event from being read. Spec §12 item 18's "never past an event that failed to ingest" still holds
+   * for every event that was read. An RPC that also refuses the probe is down, not refusing the block: nothing is
+   * skipped. Returns true when the block is skipped now.
+   */
+  private async skipUnreadableBlock(l: ChannelHandle, block: bigint, err: unknown): Promise<boolean> {
+    if (!(await this.servesEmptyQuery(block, block))) {
+      l.unreadableBlock = null;
+      l.lastError = `events: ${errorText(err)}`;
+      return false;
+    }
+    const tries = l.unreadableBlock?.block === block ? l.unreadableBlock.tries + 1 : 1;
+    if (tries < UNREADABLE_BLOCK_PASSES) {
+      l.unreadableBlock = { block, tries };
+      l.lastError = `events: block ${block}: the RPC refuses this channel's dispute events in it (${errorText(err)}); retried on the next pass`;
+      return false;
+    }
+    l.unreadableBlock = null;
+    const already = l.record.skippedEventBlocks ?? [];
+    if (!already.includes(block)) {
+      l.record = { ...l.record, skippedEventBlocks: [...already, block] };
+      this.records.saveChannel(l.record);
+    }
+    this.log(
+      `channel ${l.record.channelId}: skipping block ${block}: the RPC refused its dispute events for this channel ` +
+        `${tries} passes in a row (${errorText(err)}) while serving the same query for no channel; retried later`,
+    );
+    return true;
+  }
+
+  /** H1: re-reads the oldest block the scan skipped (`skipUnreadableBlock`), at most one per pass and once per
+   *  `BACKOFF_MAX_MS`. Its events are ingested in order (an older state is simply not adopted); once it reads and
+   *  ingests, it is no longer skipped. Never throws. */
+  private async retrySkippedEventBlock(l: ChannelHandle): Promise<void> {
+    const block = l.record.skippedEventBlocks?.[0];
+    if (block === undefined || Date.now() < l.skippedRetryAt) return;
+    l.skippedRetryAt = Date.now() + BACKOFF_MAX_MS;
+    let events: Awaited<ReturnType<HubClient["disputeEvents"]>>;
+    try {
+      events = await this.hub.disputeEvents(l.record.channelId, block, block);
+    } catch (err) {
+      this.log(`channel ${l.record.channelId}: skipped block ${block} still cannot be read: ${errorText(err)}`);
+      return;
+    }
+    try {
+      for (const e of events) {
+        await l.session.ingestOnChain(e.signed);
+        l.processedEvents++;
+      }
+    } catch (err) {
+      this.log(`channel ${l.record.channelId}: skipped block ${block} was read but an event in it failed to ingest: ${errorText(err)}`);
+      return;
+    }
+    const rest = (l.record.skippedEventBlocks ?? []).filter((b) => b !== block);
+    l.record = { ...l.record, skippedEventBlocks: rest.length > 0 ? rest : undefined };
+    this.records.saveChannel(l.record);
+    l.skippedRetryAt = 0;
+    if (rest.length === 0 && l.lastError?.startsWith("events-skipped:")) l.lastError = null;
+    this.log(`channel ${l.record.channelId}: skipped block ${block} was read and ingested`);
   }
 
   private saveCursor(l: ChannelHandle, block: bigint): void {
