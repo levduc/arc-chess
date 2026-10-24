@@ -112,7 +112,11 @@ describe("arena init --server", () => {
     });
     expect(code).toBe(1);
     expect(err.join("\n")).toContain(`pid ${process.pid}`);
-    expect(err.join("\n")).toContain(`kill ${process.pid}`);
+    // H4 fix round 1 (I3, M4): how to stop it is "arena daemon stop" (a bare kill is denied under a narrow tool
+    // allowlist), and a home that is already set up needs no init at all.
+    expect(err.join("\n")).toContain('stop it first with "arena daemon stop"');
+    expect(err.join("\n")).toContain("If this home is already set up for this server, skip init");
+    expect(err.join("\n")).not.toMatch(/\bkill\b/);
     expect(calls).toHaveLength(0); // refused before ever reaching the network
   });
 
