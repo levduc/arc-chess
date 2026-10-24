@@ -60,16 +60,19 @@ describe("HubClient.hubEvents on an RPC that caps topic-0 lists at 10", () => {
     }) as PublicClient;
   }
 
+  type AbiEventItem = Extract<(typeof channelHubAbi)[number], { type: "event" }>;
+  const abiEvents = channelHubAbi.filter((x): x is AbiEventItem => x.type === "event");
+
   it("the full read asks for exactly the channel events' selectors, no more than 10", async () => {
     const seen: unknown[][] = [];
     const hub = new HubClient(HUB, arcLikeClient(seen));
     expect(await hub.hubEvents(1n, 1000n)).toEqual([]);
     expect(seen).toHaveLength(1);
-    const want = HUB_EVENT_KINDS.map((name) => toEventSelector(channelHubAbi.find((x) => x.type === "event" && x.name === name)!));
+    const want = HUB_EVENT_KINDS.map((name) => toEventSelector(abiEvents.find((x) => x.name === name)!));
     expect([...seen[0]].sort()).toEqual([...want].sort());
     expect(seen[0].length).toBeLessThanOrEqual(10);
     // The kinds are exactly the ABI's events that carry a channelId.
-    const withChannelId = channelHubAbi.filter((x) => x.type === "event" && x.inputs.some((i) => i.name === "channelId")).map((x) => x.name);
+    const withChannelId = abiEvents.filter((x) => x.inputs.some((i) => i.name === "channelId")).map((x) => x.name);
     expect([...HUB_EVENT_KINDS].sort()).toEqual([...withChannelId].sort());
     expect(HUB_EVENT_ABI.map((x) => x.name).sort()).toEqual([...HUB_EVENT_KINDS].sort());
   });
