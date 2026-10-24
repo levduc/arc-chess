@@ -89,9 +89,20 @@ both owner and fee recipient).
 
 `explorer.testnet.arc.io` is a **Blockscout** instance (confirmed via `/api/v2/smart-contracts` and the
 Etherscan-compatible `/api?module=contract&action=getabi`, both of which respond with Blockscout's characteristic
-shapes).
+shapes). **Both contracts are now verified on it**: `ChessRules` and `ChannelHub` each show `is_verified: true`
+and `is_fully_verified: true` at `/api/v2/smart-contracts/{address}`, with `compiler_settings.viaIR: true`,
+`evmVersion: cancun`, `optimizer.runs: 200` and compiler `v0.8.28+commit.7893614a` — exactly `contracts/foundry.toml`'s
+`[profile.default]`. Explorer links:
 
-Verification was attempted two ways:
+| Contract | Explorer (source tab) |
+|---|---|
+| `ChessRules` | https://explorer.testnet.arc.io/address/0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5?tab=contract |
+| `ChannelHub` | https://explorer.testnet.arc.io/address/0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893?tab=contract |
+
+It took two tries. `scripts/verify-arc.sh` (new; mainnet reuses it unchanged) automates the sequence below.
+
+**First try (the one documented in the original version of this section): Blockscout's own standard-input
+recompile, via two independent routes, both failed.**
 1. `forge verify-contract --verifier blockscout --verifier-url https://explorer.testnet.arc.io/api --chain 5042002`
    for `ChessRules` (no constructor args). Submission succeeded (status `OK`, a GUID was returned), but polling
    `checkverifystatus` returned `Fail - Unable to verify`, with no further detail from the API.
@@ -101,20 +112,61 @@ Verification was attempted two ways:
    submissions were accepted ("Smart-contract verification started"), but `is_verified` stayed `false` for both
    addresses afterward.
 
-To rule out a bytecode mismatch on our side, we diffed forge's local build artifact
-(`out/ChessRules.sol/ChessRules.json` → `deployedBytecode.object`) against `eth_getCode` on-chain: **byte-for-byte
-identical**, 17,116 hex characters including the trailing IPFS metadata CBOR. That proves the *deployed contract*
-is exactly what our Solidity source compiles to with the repo's pinned `solc 0.8.28+commit.7893614a`, `viaIR`,
-`optimizer runs=200`, `evmVersion=cancun` settings. It does not by itself prove that the standard-json input we
-submitted reproduces that same bytecode under Blockscout's own solc invocation — that step is opaque to us: the
-mismatch is between Blockscout's recompile and our (provably correct) deployed code, and the rate-limited API
-(`"Too many requests. Increase limits now at https://dev.blockscout.com"`, hit several times while polling) never
-surfaced a reason, only the generic `Fail - Unable to verify`. We did not chase this further, per the "don't burn
-time" guidance; re-polled `is_verified` on both addresses immediately before filing this report and it is still
-`false` for both. **Source is not currently verified on the explorer**, but the deployment's correctness is
-independently established by the bytecode diff and the on-chain reads above. The explorer's own web UI (rather
-than its API) typically surfaces the specific compile/match error that the API hides, which would be the fastest
-way to actually diagnose this on a retry.
+That original report flagged a missing `viaIR: true` as the prime suspect. **This rules out:** a fresh
+`forge verify-contract --show-standard-json-input` dump (same `forge`, same `foundry.toml`) does include
+`settings.viaIR: true`, the correct `evmVersion`, `optimizer` and `metadata` settings, and the same remappings —
+confirmed by inspecting the dump directly before resubmitting. The constructor args were also correct both times:
+the explorer's own stored `creation_bytecode` for `ChannelHub` has, as its last 448 hex characters, exactly
+`cast abi-encode "constructor(address,address,address,uint256,uint256,uint256,uint256)" <token> <owner>
+<feeRecipient> 5000 1000000 2000000 50000000` — byte-for-byte.
+
+To rule out a bytecode mismatch on our side, we diffed forge's local build artifacts against `eth_getCode`
+on-chain: `ChessRules` matched **byte-for-byte identical** (17,116 hex characters, including the metadata CBOR
+tail). `ChannelHub` initially looked like a mismatch at byte offset 455, but that's `token`'s **immutable**
+storage slot (`deployedBytecode.immutableReferences` in the build artifact) — zero-filled in the unlinked
+artifact, filled with the real token address on-chain; masking every `immutableReferences` range in both buffers
+to zero made them match exactly too. Both deployed contracts are exactly what the repo's pinned
+`solc 0.8.28+commit.7893614a`, `viaIR`, `optimizer runs=200`, `evmVersion=cancun` settings produce.
+
+**The second try used a completely independent compiler — Sourcify — and that is what actually exposed and
+fixed the problem.** Submitting the *identical* standard-json input (same file, same compiler version string, same
+settings) to Sourcify's `POST /v2/verify/{chainId}/{address}` returned `creationMatch` and `runtimeMatch` of
+`"exact_match"` for both contracts, each in under 6 seconds. Re-submitting that same input back to Blockscout's
+own endpoint — this time via Sourcify's built-in "also notify Blockscout" forwarding — hit the identical
+`Fail - Unable to verify` a second time, for both contracts, confirming the first failures weren't a fluke or a
+rate-limit artifact. **This pins the root cause on Blockscout's own local recompile-and-match step on this
+particular explorer instance**, not on anything in our build: the same inputs that this instance's matcher
+rejects twice are proven correct by an entirely different compiler invocation (Sourcify's), by the exact
+on-chain-bytecode diff above, and by Blockscout's own `/api/v2/smart-contracts/verification/config`, which lists
+`v0.8.28+commit.7893614a` and `cancun` as supported and shows the Rust verifier microservice enabled. A sample of
+120 already-verified contracts on this explorer had **zero** using `viaIR: true` — consistent with (not proof
+of) a `viaIR`-specific bug in this instance's local matcher, since both our contracts are `viaIR` builds and both
+failed the same way. We did not dig into Blockscout's verifier internals further than this; filing it with
+Blockscout/Arc support would be the next step if this needs to be understood rather than worked around.
+
+**The workaround that closed it out: import, don't recompile.** Blockscout has a separate
+`POST /api/v2/smart-contracts/{address}/verification/via/sourcify` endpoint that takes a `metadata.json` plus the
+exact source files (fetched straight from `GET https://sourcify.dev/server/v2/contract/{chainId}/{address}
+?fields=metadata,sources`, once Sourcify has a match) and *imports* that already-computed match instead of
+recompiling locally. That succeeded immediately for `ChessRules` (`is_verified_via_sourcify: true`). By the time
+we ran the same import for `ChannelHub`, Blockscout responded `"Already verified"` — it had separately picked
+`ChannelHub` up into its own shared cross-instance match database (`is_verified_via_eth_bytecode_db: true` and
+`is_verified_via_verifier_alliance: true` are both `true`; `is_verified_via_sourcify` is `false` for this one),
+most likely from the same Sourcify submission propagating into that alliance before our import request landed.
+Either way, both contracts now carry `viaIR: true` in their *displayed* `compiler_settings` on Blockscout — proof
+the import path, unlike the local-recompile path, is viaIR-clean.
+
+We tried one additional diagnostic: joining Blockscout's Phoenix websocket
+(`wss://explorer.testnet.arc.io/socket/v2/websocket`, topic `addresses:<address>`) to catch a `verification_result`
+push with more detail than the REST API's generic failure string. The channel joined fine (`phx_reply` "ok"), but
+across several minutes and two failed submissions it never pushed a `verification_result` event of any kind —
+either the topic name was wrong, or this instance doesn't push that event over this channel. **Don't rely on this
+as a working diagnostic**; the REST `is_verified` / Etherscan-compatible `checkverifystatus` polling above is what
+actually worked for observing state.
+
+No `foundry.toml` edit was needed or made: `via_ir`, `optimizer_runs`, `evm_version` and the remappings there were
+already exactly what both successful verifications (the bytecode-level proof, and Sourcify's independent compile)
+needed.
 
 ### Deployer balance
 
@@ -142,11 +194,11 @@ confirming no other transactions were sent from this key. Nonce went from 0 → 
   predicted and actual addresses matched exactly — but this is worth checking explicitly (reconcile against
   `broadcast/Deploy.s.sol/5042002/run-latest.json` and `eth_getCode`) rather than trusting the dry run's file on
   its own, in case the nonce has moved between the dry run and the broadcast.
-- **Blockscout verification failed despite a provably exact bytecode match.** See "Source verification" above —
-  an unexplained gap between a local build-artifact / on-chain bytecode diff (identical) and the explorer's own
-  recompilation-based matcher (rejects both contracts). Worth another look once Plan 6 isn't gas-price/time
-  constrained, possibly flattened-source or multi-part verification instead of standard-json, or filing it with
-  Blockscout/Arc support.
+- **Blockscout's local recompile-and-match step rejected a provably exact bytecode match; importing an
+  externally-computed match (Sourcify) worked around it.** Updated: see "Source verification" above — both
+  contracts are now verified. The gap was real but is now understood to be scoped to Blockscout's own local
+  matcher on this instance (likely `viaIR`-specific; 0/120 sampled verified contracts there used it), not to our
+  build. Still worth filing with Blockscout/Arc support so the local path gets fixed directly.
 - **`forge`/`cast`/`anvil` are not on `PATH`** in this shell by default; they live at `~/.foundry/bin` (installed
   via `foundryup`) and must be added to `PATH` explicitly, matching how `scripts/dev-up.ts` already does this for
   its own `anvil`/`forge` calls.
