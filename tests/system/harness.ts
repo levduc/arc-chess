@@ -224,10 +224,10 @@ const ANVIL_PORT_MAX = 8699;
  *  `anvil` (today's behaviour) otherwise. */
 const ANVIL_BIN = process.env.ARENA_ANVIL_BIN ?? "anvil";
 /** Arc Foundry's anvil needs `--network arc` to model Arc's EVM semantics (the EIP-7708 native-transfer log;
- *  a 20 gwei base-fee floor, but -- tools/arc-foundry.md -- only at this process's default chain id, 31337,
- *  which is all this override ever runs at: never pass `--chain-id` through here) -- inferred from
- *  `ANVIL_BIN`'s basename rather than a separate flag, so a caller only has to point `ARENA_ANVIL_BIN` at
- *  `arc-anvil` to get both. */
+ *  a 20 gwei base-fee floor that holds at this process's default chain id, 31337, and at 5042, but decays
+ *  away by chain id 5042002 -- tools/arc-foundry.md point 3 has the full table; never pass `--chain-id`
+ *  through here, so this always stays at 31337) -- inferred from `ANVIL_BIN`'s basename rather than a
+ *  separate flag, so a caller only has to point `ARENA_ANVIL_BIN` at `arc-anvil` to get both. */
 const ANVIL_NETWORK_ARGS = /(?:^|\/)arc-anvil$/.test(ANVIL_BIN) ? ["--network", "arc"] : [];
 /** Plan 6 Task 3: when set (`pnpm test:arc`), the preferred port `startAnvil` uses in place of its usual
  *  dynamic scan over `ANVIL_PORT_MIN`-`ANVIL_PORT_MAX` -- so the Arc subset never races a concurrent

@@ -86,13 +86,25 @@ Verified locally: `anvil Version: 1.7.1-dev` (commit `d497beea7096ff2a8e583c8b30
   Foundry's or stock Foundry's.
 - `ARENA_TEST_ANVIL_PORT` selects the port that same anvil listens on. Unset, `global-setup.ts` keeps its
   fixed `:8546` (shared by the SDK and CLI unit suites) and `tests/system/harness.ts` keeps its existing
-  dynamic free-port scan over `8600`-`8699`. Set (only by `scripts/test-arc.sh`), both instead listen on that
-  one port -- chosen from within the harness's own `8600`-`8699` reserved range, so the system-test port
-  picker's "an explicit preferred port outside the reserved range is refused outright" invariant needs no
-  change.
+  dynamic free-port scan over `8600`-`8699`. Set, both instead listen on that one port -- chosen from within
+  the harness's own `8600`-`8699` reserved range, so the system-test port picker's "an explicit preferred
+  port outside the reserved range is refused outright" invariant needs no change. `scripts/test-arc.sh` (fix
+  round 1, `task-3-review.md` Minor-2) gives each of its four `vitest run` invocations (sdk, cli, cli's
+  `hardening.test.ts` sweep filter, system) a *distinct* port in that range (`8650`-`8653`) rather than
+  rebinding one shared port four times back to back with no proven margin for the OS to release it between
+  one invocation's `anvil.kill()` and the next invocation's bind attempt.
 
 Neither override touches `ports 8545/8080/7070`, `~/.arena`, or `.arena-dev/` (Plan 6 Global Constraints);
 they only ever affect anvil instances these test suites start and stop themselves.
+
+**Scope limit (fix round 1, Minor-1): the arc-forge contracts step's isolation is not total.** Only the
+dedicated contracts step (`arc-forge test --root contracts -n arc --out out-arc --cache-path cache-arc`)
+avoids the shared `contracts/out`/`contracts/cache`. The sdk/cli/system steps still run through
+`packages/sdk/test/global-setup.ts`'s plain `forge build` into that same shared `contracts/out` (unchanged by
+this task, required by hardcoded paths in e.g. `packages/sdk/test/helpers/chain.ts`) -- so `pnpm test:arc` run
+concurrently with `pnpm test:sdk`/`pnpm test:cli` (or another agent's run of either, in a shared checkout)
+can still race on `contracts/out`, exactly as any two of today's existing suites already could. This is not
+new risk this task introduced, and it is not fixable from this task's files alone.
 
 ## Notable local-simulation gaps found while installing
 
@@ -157,3 +169,15 @@ contract bug:
    `CHAIN_PROFILES` (`packages/cli/src/chains.ts`, Task 1) therefore does **not** key in on `31337` here --
    Arc-specific CLI behaviour gated on `profile.nativeIsUsdc` etc. needs its own explicit `--chain-id
    5042`/`5042002` coverage, which is Task 4's to add, not assumed by this infrastructure.
+7. **(Fix round 1) `anvil_setNextBlockBaseFeePerGas` is refused outright on `arc-anvil --network arc`**, with
+   an explicit RPC error: `"the next block base fee cannot be overridden on Arc; it is derived from the
+   parent block's carrier"` (code `-32602`). `packages/sdk/test/helpers/chain.ts`'s `setBaseFeePerGas` helper
+   (used by several hardening/fee-boundary tests) calls exactly this method -- any test that depends on it to
+   pin an exact fee boundary will throw on `arc-anvil`, not silently do nothing. Found by running `pnpm
+   test:arc`'s cli-sweep step for real (`packages/cli/test/hardening.test.ts`'s "Plan 5 Task 1: session-gas
+   sweep" block): `"fix round 2, minor 5: the dust boundary is exact"` fails with exactly this error. Two
+   further tests in the same file/run also failed, immediately after it in file order, sharing the same
+   arc-anvil instance -- plausibly a knock-on effect of the base-fee call throwing mid-test rather than
+   independent findings; not disentangled further here (not this task's code to fix). Full detail and the
+   third (ambiguous) failure: `.superpowers/sdd/2026-10-23-arc-launch/task-3-report.md`'s "Fix round 1"
+   section.

@@ -6,9 +6,10 @@ import { resolve } from "node:path";
  *  `anvil` (today's behaviour) otherwise. */
 const ANVIL_BIN = process.env.ARENA_ANVIL_BIN ?? "anvil";
 /** Arc Foundry's anvil needs `--network arc` to model Arc's EVM semantics (the EIP-7708 native-transfer log;
- *  a 20 gwei base-fee floor, but -- tools/arc-foundry.md -- only at this process's default chain id, 31337,
- *  which is all this override ever runs at: never pass `--chain-id` through here) -- inferred from
- *  `ANVIL_BIN`'s basename, so a caller only has to point ARENA_ANVIL_BIN at `arc-anvil` to get both. */
+ *  a 20 gwei base-fee floor that holds at this process's default chain id, 31337, and at 5042, but decays
+ *  away by chain id 5042002 -- tools/arc-foundry.md point 3 has the full table; never pass `--chain-id`
+ *  through here, so this always stays at 31337) -- inferred from `ANVIL_BIN`'s basename, so a caller only
+ *  has to point ARENA_ANVIL_BIN at `arc-anvil` to get both. */
 const ANVIL_NETWORK_ARGS = /(?:^|\/)arc-anvil$/.test(ANVIL_BIN) ? ["--network", "arc"] : [];
 /** Plan 6 Task 3: ARENA_TEST_ANVIL_PORT overrides this fixed port for `pnpm test:arc`, so it never collides
  *  with a standard-anvil run sharing this same global setup on :8546 (the SDK/CLI suites). Unset, this is
