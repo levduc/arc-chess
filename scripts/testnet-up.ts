@@ -1232,6 +1232,16 @@ async function up(args: UpArgs): Promise<void> {
     const cfg = loadConfig(home, { warn: () => {} });
     existing.push({ name: `house-${i}`, hub: cfg.hub, minChallengeTimeout: minChallengeTimeoutOf(cfg), rpcUrl: cfg.rpcUrl });
   }
+  // Homes past --house-bots (a rerun with fewer bots) are not started, so nothing watches their channels.
+  const idle = existsSync(botsDir)
+    ? readdirSync(botsDir).filter((n) => /^house-[0-9]+$/.test(n) && Number(n.slice(6)) > args.houseBots && existsSync(join(botsDir, n, "config.json")))
+    : [];
+  if (idle.length > 0) {
+    process.stderr.write(
+      `testnet-up: note: ${idle.sort().join(", ")} ${idle.length === 1 ? "exists" : "exist"} but ${idle.length === 1 ? "is" : "are"} not started (--house-bots ${args.houseBots}): any open channel of ` +
+        `theirs is unwatched. Rerun with a higher --house-bots, or settle them (testnet:down --withdraw)\n`,
+    );
+  }
   const problems = botHomeProblems(existing, { hub: deployment.hub, botTimeout: args.botTimeout, bounds: limits.timeoutBounds });
   if (problems.refusals.length > 0) throw new Error(`refusing: ${problems.refusals.join("; ")}. Nothing was started`);
   for (const n of problems.notes) process.stderr.write(`testnet-up: note: ${n}\n`);
