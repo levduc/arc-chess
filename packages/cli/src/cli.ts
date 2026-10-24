@@ -103,12 +103,12 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            pid, api, log}. All exit 0. Exit 1, with what to do, when the lock's pid is not this home's daemon (a
            reused pid, "bot", a withdraw) or does not answer, or when the child exits or never takes the lock --
            that child is then stopped.)
-  daemon stop [--timeout SECONDS] [--yes-i-understand]
+  daemon stop [--timeout SECONDS]
           (stops this home's running daemon with SIGTERM, a clean shutdown, and waits until it has exited (default
-           ${STOP_WAIT_DEFAULT_S} s); prints {stopped, pid}. The pid comes from daemon.lock and is signalled only if that process
-           started before the lock was written (never a reused pid) and is "daemon" itself, not "bot" or a withdraw.
-           Refused while a channel is Open or Challenged (or not read yet) -- with no daemon nothing answers a
-           challenge -- unless --yes-i-understand.)
+           ${STOP_WAIT_DEFAULT_S} s); prints {stopped, pid}. The pid comes from daemon.lock and is signalled only after the
+           daemon's own API, asked with this home's token, names that pid and the lock's nonce, and says it is
+           "daemon" itself, not "bot" or a withdraw; one that does not answer is never signalled. Refused while any
+           channel record is not finalized -- with no daemon nothing answers a challenge; only a human overrides that.)
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
   wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed;
            on a chain whose gas is USDC, such as Arc, one balance: {address, chainId, usdc}, and no --wait-for-native)
@@ -1539,7 +1539,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (readRecordedOwner(home) === null) throw new Error(noOwnerMessage(CLI_COMMAND));
         // Exactly as `arena bot` does: the in-process daemon takes the home lock, so nothing else can send from
         // this wallet meanwhile; it is stopped (and the lock released) whether or not the withdraw succeeds.
-        const proc = await startDaemonProcess(home, { log: () => {} });
+        const proc = await startDaemonProcess(home, { log: () => {}, role: "withdraw" });
         try {
           result = await proc.daemon.withdraw(req);
         } finally {
@@ -1604,7 +1604,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const deposit = amountOrDefault("deposit", "10");
       const stake = amountOrDefault("stake", "1");
 
-      const proc = await startDaemonProcess(home, { log: io.err });
+      const proc = await startDaemonProcess(home, { log: io.err, role: "bot" });
       // Fix round (minor 5): an explicit --timeout this daemon would never actually be able to use (below the
       // hub's own minimum or this daemon's minChallengeTimeout, or above the hub's maximum) is caught here,
       // clearly, at startup -- rather than only surfacing later as a repeating, generic createOffer failure on

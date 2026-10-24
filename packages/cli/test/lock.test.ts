@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { acquireHomeLock, livePidHoldingLock } from "../src/lock.js";
+import { acquireHomeLock, livePidHoldingLock, readLockFile } from "../src/lock.js";
 
 /** Neither a successful acquire nor a failed/stale one leaves any of its private temp files behind. */
 function tempLockFiles(home: string): string[] {
@@ -91,5 +91,24 @@ describe("livePidHoldingLock", () => {
     const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
     writeFileSync(join(home, "daemon.lock"), "not valid json {{{", { mode: 0o600 });
     expect(livePidHoldingLock(home)).toBeNull();
+  });
+});
+
+describe("H4 fix round 2: the lock's per-acquisition nonce", () => {
+  it("acquireHomeLock writes {pid, nonce}, a fresh 32-hex nonce each time; readLockFile reads it, and an older {pid} lock too", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    const l1 = acquireHomeLock(home);
+    expect(l1.nonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(JSON.parse(readFileSync(join(home, "daemon.lock"), "utf8"))).toEqual({ pid: process.pid, nonce: l1.nonce });
+    expect(readLockFile(home)).toEqual({ pid: process.pid, nonce: l1.nonce });
+    l1.release();
+    expect(readLockFile(home)).toBeNull();
+    const l2 = acquireHomeLock(home);
+    expect(l2.nonce).not.toBe(l1.nonce);
+    l2.release();
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: 4242 }), { mode: 0o600 });
+    expect(readLockFile(home)).toEqual({ pid: 4242 });
+    writeFileSync(join(home, "daemon.lock"), "not json", { mode: 0o600 });
+    expect(readLockFile(home)).toBeNull();
   });
 });

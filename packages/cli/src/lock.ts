@@ -29,18 +29,34 @@ function isStale(pid: number | null): boolean {
   return pid === null || (pid !== process.pid && !alive(pid));
 }
 
-/** Writes `{pid}` to a fresh, unique 0600 file under `home` and returns its path -- the source side of the
+/** Writes `{pid, nonce}` to a fresh, unique 0600 file under `home` and returns its path -- the source side of the
  *  atomic `linkSync` in `acquireHomeLock`: a hard link either succeeds once, atomically, or fails EEXIST, which a
  *  plain write-then-rename onto the lock path itself would not give us against a concurrent stale-takeover. */
-function writePidFile(home: string, pid: number): string {
+function writePidFile(home: string, pid: number, nonce: string): string {
   const tmp = join(home, `.daemon.lock.${pid}.${randomBytes(6).toString("hex")}.tmp`);
   const fd = openSync(tmp, "wx", 0o600);
   try {
-    writeSync(fd, JSON.stringify({ pid }));
+    writeSync(fd, JSON.stringify({ pid, nonce }));
   } finally {
     closeSync(fd);
   }
   return tmp;
+}
+
+/**
+ * H4 fix round 2 (N1, N3): `daemon.lock` as written: its `pid`, and the random `nonce` this acquisition wrote (absent in
+ * a lock written by an older CLI). Null when the lock is missing, unreadable or holds no well-formed pid. The running
+ * daemon reports the same nonce from its authenticated `/health` (`api.ts`), which is how `daemon stop` and `daemon
+ * --detach` tell the lock's writer from a process that merely has its pid -- with no clock involved.
+ */
+export function readLockFile(home: string): { pid: number; nonce?: string } | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(home, "daemon.lock"), "utf8")) as { pid?: unknown; nonce?: unknown };
+    if (typeof raw.pid !== "number") return null;
+    return typeof raw.nonce === "string" ? { pid: raw.pid, nonce: raw.nonce } : { pid: raw.pid };
+  } catch {
+    return null;
+  }
 }
 
 /** The pid currently holding `<home>/daemon.lock`, only if it is genuinely alive (not stale) -- a read-only
@@ -66,10 +82,12 @@ export function livePidHoldingLock(home: string): number | null {
  * even that fails (someone else has since relinked `daemon.lock`), this reports ambiguous contention instead of
  * guessing.
  */
-export function acquireHomeLock(home: string): { release(): void } {
+export function acquireHomeLock(home: string): { release(): void; nonce: string } {
   const path = join(home, "daemon.lock");
+  // H4 fix round 2: one per acquisition, so a later daemon with the same pid (a pid reuse) never matches it.
+  const nonce = randomBytes(16).toString("hex");
   for (let attempt = 0; attempt < 2; attempt++) {
-    const tmp = writePidFile(home, process.pid);
+    const tmp = writePidFile(home, process.pid, nonce);
     try {
       linkSync(tmp, path);
     } catch (err) {
@@ -120,6 +138,7 @@ export function acquireHomeLock(home: string): { release(): void } {
     unlinkSync(tmp); // the hard link now at `path` is unaffected by removing this second name to it
     let released = false;
     return {
+      nonce,
       release: () => {
         if (released) return;
         released = true;

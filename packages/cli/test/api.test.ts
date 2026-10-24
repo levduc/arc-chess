@@ -759,3 +759,24 @@ describe("local API", () => {
     expect(await res.json()).toEqual({ results: [], remaining: 0 }); // no settled channels yet
   });
 });
+
+describe("H4 fix round 2: /health names the process to this home's token", () => {
+  it("with the token: {ok, pid, lock, role}; without it, or without an identity, the bare {ok}", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const lockNonce = "ab".repeat(16);
+    const named = await startApi(pair.alice.daemon, { port: 0, token, identity: { lockNonce, role: "daemon" } });
+    const bare = await startApi(pair.bob.daemon, { port: 0, token: loadToken(pair.bob.home) });
+    stop = async () => {
+      named.server.close();
+      bare.server.close();
+      await pair.cleanup();
+    };
+    const health = async (url: string, tok?: string) =>
+      (await fetch(`${url}/health`, tok !== undefined ? { headers: { authorization: `Bearer ${tok}` } } : {})).json();
+    expect(await health(named.url, token)).toEqual({ ok: true, pid: process.pid, lock: lockNonce, role: "daemon" });
+    expect(await health(named.url)).toEqual({ ok: true });
+    expect(await health(named.url, "wrong")).toEqual({ ok: true });
+    expect(await health(bare.url, loadToken(pair.bob.home))).toEqual({ ok: true });
+  });
+});

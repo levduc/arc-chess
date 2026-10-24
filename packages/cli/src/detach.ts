@@ -1,8 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadToken, readConfig } from "./config.js";
-import { livePidHoldingLock } from "./lock.js";
+import { livePidHoldingLock, readLockFile } from "./lock.js";
 import { RecordStore } from "./records.js";
 
 /** Plan 6 hardening H4: how long `arena daemon --detach` waits, by default, for the daemon it started to answer.
@@ -17,7 +17,7 @@ const DETACH_POLL_MS = 200;
 
 /**
  * What `arena daemon --detach` prints, as one JSON line, whenever this home has a daemon afterwards (exit 0):
- * - `detached`, `healthy: true`: the daemon it started answers;
+ * - `detached`, `healthy: true`: the daemon it started answers, and says it is the process that holds the lock;
  * - `detached`, `healthy: false`: the daemon it started holds the home's lock but did not answer within the wait
  *   (H4 fix round 1, I1). It is left running -- its dispute timer starts before the chain reads that make it slow --
  *   and `hint` says what to do. `api` is the configured one (null when the home's port is 0);
@@ -70,120 +70,101 @@ function alive(pid: number): boolean {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** True once `<api>/health` answers 200 within 2 s. */
-async function answers(api: string | null, fetchFn: typeof fetch): Promise<boolean> {
-  if (api === null) return false;
-  try {
-    return (await fetchFn(`${api}/health`, { signal: AbortSignal.timeout(2_000) })).ok;
-  } catch {
-    return false;
-  }
-}
-
-/** A process started this long after `daemon.lock` was last written cannot be the process that wrote it. The slack
- *  covers the start-time sources' own precision: whole seconds (`/proc/stat`'s `btime`, `ps`'s `etime`). */
-const LOCK_WRITER_SLACK_MS = 2_000;
-
-/** `ps -o etime=`'s `[[dd-]hh:]mm:ss`, in seconds; null if it is not that shape. Exported for tests. */
-export function parseEtime(etime: string): number | null {
-  const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(etime.trim());
-  if (m === null) return null;
-  return Number(m[1] ?? 0) * 86_400 + Number(m[2] ?? 0) * 3_600 + Number(m[3]) * 60 + Number(m[4]);
-}
+/** Where a pid's state is read: `/proc` (Linux) or `ps` (macOS and every other system without it). */
+export type ProcessSource = "proc" | "ps";
 
 /**
- * H4 add-on: a pid's argv and when it started (ms since the epoch), or null when the process is gone (a zombie, exited
- * but not yet reaped, counts as gone) or cannot be read. Linux reads `/proc` (`cmdline`; `stat`'s start time in
- * USER_HZ ticks, 100 per second, after `/proc/stat`'s boot time); elsewhere, `ps -o etime= -o args=`.
+ * H4 fix round 2: whether `pid` still runs -- `"zombie"` (exited, not yet reaped) and `"gone"` both mean it has
+ * exited. Used only to see a stopped daemon go, never to identify one (that is `identify`'s job, with no clock).
+ * Exported for tests, which force the `ps` path.
  */
-export function processFacts(pid: number, now = Date.now()): { argv: string[]; startedAtMs: number } | null {
-  try {
-    if (existsSync("/proc/self/stat")) {
-      const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-      if (argv.at(-1) === "") argv.pop();
+export function processState(pid: number, source: ProcessSource = existsSync("/proc/self/stat") ? "proc" : "ps"): "running" | "zombie" | "gone" {
+  if (!alive(pid)) return "gone";
+  if (source === "proc") {
+    try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      // Fields after the parenthesised command name, which may itself hold spaces or ")": the state is field 3, the
-      // start time field 22.
-      const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
-      if (fields[0] === "Z") return null;
-      const ticks = Number(fields[19]);
-      const btime = Number(/^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"))?.[1]);
-      if (!Number.isFinite(ticks) || !Number.isFinite(btime)) return null;
-      return { argv, startedAtMs: btime * 1000 + ticks * 10 };
+      // The state is the field right after the parenthesised command name, which may itself hold spaces or ")".
+      return stat.slice(stat.lastIndexOf(") ") + 2).startsWith("Z") ? "zombie" : "running";
+    } catch {
+      return "gone";
     }
-    const r = spawnSync("ps", ["-o", "etime=", "-o", "args=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 });
-    const line = r.status === 0 ? r.stdout.trim() : "";
-    const [etime, ...args] = line.split(/\s+/);
-    const seconds = etime === undefined ? null : parseEtime(etime);
-    if (seconds === null || args.length === 0 || args.some((a) => a.includes("<defunct>"))) return null;
-    return { argv: args, startedAtMs: now - seconds * 1000 };
-  } catch {
-    return null;
   }
+  const r = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 });
+  if (r.status !== 0) return "gone";
+  return r.stdout.trim().startsWith("Z") ? "zombie" : "running";
 }
 
-/** Why the live pid `daemon.lock` names is not this home's `arena daemon`, or null when it is. */
-type HolderProblem = { kind: "unreadable" } | { kind: "gone" } | { kind: "reused" } | { kind: "notDaemon"; argv: string[] };
+/** What `identify` learned about the process `daemon.lock` names. */
+export type Identity =
+  | { state: "confirmed"; pid: number; role: string }
+  | { state: "silent"; why: string }
+  | { state: "other"; why: string };
 
 /**
- * H4 add-on: `daemon.lock` names a pid only. The process with that pid is the one that wrote the lock if, and only if,
- * it started before the lock was written (a pid cannot be reused while its process lives). And it must be `arena
- * daemon` itself: `arena bot` and an in-process `withdraw` hold the same lock. Shared by `daemon stop` (never signal
- * anything else) and `--detach` (fix round 1, I2: say what the holder is).
+ * H4 fix round 2 (N1, N3): who answers this home's API, and whether it is the process `daemon.lock` names -- asked of
+ * the daemon itself, with no clock. `GET /health` with this home's bearer token answers `{pid, lock, role}`: its own
+ * pid, the random nonce its `acquireHomeLock` wrote into `daemon.lock`, and the command running it. `confirmed` only
+ * when that pid is the lock's pid and that nonce the lock's nonce (a lock from an older CLI has no nonce: the
+ * authenticated pid alone then). `silent` when nothing answers, or the answer names no process (another home's
+ * daemon on that port, without this token, or an older CLI's); `other` when this home's token is answered by a
+ * different pid or nonce than the lock's.
  */
-function holderProblem(home: string, facts: { argv: string[]; startedAtMs: number } | null): HolderProblem | null {
-  if (facts === null) return { kind: "unreadable" };
-  let written: number;
+export async function identify(home: string, api: string | null, lock: { pid: number; nonce?: string }, fetchFn: typeof fetch): Promise<Identity> {
+  if (api === null) return { state: "silent", why: "cannot be asked: this home's port is 0" };
+  let body: { pid?: unknown; lock?: unknown; role?: unknown };
   try {
-    written = statSync(join(home, "daemon.lock")).mtimeMs;
+    const res = await fetchFn(`${api}/health`, {
+      headers: { authorization: `Bearer ${loadToken(home)}` },
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (!res.ok) return { state: "silent", why: `answers ${api} with ${res.status}` };
+    body = (await res.json()) as typeof body;
   } catch {
-    return { kind: "gone" };
+    return { state: "silent", why: `does not answer on ${api}` };
   }
-  if (facts.startedAtMs > written + LOCK_WRITER_SLACK_MS) return { kind: "reused" };
-  if (!facts.argv.includes("daemon")) return { kind: "notDaemon", argv: facts.argv };
-  return null;
+  if (typeof body.pid !== "number") {
+    return { state: "silent", why: `does not say on ${api} which process it is (a daemon of another home, or of an older CLI)` };
+  }
+  if (body.pid !== lock.pid || (lock.nonce !== undefined && body.lock !== lock.nonce)) {
+    return { state: "other", why: `${api} is answered with this home's token by pid ${body.pid}, not by the daemon.lock's writer` };
+  }
+  return { state: "confirmed", pid: body.pid, role: typeof body.role === "string" ? body.role : "daemon" };
 }
 
-const argvSummary = (argv: string[]) => argv.slice(1).join(" ").slice(0, 120);
-
 /**
- * H4 fix round 1 (I2, M1): what `--detach` does when the live pid `pid` already holds this home's lock -- before it
- * spawns, or after its own child lost the race for the lock. `"proceed"` when the lock turns out to be gone. A pid that
- * is not this home's daemon is named, with what to do; this home's daemon is given until `deadline` to answer
- * `/health` (it may be starting), and then is reported running, or not answering with the way out. Never a loop:
- * every message says what to run next, and none says to run `--detach` again as is.
+ * H4 fix rounds 1 and 2 (I2, M1, N3): what `--detach` does when the live pid `pid` already holds this home's lock --
+ * before it spawns, or after its own child lost the race for the lock. `"proceed"` when the lock turns out to be gone.
+ * The holder is identified through its own API (`identify`) until `deadline` (it may be starting): this home's
+ * `arena daemon` is reported running; a live pid that never answers -- still starting, stuck, or a reused pid -- gets
+ * the "not answering" message, with what to do. Never a loop: no message says to run `--detach` again as is, and
+ * none calls a lock stale while its pid lives.
  */
 async function alreadyHeld(
   home: string,
   pid: number,
   ctx: { api: string | null; log: string; deadline: number; fetch: typeof fetch; command: string },
 ): Promise<DetachResult | "proceed"> {
-  const lock = join(home, "daemon.lock");
-  const problem = holderProblem(home, processFacts(pid));
-  if (problem?.kind === "gone") return "proceed";
-  if (problem?.kind === "reused") {
-    throw new Error(
-      `${lock} names pid ${pid}, but that process started after the lock was written: it is another program that ` +
-        `reused the pid, not a daemon. No daemon can start on this home until that process exits: tell your human`,
-    );
-  }
-  if (problem?.kind === "notDaemon") {
-    throw new Error(
-      `pid ${pid} holds ${home} but is not "${ctx.command} daemon" (${argvSummary(problem.argv)}): an "${ctx.command} bot" ` +
-        `or a withdraw in progress. Wait until it ends (a withdraw takes seconds), then run "${ctx.command} daemon --detach"`,
-    );
-  }
-  // This home's daemon (or, "unreadable", one whose pid cannot be checked: its own /health is then the only word).
+  let why = "does not answer";
   do {
-    if (await answers(ctx.api, ctx.fetch)) return { alreadyRunning: true, healthy: true, pid, api: ctx.api!, log: ctx.log };
-    if (livePidHoldingLock(home) !== pid) return "proceed";
+    const lock = readLockFile(home);
+    if (lock === null || lock.pid !== pid || !alive(pid)) return "proceed";
+    const id = await identify(home, ctx.api, lock, ctx.fetch);
+    if (id.state === "confirmed") {
+      if (id.role === "daemon") return { alreadyRunning: true, healthy: true, pid, api: ctx.api!, log: ctx.log };
+      throw new Error(
+        id.role === "withdraw"
+          ? `a withdraw in progress (pid ${pid}) holds ${home}: wait until it ends (it takes seconds), then run "${ctx.command} daemon --detach"`
+          : `an "${ctx.command} ${id.role}" (pid ${pid}) holds ${home}, and a home runs one daemon or one bot: use another ARENA_HOME`,
+      );
+    }
+    if (id.state === "other") throw new Error(`pid ${pid} holds ${home}, but ${id.why}: tell your human (pid ${pid}, log ${ctx.log})`);
+    why = id.why;
     await sleep(DETACH_POLL_MS);
   } while (Date.now() < ctx.deadline);
   throw new Error(
-    `another arena daemon (pid ${pid}) is using ${home} but does not answer${ctx.api !== null ? ` on ${ctx.api}` : ""}: it ` +
-      `is still starting (a slow or rate-limited RPC) or stuck, and it may already be watching your channels, so do not ` +
-      `start another. Run "${ctx.command} channels" in a minute; if it still cannot reach the daemon, run "${ctx.command} ` +
-      `daemon stop", then "${ctx.command} daemon --detach"; if that happens again, read the end of ${ctx.log} and tell your human`,
+    `another arena daemon (pid ${pid}) holds ${home} but ${why}: it may still be starting (a slow or rate-limited RPC) ` +
+      `or be stuck, and it may already be watching your channels, so do not start another. Run "${ctx.command} channels" ` +
+      `in a minute; if it still cannot reach the daemon, tell your human: pid ${pid}, its log ${ctx.log}`,
   );
 }
 
@@ -199,11 +180,11 @@ async function alreadyHeld(
  * descriptor of the caller's.
  *
  * A live pid already holding the lock goes to `alreadyHeld`, and so does one that wins the lock from this call's own
- * child (fix round 1, M1). Otherwise it waits up to `waitMs` for the child's own start line in the log (printed once
- * its API listens), its pid in `daemon.lock` and its `/health`. Fix round 1 (I1): a child that holds the lock at the
- * deadline is never stopped -- `ArenaDaemon.start()` arms its dispute timer before the chain reads that make a start
- * slow, so it may already be guarding a channel -- and is reported `healthy: false`. Only a child that exited (an error
- * with the log's last lines) or never took the lock (stopped by its own pid: SIGTERM, then SIGKILL) fails.
+ * child (fix round 1, M1). Otherwise it waits up to `waitMs` until the child holds the lock and its API says so
+ * (`identify`). Fix round 1 (I1): a child that holds the lock at the deadline is never stopped --
+ * `ArenaDaemon.start()` arms its dispute timer before the chain reads that make a start slow, so it may already be
+ * guarding a channel -- and is reported `healthy: false`. Only a child that exited (an error with the log's last
+ * lines) or never took the lock (stopped by its own pid: SIGTERM, then SIGKILL) fails.
  */
 export async function startDetachedDaemon(
   home: string,
@@ -251,11 +232,14 @@ export async function startDetachedDaemon(
     return new Error(`the daemon ${what}${tail !== "" ? `: ${tail}` : ""} (its log: ${log})`);
   };
 
+  // A home with port 0 (tests only) has no fixed API address: the child's own start line names the one it got.
   let started: { api: string } | undefined;
   while (pid !== undefined && exited === undefined && Date.now() < deadline) {
     started ??= startLineOf(logAfter(log, from), pid);
-    if (started !== undefined && livePidHoldingLock(home) === pid && (await answers(started.api, opts.fetch))) {
-      return { detached: true, healthy: true, pid, api: started.api, log };
+    const lock = readLockFile(home);
+    const childApi = started?.api ?? api;
+    if (lock?.pid === pid && childApi !== null && (await identify(home, childApi, lock, opts.fetch)).state === "confirmed") {
+      return { detached: true, healthy: true, pid, api: childApi, log };
     }
     await sleep(DETACH_POLL_MS);
   }
@@ -279,7 +263,7 @@ export async function startDetachedDaemon(
       log,
       hint:
         `the daemon is running but still starting (a slow or rate-limited RPC), and it keeps running: do not start ` +
-        `another. Run "${opts.command} status" in a minute; next time, --timeout 100 waits longer`,
+        `another. Run "${opts.command} channels" in a minute; next time, --timeout 100 waits longer`,
     };
   }
   // It never took the lock: stop the one process this call started, and nothing else. `exited` is checked before each
@@ -305,91 +289,85 @@ export async function startDetachedDaemon(
  *  RPC calls already in flight (`ArenaDaemon.stop()`), each retried for up to 15.5 s on a rate-limited RPC. */
 export const STOP_WAIT_DEFAULT_S = 60;
 
-/** The phases a running daemon must keep watching: a challenge there needs an answer before its deadline. `Unknown`
- *  (the daemon has not read the channel's chain state yet) might be either. */
-const LIVE_PHASES = new Set(["Open", "Challenged", "Unknown"]);
-
-/** H4 add-on: why `pid` must not be signalled as `home`'s daemon, or null when it may be (see `holderProblem`). */
-export function stopRefusal(home: string, pid: number, facts: { argv: string[]; startedAtMs: number } | null, command: string): string | null {
-  const lock = join(home, "daemon.lock");
-  const problem = holderProblem(home, facts);
-  if (problem === null) return null;
-  switch (problem.kind) {
-    case "unreadable":
-      return `cannot read pid ${pid}'s start time or command line, so it cannot be verified as this home's daemon: not signalling it`;
-    case "gone":
-      return `${lock} is gone: the daemon stopped already`;
-    case "reused":
-      return (
-        `pid ${pid} started after ${lock} was written, so it is not the daemon that wrote it (its pid was reused): not ` +
-        `signalling it. The lock is stale, but while that process runs no daemon can start on this home: tell your human`
-      );
-    case "notDaemon":
-      return (
-        `pid ${pid} holds ${home} but is not "${command} daemon" (${argvSummary(problem.argv)}): an ` +
-        `"${command} bot" or a withdraw in progress holds the lock too. Not stopping it`
-      );
-  }
-}
-
-/** The channels of `home`'s running daemon that it must keep watching, by id: from its own `GET /channels`, or, if
- *  that cannot be read, every channel record on disk that is not finalized. */
-async function liveChannels(home: string, port: number, fetchFn: typeof fetch): Promise<{ ids: string[]; source: string }> {
-  try {
-    const res = await fetchFn(`http://127.0.0.1:${port}/channels`, {
-      headers: { authorization: `Bearer ${loadToken(home)}`, "x-arena-actor": "agent" },
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!res.ok) throw new Error(`answered ${res.status}`);
-    const list = (await res.json()) as Array<{ channelId?: unknown; phase?: unknown; degraded?: unknown }>;
-    if (!Array.isArray(list)) throw new Error("answered something other than a list");
-    const ids = list.filter((c) => c.degraded !== true && LIVE_PHASES.has(String(c.phase))).map((c) => String(c.channelId));
-    return { ids, source: "the daemon's channels" };
-  } catch (err) {
-    const ids = new RecordStore(home).channels().filter((r) => !r.finalized).map((r) => r.channelId);
-    return { ids, source: `the channel records on disk (the daemon's own list could not be read: ${err instanceof Error ? err.message : String(err)})` };
-  }
+/**
+ * H4 fix round 2 (N2): the channels a daemon must keep watching, by id -- every channel record of this home that is
+ * not `finalized`, whatever its phase. Not `Open`/`Challenged` alone: in `None` our own deposit may be in flight, and in
+ * `Funding` the hub opens the channel by itself on the opponent's deposit, which would then run with no watchtower; a
+ * deposit past the funding deadline needs this daemon to reclaim it. `finalized` is set only once a channel is settled,
+ * reclaimed, or retired with none of our money in it (`ArenaDaemon.markFinalized`), so a retired record, which keeps
+ * `None` or `Funding` as its final phase, does not count. Unreadable records are not counted: no daemon can watch them.
+ */
+export function liveChannelIds(home: string): string[] {
+  return new RecordStore(home).channels().filter((r) => !r.finalized).map((r) => r.channelId);
 }
 
 /**
- * H4 add-on (`arena daemon stop`): stops this home's running daemon -- SIGTERM, its own clean shutdown -- and waits up
- * to `waitMs` until that process is gone. The daemon API has no shutdown route, so the pid comes from `daemon.lock`,
- * checked with `stopRefusal` before the signal and again right before it. Refuses while a channel is `Open` or
- * `Challenged` (or not read yet) unless `override`: with no daemon, nothing answers a challenge before its deadline.
+ * H4 add-on (`arena daemon stop`), fix round 2 (N1, N3): stops this home's running `arena daemon`, and waits up to
+ * `waitMs` until it has exited. The pid comes from `daemon.lock`, and is signalled (SIGTERM, the daemon's own clean
+ * shutdown) only after the daemon's own API, asked with this home's token in this same call, said it is that pid and
+ * holds that lock's nonce (`identify`) -- checked again right before the signal. A lock pid that does not answer is
+ * never signalled, whatever it is: the error says to wait and retry, then tell the human. Refuses while any channel
+ * record is not finalized (`liveChannelIds`) unless `override`: with no daemon, nothing answers a challenge.
  */
 export async function stopDaemon(
   home: string,
-  opts: { fetch: typeof fetch; waitMs: number; command: string; override: boolean; warn(line: string): void },
+  opts: {
+    fetch: typeof fetch;
+    waitMs: number;
+    command: string;
+    override: boolean;
+    warn(line: string): void;
+    /** Test seam: how to see the process go (default: `/proc` where it exists, else `ps`). */
+    processSource?: ProcessSource;
+  },
 ): Promise<{ stopped: true; pid: number }> {
-  const pid = livePidHoldingLock(home);
-  if (pid === null) throw new Error(`no arena daemon is running on ${home}: nothing to stop`);
-  const facts = processFacts(pid);
-  const refusal = stopRefusal(home, pid, facts, opts.command);
-  if (refusal !== null) throw new Error(refusal);
+  const lock = readLockFile(home);
+  if (lock === null || livePidHoldingLock(home) === null) throw new Error(`no arena daemon is running on ${home}: nothing to stop`);
+  const { pid } = lock;
   const { config } = readConfig(home);
-  const live = await liveChannels(home, config.port, opts.fetch);
-  if (live.ids.length > 0) {
-    if (!opts.override) {
+  const api = config.port !== 0 ? `http://127.0.0.1:${config.port}` : null;
+  const log = join(home, "daemon.log");
+  const check = async () => {
+    const id = await identify(home, api, lock, opts.fetch);
+    if (id.state === "other") throw new Error(`pid ${pid} holds ${home}, but ${id.why}: not signalling anything. Tell your human (pid ${pid}, log ${log})`);
+    if (id.state === "silent") {
       throw new Error(
-        `channels are live (${live.ids.join(", ")}, from ${live.source}): settle first (${opts.command} close --channel <id>, ` +
-          `then wait for Finalized) or run the daemon elsewhere -- with no daemon, nothing answers a challenge before its ` +
-          `deadline. To stop it anyway: ${opts.command} daemon stop --yes-i-understand`,
+        `the daemon daemon.lock names (pid ${pid}) ${id.why}, so it is not signalled: it may still be starting, be stuck, ` +
+          `or not be a daemon at all. Wait a minute and run "${opts.command} daemon stop" again; if it still does not ` +
+          `answer, tell your human: pid ${pid}, its log ${log}`,
       );
     }
-    opts.warn(`note: stopping with ${live.ids.length} live channel(s) (${live.ids.join(", ")}): nothing answers a challenge until a daemon runs again`);
-  }
-  // Checked again right before the signal: the same process, started at the same time, still holds the lock.
-  const again = processFacts(pid);
-  if (livePidHoldingLock(home) !== pid || again === null || again.startedAtMs !== facts!.startedAtMs) {
-    throw new Error(`pid ${pid} changed while it was being checked: not signalling it; run "${opts.command} daemon stop" again`);
-  }
-  process.kill(pid, "SIGTERM");
-  const gone = () => {
-    const now = processFacts(pid);
-    return now === null || now.startedAtMs !== facts!.startedAtMs;
+    if (id.role !== "daemon") {
+      throw new Error(
+        `pid ${pid} is "${opts.command} ${id.role}", not "${opts.command} daemon": not stopping it` +
+          (id.role === "withdraw" ? " (a withdraw ends by itself in seconds)" : ""),
+      );
+    }
   };
+  await check();
+  const live = liveChannelIds(home);
+  if (live.length > 0) {
+    if (!opts.override) {
+      // m2: the override is the human's to give: it is named in the README, never in this message.
+      throw new Error(
+        `channels are live (${live.join(", ")}: their records are not finalized): settle first (${opts.command} close ` +
+          `--channel <id>, then wait for Finalized; a channel still being funded settles by itself at its funding deadline) ` +
+          `or run the daemon elsewhere -- with no daemon, nothing answers a challenge before its deadline, and a channel ` +
+          `being funded can open with nobody watching it. If one has only just settled, run "${opts.command} daemon stop" ` +
+          `again in a minute. Stopping it anyway is your human's decision, not yours`,
+      );
+    }
+    opts.warn(`note: stopping with ${live.length} live channel(s) (${live.join(", ")}): nothing answers a challenge until a daemon runs again`);
+  }
+  // Asked again right before the signal: the same process still holds the same lock and says so.
+  const again = readLockFile(home);
+  if (again === null || again.pid !== pid || again.nonce !== lock.nonce) {
+    throw new Error(`daemon.lock changed while it was being checked: not signalling anything; run "${opts.command} daemon stop" again`);
+  }
+  await check();
+  process.kill(pid, "SIGTERM");
   const deadline = Date.now() + opts.waitMs;
-  while (!gone()) {
+  while (processState(pid, opts.processSource) === "running") {
     if (Date.now() > deadline) {
       throw new Error(`the daemon (pid ${pid}) did not exit within ${Math.round(opts.waitMs / 1000)} s of SIGTERM; it may still be shutting down`);
     }

@@ -179,6 +179,9 @@ export async function startApi(
     sse?: { pingIntervalMs?: number; changeDebounceMs?: number };
     /** Test-only: the clock the board's one-time codes and their rate limit read (default `Date.now`). */
     board?: { now?: () => number };
+    /** H4 fix round 2: who this process is, for `/health` asked with the token -- the nonce its `daemon.lock` holds
+     *  and the command running it. `startDaemonProcess` always sets it. */
+    identity?: { lockNonce: string; role: string };
   },
 ): Promise<{ server: Server; url: string }> {
   const host = opts.host ?? "127.0.0.1";
@@ -354,7 +357,18 @@ export async function startApi(
         // path under /board that isn't one of them must 404, never 401.
         if (isBoardRequest(req.url ?? "/")) return serveBoard(req, res, url.pathname);
         const route = `${req.method} ${url.pathname}`;
-        if (route === "GET /health") return send(res, 200, { ok: true });
+        // H4 fix round 2 (N1, N3): asked with this home's token, /health also says which process answers -- its pid
+        // and the nonce of the daemon.lock it wrote -- so `daemon stop` and `daemon --detach` identify the lock's
+        // writer without any clock. Without the token it stays the bare liveness probe it always was.
+        if (route === "GET /health") {
+          return send(
+            res,
+            200,
+            opts.identity !== undefined && authorized(req, opts.token)
+              ? { ok: true, pid: process.pid, lock: opts.identity.lockNonce, role: opts.identity.role }
+              : { ok: true },
+          );
+        }
         if (route === "GET /events") {
           if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
           if (sseClients.size >= MAX_SSE_CLIENTS) return send(res, 429, { error: `too many /events clients (max ${MAX_SSE_CLIENTS})` });
