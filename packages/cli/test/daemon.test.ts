@@ -170,6 +170,9 @@ describe("ArenaDaemon core", () => {
     await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
     await bob.daemon.close(id, "agent");
     await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "finalized");
+    // H1 (flake fix): `record.finalized` is set inside settleCheck, which then awaits its own last refreshChain --
+    // a new `chain` object. Let that pass finish before taking the reference this test compares against.
+    await alice.daemon.idle();
 
     const find = async () => {
       const c = (await alice.daemon.channels()).find((c) => c.channelId === id);
