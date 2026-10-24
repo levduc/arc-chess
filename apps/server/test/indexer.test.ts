@@ -463,6 +463,46 @@ describe("H1 (review m-11): the indexer never wedges on one oversized event", ()
   });
 });
 
+describe("H3 fix round 1 (review I2): H1's probes, when the RPC refuses the probe too", () => {
+  /** A chain whose RPC answers every hub-event read -- the read and the probe of the range's other events alike --
+   *  with Arc's refusal, as a node that refuses the range itself (not its content) would. */
+  function refusesEverything(chunkBlocks: number) {
+    const cfg = testConfig({ indexer: { pollMs: 0, chunkBlocks, startBlock: 0n } });
+    const repo = new SqliteRepo(":memory:");
+    const chain = new FakeChain();
+    chain.block = 45n;
+    const reads: Array<{ from: bigint; to: bigint; probe: boolean }> = [];
+    chain.hubEvents = async (from: bigint, to: bigint, o?: { kinds?: readonly HubEvent["kind"][] }) => {
+      reads.push({ from, to, probe: o?.kinds !== undefined });
+      throw Object.assign(new Error("requested range too large"), { code: -32012 });
+    };
+    const logs: string[] = [];
+    return { repo, reads, logs, indexer: new Indexer(repo, chain, cfg, (l) => logs.push(l)) };
+  }
+
+  it("a multi-block range: the probe is refused too, so the range is neither split nor counted", async () => {
+    const { repo, reads, logs, indexer } = refusesEverything(10);
+    for (let i = 0; i <= INDEXER_UNREADABLE_POLLS; i++) await indexer.poll();
+    expect(reads.filter((r) => r.probe).length).toBe(INDEXER_UNREADABLE_POLLS + 1); // probed once a poll
+    expect(reads.every((r) => r.from === 0n && r.to === 9n)).toBe(true); // never a half
+    expect(indexer.skippedBlocks()).toEqual([]);
+    expect(repo.cursor()).toBeNull();
+    expect(logs.every((l) => /^indexer: .*requested range too large/.test(l))).toBe(true);
+    repo.close();
+  });
+
+  it("a single block: the probe of its other events is refused too, so it is never counted toward a skip", async () => {
+    const { repo, reads, logs, indexer } = refusesEverything(1);
+    for (let i = 0; i <= INDEXER_UNREADABLE_POLLS; i++) await indexer.poll();
+    expect(reads.filter((r) => r.probe).length).toBe(INDEXER_UNREADABLE_POLLS + 1);
+    expect(reads.every((r) => r.from === 0n && r.to === 0n)).toBe(true);
+    expect(indexer.skippedBlocks()).toEqual([]);
+    expect(logs.some((l) => /retried next poll|skipping/.test(l))).toBe(false); // never counted
+    expect(repo.cursor()).toBeNull();
+    repo.close();
+  });
+});
+
 describe("H3: a rate-limited RPC never splits a range nor skips a block", () => {
   /** A fake RPC behind viem's real HTTP transport: head 45, no events. While `limited`, every full read (the 7 hub
    *  events in one query) is answered `answer`; a single-kind read -- H1's probe of a range's other events -- is
