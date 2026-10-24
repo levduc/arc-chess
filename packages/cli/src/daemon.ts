@@ -415,6 +415,12 @@ export const FUND_BACKOFF_SECONDS = 30n;
  *  retrying it (the close API and the relay path still submit at once). */
 export const CLOSE_RETRY_BACKOFF_MS = 30_000;
 
+/** H1 (audit-daemon M-11): when the opponent's Close signature completes a close on this side (the relay path), the
+ *  watchtower submits it no sooner than this, plus up to `CLOSE_RELAY_JITTER_MS` -- the opponent, who signed second,
+ *  submits it at once, and two submissions race (the loser's transaction reverts on-chain). */
+export const CLOSE_RELAY_DEFER_MS = 2_000;
+export const CLOSE_RELAY_JITTER_MS = 3_000;
+
 /** Plan 4.5 Task 10 round 4: how long the reclaim API waits for the main pass to release a channel before it
  *  answers 409 (the main pass may be in a bounded receipt wait on that channel). */
 export const RECLAIM_BUSY_WAIT_MS = 2_000;
@@ -2599,9 +2605,16 @@ export class ArenaDaemon {
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }
     if (this.stopped) return;
-    // A failed submission is recorded as `close:` by trySubmitClose and retried by the watchtower.
-    if (closeReceived) await this.trySubmitClose(l).catch(() => undefined);
-    if (this.stopped) return;
+    // H1 (audit-daemon M-11): the opponent's Close signature completed the close here. The opponent signed second,
+    // so their own `close()` is submitting it right now; submitting it here as well raced theirs, and the loser's
+    // transaction reverted on-chain (about 37k gas, paid for nothing). So this side leaves it to its watchtower after
+    // a short, jittered delay (two sides that both completed it here are spread apart), and the watchtower's
+    // `submitClose` reads the phase first: a close that went through meanwhile is never sent again. If theirs never
+    // lands, this one does. The close API and every later retry are unchanged.
+    if (closeReceived && l.session.closeTransaction()) {
+      const defer = CLOSE_RELAY_DEFER_MS + Math.floor(Math.random() * CLOSE_RELAY_JITTER_MS);
+      l.closeRetryAt = Math.max(l.closeRetryAt, Date.now() + defer);
+    }
     this.notify();
   }
 

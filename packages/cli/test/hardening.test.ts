@@ -40,6 +40,8 @@ import {
 } from "../../sdk/test/helpers/chain.js";
 import {
   ArenaDaemon,
+  CLOSE_RELAY_DEFER_MS,
+  CLOSE_RELAY_JITTER_MS,
   DaemonError,
   FileSessionStore,
   RecordStore,
@@ -973,10 +975,45 @@ describe("Plan 4.5 Task 10: the watchtower retries a failed cooperative close", 
     await alice.daemon.close(id, "agent"); // alice alone: nothing to submit yet
     await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
     await expect(bob.daemon.close(id, "agent")).rejects.toThrow(/HTTP request failed/);
-    await waitFor(() => failures.length === 2, 5_000, "alice's relay-path submission to fail too");
     // Before the fix nothing retried: the channel stayed Open with a fully co-signed close.
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Finalized", 10_000, "the watchtower's retry");
     await waitFor(() => alice.daemon.handle(id).lastError === null && bob.daemon.handle(id).lastError === null, 5_000, "close: cleared");
+    // H1 (audit-daemon M-11): Alice, who got Bob's signature over the relay, no longer submits at once beside Bob's
+    // own close; her watchtower would have, after CLOSE_RELAY_DEFER_MS, had Bob's retry not settled it first.
+    expect(failures).toEqual(["bob"]);
+  });
+
+  it("H1 (audit-daemon M-11): the side the relay completes a close on waits; one closeCooperative is sent, and none reverts", async () => {
+    const { alice, bob, id } = await matched();
+    for (const m of SCHOLARS_MATE) {
+      const [mover, other] = alice.daemon.handle(id).session.isMyTurn() ? [alice, bob] : [bob, alice];
+      await mover.daemon.move(id, m, { actor: "agent" });
+      const turn = mover.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => other.daemon.handle(id).session.latest.state.turnNum >= turn, 5_000, `relay ${m}`);
+    }
+    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 8n, 5_000, "bob's auto-resign");
+    const sent = { alice: 0, bob: 0 };
+    for (const [name, p] of [["alice", alice], ["bob", bob]] as const) {
+      const hub = p.daemon.hub;
+      const real = hub.closeCooperative.bind(hub);
+      hub.closeCooperative = async (sender, tx) => {
+        sent[name]++;
+        // Bob's send is slow (an RPC round trip on a real chain): before H1, Alice's relay path read the phase as
+        // Open in that window and sent her own.
+        if (name === "bob") await new Promise((r) => setTimeout(r, 500));
+        return real(sender, tx);
+      };
+    }
+    await alice.daemon.close(id, "agent");
+    await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
+    await bob.daemon.close(id, "agent"); // the second signer submits at once
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Finalized");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 10_000, "alice sees it settled");
+    // Past Alice's deferral: her watchtower read the phase and sent nothing. Before H1 she raced Bob's close, and the
+    // loser's transaction reverted on-chain.
+    await new Promise((r) => setTimeout(r, CLOSE_RELAY_DEFER_MS + CLOSE_RELAY_JITTER_MS + 500));
+    expect(sent).toEqual({ alice: 0, bob: 1 });
+    expect(alice.daemon.handle(id).lastError).toBeNull();
   });
 });
 
