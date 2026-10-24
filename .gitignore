@@ -2,6 +2,8 @@ node_modules/
 tools/bin/
 contracts/out/
 contracts/cache/
+contracts/out-arc/
+contracts/cache-arc/
 contracts/broadcast/
 contracts/crytic-export/
 contracts/test/vectors/

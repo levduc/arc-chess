@@ -220,6 +220,21 @@ export async function freeTcpPort(): Promise<number> {
 const ANVIL_PORT_MIN = 8600;
 const ANVIL_PORT_MAX = 8699;
 
+/** Plan 6 Task 3: which anvil binary `startAnvil` spawns -- `tools/bin/arc-anvil` for `pnpm test:arc`, plain
+ *  `anvil` (today's behaviour) otherwise. */
+const ANVIL_BIN = process.env.ARENA_ANVIL_BIN ?? "anvil";
+/** Arc Foundry's anvil needs `--network arc` to model Arc's EVM semantics (the EIP-7708 native-transfer log;
+ *  a 20 gwei base-fee floor, but -- tools/arc-foundry.md -- only at this process's default chain id, 31337,
+ *  which is all this override ever runs at: never pass `--chain-id` through here) -- inferred from
+ *  `ANVIL_BIN`'s basename rather than a separate flag, so a caller only has to point `ARENA_ANVIL_BIN` at
+ *  `arc-anvil` to get both. */
+const ANVIL_NETWORK_ARGS = /(?:^|\/)arc-anvil$/.test(ANVIL_BIN) ? ["--network", "arc"] : [];
+/** Plan 6 Task 3: when set (`pnpm test:arc`), the preferred port `startAnvil` uses in place of its usual
+ *  dynamic scan over `ANVIL_PORT_MIN`-`ANVIL_PORT_MAX` -- so the Arc subset never races a concurrent
+ *  standard-anvil system-test run for the same port. Must fall within that reserved range; unset, today's
+ *  dynamic-scan behaviour for system tests is exactly unchanged. */
+const ENV_ANVIL_PORT = process.env.ARENA_TEST_ANVIL_PORT ? Number(process.env.ARENA_TEST_ANVIL_PORT) : undefined;
+
 /** Picks an Anvil port from the 8600-8699 range reserved for this harness (never the demo stack's :8545), with a
  *  bind check so two stacks started back to back don't race for the same port. `excluding` skips ports already
  *  known to be bad in this call (e.g. Anvil itself just failed to bind one, even though the bind check said it
@@ -450,16 +465,20 @@ const MAX_ANVIL_BIND_ATTEMPTS = 5;
  *  function pick the port itself; an explicit `preferred` port's failure is never silently swapped out from under
  *  the caller. */
 async function startAnvil(preferred: number | undefined, blockTime: number | undefined): Promise<{ tracked: Tracked; port: number; rpcUrl: string }> {
+  // Plan 6 Task 3: an explicit caller `preferred` port always wins; otherwise ARENA_TEST_ANVIL_PORT (set only
+  // for `pnpm test:arc`) stands in for it, so that mode's dynamic-scan is skipped too -- unset, this is
+  // `undefined` exactly as before.
+  const effectivePreferred = preferred ?? ENV_ANVIL_PORT;
   const tried = new Set<number>();
-  const attempts = preferred !== undefined ? 1 : MAX_ANVIL_BIND_ATTEMPTS;
+  const attempts = effectivePreferred !== undefined ? 1 : MAX_ANVIL_BIND_ATTEMPTS;
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
-    const port = await pickAnvilPort(preferred, tried);
+    const port = await pickAnvilPort(effectivePreferred, tried);
     tried.add(port);
     const rpcUrl = `http://127.0.0.1:${port}`;
-    const anvilArgs = ["--port", String(port), "--silent"];
+    const anvilArgs = ["--port", String(port), ...ANVIL_NETWORK_ARGS, "--silent"];
     if (blockTime !== undefined) anvilArgs.push("--block-time", String(blockTime));
-    const tracked = spawnTracked(`anvil:${port}`, "anvil", anvilArgs, {
+    const tracked = spawnTracked(`anvil:${port}`, ANVIL_BIN, anvilArgs, {
       env: { ...process.env, PATH: `${process.env.HOME}/.foundry/bin:${process.env.PATH ?? ""}` },
     });
     try {

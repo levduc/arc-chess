@@ -14,6 +14,7 @@
     "test:cli": "pnpm --filter @arena/cli test",
     "test:server": "pnpm --filter @arena/server test",
     "test:system": "pnpm --filter @arena/system-tests test",
+    "test:arc": "bash scripts/test-arc.sh",
     "soak": "tsx tests/system/soak.ts",
     "llm-games": "tsx tests/system/llm-games.ts",
     "dev:up": "tsx scripts/dev-up.ts",

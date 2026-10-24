@@ -2,7 +2,18 @@ import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
-export const ANVIL_PORT = 8546;
+/** Plan 6 Task 3: which anvil binary this spins up -- `tools/bin/arc-anvil` for `pnpm test:arc`, plain
+ *  `anvil` (today's behaviour) otherwise. */
+const ANVIL_BIN = process.env.ARENA_ANVIL_BIN ?? "anvil";
+/** Arc Foundry's anvil needs `--network arc` to model Arc's EVM semantics (the EIP-7708 native-transfer log;
+ *  a 20 gwei base-fee floor, but -- tools/arc-foundry.md -- only at this process's default chain id, 31337,
+ *  which is all this override ever runs at: never pass `--chain-id` through here) -- inferred from
+ *  `ANVIL_BIN`'s basename, so a caller only has to point ARENA_ANVIL_BIN at `arc-anvil` to get both. */
+const ANVIL_NETWORK_ARGS = /(?:^|\/)arc-anvil$/.test(ANVIL_BIN) ? ["--network", "arc"] : [];
+/** Plan 6 Task 3: ARENA_TEST_ANVIL_PORT overrides this fixed port for `pnpm test:arc`, so it never collides
+ *  with a standard-anvil run sharing this same global setup on :8546 (the SDK/CLI suites). Unset, this is
+ *  exactly today's 8546. */
+export const ANVIL_PORT = process.env.ARENA_TEST_ANVIL_PORT ? Number(process.env.ARENA_TEST_ANVIL_PORT) : 8546;
 
 async function waitForRpc(url: string): Promise<void> {
   for (let i = 0; i < 100; i++) {
@@ -26,7 +37,7 @@ export default async function setup(): Promise<() => Promise<void>> {
   const contracts = resolve(import.meta.dirname, "../../../contracts");
   const build = spawnSync("forge", ["build"], { cwd: contracts, env, stdio: "inherit" });
   if (build.status !== 0) throw new Error("forge build failed");
-  const anvil = spawn("anvil", ["--port", String(ANVIL_PORT), "--silent"], { env, stdio: "ignore" });
+  const anvil = spawn(ANVIL_BIN, ["--port", String(ANVIL_PORT), ...ANVIL_NETWORK_ARGS, "--silent"], { env, stdio: "ignore" });
   try {
     await waitForRpc(`http://127.0.0.1:${ANVIL_PORT}`);
   } catch (err) {
