@@ -25,6 +25,7 @@ import {
   botHomeProblems,
   buildServerConfig,
   checkPayRequest,
+  hideUrl,
   holdingsWei,
   hubPinProblem,
   isOurs,
@@ -33,6 +34,7 @@ import {
   parseUpArgs,
   procStartTime,
   readDeployment,
+  redact,
   shownUrl,
   testOverride,
   topUpAmount,
@@ -302,6 +304,16 @@ describe("the chain-id refusal", () => {
     expect(shownUrl("https://arc-testnet.example/?apikey=SECRETKEY")).toBe("https://arc-testnet.example/…");
     expect(shownUrl("https://rpc.testnet.arc.io")).toBe("https://rpc.testnet.arc.io");
     expect(shownUrl("not a url")).toBe("(an RPC URL)");
+  });
+
+  it("a registered --rpc is hidden in any message, viem's own included", () => {
+    const keyed = "https://arc-testnet.example/v2/SECRETKEY";
+    hideUrl(keyed);
+    hideUrl(RPC_URL); // the public one is never hidden
+    const viemLike = `HTTP request failed.\n\nURL: ${keyed}\nRequest body: {"method":"eth_getCode"}\n\nVersion: viem@2.56.8`;
+    expect(redact(viemLike)).not.toContain("SECRETKEY");
+    expect(redact(viemLike)).toContain("URL: https://arc-testnet.example/…");
+    expect(redact(`see ${RPC_URL}`)).toBe(`see ${RPC_URL}`);
   });
 
   it("an unreachable keyed RPC is refused without quoting its key", async () => {

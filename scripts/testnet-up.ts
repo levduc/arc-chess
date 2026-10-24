@@ -353,6 +353,21 @@ export function shownUrl(u: string): string {
   }
 }
 
+/** RPC URLs (other than the public one) to hide in every message this process prints, viem's included: a viem error
+ *  quotes its request URL in full, and a provider URL can carry an API key. Filled by `up` and `pay`. */
+const redactions = new Map<string, string>();
+
+export function hideUrl(u: string): void {
+  if (u !== RPC_URL) redactions.set(u, shownUrl(u));
+}
+
+/** `text` with every registered RPC URL replaced by its `shownUrl`. */
+export function redact(text: string): string {
+  let out = text;
+  for (const [u, shown] of [...redactions].sort((a, b) => b[0].length - a[0].length)) out = out.split(u).join(shown);
+  return out;
+}
+
 /** The public testnet RPC rate-limits (HTTP 429, or JSON-RPC -32005 "Request exceeds defined limit"): every client
  *  here retries with a back-off of 1, 2, 4, 8 and 16 s. Retrying a send is safe: the same signed transaction. */
 const RPC_RETRY = { timeout: 30_000, retryCount: 5, retryDelay: 1_000 } as const;
@@ -607,6 +622,7 @@ async function pay(argvIn: string[]): Promise<number> {
   // signed for chain 5042002 (EIP-155), so it is valid nowhere else.
   const viaRpc = argvIn[0] === "--rpc" ? argvIn[1] : undefined;
   const argv = viaRpc !== undefined ? argvIn.slice(2) : argvIn;
+  if (viaRpc !== undefined) hideUrl(viaRpc);
   const override = testOverride();
   const rpcUrl = override?.rpcUrl ?? viaRpc ?? RPC_URL;
   const chainId = override?.chainId ?? CHAIN_ID;
@@ -929,10 +945,16 @@ function runPay(payPath: string, to: Address, usdc: string): Promise<{ code: num
     child.once("error", reject);
     child.once("exit", (code) => resolvePromise({ code, stdout }));
   });
-  payInFlight = p.finally(() => {
+  // Tracked through a promise that never rejects (the caller awaits `p` and sees its error): a rejection here would
+  // otherwise sit unhandled until teardown.
+  const tracked = p.then(
+    () => undefined,
+    () => undefined,
+  );
+  payInFlight = tracked;
+  void tracked.then(() => {
     if (payInFlight === tracked) payInFlight = undefined;
   });
-  const tracked = payInFlight;
   return p;
 }
 
@@ -1092,7 +1114,7 @@ async function stopChild(label: string, child: ChildProcess | undefined, graceMs
 async function teardown(): Promise<void> {
   if (payInFlight !== undefined) {
     process.stderr.write("testnet-up: waiting for the pay helper in flight to finish (it may already have sent)\n");
-    await Promise.race([payInFlight.catch(() => {}), sleep(PAY_RECEIPT_TIMEOUT_MS + 60_000)]);
+    await Promise.race([payInFlight, sleep(PAY_RECEIPT_TIMEOUT_MS + 60_000)]);
   }
   for (const c of inflight) c.kill("SIGTERM");
   // The bots depend on the server; each stops its own daemon (and its API) on SIGTERM.
@@ -1138,6 +1160,8 @@ async function botChannels(home: string, child: ChildProcess, name: string, time
 }
 
 async function up(args: UpArgs): Promise<void> {
+  hideUrl(args.rpc);
+  hideUrl(args.publicRpc);
   // Before anything else: the chain, on both RPCs.
   await assertChain(args.rpc, CHAIN_ID);
   if (args.publicRpc !== args.rpc) await assertChain(args.publicRpc, CHAIN_ID);
@@ -1598,7 +1622,7 @@ if (process.argv[1] && resolve(process.argv[1]) === SELF) {
       process.exitCode = code;
     },
     async (err: unknown) => {
-      process.stderr.write(`testnet: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.stderr.write(`testnet: ${redact(err instanceof Error ? err.message : String(err))}\n`);
       // Same teardown as a Ctrl-C: a failure after the server started must not leave it running.
       if (!shuttingDown) {
         shuttingDown = true;
