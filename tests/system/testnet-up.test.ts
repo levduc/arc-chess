@@ -18,16 +18,25 @@ import {
   DEPLOYER,
   FORBIDDEN_PORTS,
   RPC_URL,
+  TESTNET_SERVER_LIMITS,
+  agentPrompt,
   assertChain,
+  assertTestnetDir,
+  botHomeProblems,
   buildServerConfig,
   checkPayRequest,
+  holdingsWei,
+  hubPinProblem,
   isOurs,
+  openNeedWei,
   parseDownArgs,
   parseUpArgs,
   procStartTime,
   readDeployment,
+  shownUrl,
   testOverride,
   topUpAmount,
+  unlessExits,
   writePayWrapper,
 } from "../../scripts/testnet-up.js";
 import { freeTcpPort, isPortFree } from "./harness.js";
@@ -103,23 +112,28 @@ describe("testnet:up arguments", () => {
     expect(a).toEqual({
       port: 8090,
       rpc: "https://rpc.testnet.arc.io",
+      publicRpc: "https://rpc.testnet.arc.io",
       houseBots: 2,
       botUsdc: "2.5",
       botDeposit: "1",
       botStake: "0.1",
       xmtpBots: false,
+      limits: {},
       dir: join(REPO_ROOT, ".arena-testnet"),
     });
   });
 
   it("takes every flag", () => {
     const a = parseUpArgs([
-      "--port", "8095", "--rpc", "https://example.invalid/arc-testnet", "--house-bots", "4", "--bot-usdc", "1.25", "--bot-deposit", "0.5", "--bot-stake", "0.05",
-      "--bot-timeout", "300", "--xmtp-bots", "--start-block", "68000000", "--dir", "/tmp/x",
+      "--port", "8095", "--rpc", "https://example.invalid/arc-testnet/KEY", "--public-rpc", "https://example.invalid/public",
+      "--house-bots", "4", "--bot-usdc", "1.25", "--bot-deposit", "0.5", "--bot-stake", "0.05",
+      "--bot-timeout", "300", "--xmtp-bots", "--limits", '{"maxOpenOffersPerIp": 10, "wsPerIp": 40}', "--start-block", "68000000",
+      "--dir", "/tmp/x",
     ]);
     expect(a).toEqual({
-      port: 8095, rpc: "https://example.invalid/arc-testnet", houseBots: 4, botUsdc: "1.25", botDeposit: "0.5", botStake: "0.05", botTimeout: 300, xmtpBots: true,
-      startBlock: 68_000_000n, dir: "/tmp/x",
+      port: 8095, rpc: "https://example.invalid/arc-testnet/KEY", publicRpc: "https://example.invalid/public", houseBots: 4,
+      botUsdc: "1.25", botDeposit: "0.5", botStake: "0.05", botTimeout: 300, xmtpBots: true,
+      limits: { maxOpenOffersPerIp: 10, wsPerIp: 40 }, startBlock: 68_000_000n, dir: "/tmp/x",
     });
     expect(parseUpArgs(["--bot-usdc", "0"]).botUsdc).toBe("0"); // 0: fund nothing
   });
@@ -142,12 +156,19 @@ describe("testnet:up arguments", () => {
     expect(() => parseUpArgs(["--house-bot", "1"])).toThrow(/unknown argument/);
     expect(() => parseUpArgs(["--port"])).toThrow(/needs a value/);
     expect(() => parseUpArgs(["--rpc", "rpc.testnet.arc.io"])).toThrow(/must be a URL/);
+    expect(() => parseUpArgs(["--public-rpc", "ftp://x"])).toThrow(/--public-rpc must be an http\(s\) URL/);
+    expect(() => parseUpArgs(["--limits", "{"])).toThrow(/JSON object/);
+    expect(() => parseUpArgs(["--limits", "[1]"])).toThrow(/JSON object/);
+    expect(() => parseUpArgs(["--limits", '{"maxOffers": 3}'])).toThrow(/unknown server limit "maxOffers"/);
+    expect(() => parseUpArgs(["--limits", '{"wsPerIp": 0}'])).toThrow(/positive whole number/);
+    expect(() => parseUpArgs(["--limits", '{"wsPerIp": 1.5}'])).toThrow(/positive whole number/);
     expect(() => parseUpArgs(["--rpc", "ws://127.0.0.1:1"])).toThrow(/http\(s\) URL/);
   });
 
   it("down: --withdraw and --dir only", () => {
-    expect(parseDownArgs([])).toEqual({ withdraw: false, dir: join(REPO_ROOT, ".arena-testnet") });
-    expect(parseDownArgs(["--withdraw", "--dir", "/tmp/y"])).toEqual({ withdraw: true, dir: "/tmp/y" });
+    expect(parseDownArgs([])).toEqual({ withdraw: false, settleSeconds: 120, dir: join(REPO_ROOT, ".arena-testnet") });
+    expect(parseDownArgs(["--withdraw", "--settle-seconds", "0", "--dir", "/tmp/y"])).toEqual({ withdraw: true, settleSeconds: 0, dir: "/tmp/y" });
+    expect(() => parseDownArgs(["--settle-seconds", "4000"])).toThrow(/between 0 and 3600/);
     expect(() => parseDownArgs(["--force"])).toThrow(/unknown argument/);
   });
 
@@ -210,7 +231,7 @@ describe("the chain-id refusal", () => {
 
   /** Runs `testnet:up` itself against `rpcUrl` (`--rpc`). */
   function runUp(rpcUrl: string, dir: string, port: number) {
-    return spawnSync(TSX_BIN, [SCRIPT, "--rpc", rpcUrl, "--port", String(port), "--house-bots", "0", "--dir", dir], {
+    return spawnSync(TSX_BIN, [SCRIPT, "--rpc", rpcUrl, "--public-rpc", rpcUrl, "--port", String(port), "--house-bots", "0", "--dir", dir], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: 60_000,
@@ -260,15 +281,31 @@ describe("the chain-id refusal", () => {
     expect(() => testOverride({ ARENA_TESTNET_TEST_OVERRIDE: "{" })).toThrow(/not JSON/);
     expect(() => testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: RPC_URL }) })).toThrow(/loopback/);
     expect(() => testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: "http://10.0.0.1:8545" }) })).toThrow(/loopback/);
-    for (const chainId of [5042, 5042002, 1]) {
-      expect(() => testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: "http://127.0.0.1:8701", chainId }) })).toThrow(
-        /may only be 31337/,
+    for (const chainId of [5042, 5042002, 1, undefined]) {
+      expect(() => testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: "http://127.0.0.1:8701", chainId, keyFile: "/k" }) })).toThrow(
+        /must be 31337/,
       );
     }
-    expect(testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: "http://127.0.0.1:8701", chainId: 31337 }) })).toEqual({
+    // m-1: no keyFile, no hook -- it never falls back to the real key file.
+    expect(() => testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: "http://127.0.0.1:8701", chainId: 31337 }) })).toThrow(
+      /keyFile is required: the hook never opens the real key file/,
+    );
+    expect(testOverride({ ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: "http://127.0.0.1:8701", chainId: 31337, keyFile: "/k" }) })).toEqual({
       rpcUrl: "http://127.0.0.1:8701/",
       chainId: 31337,
+      keyFile: "/k",
     });
+  });
+
+  it("messages show an RPC's scheme and host only: a provider key in the path never appears", () => {
+    expect(shownUrl("https://arc-testnet.example/v2/SECRETKEY")).toBe("https://arc-testnet.example/…");
+    expect(shownUrl("https://arc-testnet.example/?apikey=SECRETKEY")).toBe("https://arc-testnet.example/…");
+    expect(shownUrl("https://rpc.testnet.arc.io")).toBe("https://rpc.testnet.arc.io");
+    expect(shownUrl("not a url")).toBe("(an RPC URL)");
+  });
+
+  it("an unreachable keyed RPC is refused without quoting its key", async () => {
+    await expect(assertChain("http://127.0.0.1:1/v2/SECRETKEY")).rejects.toThrow(/^(?!.*SECRETKEY).*cannot read eth_chainId from http:\/\/127\.0\.0\.1:1\/…/s);
   });
 });
 
@@ -282,7 +319,8 @@ describe("the server config", () => {
     const raw = buildServerConfig({
       dir: "/x/.arena-testnet",
       port: 8090,
-      rpcUrl: RPC_URL,
+      rpcUrl: "https://keyed.example/v2/SECRETKEY",
+      publicRpcUrl: RPC_URL,
       deployment,
       limits: { maxDepositPerPlayer: 2_000_000n, maxCommittedEscrow: 50_000_000n, feePerPlayer: 5_000n },
       startBlock: 68_879_000n,
@@ -302,7 +340,8 @@ describe("the server config", () => {
     expect(cfg.host).toBe("127.0.0.1");
     expect(cfg.port).toBe(8090);
     expect(cfg.publicUrl).toBe("http://127.0.0.1:8090");
-    expect(cfg.rpcUrl).toBe("https://rpc.testnet.arc.io");
+    // m-10: the host's own (keyed) RPC stays private; /templates publishes publicRpcUrl.
+    expect(cfg.rpcUrl).toBe("https://keyed.example/v2/SECRETKEY");
     expect(cfg.publicRpcUrl).toBe("https://rpc.testnet.arc.io");
     expect(cfg.cliCommand).toBe("/x/.arena-testnet/bin/arena");
     expect(cfg.dbPath).toBe("/x/.arena-testnet/server.sqlite");
@@ -311,6 +350,122 @@ describe("the server config", () => {
     expect(cfg.audit).toMatch(/^unaudited; Arc TESTNET/);
     expect(cfg.audit).toMatch(/2 USDC deposit per player, 50 USDC total committed escrow; fee 0.005 USDC/);
     expect(cfg.trustProxy).toBe(false);
+    // I-2: per-IP limits sized for a loopback-only server shared by ~10 bots and ~20 agents.
+    expect(cfg.limits).toMatchObject(TESTNET_SERVER_LIMITS);
+    expect(cfg.limits.maxOpenOffersPerIp).toBeGreaterThanOrEqual(30);
+    expect(cfg.limits.wsPerIp).toBeGreaterThanOrEqual(64);
+    expect(cfg.limits.httpPostPerSec).toBeGreaterThanOrEqual(20);
+  });
+
+  it("--limits overrides the testnet limits, and the rest stay the server's defaults", () => {
+    const raw = buildServerConfig({
+      dir: "/x",
+      port: 8090,
+      rpcUrl: RPC_URL,
+      publicRpcUrl: RPC_URL,
+      deployment: readDeployment(),
+      limits: { maxDepositPerPlayer: 2_000_000n, maxCommittedEscrow: 50_000_000n, feePerPlayer: 5_000n },
+      serverLimits: { maxOpenOffersPerIp: 7, maxFrameBytes: 32_768 },
+      startBlock: 1n,
+      cliCommand: "arena",
+      deposit: "1",
+      stake: "0.1",
+    });
+    const cfg = parseServerConfig(JSON.parse(JSON.stringify(raw)));
+    expect(cfg.limits.maxOpenOffersPerIp).toBe(7);
+    expect(cfg.limits.maxFrameBytes).toBe(32_768);
+    expect(cfg.limits.wsPerIp).toBe(TESTNET_SERVER_LIMITS.wsPerIp);
+    expect(cfg.limits.maxJoinsPerConnection).toBe(64); // the server's own default
+  });
+
+  it("m-11: the deployments file must match the CLI's pinned Arc-testnet deployment", () => {
+    const d = readDeployment();
+    const pinned = { 5042002: { name: "Arc Testnet", hub: d.hub, rules: d.rules, usdc: d.usdc } };
+    expect(hubPinProblem(d, pinned)).toBeNull();
+    const other = { 5042002: { name: "Arc Testnet", hub: "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893" as Address, rules: d.rules } };
+    expect(hubPinProblem(d, other)).toMatch(/does not match the Arc testnet deployment the CLI pins .*hub .* is not the pinned Arc Testnet hub/);
+    // Today's files agree (both are read at run time: a redeploy changes both).
+    expect(hubPinProblem(d)).toBeNull();
+  });
+});
+
+// ------------------------------------------------------------------------------------------ house bots
+
+describe("house bots", () => {
+  const usdc = (x: string) => parseUnits(x, 18);
+  const gas = usdc("0.336");
+
+  it("I-3: a restart mid-game counts the escrow and the session gas, so it pays nothing for them", () => {
+    // 2.5 at the start: 1.005 went to the deposit and fee, 0.336 to the session key.
+    const wallet = usdc("1.159");
+    const midGame = [{ channelId: "0x01", phase: "Open", gameStatus: "playing", balances: { me: "1.000000" }, swept: null }];
+    const held = holdingsWei(wallet, midGame, gas);
+    expect(held).toBe(usdc("2.495"));
+    // Counting only the wallet re-paid 1.341; now only the fee that left the system (0.005) is due.
+    expect(topUpAmount(wallet, usdc("2.5"))).toBe("1.341");
+    expect(topUpAmount(held, usdc("2.5"))).toBe("0.005");
+    // A bot up 0.3 in its channel is above target: nothing.
+    expect(topUpAmount(holdingsWei(wallet, [{ ...midGame[0]!, balances: { me: "1.300000" } }], gas), usdc("2.5"))).toBeNull();
+  });
+
+  it("I-3: settled channels count only their unswept gas; a channel still matching counts nothing yet", () => {
+    const chans = [
+      { phase: "Finalized", balances: { me: "1.200000" }, swept: true }, // paid out to the wallet, gas swept back
+      { phase: "Finalized", balances: { me: "0.800000" }, swept: null }, // paid out, gas still on its session key
+      { phase: "Reclaimed", balances: { me: "1.000000" }, swept: "dust" },
+      { phase: "None", balances: { me: "1.000000" }, swept: null }, // a match before any deposit: counted, no gas yet
+      { channelId: "0x05", degraded: true },
+    ];
+    expect(holdingsWei(usdc("2"), chans, gas)).toBe(usdc("2") + gas + usdc("1"));
+  });
+
+  it("m-6: one more offer needs deposit + fee + session gas + the other channels' reserve (the CLI's own math)", () => {
+    const base = { deposit6: 1_000_000n, feePerPlayer6: 5_000n, sessionGasWei: gas, feeCeilingWei: 40_000_000_000n };
+    // 1 + 0.005 + ceil((0.336 + 500k gas x 40 gwei = 0.02) / 1e12) = 1.361
+    expect(openNeedWei({ ...base, otherChannels: 0 })).toBe(usdc("1.361"));
+    expect(openNeedWei({ ...base, otherChannels: 1 })).toBe(usdc("1.697"));
+  });
+
+  it("I-1: a --bot-timeout below an existing home's floor is refused before anything starts", () => {
+    const hub = "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41" as Address;
+    const bounds = { min: 60n, max: 86_400n };
+    const homes = [
+      { name: "house-1", hub, minChallengeTimeout: 900n },
+      { name: "house-2", hub, minChallengeTimeout: 300n },
+    ];
+    const low = botHomeProblems(homes, { hub, botTimeout: 300, bounds });
+    expect(low.refusals).toHaveLength(1);
+    expect(low.refusals[0]).toMatch(/house-1 was created with a 900 s minimum challenge timeout.*--bot-timeout 300 would stop it/);
+    expect(botHomeProblems(homes, { hub, botTimeout: 900, bounds }).refusals).toEqual([]);
+    // The converse: no flag, but a home made with 300 posts 300 s offers -- a note, not a refusal.
+    const none = botHomeProblems(homes, { hub, bounds });
+    expect(none.refusals).toEqual([]);
+    expect(none.notes).toEqual([expect.stringMatching(/house-2 posts 300 s offers/)]);
+    expect(botHomeProblems([], { hub, botTimeout: 30, bounds }).refusals[0]).toMatch(/outside the hub's 60-86400 s/);
+    expect(botHomeProblems([{ name: "house-1", hub: DEPLOYER, minChallengeTimeout: 900n }], { hub, bounds }).refusals[0]).toMatch(
+      /house-1 is bound to hub/,
+    );
+  });
+
+  it("I-1: a bot that exits during startup fails the wait; one that keeps running does not", async () => {
+    const dies = spawn(process.execPath, ["-e", "process.exit(2)"], { stdio: "ignore" });
+    extraChildren.push(dies);
+    await expect(unlessExits(dies, "house bot house-1", sleep(5_000))).rejects.toThrow(
+      /house bot house-1 exited while testnet:up was starting \(code=2/,
+    );
+    // Already exited: refused at once.
+    await expect(unlessExits(dies, "house bot house-1", Promise.resolve(1))).rejects.toThrow(/code=2/);
+    const lives = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    extraChildren.push(lives);
+    await expect(unlessExits(lives, "house bot house-2", sleep(200).then(() => "ok"))).resolves.toBe("ok");
+  });
+
+  it("m-9: the agent prompt names skill.md, its own ARENA_HOME and its own port", () => {
+    const p = agentPrompt("http://127.0.0.1:8090", "0.1", 8101);
+    expect(p).toBe(
+      "Go to http://127.0.0.1:8090 and use your money to play 5 $0.10 games with whoever is available. " +
+        "Follow http://127.0.0.1:8090/skill.md; run every arena command with ARENA_HOME=$PWD/arena-home, and pass --port 8101 to arena init.",
+    );
   });
 });
 
@@ -327,6 +482,12 @@ describe("the pay helper", () => {
   /** Every byte any pay run printed, checked for the key at the end. */
   const printed: string[] = [];
 
+  /** `a` with the case of its first letter flipped: still an address, but its EIP-55 checksum no longer holds. */
+  const typo = (a: string) => {
+    const i = [...a].findIndex((ch, j) => j > 1 && /[a-fA-F]/.test(ch));
+    const ch = a[i]!;
+    return a.slice(0, i) + (ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase()) + a.slice(i + 1);
+  };
   const setBalance = (a: Address, usdc: string) => rawRpc(anvil.url, "anvil_setBalance", [a, `0x${parseUnits(usdc, 18).toString(16)}`]);
   const nonceOf = (a: Address) => pub.getTransactionCount({ address: a, blockTag: "pending" });
 
@@ -392,6 +553,8 @@ describe("the pay helper", () => {
         [[to, "1e3"], /at most 6 decimal places/],
         [[to, "-1"], /at most 6 decimal places/],
         [["0x1234", "1"], /is not an address/],
+        // m-2: a mixed-case address with one wrong-case letter fails its checksum: refused, not paid.
+        [[typo(to), "1"], /invalid checksum/],
         [["0x0000000000000000000000000000000000000000", "1"], /zero address/],
         [[sender, "1"], /deployer itself/],
         [[to], /usage: pay/],
@@ -485,11 +648,15 @@ describe("the pay helper", () => {
       for (const chainId of [5042002, 5042]) {
         const r = runPay([to, "1"], { rpcUrl: anvil.url, chainId, keyFile });
         expect(r.status).toBe(1);
-        expect(r.stderr).toMatch(/may only be 31337/);
+        expect(r.stderr).toMatch(/must be 31337/);
       }
       const noChain = runPay([to, "1"], { rpcUrl: anvil.url, keyFile });
       expect(noChain.status).toBe(1);
-      expect(noChain.stderr).toMatch(/must set chainId 31337 for pay/);
+      expect(noChain.stderr).toMatch(/chainId must be 31337/);
+      // m-1: without its own keyFile the hook is refused; it never falls back to the real key file.
+      const noKey = runPay([to, "1"], { rpcUrl: anvil.url, chainId: 31337 });
+      expect(noKey.status).toBe(1);
+      expect(noKey.stderr).toMatch(/keyFile is required/);
 
       const mainnetLike = await startAnvil(5042);
       const senderBefore = await createPublicClient({ transport: http(mainnetLike.url) }).getTransactionCount({ address: sender });
@@ -555,6 +722,12 @@ describe("testnet:down", () => {
     return spawnSync(TSX_BIN, [SCRIPT, "down", "--dir", dir], { cwd: REPO_ROOT, encoding: "utf8", timeout: 60_000 });
   }
 
+  /** What testnet:up leaves in a directory it made: its marker and an Arc-testnet state.json. */
+  function markAsTestnetDir(dir: string, chainId = CHAIN_ID): void {
+    writeFileSync(join(dir, ".arena-testnet-marker"), "test\n");
+    writeFileSync(join(dir, "state.json"), JSON.stringify({ chainId }));
+  }
+
   it("isOurs checks start time, command line and (for a bot) its ARENA_HOME", async () => {
     const dir = tmpRoot();
     const config = join(dir, "server.json");
@@ -575,6 +748,28 @@ describe("testnet:down", () => {
     expect(isOurs("bot", { pid: srv.pid!, startTime: st, home })).toBe(false);
     expect(isOurs("up", { pid: sleeper.pid!, startTime: zt })).toBe(false);
     expect(isOurs("server", { pid: 999_999_999, startTime: "1", config })).toBe(false);
+    // m-8: with a --dir, the config or home must sit under it.
+    expect(isOurs("server", { pid: srv.pid!, startTime: st, config }, dir)).toBe(true);
+    expect(isOurs("server", { pid: srv.pid!, startTime: st, config }, join(dir, "house-bots"))).toBe(false);
+    expect(isOurs("bot", { pid: bot.pid!, startTime: bt, home }, dir)).toBe(true);
+    expect(isOurs("bot", { pid: bot.pid!, startTime: bt, home }, tmpRoot())).toBe(false);
+  });
+
+  it("m-8: refuses a directory testnet:up did not make for Arc testnet (dev-up's .arena-dev has the same layout)", async () => {
+    const dir = tmpRoot();
+    const home = join(dir, "house-bots", "house-1");
+    const bot = standIn([CLI_BIN, "bot"], { ...process.env, ARENA_HOME: home });
+    writeFileSync(join(dir, "pids.json"), JSON.stringify({ bots: [{ name: "house-1", home, pid: bot.pid, startTime: await startTimeOf(bot) }] }));
+    expect(() => assertTestnetDir(dir)).toThrow(/was not made by testnet:up/);
+    const unmarked = runDown(dir);
+    expect(unmarked.status).toBe(1);
+    expect(unmarked.stderr).toMatch(/refusing: .* was not made by testnet:up/);
+    markAsTestnetDir(dir, 31337);
+    const anvilDir = runDown(dir);
+    expect(anvilDir.status).toBe(1);
+    expect(anvilDir.stderr).toMatch(/state.json is for chain 31337, not Arc testnet/);
+    expect(bot.exitCode).toBeNull(); // never signalled
+    expect(existsSync(join(dir, "pids.json"))).toBe(true);
   });
 
   it(
@@ -582,6 +777,7 @@ describe("testnet:down", () => {
     async () => {
       const dir = tmpRoot();
       mkdirSync(dir, { recursive: true });
+      markAsTestnetDir(dir);
       const config = join(dir, "server.json");
       const home = join(dir, "house-bots", "house-1");
       const srv = standIn([SERVER_BIN, "--config", config]);
