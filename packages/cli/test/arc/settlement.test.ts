@@ -242,7 +242,7 @@ describe.skipIf(!ON_ARC_ANVIL)("Plan 6 Task 4 (arc-anvil): games, disputes and p
     await setBlocklisted(bob.address, false);
     const before = await nativeOf(bob.address);
     const claimer = new SerialTxSender(new LocalKeyTxSender(bob.walletKey, RPC, CHAIN));
-    const claim = await new HubClient(env.hub, publicClient()).claim(claimer, bob.address);
+    const claim = await new HubClient(env.hub, publicClient()).claim(claimer); // pays the caller only (audit M1)
     expect(claim.status).toBe("success");
     expect(await alice.daemon.hub.owed(bob.address)).toBe(0n);
     expect(await nativeOf(bob.address)).toBe(before + DEPOSIT * E12 - claim.gasUsed * claim.effectiveGasPrice);

@@ -67,7 +67,9 @@ delegation) therefore cannot revoke ECDSA signatures it already produced, while 
   ERC-777 style), not fee-on-transfer, not rebasing, and `transfer`/`transferFrom` must return a bool or
   nothing. Escrow accounting assumes the hub receives and sends exactly the amounts requested, and payout
   safety assumes the token cannot call back into the hub. A token that refuses some recipients (blocklist,
-  pause) is tolerated: refused payouts are deferred to `owed` and withdrawn with `claim`.
+  pause) is tolerated: refused payouts are deferred to `owed` and withdrawn with `claim()`, which pays only the
+  caller (audit M1). A blocklisted payee's `owed` therefore stays in the hub until the token unblocks it; the hub
+  is no way around the blocklist.
 - `Params.rules` is chosen by the players, not vetted on-chain. It must come from the host's allowlist of
   audited game templates (daemons refuse unlisted rules by default). A reverting or malicious rules contract
   blocks every exit that consults it (challenge, respond, timeout, and cooperative close on any later state):
@@ -100,8 +102,10 @@ funds, alter an existing channel's terms, or block an exit. One side effect of t
 deposit too, so a player who has already funded a new channel stays locked until that channel's `fundingDeadline`
 (at most `MAX_FUNDING_WINDOW`, 1 day, on-chain; at most 2 hours through an honest host) and then reclaims.
 
-**Never renounce ownership** (`Ownable.renounceOwnership` is inherited): renouncing while paused freezes new
-business forever. Funds are unaffected, but the hub could never be unpaused or have its caps raised again.
+**Ownership cannot be renounced** (audit M2): `renounceOwnership` is overridden to always revert with
+`RenounceDisabled`, for every caller. Renouncing while paused would freeze new business forever: funds would be
+unaffected, but the hub could never be unpaused or have its caps raised again. Ownership moves only through
+Ownable2Step's `transferOwnership` and the new owner's `acceptOwnership`.
 
 **Residual risk: first-come squatting of `maxCommittedEscrow`.** `params.fundingDeadline` is bounded to at
 most `block.timestamp + MAX_FUNDING_WINDOW` (a constant, 1 day) by `_validateNewParams` — without this, a
@@ -117,5 +121,5 @@ raise `maxCommittedEscrow`; monitor `committedEscrow` against real game activity
 
 Every state-changing entry point takes flat arguments or a single ABI-encoded `bytes` payload
 (`deposit(bytes)`, `closeCooperative(bytes)`, `challenge(bytes)`, `respond(bytes)`, `timeout(bytes32)`,
-`reclaim(bytes32)`, `claim(address)`), so it can be called with `circle wallet execute`. The Arc spike
+`reclaim(bytes32)`, `claim()`), so it can be called with `circle wallet execute`. The Arc spike
 (spec §10 step 0) must confirm `circle wallet execute` accepts a `bytes` argument.

@@ -220,13 +220,13 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (c.funded[1]) _pay(p.participants[1], amount);
     }
 
-    /// @notice Withdraw payouts that could not be pushed (e.g. the recipient was blocked by the token).
-    function claim(address to) external nonReentrant {
+    /// @notice Withdraw, to the caller only, payouts that could not be pushed (audit M1: a blocked one stays here).
+    function claim() external nonReentrant {
         uint256 amount = owed[msg.sender];
         if (amount == 0) revert NothingToClaim();
         owed[msg.sender] = 0;
-        emit Claimed(msg.sender, to, amount);
-        token.safeTransfer(to, amount);
+        emit Claimed(msg.sender, msg.sender, amount);
+        token.safeTransfer(msg.sender, amount);
     }
 
     // ----------------------------------------------------------------- close
@@ -336,6 +336,16 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         emit PausedSet(paused_);
     }
 
+    /// @dev Declared here rather than with the other errors, so that the lines `scripts/tools/mutants.sh`
+    /// addresses by number do not move.
+    error RenounceDisabled();
+
+    /// @notice Always reverts (audit M2): an ownerless hub could never be unpaused or have its caps raised again.
+    /// Hand over with `transferOwnership` and `acceptOwnership` (Ownable2Step) instead.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
     // -------------------------------------------------------------- internal
 
     function _setFee(uint256 feePerPlayer_, address feeRecipient_) private {
@@ -421,6 +431,8 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev Spec §4.3 support rule. Returns the supported latest state and its EIP-712 hash.
+    /// `challenge`/`respond` emit `proof.latest` verbatim, so each of its two slots is either empty or a valid
+    /// signature by that slot's signer; unchecked bytes are never accepted (audit I1).
     function _supported(Channel storage c, Params memory p, bytes32 id, Proof memory proof)
         private
         view
@@ -431,7 +443,12 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         h = hashState(s);
         IGameRules rules = IGameRules(p.rules);
         if (!proof.hasPrev) {
-            if (s.turnNum == 0 && _isOpening(rules, id, p, h)) return (s, h);
+            // The opening needs no signatures: accepted here only with both slots empty. A co-signed opening
+            // falls through to the both-signed check below.
+            if (
+                s.turnNum == 0 && proof.latest.sigA.length == 0 && proof.latest.sigB.length == 0
+                    && _isOpening(rules, id, p, h)
+            ) return (s, h);
             if (_signedBy(p.signers[0], h, proof.latest.sigA) && _signedBy(p.signers[1], h, proof.latest.sigB)) {
                 return (s, h);
             }
@@ -444,6 +461,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (s.prevHash != ph || s.turnNum != prev.turnNum + 1) revert Unsupported();
         uint8 m = rules.mover(prev, p);
         if (!_signedBy(p.signers[m], h, m == 0 ? proof.latest.sigA : proof.latest.sigB)) revert BadSignature();
+        // The non-mover's slot is not needed for support, but it is emitted: empty, or a valid co-signature.
+        bytes memory other = m == 0 ? proof.latest.sigB : proof.latest.sigA;
+        if (other.length != 0 && !_signedBy(p.signers[1 - m], h, other)) revert BadSignature();
         if (!rules.validTransition(prev, s, p)) revert InvalidTransition();
 
         bool prevEndorsed = (c.hasRegistered && ph == c.registeredHash)

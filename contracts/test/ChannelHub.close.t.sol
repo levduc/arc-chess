@@ -115,15 +115,22 @@ contract ChannelHubCloseTest is HubFixture {
         assertEq(usdc.balanceOf(feeRecipient), 2 * FEE);
         assertEq(hub.owed(bob), DEPOSIT - STAKE);
 
-        address bobNew = makeAddr("bobNew");
+        // Audit M1: claim pays the caller only, so bob's payout stays in the hub while he is blocked.
         vm.prank(bob);
-        hub.claim(bobNew);
-        assertEq(usdc.balanceOf(bobNew), DEPOSIT - STAKE);
+        vm.expectRevert("blocked");
+        hub.claim();
+        assertEq(hub.owed(bob), DEPOSIT - STAKE);
+
+        usdc.setBlocked(bob, false);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        hub.claim();
+        assertEq(usdc.balanceOf(bob), bobBefore + DEPOSIT - STAKE);
         assertEq(hub.owed(bob), 0);
 
         vm.prank(bob);
         vm.expectRevert(ChannelHub.NothingToClaim.selector);
-        hub.claim(bobNew);
+        hub.claim();
     }
 
     // ---- ruling R12: cooperative close needs an explicit Close intent
