@@ -163,7 +163,12 @@ export type ActionOutcome = { unconfirmed?: string };
  *  unreadable -- is an action that went through, unconfirmed; any other error is rethrown. */
 function minedUnconfirmed(what: string, err: unknown): ActionOutcome {
   if (!(err instanceof TxReceiptMissingError)) throw err;
-  return { unconfirmed: `the ${what} transaction ${err.hash} was mined (block ${err.blockNumber}), but its receipt could not be read` };
+  // Fix round 2 (re-review M-e): mined is not succeeded -- a race the simulate did not see can revert it.
+  return {
+    unconfirmed:
+      `the ${what} transaction ${err.hash} was mined (block ${err.blockNumber}), but its receipt could not be read: ` +
+      "whether it succeeded is not known yet; check status",
+  };
 }
 
 export type ChainView = {

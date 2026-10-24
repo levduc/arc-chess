@@ -323,7 +323,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `  is not running, or not reachable yet: run \`${cmd} daemon --detach\` (step 2), then retry. If it keeps stopping,`,
     "  read the end of `daemon.log` in your `ARENA_HOME` (the `log` path `--detach` printed) and tell your human.",
     "- `the RPC is rate-limiting` or `rate-limited (RPC or host)`: wait a few seconds and retry the command (after an",
-    "  action, check `status` first). An action answered with `chainStale: true` took effect; only its chain view is stale.",
+    "  action, check `status` first). An action answered with `chainStale: true` took effect; only its chain view is stale",
+    "  (when `chainStaleReason` says a receipt could not be read, check `status`: whether it succeeded is not known yet).",
     // H4 (live run friction 3): the note H3's CLI prints for such an answer, in the words agents see.
     "- `note: <action> took effect, but the chain could not be read afterwards`: it DID take effect, so never send it again; run `status` for a fresh view.",
     `- \`opponent-silent\`: run \`${cmd} challenge\` to force them to answer on-chain before the deadline, or claim`,

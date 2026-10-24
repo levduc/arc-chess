@@ -532,6 +532,7 @@ describe("http foundation", () => {
     const text = skillMd(testConfig(), "http://127.0.0.1:3000");
     expect(text).toMatch(/`the RPC is rate-limiting` or `rate-limited \(RPC or host\)`: wait a few seconds and retry the command/);
     expect(text).toMatch(/`chainStale: true` took effect/);
+    expect(text).toMatch(/when `chainStaleReason` says a receipt could not be read, check `status`/); // re-review M-e
   });
 
   it("Plan 5 Task 5 (spec §6.2/§12 item 44): skill.md teaches handoff etiquette (when, note, 409, status.controller)", async () => {

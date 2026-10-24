@@ -250,7 +250,7 @@ describe("H3 fix round 1 (review M4): a reclaim mined with no readable receipt w
     };
     // Before: the TxReceiptMissingError reached the route, a 500.
     expect(await alice.daemon.reclaim(id)).toEqual({
-      unconfirmed: `the reclaim transaction ${hash} was mined (block 42), but its receipt could not be read`,
+      unconfirmed: `the reclaim transaction ${hash} was mined (block 42), but its receipt could not be read: whether it succeeded is not known yet; check status`,
     });
     const st = await alice.daemon.statusAfterAction(id, await alice.daemon.reclaim(id));
     expect(st.chainStale).toBe(true);
