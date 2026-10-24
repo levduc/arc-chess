@@ -703,8 +703,9 @@ describe("http foundation", () => {
       for (const fragment of [
         "fund --games N --stake X",
         "wallet --wait-for-usdc",
-        "reached: false` (exit 2) means it timed out.",
-        "If it times out, tell your human what has and has not arrived.",
+        // H4: one timed-out wait is a reminder to the human; the whole ~30 minutes is the report.
+        "reached: false` (exit 2) means that wait timed out: before the next one, remind your human in your reply",
+        "If about 30 minutes pass without `reached: true`, tell your\n   human what has and has not arrived.",
         // H2 fix round 1 (N-3): what did arrive is offered back before stopping.
         "shows USDC that did arrive, offer them `withdraw --all` for it",
         "Then stop.",
@@ -718,8 +719,8 @@ describe("http foundation", () => {
         expect(text).toContain(fragment);
       }
       // Fix round 1 (I2): the reached:false cue sits just before the pinned timeout sentence, in reading order.
-      expect(text.indexOf("reached: false` (exit 2) means it timed out.")).toBeLessThan(
-        text.indexOf("If it times out, tell your human what has and has not arrived."),
+      expect(text.indexOf("reached: false` (exit 2) means that wait timed out")).toBeLessThan(
+        text.indexOf("If about 30 minutes pass without `reached: true`, tell your"),
       );
     });
 
@@ -750,7 +751,7 @@ describe("http foundation", () => {
       expect(step(2)).toMatch(/Accept it only in step 5, once the money for it has\s+arrived/);
       // Step 4: the wait (pinned text) and the starting balance, then the owner, then the no-offer-fits path.
       expect(step(3)).toContain(`${cmd} wallet --wait-for-usdc <usdc.need> --wait-for-native <native.need> --timeout 100`);
-      expect(step(3)).toContain("reached: false` (exit 2) means it timed out.");
+      expect(step(3)).toContain("reached: false` (exit 2) means that wait timed out");
       expect(step(3)).toMatch(/Note your starting USDC balance for step 7: the `usdc` the wait printed with `reached: true`, or `fund`'s\s+`usdc.have` if nothing was short/);
       expect(step(3)).toContain(`${cmd} owner set <address>`);
       expect(step(3)).toMatch(new RegExp(`No offer fits: run \`${cmd.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} fund --games N --stake X\` instead`));
@@ -898,7 +899,8 @@ describe("http foundation", () => {
       // C-1, M-8.
       expect(recipe).toContain(ARC_SOURCING);
       // M-8, and fix round 1 m-5: where to read it.
-      expect(recipe).toMatch(/read this site's templates, the `chess` entry of\s+`https:\/\/chess\.example\/templates`, and tell your human what its `audit` says about these contracts and its\s+per-player cap \(`limits\.maxDepositPerPlayer`, in base units/);
+      // H4 (live run friction 2): `fund`'s tellYourHuman carries the audit text and the cap; the recipe says so.
+      expect(recipe).toMatch(/It says what they are funding \(this site's `audit` text from `https:\/\/chess\.example\/templates`, the network, the hub, the\s+per-player deposit cap and fee per channel, and that withdrawals go only to the owner address\)/);
       expect(recipe).toMatch(/This server has no faucet: your human\s+funds the wallet in step 4\./);
       expect(text).not.toContain("auto-funds it from this server's dev");
       // C-2: step 1's --owner, step 4's owner set, step 8's confirmation.
@@ -934,7 +936,7 @@ describe("http foundation", () => {
       expect(text).not.toMatch(/stop waiting/);
       expect(text).toMatch(/minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed/);
       // Fix round 1 N-3: a timed-out funding wait offers back what did arrive.
-      expect(recipe).toMatch(/If it times out, tell your human what has and has not arrived\. If\s+`npx -y @x\/arena@0\.1\.0 wallet` shows USDC that did arrive, offer them `withdraw --all` for it/);
+      expect(recipe).toMatch(/tell your\s+human what has and has not arrived\. If\s+`npx -y @x\/arena@0\.1\.0 wallet` shows USDC that did arrive, offer them `withdraw --all` for it/);
       // Fix round 1 N-2: the agent never sends funds itself; the human funds the wallet on Arc only.
       expect(text).not.toMatch(/send USDC from it to the generated address instead/);
       expect(text).toMatch(/If the money is in another wallet, your human sends USDC from it to the generated address,\s+on Arc only \(chain id `5042`\): USDC sent on any other network never arrives here\. You never\s+send it yourself, from any wallet \(recipe step 4\)\./);
@@ -997,6 +999,73 @@ describe("http foundation", () => {
       expect(recipeOf(text)).toMatch(/wait\s+until its `swept` is no longer `null`/);
       expect(step4).toMatch(/--ttl 1800` makes the offer stop being\s+matchable after 30 minutes, the same as your wait/);
       expect(text).toMatch(/your human sends USDC from it to the generated address,\s+on this chain only \(chain id `31337`\)\. You never send it yourself/);
+    });
+  });
+
+  describe("Plan 6 hardening H4 (the first live agent run's frictions): skill.md", () => {
+    const PINNED = "npx -y @x/arena@0.1.0";
+    const URL = "https://chess.example";
+    const pinned = { cli: { package: "@x/arena", version: "0.1.0" }, cliCommand: PINNED };
+    const arc = (chainId: number) =>
+      testConfig({
+        chainId,
+        rpcUrl: "https://rpc.mainnet.arc.io",
+        publicRpcUrl: "https://rpc.mainnet.arc.io",
+        usdc: "0x3600000000000000000000000000000000000000",
+        ...pinned,
+        audit: "unaudited",
+      });
+    const variants = [
+      ["dev (31337)", testConfig(pinned)],
+      ["Arc Testnet (5042002)", arc(5042002)],
+      ["Arc (5042)", arc(5042)],
+    ] as const;
+    const recipeOf = (text: string) => text.slice(text.indexOf("## Recipe: play N games at $X per game"), text.indexOf("## Setup (once)"));
+    const stepOf = (text: string, from: string, to: string) => text.slice(text.indexOf(from), text.indexOf(to, text.indexOf(from)));
+
+    it.each(variants)("%s: friction 1/2 -- step 4 puts fund's tellYourHuman in the reply before any wait, and reminds after each timed-out one", (_label, cfg) => {
+      const step4 = stepOf(recipeOf(skillMd(cfg, URL)), `4. \`${PINNED} fund --offer`, "5. Run");
+      const tellAt = step4.indexOf("Your human sees only your own replies, never a command's output, so `fund` prints `tellYourHuman` first:");
+      expect(tellAt).toBeGreaterThan(-1);
+      expect(step4).toContain("write the text after its colon into your reply to your human now, word for word, before you run any wait.");
+      expect(tellAt).toBeLessThan(step4.indexOf(`${PINNED} wallet --wait-for-usdc`));
+      expect(step4).toMatch(/It says what they are funding \(this site's `audit` text from `https:\/\/chess\.example\/templates`, the network, the hub/);
+      expect(step4).toMatch(/means that wait timed out: before the next one, remind your human in your reply\s+\(the amount still missing, the address and the network\)/);
+      expect(step4).toContain("Write its `tellYourHuman` in your reply and wait exactly as above");
+      expect(step4).not.toMatch(/relay `fund`'s `message`|verbatim/);
+    });
+
+    it.each(variants)("%s: friction 4 -- the daemon starts with daemon --detach, never the tool's background feature", (_label, cfg) => {
+      const text = skillMd(cfg, URL);
+      const step2 = stepOf(recipeOf(text), "2. Start the daemon", "3. Pick an opponent's offer");
+      expect(step2).toContain(`2. Start the daemon so it keeps running while you play: \`${PINNED} daemon --detach\`.`);
+      expect(step2).toMatch(/Do not start it with your tool's own background-task feature or `nohup … &` instead: a daemon started that\s+way stops when your session does, even mid-game\./);
+      expect(step2).toMatch(/If `--detach` says another daemon is already using this\s+home, that one is running: go on\./);
+      expect(step2).toContain(`then \`${PINNED} daemon --detach\` again`);
+      expect(step2).not.toMatch(/nohup npx/);
+      const setup = stepOf(text, "## Setup (once)", "## Find an opponent");
+      expect(setup).toContain(`2. \`${PINNED} daemon --detach\` — start it so it keeps running while you play`);
+      expect(setup).toContain(`\`nohup sh -c 'while true; do ${PINNED} daemon; sleep 5; done' >> "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\``);
+      expect(setup).not.toMatch(/use its own background-task feature instead/);
+      expect(text).toContain(`not reachable yet: run \`${PINNED} daemon --detach\` (step 2), then retry.`);
+    });
+
+    it.each(variants)("%s: friction 5 -- an offer is picked at random among equals, and a lost race needs no new money", (_label, cfg) => {
+      const text = skillMd(cfg, URL);
+      const recipe = recipeOf(text);
+      expect(stepOf(recipe, "3. Pick an opponent's offer", "4. `")).toMatch(
+        /If several offers fit equally well, pick one of them at random, not the first\s+listed: other agents read the same list/,
+      );
+      const step5 = stepOf(recipe, `5. Run \`${PINNED} offers\` again`, "6. The play loop");
+      expect(step5).toMatch(/`accept` failing with `offer … not found` or `offer already matched` is this case\s+too\./);
+      expect(step5).toMatch(/The USDC that already arrived still counts: ask your human for more \(as in step 4\) only if that `fund`\s+shows a shortfall above zero\./);
+      expect(text).toContain("pick another (at random among those that fit), and run `fund --offer` for it (step 5). The USDC already in your wallet still counts");
+    });
+
+    it.each(variants)("%s: friction 3 -- the CLI's took-effect note means the action took effect: never resend it", (_label, cfg) => {
+      expect(skillMd(cfg, URL)).toContain(
+        "- `note: <action> took effect, but the chain could not be read afterwards`: it DID take effect, so never send it again; run `status` for a fresh view.",
+      );
     });
   });
 

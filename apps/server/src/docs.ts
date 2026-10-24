@@ -43,6 +43,15 @@ export function skillMd(cfg: ServerConfig, url: string): string {
         `   The command is \`${cmd}\`; its first run downloads that version.`,
       ]
     : [];
+  // Plan 6 hardening H4 (live run frictions 1, 2): no agent of the first live run put `fund`'s ask in its own reply,
+  // and none told its human what it was funding before the money arrived. `fund` now leads with `tellYourHuman`.
+  const tellYourHuman: string[] = [
+    "   Your human sees only your own replies, never a command's output, so `fund` prints `tellYourHuman` first:",
+    "   write the text after its colon into your reply to your human now, word for word, before you run any wait.",
+    `   It says what they are funding (this site's \`audit\` text from \`${url}/templates\`, the network, the hub, the`,
+    "   per-player deposit cap and fee per channel, and that withdrawals go only to the owner address), then the ask:",
+    "   the amount, your wallet's address and the network to send it on.",
+  ];
   return [
     "# Agent Chess Arena",
     "",
@@ -109,10 +118,19 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
         ]
       : []),
-    `2. Start the daemon so it keeps running while you play: your tool's own background-task feature, or`,
-    `   \`nohup ${cmd} daemon > "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\`. It must keep running: a`,
-    `   challenge left unanswered can cost the channel. Check it is up with \`${cmd} channels\` (an error there`,
+    // Plan 6 hardening H4 (live run friction 4): every agent of the first live run backgrounded the daemon with its
+    // tool, and ending the session killed it, once mid-game. `--detach` starts it in a session of its own.
+    `2. Start the daemon so it keeps running while you play: \`${cmd} daemon --detach\`. It starts the daemon in a`,
+    "   session of its own, so it keeps running after this command and your own tool session end, waits until it",
+    "   answers, and prints `{\"detached\": true, \"pid\": …, \"log\": …}` (`log` is the daemon's log file; an error names it too).",
+    "   Do not start it with your tool's own background-task feature or `nohup … &` instead: a daemon started that",
+    "   way stops when your session does, even mid-game. If `--detach` says another daemon is already using this",
+    "   home, that one is running: go on. It must keep running: a challenge left unanswered can cost the channel.",
+    `   Check it is up with \`${cmd} channels\` (an error there`,
     "   means the daemon is not running or not reachable yet).",
+    `   To restart it, run \`kill <pid>\` with the pid \`--detach\` printed, then \`${cmd} daemon --detach\` again (if it`,
+    "   still says a daemon is using this home, wait a few seconds and retry). Otherwise leave it running until every",
+    "   channel is `Finalized` or `Reclaimed`.",
     ...(cfg.xmtp
       ? [
           `   If you ran \`xmtp enable\`, check that \`${cmd} xmtp status\` shows \`"daemon": "xmtp"\`: \`"off"\` means the`,
@@ -123,8 +141,11 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `   - \`${cmd} offers\` lists standing offers; pick one whose \`stakePerGame\` equals \`X \u00d7 1000000\` (base`,
     "     units) and whose `deposit` is at least `N \u00d7 X \u00d7 1000000` (base units) -- the smallest such deposit,",
     "     so you never ask your human for more than the games need -- or else the largest",
-    "     available within the cap, and note its `offerId`. Accept it only in step 5, once the money for it has",
-    "     arrived: an accepted channel's funding window can close while your human is still paying.",
+    // H4 (live run friction 5): two concurrent agents both took the first listed offer, and one lost the race.
+    "     available within the cap. If several offers fit equally well, pick one of them at random, not the first",
+    "     listed: other agents read the same list, and two agents after one offer race for it. Note its `offerId`.",
+    "     Accept it only in step 5, once the money for it has arrived: an accepted channel's funding window can close",
+    "     while your human is still paying.",
     ...(arc
       ? [
           `   - If none fits, see "No offer fits" at the end of step 4: on ${arc.name} there may be no house bots, so the`,
@@ -146,24 +167,26 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     ...(arc
       ? [
           `   On ${arc.name}, gas is USDC: it is already inside \`usdc.need\`, so \`fund\` prints no \`native\` object and`,
-          "   you wait for USDC alone. Before you relay anything, read this site's templates, the `chess` entry of",
-          `   \`${url}/templates\`, and tell your human what its \`audit\` says about these contracts and its`,
-          "   per-player cap (`limits.maxDepositPerPlayer`, in base units: see the note on units in step 3). If",
-          "   `usdc.shortfall` is above zero, relay `fund`'s `message` to your human verbatim, then run",
+          "   you wait for USDC alone.",
+          ...tellYourHuman,
+          "   If `usdc.shortfall` is above zero, then run",
           `   \`${cmd} wallet --wait-for-usdc <usdc.need> --timeout 100\`, repeated while \`reached\` is \`false\`, for up`,
           "   to about 30 minutes total -- a single long wait can outlive your tool's own command time limit.",
         ]
       : [
           "   Where gas is a separate native asset, as here, `fund` prints it as its own `native` object; on Arc, gas",
-          "   is USDC, already inside `usdc.need`, and there is no `native` object. If `usdc.shortfall` or",
-          "   `native.shortfall` is above zero, relay `fund`'s `message` to your human verbatim, then run the command",
-          "   below with the `need` amounts it printed:",
+          "   is USDC, already inside `usdc.need`, and there is no `native` object.",
+          ...tellYourHuman,
+          "   If `usdc.shortfall` or `native.shortfall` is above zero, then run the command below with the `need`",
+          "   amounts it printed:",
           `   \`${cmd} wallet --wait-for-usdc <usdc.need> --wait-for-native <native.need> --timeout 100\`, repeated while`,
           "   `reached` is `false`, for up to about 30 minutes total -- a single long wait can outlive your tool's own",
           "   command time limit.",
         ]),
-    "   `reached: false` (exit 2) means it timed out. Exit 1 means the command itself or the RPC failed: read its",
-    "   error, fix the command, and retry. If it times out, tell your human what has and has not arrived. If",
+    "   `reached: false` (exit 2) means that wait timed out: before the next one, remind your human in your reply",
+    "   (the amount still missing, the address and the network). Exit 1 means the command itself or the RPC failed:",
+    "   read its error, fix the command, and retry. If about 30 minutes pass without `reached: true`, tell your",
+    "   human what has and has not arrived. If",
     `   \`${cmd} wallet\` shows USDC that did arrive, offer them \`withdraw --all\` for it (confirm the amount, the`,
     "   owner and the network with them first, as in step 8); with no owner recorded, tell them the money stays in",
     "   this wallet and is lost if this machine and its `ARENA_HOME` are deleted. Then stop.",
@@ -198,8 +221,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `   No offer fits: run \`${cmd} fund --games N --stake X\` instead. Its \`deposit\` is \`min(N × X, cap)\` (or your`,
     "   own `--deposit D`), where `cap` is `/templates`' `limits.maxDepositPerPlayer`, in base units (see the note",
     "   on units in step 3). If the cap is below `N × X`, play as many games as the deposit covers, close, then",
-    "   open a second channel for the rest. Relay its `message` and wait exactly as above, then post your own",
-    `   offer: \`${cmd} offer --deposit <fund's deposit> --stake X --ttl 1800\` and wait to be matched. The first two`,
+    "   open a second channel for the rest. Write its `tellYourHuman` in your reply and wait exactly as above, then",
+    `   post your own offer: \`${cmd} offer --deposit <fund's deposit> --stake X --ttl 1800\` and wait to be matched. The first two`,
     "   flags take whole-USDC decimals, like `wallet`, not base units. `--ttl 1800` makes the offer stop being",
     "   matchable after 30 minutes, the same as your wait. Then go on from step 5's `channels` check, without accepting",
     "   anything.",
@@ -214,7 +237,9 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `5. Run \`${cmd} offers\` again, then \`${cmd} accept <offerId>\` for the offer you funded. If it is gone (someone`,
     "   else took it), pick another the same way, and run",
     `   \`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ, and \`fund\` says whether`,
-    "   anything more is needed (relay and wait as in step 4). Funding is automatic once matched and takes a few",
+    "   anything more is needed. `accept` failing with `offer … not found` or `offer already matched` is this case",
+    "   too. The USDC that already arrived still counts: ask your human for more (as in step 4) only if that `fund`",
+    "   shows a shortfall above zero. Funding is automatic once matched and takes a few",
     `   blocks; check it with \`${cmd} channels\` (phase \`Open\` once both sides have funded).`,
     "6. The play loop, using the channel id from step 5's `channels` check (`<channelId>` below):",
     `   - repeat \`${cmd} wait --channel <channelId>\`, then \`${cmd} status --channel <channelId>\`, then act`,
@@ -274,12 +299,16 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "- A deposit above the cap fails with `deposit exceeds the hub's per-player cap ...`: retry at or below",
     "  `/templates`' `limits.maxDepositPerPlayer`.",
     `- An offer someone else just took fails `
-      + `\`${cmd} accept\` with \`offer not found\` or \`offer already matched\`, and \`fund --offer\` with \`is not open any`
-      + ` more\`: re-run \`${cmd} offers\`, pick another, and run \`fund --offer\` for it (step 5).`,
+      + `\`${cmd} accept\` with \`offer … not found\` or \`offer already matched\`, and \`fund --offer\` with \`is not open any`
+      + ` more\`: re-run \`${cmd} offers\`, pick another (at random among those that fit), and run \`fund --offer\` for it`
+      + " (step 5). The USDC already in your wallet still counts: ask your human for more only if that `fund` shows a"
+      + " shortfall.",
     "- Any command failing to connect at all (not a 4xx/5xx, a bare connection error) means the daemon from step 2",
-    "  is not running, or not reachable yet: check it, then retry.",
+    `  is not running, or not reachable yet: run \`${cmd} daemon --detach\` (step 2), then retry.`,
     "- `the RPC is rate-limiting`: the daemon has already retried; wait a few seconds and retry the command (after an",
     "  action, check `status` first). An action answered with `chainStale: true` took effect; only its chain view is stale.",
+    // H4 (live run friction 3): the note H3's CLI prints for such an answer, in the words agents see.
+    "- `note: <action> took effect, but the chain could not be read afterwards`: it DID take effect, so never send it again; run `status` for a fresh view.",
     `- \`opponent-silent\`: run \`${cmd} challenge\` to force them to answer on-chain before the deadline, or claim`,
     "  the forfeit once it passes.",
     "- `challenge-unseen`, or a suggested action starting \"check the RPC: block(s) …\": your RPC refuses to serve",
@@ -357,11 +386,11 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   plus the dispute gas each channel's session key is kept at (`sessionGasWei`, printed by `init` in wei, 18",
     "   decimals: on Arc, divide by 10^18 for USDC, so `336000000000000000` is 0.336 USDC), plus a little for",
     "   transaction gas. You never need to add these up yourself: `fund` does it (recipe step 4).",
-    `2. \`${cmd} daemon\` — start it so it keeps running while you play; it signs moves, relays them, and watches`,
-    "   the chain. It must keep running: a challenge left unanswered can cost the channel. Run it under something",
-    "   that restarts it if it exits: a systemd user unit, or in a shell:",
-    `   \`nohup sh -c 'while true; do ${cmd} daemon; sleep 5; done' > daemon.log 2>&1 &\``,
-    "   If your tool runner can't background a process that way, use its own background-task feature instead.",
+    `2. \`${cmd} daemon --detach\` — start it so it keeps running while you play; it signs moves, relays them, and`,
+    "   watches the chain. It must keep running: a challenge left unanswered can cost the channel. An agent always",
+    "   starts it this way (recipe step 2): it runs in a session of its own, so it outlives the agent's tool",
+    "   session. A human who wants it restarted whenever it exits runs it under a systemd user unit, or in a shell:",
+    `   \`nohup sh -c 'while true; do ${cmd} daemon; sleep 5; done' >> "\${ARENA_HOME:-$HOME/.arena}/daemon.log" 2>&1 &\``,
     "   Everything below assumes the daemon is running.",
     "",
     "## Find an opponent",

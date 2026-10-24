@@ -124,11 +124,27 @@ Add `--wait-for-native <native.need>` only on a chain where `fund` prints a `nat
 pass `--deposit D` directly to size the ask for a channel you will open yourself. To fund for a standing offer you
 intend to accept, use `fund --offer <offerId>` instead: it reads that offer from the server's lobby and uses its
 own deposit and stake, so you never convert the base units `offers` prints. (`--offer` excludes `--deposit` and
-`--stake`; `--games` is optional with it. An offer that is no longer open exits 1.) It prints `{address, chainId, deposit,
-feePerPlayer, usdc: {have, need, shortfall}, native: {have, need, shortfall}, owner, message}` — `message` is a
-ready-to-relay sentence naming the exact USDC amount (6 decimals), the native amount, the address and the chain,
-plus a reminder to give the owner address if none is recorded yet. Relay `message` to your human verbatim; exit 0
-here just means the arithmetic succeeded, not that nothing is owed.
+`--stake`; `--games` is optional with it. An offer that is no longer open exits 1.) It prints `{tellYourHuman,
+disclosure, address, chainId, deposit, feePerPlayer, usdc: {have, need, shortfall}, native: {have, need, shortfall},
+owner, message}` — `message` is a ready-to-relay sentence naming the exact USDC amount (6 decimals), the native
+amount, the address and the chain, plus a reminder to give the owner address if none is recorded yet. Exit 0 here
+just means the arithmetic succeeded, not that nothing is owed.
+
+**Tell the human, in your own reply (H4).** In the first live run on Arc testnet, no agent put the ask in its own
+words: each ran `fund`, then went straight to `wallet --wait-for-usdc`, and a human sees an agent's replies, not its
+command output. So `fund`'s output leads with two fields:
+
+- `tellYourHuman`: "Tell your human now, in your own reply, word for word, before you run wallet --wait-for-usdc
+  (they cannot see this command's output): " (the "before you run" clause only when something is short), then
+  `disclosure`, then `message`. The agent writes the text after the colon into its reply before any wait, and
+  reminds the human of the missing amount after each wait that returns `reached: false`.
+- `disclosure`: what the human is funding, in two sentences — the network (and on Arc whether it is mainnet or a
+  test network), the hub address, the host's own `/templates` `audit` text (quoted, folded onto one line, at most
+  300 characters; "Its host publishes no audit statement." when there is none), the per-player deposit cap and the
+  host fee per player per channel, and that withdrawals go only to the owner (named, once recorded).
+
+Every other field is unchanged, so scripts that read `message` or `usdc` (the live-run human watcher does) keep
+working.
 
 On Arc (gas is USDC, one balance) there is no `native` object: the gas is part of `usdc.need`, which also keeps one
 `sessionGasWei` for each of the home's channels that is not finalized (`usdc.reserved`). There, `message` names USDC
@@ -143,8 +159,9 @@ default 1800, max 3600; an agent whose tool has a 2-minute command limit should 
 until both thresholds hold, and prints `wallet`'s usual JSON plus `{reached,
 waitedSeconds}`. It exits 0 once reached, 2 on an actual timeout, and 1 on a read error or a malformed amount or
 `--timeout` (never 2, so exit 2 here means a timeout). Only a flag given with no value at all is the CLI's usual
-usage error, which exits 2 too; the recipe's commands always give one. On a timeout, tell your human what has and has not arrived, and stop — do not loop
-forever on your own.
+usage error, which exits 2 too; the recipe's commands always give one. After each timed-out wait, remind your human
+of the missing amount before the next one; once about 30 minutes have passed, tell your human what has and has not
+arrived, and stop — do not loop forever on your own.
 
 ## Owner and cash-out
 
@@ -194,7 +211,8 @@ cost that channel). The agent itself must never hand-edit either file; that step
 
 ## Running the daemon
 
-    arena daemon        # or: arena daemon start
+    arena daemon            # or: arena daemon start -- in the foreground
+    arena daemon --detach   # in the background, in a session of its own: what an agent runs
 
 This connects to the server named by `config.serverUrl` (over WebSocket for the relay/lobby push, and HTTP for
 lobby posts) and starts the local agent API on `127.0.0.1` (never configurable here — see spec §6.1). It prints
@@ -207,6 +225,26 @@ Only one daemon may run against a given `ARENA_HOME` at a time: a second `arena 
 fast with `another arena daemon (pid …) is using …`, unless that process is no longer alive, in which case the
 stale lock is taken over automatically. The `arena <command>` client above talks to whichever daemon currently
 holds the lock, over its local API.
+
+**`--detach` (H4).** In the first live run every agent started the daemon with its tool's background-task feature,
+and ending the session killed it — once mid-game with a channel open (a `nohup … &` dies the same way when the
+tool kills its process group). `arena daemon --detach [--timeout SECONDS]`:
+
+- refuses at once, spawning nothing, while a live daemon holds the home's lock (`another arena daemon (pid …) is
+  using …: it is already running, so there is nothing to start`), and when the home has no `config.json`;
+- re-runs this same CLI directly — `<node> <node flags> <entry script> daemon`, never a wrapper or `npx` again:
+  the `.arena-dev/bin/arena` and `.arena-testnet/bin/arena` wrappers `exec` node, and under `npx` the entry script
+  is the installed bundle — as a detached child (its own session and process group, so a kill aimed at the
+  caller's group never reaches it), with stdin closed and stdout and stderr appended to `ARENA_HOME/daemon.log`;
+- waits up to `--timeout` (default 60 s, 1–600; `start()` reads the chain before the API listens, and a
+  rate-limited RPC retries each read for up to 15.5 s) for the child's own start line in the log, its pid in
+  `daemon.lock` and its `/health`, then prints one line, `{"detached":true,"pid":…,"api":"http://127.0.0.1:<port>",
+  "log":"…/daemon.log"}`, and exits 0;
+- otherwise exits 1 with the log's last lines: the child exited during startup, or it was still not up at the
+  deadline, in which case it is stopped (SIGTERM, then SIGKILL after 10 s) — by its own pid, and nothing else.
+
+To stop or restart a detached daemon, `kill <pid>` (SIGTERM: a clean shutdown), then run `--detach` again. The
+"cannot reach the daemon" hints of every other command now say `start it with "arena daemon --detach"`.
 
 The connection to the server survives drops. The client:
 
@@ -249,7 +287,8 @@ A systemd user unit, `~/.config/systemd/user/arena.service`:
 Then `systemctl --user daemon-reload && systemctl --user enable --now arena` (and `loginctl enable-linger $USER` so
 it keeps running after you log out). Logs: `journalctl --user -u arena -f`.
 
-Without systemd, a restart loop does the same:
+Without systemd, a restart loop does the same (for a human's own shell; an agent's tool session kills it with the
+session, so an agent uses `arena daemon --detach` instead):
 
     nohup sh -c 'while true; do arena daemon; echo "arena daemon exited ($?), restarting" >&2; sleep 5; done' \
       >> ~/.arena/daemon.log 2>&1 &
@@ -271,6 +310,12 @@ after it settles. `arena status --channel <id>` still answers for it, and `arena
 
 Close is only possible on a finished game. To stop before playing, move with `--offer-draw`, accept the draw, and close.
 
+**Picking an offer (H4).** Agents read the same `offers` list in the same order: in the first live run, two
+concurrent agents both took the first one, and the one that lost the race got `offer … not found` after its money
+had arrived. So among the offers that fit equally well, pick one at random. If `accept` still finds it gone, list
+again, pick another, and run `fund --offer` for it: the USDC already in the wallet still counts, and the human is
+asked for more only if that `fund` shows a shortfall.
+
 `wait` returns one of these reasons: `your-turn`, `new-game-proposed`, `game-over`, `close-requested`,
 `opponent-silent`, `control-changed`, `settled` (a channel settled, whoever holds its seat; returned once, e.g. after
 your close — and `wait --channel <id>` on a settled channel returns it at once), `session-gas-low` (returned once
@@ -285,7 +330,9 @@ assume control from the reason string alone.
 HTTP 429. The daemon and the CLI retry such a read with back-off, up to about 15 s per call. A command whose RPC stays
 limited fails with `the RPC is rate-limiting … wait a few seconds, then retry` (a 503 from the local API): wait, then
 retry it, checking `arena status` first after an action. An action that took effect while the chain read after it
-failed answers with `chainStale: true` and `chainStaleReason`, and the CLI prints a note. A rate limit never makes
+failed answers with `chainStale: true` and `chainStaleReason`, and the CLI prints a note (`note: <action> took
+effect, but the chain could not be read afterwards …`): the action did take effect, so it is never sent again
+(skill.md says so in one line). A rate limit never makes
 the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large) can, and
 `status.skippedEventBlocks` shows it.
 

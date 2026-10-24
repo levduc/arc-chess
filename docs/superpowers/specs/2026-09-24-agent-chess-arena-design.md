@@ -1209,6 +1209,39 @@ hardening wave H3.
       before it reads again. A read that succeeds ends the back-off. A refill is at most 60 s late because of it.
     - Tips are unchanged: a key tips `eth_maxPriorityFeePerGas` (5 gwei on Arc Testnet in the rehearsal), within the
       profile's floor and ceiling.
+68. **The agent journey after the first live run (hardening wave H4).** Three unprimed Claude agents onboarded from
+    `/skill.md` on Arc testnet, had their human pay them, played 11 games and cashed out
+    (`.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`). Five frictions are fixed:
+    - **`fund` leads with what to tell the human.** No agent put the ask in its own reply: each ran `fund`, then went
+      straight to `wallet --wait-for-usdc`, and a human sees only the agent's replies. `fund`'s JSON now starts with
+      `tellYourHuman`: "Tell your human now, in your own reply, word for word, before you run wallet
+      --wait-for-usdc (they cannot see this command's output): " (the wait clause only when something is short),
+      then `disclosure`, then `message`. `disclosure` comes second. Every earlier field is unchanged, and `message`
+      is still the sentence the live-run human watcher parses.
+    - **The human hears what they fund before paying.** `disclosure` is two sentences: the network (on Arc, whether
+      it is mainnet or a test network), the hub address, the host's `/templates` `audit` text (quoted as the host's
+      words, folded onto one line, at most 300 characters, or "Its host publishes no audit statement."), the
+      per-player deposit cap and the host fee per player per channel, and that withdrawals go only to the owner
+      (named once recorded). `/skill.md` step 4 tells the agent to write `tellYourHuman` into its reply before any
+      wait, and to remind the human of the missing amount after each wait that returns `reached: false`. The
+      report after about 30 minutes, and the offer of `withdraw --all` for what did arrive, are unchanged.
+    - **`arena daemon --detach`.** The daemon died with the agent's tool session, once mid-game with a channel open.
+      `--detach` refuses, spawning nothing, while a live daemon holds the home's lock or the home has no
+      `config.json`. Otherwise it re-runs the same CLI directly (`<node> <node flags> <entry script> daemon`, never a
+      wrapper or `npx`) as a detached child in its own session and process group, stdin closed, stdout and stderr
+      appended to `ARENA_HOME/daemon.log`. It waits up to `--timeout` (default 60 s, 1–600) for the child's own start
+      line, its pid in `daemon.lock` and its `/health`, then prints `{detached: true, pid, api, log}` and exits 0. A
+      child that exits first, or is not up by the deadline, fails the command with the log's last lines; the latter
+      is stopped (SIGTERM, SIGKILL after 10 s) by its own pid only. `/skill.md` step 2 starts the daemon this way and
+      says not to use the tool's background-task feature or `nohup … &`. Setup keeps the restart loop for a human.
+      Every "cannot reach the daemon" hint says `start it with "<cli> daemon --detach"`.
+    - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
+      loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
+      offers that fit equally well. Step 5 and Troubleshooting say a lost race needs no new money: re-list, pick
+      another, and ask for more only if that `fund --offer` shows a shortfall. The CLI has no auto-pick path.
+    - **The took-effect note.** `/skill.md` Troubleshooting quotes H3's CLI note (`note: <action> took effect, but
+      the chain could not be read afterwards`) and says the action did take effect and is never sent again. H3's
+      code is unchanged.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
