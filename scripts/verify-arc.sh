@@ -90,9 +90,17 @@ blockscout_compiler_version() {
     | head -1
 }
 
+# "true" only for a FULL match: Blockscout sets is_verified for a partial match too (metadata differs), and a partial
+# match is not proof that the published source is what was deployed (T5 review m-5). Every decision below uses this.
 is_verified() {
   curl -fsS -m 15 "$EXPLORER_URL/api/v2/smart-contracts/$1" 2>/dev/null \
-    | jq -r '.is_verified // false' 2>/dev/null || echo false
+    | jq -r '(.is_verified // false) and (.is_fully_verified // false)' 2>/dev/null || echo false
+}
+
+# For the log: both flags as Blockscout reports them.
+verified_flags() {
+  curl -fsS -m 15 "$EXPLORER_URL/api/v2/smart-contracts/$1" 2>/dev/null \
+    | jq -r '"is_verified=\(.is_verified // false) is_fully_verified=\(.is_fully_verified // false)"' 2>/dev/null || echo "unreadable"
 }
 
 # Step 1: optimistic, best-effort standard-input submission straight to Blockscout. Non-fatal on failure --
@@ -202,7 +210,7 @@ verify_one() {
   echo "==> $label ($addr)"
 
   if [[ "$(is_verified "$addr")" == "true" ]]; then
-    echo "    already verified on Blockscout -- skipping"
+    echo "    already fully verified on Blockscout -- skipping"
     return 0
   fi
 
@@ -229,7 +237,7 @@ verify_one() {
     waited=$((waited + 5))
     final="$(is_verified "$addr")"
   done
-  echo "    final Blockscout is_verified=$final (after ${waited}s) -- $EXPLORER_URL/address/$addr#code"
+  echo "    final Blockscout full match: $final (after ${waited}s; $(verified_flags "$addr")) -- $EXPLORER_URL/address/$addr#code"
   [[ "$final" == "true" ]]
 }
 
@@ -241,7 +249,7 @@ verify_chess_rules() {
 verify_channel_hub() {
   if [[ "$(is_verified "$HUB_ADDR")" == "true" ]]; then
     echo "==> ChannelHub ($HUB_ADDR)"
-    echo "    already verified on Blockscout -- skipping (no ARENA_OWNER/ARENA_FEE_RECIPIENT needed)"
+    echo "    already fully verified on Blockscout -- skipping (no ARENA_OWNER/ARENA_FEE_RECIPIENT needed)"
     return 0
   fi
 

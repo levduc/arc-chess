@@ -43,7 +43,7 @@ describe("HubClient.transfer", () => {
 // entries, even for one block (-32012 "requested range too large", on testnet and mainnet alike). The hub's ABI has
 // 15 events; hubEvents' full read must ask for the 7 that carry a channelId and nothing else.
 describe("HubClient.hubEvents on an RPC that caps topic-0 lists at 10", () => {
-  const HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893" as const;
+  const HUB = `0x${"ab".repeat(20)}` as const; // a synthetic address: the transport below is the whole "chain"
   /** A transport that answers eth_getLogs like Arc's RPC: refused with more than 10 topics in position 0, else []. */
   function arcLikeClient(seen: unknown[][]): PublicClient {
     return createPublicClient({

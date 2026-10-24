@@ -40,7 +40,17 @@
  *   pids are ever signalled.
  * - Between channels, the closed-system total (deployer + wallets + session keys; fees go back to the deployer, the
  *   fee recipient) may fall only by gas. The run stops if that exceeds 2 USDC.
- * - `state.json` records the steps done, so a rerun with the same `--dir` resumes after the last completed step.
+ * - Children never inherit this process's whole environment, only an allowlist (`arc-rehearsal-lib.ts`: `PATH`, the
+ *   locale, proxies, `NODE_*`, …). A key exported in the operator's shell never reaches a daemon, the server or the
+ *   `npm install` that `arena xmtp enable` runs.
+ * - Each detached process is recorded with its pid and start time, and is signalled only while both still match
+ *   (and its command line is this run's), so a pid the kernel reused is never touched.
+ *
+ * Resume: `state.json` records the steps done, so a rerun with the same `--dir` resumes after the last completed step.
+ * A run that stops leaves the server and daemons running on purpose, so the watchtowers keep watching. Before resuming,
+ * stop them by the pids in `state.json` (`kill <pid>`, once no channel needs them). The rerun refuses to start over one
+ * that is still running, and its message names the pid. A channel step that was half done resumes from the chain and
+ * the daemons' state. One that cannot, such as an offer posted with no channel recorded, stops with "settle it by hand".
  */
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs";
@@ -64,6 +74,7 @@ import {
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { channelHubAbi } from "../packages/sdk/src/abi.js";
+import { childEnv as allowlistedEnv, isOurs, procStartTime, type ProcEntry } from "./arc-rehearsal-lib.js";
 
 // ------------------------------------------------------------------------------------------------- constants
 
@@ -106,6 +117,9 @@ function deployBlock(flag: string | undefined): bigint {
 const FUND_PER_HOME = 2n * 10n ** 18n;
 const DEPOSIT = 1_000_000n;
 const STAKE = 100_000n;
+/** The fee per player the deploy set: `Deploy.s.sol`'s `ARENA_FEE_PER_PLAYER` default, left unset by the testnet
+ *  deploys (rehearsal report §1). The hub-side checks expect it, never the hub's own value (T5 review m-1). */
+const FEE_PER_PLAYER = 5_000n;
 const NORMAL_TIMEOUT = 900n;
 /** Testnet only: the dispute channel's challengeTimeout (both homes are init-ed with --min-challenge-timeout 300). */
 const DISPUTE_TIMEOUT = 300n;
@@ -187,7 +201,9 @@ type State = {
   deployerBefore?: string;
   deployerNonceBefore?: number;
   homes: Record<Name, { home: string; apiPort: number; wallet?: Address; inited?: boolean; owner?: boolean; xmtp?: boolean; fundTx?: Hex }>;
-  pids: { server?: number; alice?: number; bob?: number };
+  /** Each detached process with its start time (T5 review I-2): a bare number is a `state.json` from before that check,
+   *  and is never signalled. */
+  pids: { server?: ProcEntry | number; alice?: ProcEntry | number; bob?: ProcEntry | number };
   channels: Partial<Record<ChannelKind, ChannelState>>;
   done: string[];
   measures: Measure[];
@@ -323,11 +339,10 @@ async function isPortFree(port: number): Promise<boolean> {
   });
 }
 
-function childEnv(home?: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: FAKE_HOME, npm_config_cache: NPM_CACHE };
-  delete env.ARENA_HOME;
-  if (home) env.ARENA_HOME = home;
-  return env;
+/** A child's environment (T5 review I-1): an allowlist of this process's variables (`arc-rehearsal-lib.ts`), never
+ *  the whole of it, plus the fake `HOME`, npm's cache and, for an `arena` process, its `ARENA_HOME`. */
+function childEnv(home?: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return allowlistedEnv(process.env, { HOME: FAKE_HOME, npm_config_cache: NPM_CACHE, ARENA_HOME: home, ...extra });
 }
 
 /** Runs one `arena` command to completion; output goes to `logs/cli.log` too (the CLI never prints a key). */
@@ -396,27 +411,46 @@ function spawnDetached(label: string, args: string[], env: NodeJS.ProcessEnv): C
   return child;
 }
 
-function alive(pid: number | undefined): boolean {
-  if (pid === undefined) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
+/** The command-line strings that identify each detached process of this run (with its start time: `isOurs`). */
+function marksOf(label: "server" | Name): string[] {
+  return label === "server" ? [SERVER_BIN, serverConfigPath()] : [CLI_BIN, "daemon"];
+}
+
+/** The pid and start time of a process just spawned; the start time is read from /proc, retried briefly. */
+async function entryOf(child: ChildProcess, label: string): Promise<ProcEntry> {
+  for (let i = 0; i < 40 && child.pid !== undefined; i++) {
+    const startTime = procStartTime(child.pid);
+    if (startTime !== null) return { pid: child.pid, startTime };
+    await sleep(25);
+  }
+  throw new Error(`cannot read the start time of ${label} (pid ${child.pid}) from /proc: it could not be stopped safely later`);
+}
+
+/** Signals `entry` only while it is still the process this script started (pid, start time and command line: T5
+ *  review I-2), then waits until it is gone; SIGKILL after `graceMs`. Anything else is left alone, and logged. */
+async function stopPid(label: string, entry: ProcEntry | number | undefined, marks: string[], signal: NodeJS.Signals = "SIGTERM", graceMs = 30_000): Promise<void> {
+  if (entry === undefined) return;
+  if (!isOurs(entry, marks)) {
+    progress("stop", { what: label, entry, skipped: "not this run's process (gone, or the pid was reused): not signalled" });
+    return;
+  }
+  const { pid } = entry as ProcEntry;
+  progress("stop", { what: label, pid, signal });
+  process.kill(pid, signal);
+  const end = Date.now() + graceMs;
+  while (isOurs(entry, marks) && Date.now() < end) await sleep(200);
+  if (isOurs(entry, marks)) {
+    progress("stop", { what: label, pid, signal: "SIGKILL", why: `still alive after ${graceMs} ms` });
+    process.kill(pid, "SIGKILL");
+    while (isOurs(entry, marks)) await sleep(200);
   }
 }
 
-/** Signals only `pid` (a process this script started), then waits for it to exit. */
-async function stopPid(label: string, pid: number | undefined, signal: NodeJS.Signals = "SIGTERM", graceMs = 30_000): Promise<void> {
-  if (!alive(pid)) return;
-  progress("stop", { what: label, pid, signal });
-  process.kill(pid!, signal);
-  const end = Date.now() + graceMs;
-  while (alive(pid) && Date.now() < end) await sleep(200);
-  if (alive(pid)) {
-    progress("stop", { what: label, pid, signal: "SIGKILL", why: `still alive after ${graceMs} ms` });
-    process.kill(pid!, "SIGKILL");
-    while (alive(pid)) await sleep(200);
+/** Refuses to start over a process an earlier run left running (resume: see the header), by its pid and start time. */
+function refuseIfLeftRunning(label: "server" | Name): void {
+  const entry = state.pids[label];
+  if (isOurs(entry, marksOf(label))) {
+    throw new Error(`${label} from an earlier run is still running (pid ${(entry as ProcEntry).pid}); stop it first: kill ${(entry as ProcEntry).pid}`);
   }
 }
 
@@ -471,10 +505,10 @@ function writeServerConfig(): void {
 }
 
 async function startServer(): Promise<void> {
-  if (alive(state.pids.server)) throw new Error(`a server from an earlier run is still alive (pid ${state.pids.server}); stop it first`);
+  refuseIfLeftRunning("server");
   if (!(await isPortFree(SERVER_PORT))) throw new Error(`port ${SERVER_PORT} is busy`);
   const child = spawnDetached("server", [SERVER_BIN, "--config", serverConfigPath()], childEnv());
-  state.pids.server = child.pid;
+  state.pids.server = await entryOf(child, "the server");
   save();
   await waitHttp(`http://127.0.0.1:${SERVER_PORT}/healthz`, "the host server");
   progress("server up", { port: SERVER_PORT, pid: child.pid });
@@ -662,12 +696,12 @@ function channelIdsOf(name: Name): Hex[] {
 
 async function startDaemon(name: Name): Promise<void> {
   const h = state.homes[name];
-  if (alive(state.pids[name])) throw new Error(`${name}'s daemon from an earlier run is still alive (pid ${state.pids[name]}); stop it first`);
+  refuseIfLeftRunning(name);
   if (!(await isPortFree(h.apiPort))) throw new Error(`port ${h.apiPort} is busy`);
   const logPath = join(LOGS, `${name}.log`);
   const before = existsSync(logPath) ? readFileSync(logPath, "utf8").length : 0;
   const child = spawnDetached(name, [CLI_BIN, "daemon"], childEnv(h.home));
-  state.pids[name] = child.pid;
+  state.pids[name] = await entryOf(child, `${name}'s daemon`);
   save();
   await waitHttp(`http://127.0.0.1:${h.apiPort}/health`, `${name}'s daemon`);
   const token = (JSON.parse(readFileSync(join(h.home, "token.json"), "utf8")) as { token: string }).token;
@@ -1012,7 +1046,7 @@ function xmtpInbox(address: Address): Promise<{ inboxId: string | null; installa
   const sdkEntry = join(state.homes.alice.home, "xmtp/sdk/node_modules/@xmtp/node-sdk/dist/index.js");
   return new Promise((resolvePromise, reject) => {
     const child = spawn(process.execPath, [helper, address], {
-      env: { ...childEnv(), XMTP_SDK_URL: pathToFileURL(sdkEntry).href },
+      env: childEnv(undefined, { XMTP_SDK_URL: pathToFileURL(sdkEntry).href }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -1086,8 +1120,12 @@ async function channelXmtp(): Promise<void> {
   }
   if (ch.stage === "relay-moves") {
     const killedAt = Date.now();
-    await stopPid("server (mid-game kill)", state.pids.server, "SIGKILL");
-    progress("host killed", { pid: state.pids.server });
+    const killed = state.pids.server;
+    await stopPid("server (mid-game kill)", killed, marksOf("server"), "SIGKILL");
+    // T5 review I-2: the pid is dead now and may be reused; nothing may signal it again.
+    delete state.pids.server;
+    save();
+    progress("host killed", { pid: typeof killed === "object" ? killed.pid : killed });
     stage("host-killed");
     try {
       await waitTransport(alice, id, "xmtp", 90_000);
@@ -1239,8 +1277,9 @@ async function runRehearsal(): Promise<void> {
     }
   });
 
-  for (const n of NAMES) await stopPid(`${n}'s daemon`, state.pids[n]);
-  await stopPid("server", state.pids.server);
+  for (const n of NAMES) await stopPid(`${n}'s daemon`, state.pids[n], marksOf(n));
+  await stopPid("server", state.pids.server, marksOf("server"));
+  for (const k of ["server", ...NAMES] as const) delete state.pids[k];
   state.endBlock = (await pub.getBlockNumber()).toString();
   save();
 }
@@ -1307,7 +1346,7 @@ async function collect(): Promise<void> {
 
   // Every transaction each sender sent since the run started; Blockscout's list must match the sender's nonce.
   const hashes = new Map<Hex, string>();
-  const nonceCheck: Array<{ sender: string; label: string; listed: number; nonceDelta: number }> = [];
+  const nonceCheck: Array<{ sender: string; label: string; listed: number; nonceDelta: number; ok: boolean }> = [];
   for (const s of senders) {
     const nonceEnd = await pub.getTransactionCount({ address: s, blockTag: "latest" });
     const nonceStart = s === DEPLOYER.toLowerCase() ? (state.deployerNonceBefore ?? 0) : 0;
@@ -1317,7 +1356,9 @@ async function collect(): Promise<void> {
       if (listed.length >= nonceEnd - nonceStart) break;
       await sleep(15_000);
     }
-    nonceCheck.push({ sender: s, label: label.get(s)!, listed: listed.length, nonceDelta: nonceEnd - nonceStart });
+    // T5 review m-2: a short listing (Blockscout behind, or a transaction it never indexed) is a failed check, not a
+    // quiet gap that only shows up later as a reconciliation that does not add up.
+    nonceCheck.push({ sender: s, label: label.get(s)!, listed: listed.length, nonceDelta: nonceEnd - nonceStart, ok: listed.length === nonceEnd - nonceStart });
     for (const h of listed) hashes.set(h, s);
   }
   // Belt and braces: hashes the run recorded itself.
@@ -1443,16 +1484,21 @@ async function collect(): Promise<void> {
     const p = payouts[ch.id];
     const rec = recordOf("alice", ch.id)!;
     const [p0, p1] = rec.participants.map((a) => a.toLowerCase());
-    const fee = await pub.readContract({ address: HUB, abi: channelHubAbi, functionName: "channelParams", args: [ch.id] }) as { feePerPlayer: bigint; feeRecipient: Address };
+    const id = ch.id;
+    const params = (await read(() => pub.readContract({ address: HUB, abi: channelHubAbi, functionName: "channelParams", args: [id] }))) as { feePerPlayer: bigint; feeRecipient: Address };
     const add = (check: string, want: string, got: string) => hubChecks.push({ channel: kind, check, want, got, ok: want === got });
-    add("deposits", `2 x ${DEPOSIT + fee.feePerPlayer}`, `${p?.deposits.length ?? 0} x ${[...new Set(p?.deposits.map((d) => d.amount) ?? [])].join("/")}`);
+    // T5 review m-1: every expectation is the script's own (the deploy's fee, the scripted results, the deployer as fee
+    // recipient), never read back from the hub, so a hub with another fee or recipient fails here.
+    add("channel's fee per player (the deploy's)", FEE_PER_PLAYER.toString(), params.feePerPlayer.toString());
+    add("channel's fee recipient (the deployer)", DEPLOYER.toLowerCase(), params.feeRecipient.toLowerCase());
+    add("deposits", `2 x ${DEPOSIT + FEE_PER_PLAYER}`, `${p?.deposits.length ?? 0} x ${[...new Set(p?.deposits.map((d) => d.amount) ?? [])].join("/")}`);
     add("Finalized.balanceA (participant 0)", ch.expectedA ?? "?", p?.finalized?.a ?? "none");
     add("Finalized.balanceB (participant 1)", ch.expectedB ?? "?", p?.finalized?.b ?? "none");
-    add("Finalized.fee", (2n * fee.feePerPlayer).toString(), p?.finalized?.fee ?? "none");
+    add("Finalized.fee", (2n * FEE_PER_PLAYER).toString(), p?.finalized?.fee ?? "none");
     const tr = (who: string) => p?.finalized?.transfers.filter((t) => t.to === who).map((t) => t.amount).join("+") || "none";
     add("USDC transfer hub -> participant 0", ch.expectedA ?? "?", tr(p0));
     add("USDC transfer hub -> participant 1", ch.expectedB ?? "?", tr(p1));
-    add("USDC transfer hub -> fee recipient (deployer)", (2n * fee.feePerPlayer).toString(), tr(fee.feeRecipient.toLowerCase()));
+    add("USDC transfer hub -> fee recipient (deployer)", (2n * FEE_PER_PLAYER).toString(), tr(DEPLOYER.toLowerCase()));
     add("PayoutDeferred events", "0", String(p?.owed.length ?? 0));
   }
 
@@ -1503,7 +1549,7 @@ async function collect(): Promise<void> {
   const result = { generatedAt: new Date().toISOString(), hub: HUB, rules: RULES, startBlock: state.startBlock, endBlock: state.endBlock, nonceCheck, rows, balances, owedNow, committedEscrow, hubChecks, hardening, recon, system, channels: state.channels, measures: state.measures, notes: state.notes, withdraws: state.withdraws, spawns: state.spawns ?? [], rateLimited: state.rateLimited ?? {} };
   writeFileSync(join(DIR, "result.json"), `${JSON.stringify(result, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2)}\n`);
   writeFileSync(join(DIR, "report-fragment.md"), fragment(result));
-  progress("collected", { txs: rows.length, totalGasUsdc: formatUnits(totalGas, 18), systemOk: system.ok, reconOk: recon.every((r) => r.ok), hubOk: hubChecks.every((c) => c.ok), hardeningOk: hardening.every((c) => c.ok) });
+  progress("collected", { txs: rows.length, totalGasUsdc: formatUnits(totalGas, 18), systemOk: system.ok, reconOk: recon.every((r) => r.ok), hubOk: hubChecks.every((c) => c.ok), hardeningOk: hardening.every((c) => c.ok), nonceOk: nonceCheck.every((c) => c.ok) });
 }
 
 const usdc18 = (wei: string | bigint) => formatUnits(BigInt(wei), 18);
@@ -1536,8 +1582,8 @@ function fragment(r: any): string {
   L.push("", `System: deployer before ${usdc18(r.system.deployerBefore)} = deployer after ${usdc18(r.system.deployerAfter)} + held by agents ${usdc18(r.system.heldByAgentsAfter)} + gas ${usdc18(r.system.totalGas)} → ${r.system.ok ? "exact" : `**off by ${r.system.residual} wei**`}.`);
   L.push("", "### Balances after (native, 18 decimals)", "", "| Address | Balance (USDC) |", "|---|---|");
   for (const [k, v] of Object.entries(r.balances)) L.push(`| ${k} | ${usdc18(v as string)} |`);
-  L.push("", "### Sender nonce check (Blockscout listing vs nonce)", "", "| Sender | Listed | Nonce delta |", "|---|---|---|");
-  for (const x of r.nonceCheck) L.push(`| ${x.label} | ${x.listed} | ${x.nonceDelta} |`);
+  L.push("", "### Sender nonce check (Blockscout listing vs nonce)", "", "| Sender | Listed | Nonce delta | OK |", "|---|---|---|---|");
+  for (const x of r.nonceCheck) L.push(`| ${x.label} | ${x.listed} | ${x.nonceDelta} | ${x.ok ? "yes" : "**NO**"} |`);
   L.push("", "### Checkout at each spawn", "", "| Process | At | Checkout |", "|---|---|---|");
   for (const x of r.spawns ?? []) L.push(`| ${x.label} | ${x.at} | ${x.checkout} |`);
   L.push("", "### Timings", "", "| Step | Seconds | Note |", "|---|---|---|");
