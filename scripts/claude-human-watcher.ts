@@ -19,7 +19,10 @@
  * `tests/system/claude-sandbox.ts`.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** One "send X USDC to 0x…" the agent put in front of its human. */
 export type FundingAsk = { usdc: string; address: string };
@@ -270,16 +273,60 @@ export class HumanWatcher {
       return true;
     }
     this.record({ t: new Date().toISOString(), kind: "pay", ...ask });
-    const result = await new Promise<{ exit: number | null; stdout: string; stderr: string }>((resolve) => {
-      const child = spawn(this.o.pay, [ask.address, ask.usdc], { stdio: ["ignore", "pipe", "pipe"] });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-      child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-      child.once("exit", (exit) => resolve({ exit, stdout: stdout.trim(), stderr: stderr.trim() }));
-    });
-    // Exit 1 with `"status":"pending"` means sent but unconfirmed: never resend, look the hash up instead.
-    this.record({ t: new Date().toISOString(), kind: "paid", ...ask, ...result });
-    return true;
+    const release = await payLock(this.o.pay);
+    try {
+      for (let attempt = 1; ; attempt++) {
+        const result = await new Promise<{ exit: number | null; stdout: string; stderr: string }>((resolve) => {
+          const child = spawn(this.o.pay, [ask.address, ask.usdc], { stdio: ["ignore", "pipe", "pipe"] });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+          child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+          child.once("exit", (exit) => resolve({ exit, stdout: stdout.trim(), stderr: stderr.trim() }));
+        });
+        this.record({ t: new Date().toISOString(), kind: "paid", ...ask, ...result });
+        // Exit 1 with `"status":"pending"` means sent but unconfirmed: never resend, look the hash up instead. Any
+        // failure other than a refusal before sending is left for a person (see `isRefusalBeforeSend`).
+        if (result.exit === 0 || !isRefusalBeforeSend(result.stderr) || attempt >= 3) return true;
+        await new Promise((r) => setTimeout(r, 10_000 + Math.floor(Math.random() * 10_000)));
+      }
+    } finally {
+      release();
+    }
+  }
+}
+
+/** True only for the pay helper's refusal while another transaction from the deployer is pending: it refused before
+ *  signing anything, so a retry once that one confirms is safe. Not "the send failed and <hash> is not on the
+ *  chain": the helper's lookup cannot tell a dropped send from a rate-limited lookup, so that one is left for a
+ *  person, and so is `"status":"pending"`, which is never resent. */
+export function isRefusalBeforeSend(stderr: string): boolean {
+  return /refusing: the deployer has a pending transaction/.test(stderr);
+}
+
+/** One pay at a time per pay helper, across every watcher process on this machine. The live run's two watchers paid
+ *  from the one deployer at the same moment, both read the same nonce, and the second send failed ("Transaction
+ *  creation failed"). An exclusive lock file in the tmp dir, keyed by the helper's path; a lock older than 5 minutes
+ *  (a watcher killed mid-pay -- the helper itself gives up on a receipt after 3) is taken over. */
+async function payLock(pay: string): Promise<() => void> {
+  const path = join(tmpdir(), `claude-human-pay-${createHash("sha256").update(pay).digest("hex").slice(0, 16)}.lock`);
+  for (;;) {
+    try {
+      closeSync(openSync(path, "wx"));
+      return () => {
+        try {
+          unlinkSync(path);
+        } catch {
+          // already gone
+        }
+      };
+    } catch {
+      try {
+        if (Date.now() - statSync(path).mtimeMs > 5 * 60_000) unlinkSync(path);
+      } catch {
+        // released meanwhile
+      }
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
   }
 }

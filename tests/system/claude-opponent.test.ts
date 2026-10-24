@@ -12,6 +12,7 @@ import {
   agentTexts,
   decide,
   fundOutputAsks,
+  isRefusalBeforeSend,
   microUsdc,
   parseFundingAsks,
   sessionIdOf,
@@ -144,6 +145,13 @@ describe("the human watcher's decision", () => {
     expect(decide({ usdc: "3.01", address: WALLET }, WALLET, [], "10")).toMatchObject({ pay: false });
     expect(decide({ usdc: "1.7", address: WALLET }, WALLET, [paid("1.35")], "3")).toMatchObject({ pay: false });
     expect(decide({ usdc: "1.65", address: WALLET }, WALLET, [paid("1.35")], "3")).toEqual({ pay: true });
+  });
+
+  it("retries only the helper's refusal before sending, never a send whose fate it could not see", () => {
+    expect(isRefusalBeforeSend("testnet: refusing: the deployer has a pending transaction (nonce latest 7, pending 8)")).toBe(true);
+    expect(isRefusalBeforeSend("testnet: the send failed and 0x3dc0 is not on the chain: Transaction creation failed.")).toBe(false);
+    expect(isRefusalBeforeSend("pay: no receipt within 180s; do not resend until 0xab confirms or drops")).toBe(false);
+    expect(isRefusalBeforeSend("refusing: the deployer holds 2.1 USDC; sending 1 would leave it under 2 USDC")).toBe(false);
   });
 
   it("does budget arithmetic in exact micro-USDC", () => {
