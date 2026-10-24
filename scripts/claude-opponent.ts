@@ -272,11 +272,16 @@ async function main(): Promise<void> {
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
 
+  // Cleared in `finally`: left pending, it kept this script alive for the rest of --minutes after the session had
+  // already exited (seen on every short --resume of the live run).
+  let budgetTimer: NodeJS.Timeout | undefined;
   try {
     const timeoutMs = Math.max(0, args.minutes * 60_000);
     const result = await Promise.race([
       exitedPromise,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+      new Promise<null>((resolve) => {
+        budgetTimer = setTimeout(() => resolve(null), timeoutMs);
+      }),
     ]);
     if (result === null) {
       stopNow(`--minutes ${args.minutes} elapsed`);
@@ -288,6 +293,7 @@ async function main(): Promise<void> {
       await exitedPromise;
     }
   } finally {
+    clearTimeout(budgetTimer);
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
     if (!exited) {
