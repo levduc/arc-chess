@@ -112,12 +112,13 @@ export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc
  */
 export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {
   // 5042: Arc mainnet -- pinned by Plan 6 Task 6, after the gated mainnet deploy (contracts/deployments/5042.json).
-  // Plan 6 Task 5: the testnet deploy, source-verified on explorer.testnet.arc.io (contracts/deployments/5042002.json;
-  // docs/superpowers/arc-testnet-rehearsal.md §1).
+  // Plan 6 Task 5: the hardened hub's testnet deploy (audit I1, M1, M2), source-verified on explorer.testnet.arc.io
+  // (contracts/deployments/5042002.json; docs/superpowers/arc-testnet-rehearsal.md, "Redeploy (hardened hub)"). The
+  // pre-hardening hub 0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893 is superseded and refused.
   5042002: {
     name: "Arc Testnet",
-    hub: "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893",
-    rules: "0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5",
+    hub: "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41",
+    rules: "0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01",
     usdc: "0x3600000000000000000000000000000000000000",
   },
 };

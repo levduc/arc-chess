@@ -219,9 +219,17 @@ verify_one() {
       "docs/superpowers/arc-testnet-rehearsal.md" >&2
   fi
 
-  local final
+  # Blockscout's import only *starts* verification ("Smart-contract verification started"): is_verified flips
+  # seconds later. Plan 6 Task 5's redeploy read it at once, saw false, and set -e stopped the run before
+  # ChannelHub -- so poll for up to 90 s.
+  local final waited=0
   final="$(is_verified "$addr")"
-  echo "    final Blockscout is_verified=$final -- $EXPLORER_URL/address/$addr#code"
+  while [[ "$final" != "true" && "$waited" -lt 90 ]]; do
+    sleep 5
+    waited=$((waited + 5))
+    final="$(is_verified "$addr")"
+  done
+  echo "    final Blockscout is_verified=$final (after ${waited}s) -- $EXPLORER_URL/address/$addr#code"
   [[ "$final" == "true" ]]
 }
 
