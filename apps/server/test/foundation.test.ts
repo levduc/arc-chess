@@ -919,10 +919,12 @@ describe("http foundation", () => {
       expect(step7).toContain("minus the starting balance you noted in step 4");
       // I-7, and fix round 1 N-1: tell the human after ~30 min, but keep waiting and playing until the offer has
       // expired -- an unplayed late match loses a stake -- and only then offer the withdraw.
-      expect(recipe).toMatch(/After about 30 minutes unmatched, tell your human, but do not stop\s+yet\./);
-      expect(recipe).toMatch(/stays matchable until its `expiresAt` \(1 hour after you posted it; `offers` shows it, in unix\s+seconds\) and cannot be cancelled/);
-      expect(recipe).toMatch(/keep repeating `wait`\s+and checking `channels` until `expiresAt` has passed, and play any channel that appears \(step 6\)/);
-      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not `Finalized` or `Reclaimed`, offer your\s+human `withdraw --all` \(step 8\), then stop\./);
+      expect(recipe).toMatch(/tell your human\s+you found no opponent, offer them `withdraw --all`/);
+      // H1 offer --ttl: the agent's own offer expires when its wait does, and it plays any match until expiresAt.
+      expect(recipe).toMatch(/offer --deposit <fund's deposit> --stake X --ttl 1800/);
+      expect(recipe).toMatch(/cannot be cancelled, but it expires at its `expiresAt`/);
+      expect(recipe).toMatch(/keep repeating `wait`\s+and checking `channels` until `expiresAt` has passed, and play any channel that appears\s+\(step 6\)/);
+      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not `Finalized` or `Reclaimed`, tell your human\s+you found no opponent, offer them `withdraw --all` \(step 8\), then stop\./);
       expect(text).not.toMatch(/stop waiting/);
       expect(text).toMatch(/minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed/);
       // Fix round 1 N-3: a timed-out funding wait offers back what did arrive.
@@ -987,7 +989,7 @@ describe("http foundation", () => {
       // The owner is still confirmed for this chain, and the swept wait and stopping rule hold everywhere.
       expect(step4).toMatch(/first confirm with them that it can receive\s+USDC on this chain \(chain id `31337`\)/);
       expect(recipeOf(text)).toMatch(/wait\s+until its `swept` is no longer `null`/);
-      expect(step4).toMatch(/tell your human, but do not stop\s+yet\./);
+      expect(step4).toMatch(/--ttl 1800` makes the offer stop being\s+matchable after 30 minutes, the same as your wait/);
       expect(text).toMatch(/your human sends USDC from it to the generated address,\s+on this chain only \(chain id `31337`\)\. You never send it yourself/);
     });
   });
