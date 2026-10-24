@@ -50,7 +50,8 @@ that the hub, USDC and rules addresses hold code, and fails otherwise. It prints
 `trust` line. The server never holds your funds or keys, but these addresses decide where your deposit goes and
 the RPC decides what your watchtower sees. Verify them against a source you trust, or pass all five flags
 explicitly, in which case `init` fetches nothing from the server (it still reads the RPC's gas price for the
-default `--session-gas-wei`, unless you pass that too). Preferably use your own RPC. A non-loopback `http://`
+default `--session-gas-wei`, unless you pass that too, except on a chain with a built-in profile, such as Arc).
+Preferably use your own RPC. A non-loopback `http://`
 server gets a warning on stderr, since anyone on the path could rewrite its answer.
 
 Other `init` settings:
@@ -101,8 +102,7 @@ regardless of whether it has been swept. A top-up's gas limit is its `estimateGa
 estimate sends nothing), and a top-up counts only once its receipt shows success. If the wallet cannot refill a
 session key because of insufficient funds, its fee cap, a failed estimate, or a top-up that reverted, `status`
 raises the `session-gas-low` attention: fund the wallet. On Arc, that means USDC: `status` gives the reason in USDC
-and asks for one channel's gas budget (`sessionGasWei` + 500,000 × the fee ceiling: 0.356 USDC by default) when the
-daemon passes it the chain's gas numbers.
+and asks for one channel's gas budget (`sessionGasWei` + 500,000 × the fee ceiling: 0.356 USDC by default).
 
 ## Funding your agent
 

@@ -52,7 +52,7 @@ The validator set is permissioned at launch. The network itself is public.
 ## Consequences for Plan 6, found by this check
 
 1. **`fund` and `withdraw --all`.** USDC and gas are one balance on Arc. `fund` must add the gas reserve into the USDC need instead of asking for "native gas" separately. `withdrawReserve()` must keep enough USDC for each live channel's session-gas refills, or `withdraw --all` can strand a channel's dispute gas.
-2. **Session-key top-ups** hard-code `gas: 21_000` (`daemon.ts`). That is *correct* on Arc; see the correction above. Estimating it is still good hardening, and the top-up must check the receipt status.
+2. **Session-key top-ups** hard-coded `gas: 21_000` before Plan 6 Task 2 (correct on Arc; see above). They now use `estimateGas` + 20 % + 5,000 and check the receipt status.
 3. **Fee floor.** Clamp every `maxFeePerGas` to at least 20 gwei on Arc. A lower `--fee-ceiling-wei` would make transactions vanish silently.
 4. **Receipts.** A blocklist revert may produce no receipt. The bounded waits already exist; confirm the hub's payout path treats a reverting USDC `transfer` as `owed`.
 5. **Session gas sizing.** The default formula is 4 × 2.1M × max(fee ceiling, 4 × eth_gasPrice). On Arc, `eth_gasPrice` is 20–25 gwei, so the second term is at least 80 gwei, giving at least 0.672 USDC per channel, and 0.84 USDC at 25 gwei. The ruling for Plan 6 is that on profile chains `sessionGasWei` = 4 × 2.1M × the profile ceiling (40 gwei), which is 0.336 USDC; refills cover fee spikes.

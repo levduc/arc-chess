@@ -1126,7 +1126,7 @@ the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Task
     top-up checks its receipt: a reverted one never counts as a refill, raises `session-gas-low`, and backs off
     (item 37). Arc may give no receipt for a gas-consuming blocklist revert, so every receipt wait stays bounded
     (item 25), and a wait that times out must never be reported as success on the deposit, close, dispute, sweep
-    or withdraw path (Arc launch spec §2.6).
+    or withdraw path (to be confirmed path by path: Arc launch spec §2.6).
 64. **Pinned deployments.** On a chain with a profile, `init` always refuses a USDC other than the profile's and,
     once `KNOWN_DEPLOYMENTS` pins that chain, any other hub or rules, whether from `/templates` or from flags. The
     daemon re-checks the pin when it starts. Other chains keep item 31's warning. The entries for 5042 and 5042002
@@ -1147,9 +1147,12 @@ the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Task
       owner question, `owner set`'s stderr note and `/skill.md` all say so.
     - `/skill.md` on 5042 and 5042002 uses only `usdc.*` and `--wait-for-usdc`; reads the profit and loss only
       once `status.swept` is set, or after a bounded wait and `arena sweep`, and counts the USDC spent on gas;
-      confirms the amount, owner and network before `withdraw --all`; and stops after about 30 minutes unmatched,
-      noting the offer's 1 h expiry and that there is no cancel.
-    - `buildStatus` takes optional `gasFunding` `{chainId, sessionGasWei, feeCeilingWei}`. With it, on Arc,
+      confirms the amount, owner and network before `withdraw --all`; after about 30 minutes unmatched, tells its
+      human but keeps waiting, and plays any late match, until the offer's `expiresAt` (1 h; there is no cancel)
+      has passed; offers back, with `withdraw --all`, whatever arrived when a funding wait times out; and leaves
+      funding to the human, on Arc only.
+    - `buildStatus` takes optional `gasFunding` `{chainId, sessionGasWei, feeCeilingWei}`, which the daemon's
+      `statusOf` passes (`cb142ea`). With it, on Arc,
       `session-gas-low`'s reason is shown in USDC and gwei, and its action asks for one channel's gas budget in
       USDC ($\text{sessionGasWei} + 500{,}000 \times \text{ceiling}$, 0.356 USDC by default).
     - `arena xmtp enable` removes the `.sdk-tmp-*` directory a killed earlier run left behind. `/skill.md` tells

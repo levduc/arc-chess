@@ -52,7 +52,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
      (audit-daemon I-5):* the reserve of the other unsettled channels also gates the opening paths
      (`createOffer`, `acceptOffer`, `fund()`'s top-up and deposit), and `arena fund` counts it, so a new channel can
      never spend a live channel's refill money.
-2. **Gas for session-key top-ups.** Today the daemon hard-codes `gas: 21_000n` for these value transfers. They are
+2. **Gas for session-key top-ups.** Before Plan 6, the daemon hard-coded `gas: 21_000n` for these value transfers. They are
    now estimated with `estimateGas`, plus a margin of +20 % and +5,000. This is hardening: a native transfer costs 21,000 gas on Arc, as the 2026-10-24 correction to `arc-facts.md` shows. Every top-up must check its receipt status (audit-daemon I-1).
 3. **Fee floor.** `SerialTxSender` gains a `minFeePerGas` option, set from the profile. Every send and replacement
    uses `maxFeePerGas` ≥ `minFeePerGas`, and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. The floor is applied after
