@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { HubClient, type DisputeEvent } from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
 import { UNREADABLE_BLOCK_PASSES, UNSEEN_REGISTERED_PASSES } from "../src/daemon.js";
-import { increaseTime, usdcBalance } from "../../sdk/test/helpers/chain.js";
+import { increaseTime, setEthBalance, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { START, startPair, waitFor } from "./helpers/harness.js";
 
 let cleanup: (() => Promise<void>) | undefined;
@@ -166,6 +166,8 @@ async function griefedDrawOn(m: Awaited<ReturnType<typeof matched>>, junk: Hex) 
     junkBlock = r.blockNumber;
     return r;
   };
+  // The griefer pays for his own junk: 100 KB costs about 3M gas, over the test's session gas at arc-anvil's 25 gwei.
+  await setEthBalance(bob.daemon.handle(id).sessionSender.address, 10n ** 18n);
   await bob.daemon.acceptDraw(undefined, "agent");
   await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open" && junkBlock !== undefined, 20_000, "bob's respond");
   const bobSender = bob.daemon.handle(id).sessionSender;
@@ -197,6 +199,7 @@ async function griefedChallengeOn(m: Awaited<ReturnType<typeof matched>>, junk: 
     return r;
   };
   await bob.daemon.move(undefined, "e5", { actor: "agent" }); // signed, never relayed
+  await setEthBalance(bob.daemon.handle(id).sessionSender.address, 10n ** 18n); // he pays for his own junk
   await bob.daemon.challenge(undefined, "agent");
   expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
   const bobSigned = bob.daemon.handle(id).session.latest;

@@ -33,6 +33,7 @@ ARENA_TEST_ANVIL_PORT_CLI="${ARENA_TEST_ANVIL_PORT_CLI:-8651}"
 ARENA_TEST_ANVIL_PORT_CLI_SWEEP="${ARENA_TEST_ANVIL_PORT_CLI_SWEEP:-8652}"
 ARENA_TEST_ANVIL_PORT_SYSTEM="${ARENA_TEST_ANVIL_PORT_SYSTEM:-8653}"
 ARENA_TEST_ANVIL_PORT_CLI_ARC="${ARENA_TEST_ANVIL_PORT_CLI_ARC:-8654}"
+ARENA_TEST_ANVIL_PORT_CLI_H1="${ARENA_TEST_ANVIL_PORT_CLI_H1:-8655}"
 
 FAILED=0
 step() {
@@ -77,6 +78,9 @@ step "system dispute e2e" bash -c "cd '$ROOT/tests/system' && ARENA_TEST_ANVIL_P
 # proxy at 0x3600...0000, and a test-only Arc profile at 31337. These files skip themselves on stock anvil, so this is
 # the only place they run.
 step "cli Arc-like harness (one balance, settlement, floor, blocklist)" bash -c "cd '$ROOT/packages/cli' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_CLI_ARC' pnpm exec vitest run test/arc/"
+# Plan 6 hardening H1: the griefed-dispute regressions (a junk signature, oversized events, a challenge whose event
+# cannot be read) and the refill-failure causes, on Arc's fee market as well as standard anvil.
+step "cli H1 disputes and refills (h1-disputes, h1-refill)" bash -c "cd '$ROOT/packages/cli' && ARENA_TEST_ANVIL_PORT='$ARENA_TEST_ANVIL_PORT_CLI_H1' pnpm exec vitest run test/h1-disputes.test.ts test/h1-refill.test.ts"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then
