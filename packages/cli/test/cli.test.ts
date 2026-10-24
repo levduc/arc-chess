@@ -709,6 +709,9 @@ async function initArcHome(chainId = 5042002) {
     "--hub", "0x000000000000000000000000000000000000beef", "--usdc", ARC_USDC,
     "--rules", "0x00000000000000000000000000000000000000e5", "--server", "http://127.0.0.1:3000", "--port", "7010",
     "--session-gas-wei", "10000000000000000", // 1e16 wei = 0.01 USDC
+    // Fix round 1 (m-3): explicit, so the pinned amounts below do not move with the profile's default ceiling
+    // (Task 2). 500,000 x 40 gwei = 0.02 USDC.
+    "--fee-ceiling-wei", "40000000000",
   ];
   const t = io(home, [], { chainId });
   expect(await runCli(args, t.io), t.err.join("\n")).toBe(0);
@@ -716,12 +719,21 @@ async function initArcHome(chainId = 5042002) {
 }
 
 /** JSON-RPC calls `arcIo` answered, each as its method -- an `eth_call` with its 4-byte selector. */
-function arcIo(home: string, opts: { balanceWei: bigint | (() => bigint); env?: Record<string, string> }) {
+function arcIo(
+  home: string,
+  opts: { balanceWei: bigint | (() => bigint); env?: Record<string, string>; faucet?: () => { usdc: bigint; native: bigint } },
+) {
   const rpc: string[] = [];
   const out: string[] = [];
   const err: string[] = [];
   const fetchFn = (async (url: string, init?: RequestInit) => {
-    if (url.endsWith("/templates")) return new Response(JSON.stringify(CHESS_TEMPLATE()));
+    if (url.endsWith("/templates")) {
+      return new Response(JSON.stringify(CHESS_TEMPLATE(opts.faucet ? { faucet: "http://127.0.0.1:3000/faucet" } : {})));
+    }
+    if (url.endsWith("/faucet") && opts.faucet) {
+      const f = opts.faucet();
+      return new Response(JSON.stringify({ address: "0x", usdc: f.usdc.toString(), native: f.native.toString() }));
+    }
     const req = JSON.parse(String(init?.body)) as { id: number; method: string; params: Array<{ data?: string }> };
     rpc.push(req.method === "eth_call" ? `eth_call ${String(req.params[0]?.data).slice(0, 10)}` : req.method);
     const balance = typeof opts.balanceWei === "function" ? opts.balanceWei() : opts.balanceWei;
@@ -791,10 +803,10 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "message"]);
     expect(printed.deposit).toBe("3.000000");
     expect(printed.feePerPlayer).toBe("0.005000");
-    // 3 + 0.005 + ceil((1e16 session gas + 500,000 x 100 gwei) / 10^12) = 3.005 + 0.06
-    expect(printed.usdc).toEqual({ have: "0.000000", need: "3.065000", shortfall: "3.065000" });
+    // 3 + 0.005 + ceil((1e16 session gas + 500,000 x 40 gwei) / 10^12) = 3.005 + 0.03; no other channel, nothing reserved
+    expect(printed.usdc).toEqual({ have: "0.000000", need: "3.035000", shortfall: "3.035000", reserved: "0.000000" });
     expect(printed.message).toBe(
-      `Please send 3.065000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`,
+      `Please send 3.035000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`,
     );
     // The one balance is the native one: no USDC balanceOf (0x70a08231) at all.
     expect(t.rpc.filter((m) => m.startsWith("eth_call 0x70a08231"))).toEqual([]);
@@ -803,13 +815,45 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     // Part of it already there: have is the native balance rounded down; the shortfall is the rest.
     const part = arcIo(home, { balanceWei: 1_500_000_000_000_000_001n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], part.io)).toBe(0);
-    expect(part.json().usdc).toEqual({ have: "1.500000", need: "3.065000", shortfall: "1.565000" });
-    expect(part.json().message).toBe(`Please send 1.565000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`);
+    expect(part.json().usdc).toEqual({ have: "1.500000", need: "3.035000", shortfall: "1.535000", reserved: "0.000000" });
+    expect(part.json().message).toBe(`Please send 1.535000 USDC to ${address} on chain 5042002. Also tell me the address to return winnings to.`);
 
     // Enough: nothing to send.
-    const enough = arcIo(home, { balanceWei: 3_065_000n * 10n ** 12n });
+    const enough = arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n });
     expect(await runCli(["fund", "--games", "3", "--stake", "1"], enough.io)).toBe(0);
-    expect(enough.json().usdc).toEqual({ have: "3.065000", need: "3.065000", shortfall: "0.000000" });
+    expect(enough.json().usdc).toEqual({ have: "3.035000", need: "3.035000", shortfall: "0.000000", reserved: "0.000000" });
     expect(enough.json().message).toBe("This wallet already holds enough to play 3 games at 1.000000 USDC. Tell me the address to return winnings to.");
+  });
+
+  it("fix round 1 (I-5): fund keeps one session gas per unfinalized channel of the home in need, as usdc.reserved; have stays the balance", async () => {
+    const home = await initArcHome();
+    const id = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as Hex;
+    const save = (channelId: Hex, finalized: boolean) => writeJsonAtomic(arenaPaths(home).channelRecord(channelId), { channelId, finalized });
+    save(id(1), false);
+    save(id(2), false);
+    save(id(3), true); // finalized: no refill left to pay for
+
+    // Exactly the old need (3.035) is in the wallet, but 2 x 0.01 of it belongs to the two unsettled channels.
+    const t = arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io), t.err.join("\n")).toBe(0);
+    expect(t.json().usdc).toEqual({ have: "3.035000", need: "3.055000", shortfall: "0.020000", reserved: "0.020000" });
+    expect(t.json().message).toMatch(/^Please send 0\.020000 USDC to 0x[0-9a-fA-F]{40} on chain 5042002\./);
+  });
+
+  it("fix round 1 (m-6): on a one-balance chain, fund's faucet report is {usdc} only", async () => {
+    const home = await initArcHome();
+    let funded = false;
+    const t = arcIo(home, {
+      balanceWei: () => (funded ? 10n * 10n ** 18n : 0n),
+      faucet: () => {
+        funded = true;
+        return { usdc: 10_000_000n, native: 10n * 10n ** 18n };
+      },
+    });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], t.io), t.err.join("\n")).toBe(0);
+    const printed = t.json();
+    expect(printed.faucet).toEqual({ usdc: "10.000000" });
+    expect(Object.keys(printed)).toEqual(["address", "chainId", "deposit", "feePerPlayer", "usdc", "owner", "faucet", "message"]);
+    expect(printed.usdc).toEqual({ have: "10.000000", need: "3.035000", shortfall: "0.000000", reserved: "0.000000" });
   });
 });

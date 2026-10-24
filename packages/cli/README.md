@@ -62,9 +62,13 @@ Other `init` settings:
 - `--min-challenge-timeout SECONDS` (default 900): the daemon refuses to offer, accept or fund a channel with a
   shorter `challengeTimeout`. A missed challenge deadline can cost more than one stake, and a restart or an RPC
   outage can take longer than the hub's 60 s minimum.
-- `init` warns loudly (`WARNING: hub … is not the canonical …`) when the hub, rules or USDC address differs from the
-  canonical deployment of a known chain (`KNOWN_DEPLOYMENTS` in `src/config.ts`; empty until the Arc mainnet
-  deployment is added).
+- On a chain with a built-in profile (`CHAIN_PROFILES` in `src/chains.ts`: Arc, 5042, and Arc Testnet, 5042002),
+  `init` **refuses** a USDC address other than the profile's, even before the chain's deployment is pinned, and
+  once `KNOWN_DEPLOYMENTS` (`src/config.ts`) pins it, any other hub or rules -- whether they come from the server's
+  `/templates` or from flags, on a fresh init or a re-run. The daemon re-checks this when it starts and refuses to
+  start on a `config.json` that no longer matches. On any other chain, `init` only warns loudly
+  (`WARNING: hub … is not the canonical …`) when the hub, rules or USDC address differs from a `KNOWN_DEPLOYMENTS`
+  entry.
 
 `ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json`, `daemon.lock` and
 `channels/<id>/`. All of these files are mode 0600.

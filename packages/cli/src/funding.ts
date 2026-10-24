@@ -23,12 +23,35 @@ export type Amounts = { have: bigint; need: bigint; shortfall: bigint };
 export type FundingNeed = { deposit: bigint; feePerPlayer: bigint; usdc: Amounts; native: Amounts };
 
 /** Plan 6 (spec §2.1): the need on a chain whose gas is USDC (`nativeIsUsdc`): one balance, so the gas is folded into
- *  `usdc` and there is no `native` at all. */
-export type OneBalanceFundingNeed = { deposit: bigint; feePerPlayer: bigint; usdc: Amounts };
+ *  `usdc` and there is no `native` at all. Fix round 1 (I-5): `usdc.reserved` is the part of `usdc.need` that stays
+ *  in the wallet as the gas reserve of the home's other unsettled channels (0 with none). */
+export type OneBalanceFundingNeed = { deposit: bigint; feePerPlayer: bigint; usdc: Amounts & { reserved: bigint } };
 
 /** Plan 6: `computeOneBalanceFundingNeed`'s input -- `computeFundingNeed`'s, with the one native balance (wei, 18
- *  decimals) in place of the two balances. */
-export type OneBalanceFundingInput = Omit<FundingInput, "usdcHave" | "nativeHave"> & { balanceWei: bigint };
+ *  decimals) in place of the two balances. Fix round 1 (I-5): `unsettledChannels` is how many channels the home
+ *  already has that are not finalized (default 0); each keeps one `sessionGasWei` of reserve. */
+export type OneBalanceFundingInput = Omit<FundingInput, "usdcHave" | "nativeHave"> & { balanceWei: bigint; unsettledChannels?: number };
+
+/**
+ * Plan 6 fix round 1 (spec §2.1 as amended, audit-daemon I-5): on a `nativeIsUsdc` chain, the one balance (micro-USDC)
+ * that opening -- or funding -- one more channel needs, so that it never spends a live channel's refill money:
+ *   deposit + fee + ceil((ownGasWei + otherChannels x sessionGasWei + FUND_TX_GAS_UNITS x feeCeilingWei) / 10^12).
+ * `ownGasWei` is the session gas this channel still has to receive (a whole `sessionGasWei` before its top-up). The
+ * last two terms are `withdrawReserve` of the other channels; the gas is rounded up once, as a sum, so `arena fund`
+ * and the daemon's gates agree to the micro-USDC.
+ */
+export function oneBalanceOpenNeed(i: {
+  deposit: bigint;
+  feePerPlayer: bigint;
+  ownGasWei: bigint;
+  otherChannels: number;
+  sessionGasWei: bigint;
+  feeCeilingWei: bigint;
+}): bigint {
+  if (i.otherChannels < 0 || !Number.isInteger(i.otherChannels)) throw new RangeError("otherChannels must be a non-negative integer");
+  const gasWei = i.ownGasWei + BigInt(i.otherChannels) * i.sessionGasWei + FUND_TX_GAS_UNITS * i.feeCeilingWei;
+  return i.deposit + i.feePerPlayer + weiToUsdc6Up(gasWei);
+}
 
 const short = (have: bigint, need: bigint): Amounts => ({ have, need, shortfall: need > have ? need - have : 0n });
 
@@ -68,13 +91,19 @@ export function computeFundingNeed(i: FundingInput): FundingNeed {
 
 /** Plan 6 (spec §2.1, Review Focus 1): `computeFundingNeed` on a `nativeIsUsdc` chain, where USDC and gas are one
  *  balance -- never asked for as two assets. `usdc.need` = deposit + fee + the gas budget converted from 18 to 6
- *  decimals rounded UP; `usdc.have` = the native balance converted rounded DOWN. */
+ *  decimals rounded UP; `usdc.have` = the native balance converted rounded DOWN.
+ *  Fix round 1 (I-5): `usdc.need` also holds one `sessionGasWei` of reserve per unsettled channel the home already
+ *  has (`oneBalanceOpenNeed`, the daemon's own opening gate), shown as `usdc.reserved`. `usdc.have` stays the wallet's
+ *  whole balance, the same figure `wallet` prints. */
 export function computeOneBalanceFundingNeed(i: OneBalanceFundingInput): OneBalanceFundingNeed {
   const deposit = fundingDeposit(i);
+  const open = (otherChannels: number) =>
+    oneBalanceOpenNeed({ deposit, feePerPlayer: i.feePerPlayer, ownGasWei: i.sessionGasWei, otherChannels, sessionGasWei: i.sessionGasWei, feeCeilingWei: i.feeCeilingWei });
+  const need = open(i.unsettledChannels ?? 0);
   return {
     deposit,
     feePerPlayer: i.feePerPlayer,
-    usdc: short(weiToUsdc6Down(i.balanceWei), deposit + i.feePerPlayer + weiToUsdc6Up(fundingGasWei(i))),
+    usdc: { ...short(weiToUsdc6Down(i.balanceWei), need), reserved: need - open(0) },
   };
 }
 

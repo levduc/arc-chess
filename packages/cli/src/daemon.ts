@@ -58,13 +58,14 @@ import {
   autoReturnSecondsOf,
   isCanonicalId,
   minChallengeTimeoutOf,
+  pinnedDeploymentRefusals,
   sessionGasFloorOf,
   DEFAULT_LOG_CHUNK_BLOCKS,
   type ArenaConfig,
 } from "./config.js";
 import { chainProfile, weiToUsdc6Up, type ChainProfile } from "./chains.js";
 import { FileSessionStore } from "./fileStore.js";
-import { FUND_TX_GAS_UNITS, formatUsdc6 } from "./funding.js";
+import { FUND_TX_GAS_UNITS, formatUsdc6, oneBalanceOpenNeed } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
 import { buildStatus, type ChannelStatus } from "./status.js";
@@ -575,6 +576,19 @@ export class ArenaDaemon {
    *  its receipt waits for good -- so a restart creates a new ArenaDaemon on the same home. */
   async start(): Promise<void> {
     if (this.stopped) throw new Error("a stopped ArenaDaemon cannot be restarted: create a new one on the same home");
+    // Plan 6 fix round 1 (m-1, spec §2.5): `init` refuses a non-pinned USDC, hub or rules on a chain with a profile,
+    // but config.json can be edited by hand, or written before the chain's deployment was pinned. Re-checked here,
+    // before anything subscribes or reads the chain: on such a chain this daemon deposits only to the pinned hub.
+    const c = this.opts.config;
+    const pinned = pinnedDeploymentRefusals(c.chainId, { hub: c.hub, rules: c.rules, usdc: c.usdc });
+    if (pinned.length > 0) {
+      const name = chainProfile(c.chainId)?.name ?? `chain ${c.chainId}`;
+      throw new Error(
+        `refusing to start on ${name} (chain ${c.chainId}): ${arenaPaths(this.opts.home).config} names contracts this CLI does ` +
+          `not accept there: ${pinned.join("; ")}. Deposits go to the hub config.json names. Restore the pinned addresses ` +
+          `in config.json (withdraw needs the daemon too), or move to a fresh ARENA_HOME with "${selfCommand()} init"`,
+      );
+    }
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => this.fireAndForget("onMatch", this.onMatch(m))));
     this.unsubscribers.push(this.opts.relay.onMessage((m) => this.fireAndForget("onRelay", this.onRelay(m))));
     this.unsubscribers.push(this.opts.relay.onJoined((id) => this.fireAndForget("onJoined", this.onJoined(id))));
@@ -836,14 +850,16 @@ export class ArenaDaemon {
   /**
    * Plan 6 (spec §2.1): the channels whose session keys this wallet may still have to refill -- every channel record
    * that is not finalized, whether live or recorded on disk and not yet opened (degraded ones excluded: they are
-   * never watched). The same candidates `channelsAwaitingOwnDeposit` reads.
+   * never watched). The same candidates `channelsAwaitingOwnDeposit` reads. Fix round 1 (I-5): `exclude` leaves out
+   * the channel being funded.
    */
-  private unsettledChannelCount(): number {
+  private unsettledChannelCount(exclude?: Hex): number {
     const ids = new Set<Hex>();
     for (const l of this.live.values()) if (!l.record.finalized) ids.add(l.record.channelId);
     for (const r of this.records.channels()) {
       if (!r.finalized && !this.degraded.has(r.channelId) && !this.live.has(r.channelId)) ids.add(r.channelId);
     }
+    if (exclude !== undefined) ids.delete(exclude);
     return ids.size;
   }
 
@@ -971,6 +987,44 @@ export class ArenaDaemon {
     }
   }
 
+  /**
+   * Plan 6 fix round 1 (spec §2.1 as amended, audit-daemon I-5): on a `nativeIsUsdc` chain, deposits, top-ups and
+   * refills all draw on one USDC balance, so opening or funding a channel must leave the other unsettled channels'
+   * `withdrawReserve` in the wallet. Returns why this wallet cannot pay `deposit` + fee + `ownGasWei` of session gas on
+   * top of that reserve (`oneBalanceOpenNeed`), or null when it can -- and always null, with no chain read at all, on
+   * a chain whose gas is native. `exclude` is the channel being funded, which is not one of the "others". The balance
+   * is the ERC-20 `balanceOf`, the figure `withdraw()` uses (on Arc, the native balance rounded down).
+   */
+  private async openingShortfall(o: { deposit: bigint; feePerPlayer?: bigint; ownGasWei: bigint; exclude?: Hex }): Promise<string | null> {
+    const profile = chainProfile(this.opts.config.chainId);
+    if (profile?.nativeIsUsdc !== true) return null;
+    const feePerPlayer = o.feePerPlayer ?? (await this.hub.feeConfig()).feePerPlayer;
+    const others = this.unsettledChannelCount(o.exclude);
+    const gas = { sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling };
+    const need = oneBalanceOpenNeed({ deposit: o.deposit, feePerPlayer, ownGasWei: o.ownGasWei, otherChannels: others, ...gas });
+    const balance = await this.usdcBalance(this.opts.config.usdc);
+    if (balance >= need) return null;
+    const reserve = withdrawReserve({ profile, unsettledChannels: others, ...gas });
+    return (
+      `this wallet holds ${formatUsdc6(balance)} USDC, ${formatUsdc6(need - balance)} USDC short of the ${formatUsdc6(need)} USDC ` +
+      `this channel needs: its deposit of ${formatUsdc6(o.deposit)} USDC and fee of ${formatUsdc6(feePerPlayer)} USDC, its ` +
+      `session gas, and the ${formatUsdc6(reserve)} USDC gas reserve that always stays in the wallet (gas on ${profile.name} ` +
+      `is paid in USDC, for the session gas of ${others} other unsettled channel(s) and this wallet's own transactions)`
+    );
+  }
+
+  /** Plan 6 fix round 1 (I-5): `createOffer` and `acceptOffer` refuse (409) a channel this wallet could not fund
+   *  without spending the other channels' reserve -- so a matched channel never sits unfundable until its deadline. */
+  private async checkOpeningAffordable(deposit: bigint, what: "offer" | "accept"): Promise<void> {
+    const why = await this.openingShortfall({ deposit, ownGasWei: this.opts.config.sessionGasWei });
+    if (why !== null) {
+      throw new DaemonError(
+        409,
+        `cannot ${what === "offer" ? "post this offer" : "accept this offer"}: ${why}. Run "${selfCommand()} fund" for what to ask your human for`,
+      );
+    }
+  }
+
   /** Final review I4: refuses a `challengeTimeout` under this daemon's `minChallengeTimeout`. Missing a challenge
    *  deadline can cost more than one stake (the challenger may time out on an old state), and a daemon restart, an
    *  RPC outage or an agent that must move under a challenge can all take longer than the hub's 60 s minimum. */
@@ -1003,6 +1057,8 @@ export class ArenaDaemon {
     }
     this.checkChallengeTimeout(challengeTimeout);
     await this.checkDepositAllowed(o.deposit, { escrow: true });
+    // Plan 6 fix round 1 (I-5): on a one-balance chain, never an offer whose channel would spend the others' reserve.
+    await this.checkOpeningAffordable(o.deposit, "offer");
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
     // (the chain's block timestamp), not wall-clock Date.now() — a test (or a real deployment) that has moved
@@ -1084,6 +1140,8 @@ export class ArenaDaemon {
       this.checkChallengeTimeout(so.offer.challengeTimeout);
       // Task 2 (spec §13): before generating a session key or signing anything.
       await this.checkDepositAllowed(so.offer.deposit, { escrow: true });
+      // Plan 6 fix round 1 (I-5): see createOffer.
+      await this.checkOpeningAffordable(so.offer.deposit, "accept");
       const sessionKey = generatePrivateKey();
       const acceptance = {
         offerId,
@@ -1417,6 +1475,27 @@ export class ArenaDaemon {
   protected async fund(l: ChannelHandle): Promise<void> {
     if (this.stopped) return;
     const p = l.record.params;
+    // Plan 6 fix round 1 (spec §2.1 as amended, audit-daemon I-5): on a one-balance chain, neither the approve, the
+    // top-up nor the deposit goes out while the wallet cannot pay them on top of the other channels' reserve. The
+    // channel backs off like a launch-limit revert below, and is retired at its deadline if it never can: an
+    // unfunded side costs nothing to leave. A no-op (no read) on a chain whose gas is native.
+    if (chainProfile(this.opts.config.chainId)?.nativeIsUsdc === true) {
+      const target = this.opts.config.sessionGasWei;
+      const keyBalance = target > 0n ? await this.client.getBalance({ address: l.sessionSender.address }) : 0n;
+      const why = await this.openingShortfall({
+        deposit: p.deposit,
+        feePerPlayer: p.feePerPlayer,
+        ownGasWei: keyBalance < target ? target - keyBalance : 0n,
+        exclude: l.record.channelId,
+      });
+      if (why !== null) {
+        const message = `funding: ${why}`;
+        if (l.lastError !== message) this.log(`channel ${l.record.channelId}: ${message} (retried in ${FUND_BACKOFF_SECONDS}s of chain time)`);
+        l.lastError = message;
+        l.fundBlockedUntil = (await this.client.getBlock()).timestamp + FUND_BACKOFF_SECONDS;
+        return;
+      }
+    }
     // Plan 4.5 Task 10: read the allowance every time instead of remembering "approved" in memory -- a reorg can
     // drop the approve transaction (and a wallet owner can revoke it), after which a remembered flag would make
     // every later deposit revert on the allowance until the daemon restarts. fund() only runs while this player

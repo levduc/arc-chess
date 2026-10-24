@@ -19,14 +19,19 @@ import {
 import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { LobbyClient, RelayClient } from "@arena/sdk";
 import {
+  ArenaDaemon,
+  KNOWN_DEPLOYMENTS,
   MAX_MATCH_RETRIES,
+  RecordStore,
   arenaPaths,
   confirmsTransfer,
   initHome,
   livePidHoldingLock,
   loadConfig,
   loadToken,
+  loadWalletKey,
   runCli,
   startApi,
   startDaemonProcess,
@@ -126,8 +131,13 @@ async function startDaemon(home: string): Promise<DaemonProcess> {
 }
 
 describe("arena withdraw (spec §4.4)", () => {
-  it("withdrawReserve is 0 on this native-gas chain (the Plan 6 Arc seam)", () => {
-    expect(withdrawReserve()).toBe(0n);
+  it("withdrawReserve is 0 on anvil 31337, which has no chain profile -- whatever its channels and gas (Plan 6)", () => {
+    expect(chainProfile(31337)).toBeUndefined();
+    for (const unsettledChannels of [0, 1, 3]) {
+      expect(
+        withdrawReserve({ profile: chainProfile(31337), unsettledChannels, sessionGasWei: 10n ** 16n, feeCeilingWei: 100_000_000_000n }),
+      ).toBe(0n);
+    }
   });
 
   it("with no owner set: exit 1 naming `owner set`, nothing moves, and no daemon is left running", async () => {
@@ -716,19 +726,21 @@ describe("Plan 6: withdrawReserve on a nativeIsUsdc chain", () => {
   });
 });
 
+/** Runs `body` with a USDC-gas profile for 31337, so the daemon's reserve and its gates apply. Anvil's gas stays
+ *  native, and the daemon reads the ERC-20 balance: only the arithmetic and the refusals are under test here (Task 4
+ *  covers arc-anvil). Every daemon in this process sees the profile while `body` runs. */
+async function asOneBalance<T>(usdc: Address, body: () => Promise<T>): Promise<T> {
+  CHAIN_PROFILES[31337] = { name: "Local USDC-gas", usdc, nativeIsUsdc: true, minFeePerGas: 1n, feeCeilingWei: 40_000_000_000n };
+  try {
+    return await body();
+  } finally {
+    delete CHAIN_PROFILES[31337];
+  }
+}
+// No feeCeilingWei in these configs: the wallet sender's default, 100 gwei. 500,000 x 100 gwei = 0.05 USDC.
+const NO_CHANNEL_RESERVE = 50_000n;
+
 describe("Plan 6: withdraw keeps the reserve on a nativeIsUsdc chain (a test-only profile for anvil 31337)", () => {
-  /** Runs `body` with a USDC-gas profile for 31337, so the daemon's own `withdraw()` path keeps a reserve. Anvil's
-   *  gas stays native: only the arithmetic and the refusals are under test here (Task 4 covers arc-anvil). */
-  const asOneBalance = async <T>(usdc: Address, body: () => Promise<T>): Promise<T> => {
-    CHAIN_PROFILES[31337] = { name: "Local USDC-gas", usdc, nativeIsUsdc: true, minFeePerGas: 1n, feeCeilingWei: 40_000_000_000n };
-    try {
-      return await body();
-    } finally {
-      delete CHAIN_PROFILES[31337];
-    }
-  };
-  // No feeCeilingWei in these configs: the wallet sender's default, 100 gwei. 500,000 x 100 gwei = 0.05 USDC.
-  const NO_CHANNEL_RESERVE = 50_000n;
 
   it("with no channel: --amount above balance - reserve is refused naming the reserve; --all moves balance - reserve", async () => {
     const { env, home, wallet } = await walletHome();
@@ -762,7 +774,7 @@ describe("Plan 6: withdraw keeps the reserve on a nativeIsUsdc chain (a test-onl
     expect(livePidHoldingLock(home)).toBeNull();
   });
 
-  it("with one open channel: the reserve adds that channel's whole sessionGasWei", async () => {
+  it("with one open channel: the reserve adds that channel's whole sessionGasWei, and drops it again once it is finalized", async () => {
     const pair = await startPair();
     cleanups.push(() => pair.cleanup());
     const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
@@ -785,5 +797,203 @@ describe("Plan 6: withdraw keeps the reserve on a nativeIsUsdc chain (a test-onl
     });
     expect(await usdcBalance(pair.env.usdc, owner)).toBe(balance - reserve);
     expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(reserve);
+
+    // Fix round 1 (m-2): a finalized channel no longer counts -- the reserve is back to the 0-channel figure.
+    await pair.alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => pair.bob.daemon.handle(id).session.isMyTurn(), 5_000, "bob's turn");
+    await pair.bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await pair.alice.daemon.status(id)).attention === "game-over", 5_000, "draw seen");
+    await pair.alice.daemon.close(id, "agent");
+    await waitFor(async () => (await pair.bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
+    await pair.bob.daemon.close(id, "agent");
+    await waitFor(() => pair.bob.daemon.handle(id).record.finalized, 20_000, "finalized");
+    const after = await usdcBalance(pair.env.usdc, pair.bob.address);
+    expect(after).toBeGreaterThan(reserve); // the deposit came back
+    await asOneBalance(pair.env.usdc, async () => {
+      const refused = pair.bob.daemon.withdraw({ amount: after - NO_CHANNEL_RESERVE + 1n });
+      await expect(refused).rejects.toThrow("0.050000 USDC of it is the gas reserve");
+      await expect(refused).rejects.toThrow("for the session gas of 0 unsettled channel(s)");
+      expect((await pair.bob.daemon.withdraw({ all: true })).amount).toBe(after - NO_CHANNEL_RESERVE);
+    });
+    expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(NO_CHANNEL_RESERVE);
+  });
+});
+
+// ------------------------------------------------------------------ Plan 6 fix round 1 (I-5, m-1, m-2)
+
+/** Alice and Bob with one Open channel A between them; Bob's wallet then holds exactly `bobHolds` USDC (the rest went
+ *  to his owner) and has an owner set. Fees: 0.005 USDC per player; sessionGasWei 1e16 (0.01 USDC). */
+async function pairWithOpenChannel(bobHolds: bigint) {
+  const pair = await startPair();
+  cleanups.push(() => pair.cleanup());
+  const { offerId } = await pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+  await pair.bob.daemon.acceptOffer(offerId);
+  const a = await waitFor(() => pair.bob.daemon.channelIds()[0], 20_000, "channel A");
+  await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(a)).phase === "Open", 30_000, "A open");
+  await firstSet(pair.bob.home, newAddress());
+  const balance = await usdcBalance(pair.env.usdc, pair.bob.address);
+  await pair.bob.daemon.withdraw({ amount: balance - bobHolds });
+  expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(bobHolds);
+  return { ...pair, a };
+}
+
+// With channel A unsettled, a new channel needs d + 0.005 fee + ceil((1e16 own session gas + 1e16 for A + 500,000 x
+// 100 gwei) / 10^12) = d + 0.075 USDC. At 2 USDC, the largest deposit Bob can open is 1.925.
+const HOLDS = 2_000_000n;
+const MAX_DEPOSIT = 1_925_000n;
+
+describe("Plan 6 fix round 1 (I-5): on a nativeIsUsdc chain, opening a channel never spends the other channels' reserve", () => {
+  it("createOffer refuses (409) a deposit the wallet could only fund out of the reserve, naming the reserve and the shortfall", async () => {
+    const pair = await pairWithOpenChannel(HOLDS);
+    await asOneBalance(pair.env.usdc, async () => {
+      const offersBefore = new RecordStore(pair.bob.home).offers().length;
+      const refused = pair.bob.daemon.createOffer({ deposit: MAX_DEPOSIT + 1n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await expect(refused).rejects.toMatchObject({ code: 409 });
+      await expect(refused).rejects.toThrow(
+        "cannot post this offer: this wallet holds 2.000000 USDC, 0.000001 USDC short of the 2.000001 USDC this channel needs",
+      );
+      await expect(refused).rejects.toThrow("the 0.060000 USDC gas reserve that always stays in the wallet");
+      await expect(refused).rejects.toThrow("for the session gas of 1 other unsettled channel(s)");
+      expect(new RecordStore(pair.bob.home).offers().length).toBe(offersBefore); // nothing recorded, nothing posted
+
+      await expect(pair.bob.daemon.createOffer({ deposit: MAX_DEPOSIT, stakePerGame: 100_000n, challengeTimeout: 600n })).resolves.toMatchObject({
+        offerId: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+      });
+    });
+  });
+
+  it("acceptOffer refuses (409) the same way, before signing anything", async () => {
+    const pair = await pairWithOpenChannel(HOLDS);
+    await asOneBalance(pair.env.usdc, async () => {
+      const big = await pair.alice.daemon.createOffer({ deposit: MAX_DEPOSIT + 1n, stakePerGame: 100_000n, challengeTimeout: 600n });
+      const refused = pair.bob.daemon.acceptOffer(big.offerId);
+      await expect(refused).rejects.toMatchObject({ code: 409 });
+      await expect(refused).rejects.toThrow("cannot accept this offer: this wallet holds 2.000000 USDC, 0.000001 USDC short");
+      await expect(refused).rejects.toThrow("0.060000 USDC gas reserve");
+      expect(new RecordStore(pair.bob.home).offer(big.offerId)).toBeNull(); // no acceptance recorded or sent
+
+      const fits = await pair.alice.daemon.createOffer({ deposit: MAX_DEPOSIT, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await expect(pair.bob.daemon.acceptOffer(fits.offerId)).resolves.toBeUndefined();
+    });
+  });
+
+  it("fund() sends neither the approve, the top-up nor the deposit while short; it backs off, and funds once the wallet can", async () => {
+    const pair = await pairWithOpenChannel(HOLDS);
+    await asOneBalance(pair.env.usdc, async () => {
+      // Bob offers exactly what 2 USDC can open, then holds 1 micro-USDC less: as the offerer, he deposits first.
+      const { offerId } = await pair.bob.daemon.createOffer({ deposit: MAX_DEPOSIT, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await pair.bob.daemon.withdraw({ amount: 1n });
+      await pair.alice.daemon.acceptOffer(offerId);
+      const b = await waitFor(() => pair.bob.daemon.channelIds().find((id) => id !== pair.a), 20_000, "channel B");
+      const handle = pair.bob.daemon.handle(b);
+      await waitFor(() => handle.lastError?.startsWith("funding: "), 20_000, "the funding refusal");
+      expect(handle.lastError).toContain("this wallet holds 1.999999 USDC, 0.000001 USDC short of the 2.000000 USDC this channel needs");
+      expect(handle.lastError).toContain("the 0.060000 USDC gas reserve");
+      expect(handle.fundBlockedUntil).not.toBeNull();
+      // Nothing went out: no top-up, no approve, no deposit.
+      expect(await publicClient().getBalance({ address: handle.sessionSender.address })).toBe(0n);
+      const allowance = await publicClient().readContract({
+        address: pair.env.usdc,
+        abi: erc20Abi,
+        functionName: "allowance",
+        args: [pair.bob.address, pair.env.hub],
+      });
+      expect(allowance).toBe(0n);
+      expect((await pair.bob.daemon.hub.channelInfo(b)).phase).toBe("None");
+      expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(HOLDS - 1n);
+
+      // The micro-USDC arrives; once the back-off has passed in chain time, B funds and opens.
+      await mintUsdc(pair.env.usdc, pair.bob.address, 1n);
+      await increaseTime(31);
+      await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(b)).phase === "Open", 30_000, "B open");
+      expect(handle.lastError ?? "").not.toMatch(/^funding:/);
+      // B took its deposit, fee and top-up; A's reserve (and the wallet-gas term) is still in the wallet.
+      expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(HOLDS - MAX_DEPOSIT - 5_000n);
+    });
+  });
+
+  it("on anvil 31337 (no profile) nothing changes: the same short wallet offers, accepts and funds as before", async () => {
+    const pair = await pairWithOpenChannel(HOLDS);
+    const offered = await pair.bob.daemon.createOffer({ deposit: MAX_DEPOSIT + 1n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    expect(offered.offerId).toMatch(/^0x[0-9a-f]{64}$/);
+    const theirs = await pair.alice.daemon.createOffer({ deposit: 1_995_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await pair.bob.daemon.acceptOffer(theirs.offerId); // 1.995 + 0.005 fee = all of Bob's 2 USDC
+    const b = await waitFor(() => pair.bob.daemon.channelIds().find((id) => id !== pair.a), 20_000, "channel B");
+    await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(b)).phase === "Open", 30_000, "B open");
+    expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(0n);
+  });
+});
+
+describe("Plan 6 fix round 1 (m-2): which channels the reserve counts", () => {
+  it("counts unfinalized channels, live or only on disk, once each; never a finalized or degraded one, nor the one being funded", async () => {
+    const { home } = await walletHome();
+    const d = new ArenaDaemon({
+      home,
+      config: loadConfig(home),
+      walletKey: loadWalletKey(home),
+      lobby: {} as LobbyClient,
+      relay: {} as RelayClient,
+    }) as unknown as {
+      live: Map<Hex, { record: { channelId: Hex; finalized: boolean } }>;
+      degraded: Map<string, string>;
+      unsettledChannelCount(exclude?: Hex): number;
+    };
+    const id = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as Hex;
+    const save = (channelId: Hex, finalized: boolean) => writeJsonAtomic(arenaPaths(home).channelRecord(channelId), { channelId, finalized });
+    expect(d.unsettledChannelCount()).toBe(0);
+    save(id(1), false); // on disk only, not finalized: counted
+    save(id(2), true); // finalized: not counted
+    save(id(3), false); // degraded: never watched, so never refilled
+    d.degraded.set(id(3), "does not match this hub");
+    save(id(4), false); // live and on disk: counted once
+    d.live.set(id(4), { record: { channelId: id(4), finalized: false } });
+    d.live.set(id(5), { record: { channelId: id(5), finalized: true } }); // live but finalized: not counted
+    d.live.set(id(6), { record: { channelId: id(6), finalized: false } }); // live, not yet on disk: counted
+    mkdirSync(join(arenaPaths(home).channels, "not-a-channel"), { recursive: true }); // unreadable: skipped
+    expect(d.unsettledChannelCount()).toBe(3);
+    expect(d.unsettledChannelCount(id(4))).toBe(2); // the channel being funded is not one of the others
+    expect(d.unsettledChannelCount(id(2))).toBe(3); // excluding a channel that is not counted changes nothing
+  });
+});
+
+describe("Plan 6 fix round 1 (m-1): the daemon re-checks the pin when it starts", () => {
+  it("refuses to start on a profiled chain whose config.json names another USDC, or a hub other than the pinned one", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    // A USDC other than the profile's (as a hand-edited config.json, or one written before a correction, would hold).
+    await asOneBalance(newAddress(), async () => {
+      await expect(startDaemonProcess(home, { log: () => {} })).rejects.toThrow(
+        /^refusing to start on Local USDC-gas \(chain 31337\): .*config\.json names contracts this CLI does not accept there: usdc 0x[0-9a-fA-F]{40} is not Local USDC-gas's USDC/,
+      );
+      expect(livePidHoldingLock(home)).toBeNull(); // the lock is released
+      // The CLI's in-process daemon (withdraw) is refused the same way, and nothing moves.
+      const t = cliIo(home);
+      expect(await runCli(["withdraw", "--all"], t.io)).toBe(1);
+      expect(t.err.join("\n")).toMatch(/refusing to start on Local USDC-gas/);
+      expect(await usdcBalance(env.usdc, owner)).toBe(0n);
+    });
+    // The profile's USDC, but the chain's deployment is pinned to another hub.
+    await asOneBalance(env.usdc, async () => {
+      const other = newAddress();
+      KNOWN_DEPLOYMENTS[31337] = { name: "Local", hub: other, rules: env.rules };
+      try {
+        await expect(startDaemonProcess(home, { log: () => {} })).rejects.toThrow(`hub ${env.hub} is not the pinned Local hub ${other}`);
+      } finally {
+        delete KNOWN_DEPLOYMENTS[31337];
+      }
+      // The pinned deployment itself (or no pin): it starts.
+      const proc = await startDaemon(home);
+      expect(proc.daemon.wallet.address).toMatch(/^0x/);
+    });
+    // Without a profile, a table entry alone never stops a daemon (unprofiled chains only ever warn, at init).
+    KNOWN_DEPLOYMENTS[31337] = { name: "Local", hub: newAddress(), rules: env.rules };
+    try {
+      for (const c of cleanups.splice(0)) await c();
+      const proc = await startDaemon(home);
+      expect(proc.daemon.wallet.address).toMatch(/^0x/);
+    } finally {
+      delete KNOWN_DEPLOYMENTS[31337];
+    }
   });
 });

@@ -3,6 +3,7 @@ import {
   computeFundingNeed,
   computeOneBalanceFundingNeed,
   formatNativeCeil4,
+  oneBalanceOpenNeed,
   fundMessage,
   FUND_TX_GAS_UNITS,
   type FundingInput,
@@ -136,7 +137,7 @@ describe("computeOneBalanceFundingNeed (nativeIsUsdc)", () => {
   it("usdc.need = deposit + fee + ceil((sessionGasWei + 500,000 x feeCeiling) / 10^12); there is no native", () => {
     const n = computeOneBalanceFundingNeed(ONE);
     expect(n.deposit).toBe(3_000_000n);
-    expect(n.usdc).toEqual({ have: 0n, need: 3_000_000n + 5_000n + 60_000n, shortfall: 3_065_000n });
+    expect(n.usdc).toEqual({ have: 0n, need: 3_000_000n + 5_000n + 60_000n, shortfall: 3_065_000n, reserved: 0n });
     expect("native" in n).toBe(false);
     expect(Object.keys(n)).toEqual(["deposit", "feePerPlayer", "usdc"]);
   });
@@ -157,6 +158,28 @@ describe("computeOneBalanceFundingNeed (nativeIsUsdc)", () => {
     const exact = computeOneBalanceFundingNeed({ ...ONE, balanceWei: 3_065_000n * 10n ** 12n });
     expect(exact.usdc.shortfall).toBe(0n);
     expect(computeOneBalanceFundingNeed({ ...ONE, balanceWei: 3_065_000n * 10n ** 12n - 1n }).usdc.shortfall).toBe(1n);
+  });
+
+  it("fix round 1 (I-5): each unsettled channel of the home adds one sessionGasWei of reserve to need, shown as reserved; have stays the balance", () => {
+    const one = computeOneBalanceFundingNeed({ ...ONE, unsettledChannels: 1, balanceWei: 2n * 10n ** 18n });
+    expect(one.usdc).toEqual({ have: 2_000_000n, need: 3_075_000n, shortfall: 1_075_000n, reserved: 10_000n });
+    expect(computeOneBalanceFundingNeed({ ...ONE, unsettledChannels: 3 }).usdc).toMatchObject({ need: 3_095_000n, reserved: 30_000n });
+    // At Arc's numbers, one live channel adds its whole 0.336 USDC refill.
+    const arc = { ...ONE, sessionGasWei: 4n * 2_100_000n * 40_000_000_000n, feeCeilingWei: 40_000_000_000n };
+    expect(computeOneBalanceFundingNeed({ ...arc, unsettledChannels: 1 }).usdc.reserved).toBe(336_000n);
+    expect(() => computeOneBalanceFundingNeed({ ...ONE, unsettledChannels: -1 })).toThrow(RangeError);
+  });
+
+  it("fix round 1: oneBalanceOpenNeed rounds the gas up once, as a sum -- the figure the daemon's opening gates use", () => {
+    const base = { deposit: 1_000_000n, feePerPlayer: 5_000n, sessionGasWei: 10n ** 12n + 1n, feeCeilingWei: 0n };
+    expect(oneBalanceOpenNeed({ ...base, ownGasWei: base.sessionGasWei, otherChannels: 0 })).toBe(1_005_002n); // ceil(1e12 + 1)
+    expect(oneBalanceOpenNeed({ ...base, ownGasWei: base.sessionGasWei, otherChannels: 1 })).toBe(1_005_003n); // ceil(2e12 + 2), not 2 + 2
+    expect(oneBalanceOpenNeed({ ...base, ownGasWei: 0n, otherChannels: 1 })).toBe(1_005_002n); // the key is already topped up
+    expect(oneBalanceOpenNeed({ ...base, ownGasWei: 0n, otherChannels: 0 })).toBe(1_005_000n);
+    // The same sum as computeOneBalanceFundingNeed's need, so `fund`'s ask always passes the daemon's gate.
+    const n = computeOneBalanceFundingNeed({ ...ONE, sessionGasWei: base.sessionGasWei, feeCeilingWei: 0n, unsettledChannels: 1 });
+    expect(n.usdc.need).toBe(oneBalanceOpenNeed({ deposit: n.deposit, feePerPlayer: ONE.feePerPlayer, ownGasWei: base.sessionGasWei, otherChannels: 1, sessionGasWei: base.sessionGasWei, feeCeilingWei: 0n }));
+    expect(() => oneBalanceOpenNeed({ ...base, ownGasWei: 0n, otherChannels: 0.5 })).toThrow(RangeError);
   });
 
   it("the deposit rules are computeFundingNeed's own", () => {

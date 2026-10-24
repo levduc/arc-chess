@@ -91,10 +91,11 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
         Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
         message is a ready-to-relay sentence. On a chain whose gas is USDC, such as Arc, there is no native:
-        the gas is part of usdc.need, and message asks for USDC only. faucet is present only when a faucet
-        call was attempted: on success it is {usdc, native} (the wallet's new balances, formatted like
-        "arena faucet"); on failure (unreachable, rate-limited, wrong origin, ...) it is the string
-        "skipped: <reason>" instead, and the
+        the gas is part of usdc.need, and message asks for USDC only; usdc.need also keeps one session gas for
+        each channel of this home that is not finalized, shown as usdc.reserved. faucet is present only when a
+        faucet call was attempted: on success it is {usdc, native} (the wallet's new balances, formatted like
+        "arena faucet"; {usdc} alone where gas is USDC); on failure (unreachable, rate-limited, wrong origin, ...)
+        it is the string "skipped: <reason>" instead, and the
         usdc/native fields above keep reporting the shortfall as it actually stands. Exit 0 whenever the
         computation succeeds -- a shortfall is data, not an error; exit 1 if the server or the hub cannot be
         read at all (for example, a hub address with no contract code on this chain).)
@@ -1129,6 +1130,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // one, read alone -- and one ask: the gas is folded into `usdc.need`, and there is no `native`. Every other
       // chain reads both balances and asks for both, exactly as before.
       const oneBalance = chainProfile(cfg.chainId)?.nativeIsUsdc === true;
+      // Fix round 1 (spec §2.1 as amended, audit-daemon I-5): on such a chain, this home's channels that are not
+      // finalized each keep one sessionGasWei of the same balance for their refills, so the ask includes it
+      // (`usdc.reserved`) -- the daemon's opening gates refuse a new channel that would spend it. No daemon needed: the
+      // records on disk. A record that cannot be read is not counted (the daemon cannot open it either).
+      const unsettledChannels = oneBalance ? new RecordStore(home).channels().filter((r) => !r.finalized).length : 0;
       const sized = <T>(compute: () => T): T => {
         try {
           return compute();
@@ -1149,7 +1155,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         };
         if (oneBalance) {
           const balanceWei = await nativeBalanceOf(io, cfg.rpcUrl, address);
-          return sized(() => computeOneBalanceFundingNeed({ ...common, balanceWei }));
+          return sized(() => computeOneBalanceFundingNeed({ ...common, balanceWei, unsettledChannels }));
         }
         const usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
         const nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
@@ -1178,11 +1184,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
 
       // spec §4.1: call the faucet (as init does) only when something is actually short and the template
       // advertises one; never fails fund -- a failed top-up just leaves the shortfall for the human to cover.
-      let faucetReported: { usdc: string; native: string } | string | undefined;
+      let faucetReported: { usdc: string; native?: string } | string | undefined;
       if ((funding.usdc.shortfall > 0n || ("native" in funding && funding.native.shortfall > 0n)) && faucetUrl !== undefined) {
         try {
           const funded = await callFaucet(io, faucetUrl, cfg.serverUrl, address);
-          faucetReported = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
+          // Fix round 1 (m-6): on a one-balance chain, USDC only, like the rest of this output.
+          faucetReported = oneBalance
+            ? { usdc: formatUsdc6(funded.usdc) }
+            : { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
           funding = await readNeed();
         } catch (err) {
           faucetReported = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
@@ -1200,7 +1209,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         ...(offerId !== undefined ? { offerId, stakePerGame: formatUsdc6(fundStake) } : {}),
         deposit: formatUsdc6(funding.deposit),
         feePerPlayer: formatUsdc6(funding.feePerPlayer),
-        usdc: { have: formatUsdc6(funding.usdc.have), need: formatUsdc6(funding.usdc.need), shortfall: formatUsdc6(funding.usdc.shortfall) },
+        usdc: {
+          have: formatUsdc6(funding.usdc.have),
+          need: formatUsdc6(funding.usdc.need),
+          shortfall: formatUsdc6(funding.usdc.shortfall),
+          // Fix round 1 (I-5): one-balance chains only -- the part of `need` kept for the other unsettled channels.
+          ...("reserved" in funding.usdc ? { reserved: formatUsdc6(funding.usdc.reserved) } : {}),
+        },
         // Plan 6: absent on a one-balance chain, whose gas is in `usdc` above.
         ...("native" in funding
           ? {
