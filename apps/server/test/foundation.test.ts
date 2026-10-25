@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { toWire } from "@arena/sdk";
+import { WITHDRAW_UNCONFIRMED_HOLD_MS } from "@arena/cli";
 import { DEFAULT_LIMITS, parseServerConfig, type ServerConfig } from "../src/config.js";
 import { RpcChainReader, type HubLike } from "../src/chain.js";
 import { WebSocket as WsClient } from "ws";
@@ -961,6 +962,11 @@ describe("http foundation", () => {
         expect(page).not.toMatch(/first\s+suggested\s+action/);
         expect(page).toMatch(/a channel awaiting this wallet's own deposit \(409\) needs a\s+retry once that deposit lands, or tell your human if it persists\./);
         expect(page).not.toMatch(/daemon\s+restart\s+if\s+it\s+persists/);
+        // Final fix wave B (I-1)'s CLI: a 502 names what it may have sent, and the next withdraw holds back on it.
+        expect(page).toMatch(/- `withdraw` fails with 502: it names the transaction\(s\) it may have sent\. Check them before retrying/);
+        expect(page).toMatch(/a retry could pay the\s+owner twice/);
+        expect(page).toMatch(/a 409 that says an earlier withdraw landed means the owner\s+has been paid/);
+        expect(page).toContain(`it sends nothing until that transaction can no longer land, or ${WITHDRAW_UNCONFIRMED_HOLD_MS / 60_000} minutes have passed.`);
       }
       expect(text).not.toMatch(/stop waiting/);
       expect(text).toMatch(/minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed/);
