@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fundDisclosure, fundMessage, tellYourHuman } from "../../packages/cli/src/funding.js";
 import { buildPrompt, homePrefixRules, parseArgs, runPaths } from "../../scripts/claude-opponent.js";
+import { payUnconfirmed } from "../../scripts/testnet-up.js";
 import {
   agentTexts,
   decide,
@@ -15,6 +16,7 @@ import {
   isRefusalBeforeSend,
   microUsdc,
   parseFundingAsks,
+  payOutcome,
   sessionIdOf,
   waitsForUsdc,
   type LedgerEntry,
@@ -174,6 +176,37 @@ describe("the human watcher's decision", () => {
     expect(isRefusalBeforeSend("testnet: the send failed and 0x3dc0 is not on the chain: Transaction creation failed.")).toBe(false);
     expect(isRefusalBeforeSend("pay: no receipt within 180s; do not resend until 0xab confirms or drops")).toBe(false);
     expect(isRefusalBeforeSend("refusing: the deployer holds 2.1 USDC; sending 1 would leave it under 2 USDC")).toBe(false);
+  });
+
+  it("final wave C add-on: a payment that may have landed is maybe-paid, and nothing more is paid to that wallet", () => {
+    const HASH = `0x${"cd".repeat(32)}` as const;
+    const open = payUnconfirmed({ hash: HASH, to: WALLET as `0x${string}`, wei: 1_350_000_000_000_000_000n, sentKnown: true, why: "the RPC is rate-limiting (HTTP 429)", timeoutMs: 180_000 });
+    const lost = payUnconfirmed({ hash: HASH, to: WALLET as `0x${string}`, wei: 1_350_000_000_000_000_000n, sentKnown: false, why: "not mined yet", timeoutMs: 180_000 });
+    // The pay helper's own output, as the watcher captures it (trimmed).
+    expect(payOutcome({ exit: 1, stdout: open.stdout.trim(), stderr: `pay: sent 1.35 USDC to ${WALLET}: x/tx/${HASH}\n${open.stderr}`.trim() })).toBe("maybe-paid");
+    expect(payOutcome({ exit: 1, stdout: lost.stdout.trim(), stderr: lost.stderr.trim() })).toBe("maybe-paid");
+    expect(payOutcome({ exit: 1, stdout: "", stderr: `testnet: the send failed and ${HASH} is not on the chain: Transaction creation failed.` })).toBe("maybe-paid");
+    expect(payOutcome({ exit: 0, stdout: '{"sent":true,"status":"success"}', stderr: "" })).toBe("paid");
+    expect(payOutcome({ exit: 1, stdout: `{"sent":false,"status":"reverted","txHash":"${HASH}"}`, stderr: "" })).toBe("failed");
+    expect(payOutcome({ exit: 1, stdout: "", stderr: "testnet: refusing: the deployer has a pending transaction (nonce latest 7, pending 8)" })).toBe("not-sent");
+    expect(payOutcome({ exit: 1, stdout: "", stderr: "testnet: RPC https://rpc.testnet.arc.io eth_chainId: HTTP 429" })).toBe("not-sent");
+
+    // Once maybe-paid, no other ask to that wallet is paid -- not even a different amount within the budget.
+    const ledger: LedgerEntry[] = [
+      { t: "t", kind: "pay", usdc: "1.35", address: WALLET },
+      { t: "t", kind: "paid", usdc: "1.35", address: WALLET, exit: 1, stdout: open.stdout.trim(), stderr: open.stderr.trim(), outcome: "maybe-paid" },
+    ];
+    expect(decide({ usdc: "1.35", address: WALLET }, WALLET, ledger, "3")).toMatchObject({ pay: false, why: "already paid this ask" });
+    expect(decide({ usdc: "1.36", address: WALLET }, WALLET, ledger, "3")).toEqual({
+      pay: false,
+      why: `an earlier payment of 1.35 USDC may have landed (tx ${HASH}): a person checks it before anything more is paid`,
+    });
+    // A ledger line from before `outcome` existed is read from its output the same way.
+    const { outcome: _o, ...older } = ledger[1] as Extract<LedgerEntry, { kind: "paid" }>;
+    expect(decide({ usdc: "1.36", address: WALLET }, WALLET, [ledger[0]!, older], "3")).toMatchObject({ pay: false });
+    // A confirmed payment does not hold the next ask back.
+    const confirmed: LedgerEntry[] = [ledger[0]!, { ...older, exit: 0, stdout: '{"sent":true,"status":"success"}', stderr: "", outcome: "paid" }];
+    expect(decide({ usdc: "1.36", address: WALLET }, WALLET, confirmed, "3")).toEqual({ pay: true });
   });
 
   it("does budget arithmetic in exact micro-USDC", () => {

@@ -15,7 +15,9 @@
  * from `wallet.json`. An ask naming any other address (the owner's, an opponent's) is logged and never paid.
  *
  * Every decision is appended to a JSON-lines ledger, with an ISO timestamp, *before* the pay helper runs, so a
- * resumed session (`--resume`) or a crash mid-payment can never pay the same ask twice. Node built-ins only, like
+ * resumed session (`--resume`) or a crash mid-payment can never pay the same ask twice. A payment whose outcome the
+ * helper could not see (no receipt by its deadline, a lost send) is `maybe-paid`: it is never sent again, and nothing
+ * more is paid to that wallet until a person has checked the transaction (`payOutcome`, `decide`). Node built-ins only, like
  * `tests/system/claude-sandbox.ts` (and `arc-rehearsal-lib.ts`, whose allowlist is the environment of both children,
  * the CLI's `wallet` and the pay helper: never this process's whole environment, final review C m-9).
  */
@@ -29,13 +31,44 @@ import { childEnv } from "./arc-rehearsal-lib.js";
 /** One "send X USDC to 0x…" the agent put in front of its human. */
 export type FundingAsk = { usdc: string; address: string };
 
-/** One line of the ledger. `pay` is written before the helper runs; `paid` after it returns. */
+/** What one run of the pay helper did, as far as its output tells (see `payOutcome`). */
+export type PayOutcome = "paid" | "maybe-paid" | "not-sent" | "failed";
+
+/** One line of the ledger. `pay` is written before the helper runs; `paid` after it returns (`outcome` since the
+ *  final wave C add-on; an older line's is read from its output). */
 export type LedgerEntry =
   | { t: string; kind: "ask"; usdc: string; address: string; text: string; source?: "text" | "fund-output" }
   | { t: string; kind: "skip"; usdc: string; address: string; why: string }
   | { t: string; kind: "pay"; usdc: string; address: string }
-  | { t: string; kind: "paid"; usdc: string; address: string; exit: number | null; stdout: string; stderr: string }
+  | { t: string; kind: "paid"; usdc: string; address: string; exit: number | null; stdout: string; stderr: string; outcome?: PayOutcome }
   | { t: string; kind: "note"; text: string };
+
+const TX_HASH = /0x[0-9a-fA-F]{64}\b/;
+
+/**
+ * Final wave C add-on (live run #2): what one pay helper run did, read from its exit code and output.
+ * - `paid`: exit 0, a `success` receipt.
+ * - `failed`: its JSON says the transfer was mined and reverted: nothing moved.
+ * - `maybe-paid`: anything else that names a transaction -- no receipt by the deadline (`"status": "pending"`, `sent`
+ *   true or `"unknown"`), or a send whose answer was lost. It may have landed, so it is never paid again.
+ * - `not-sent`: a run that names no transaction: it stopped before signing (a refusal, an RPC failure, a usage error).
+ * The helper prints a transaction's hash as soon as it has one, so "names no hash" means nothing was signed.
+ */
+export function payOutcome(r: { exit: number | null; stdout: string; stderr: string }): PayOutcome {
+  if (r.exit === 0) return "paid";
+  let json: { status?: unknown; sent?: unknown } | undefined;
+  for (const line of r.stdout.split("\n").reverse()) {
+    try {
+      json = JSON.parse(line) as typeof json;
+      break;
+    } catch {
+      // not the JSON line
+    }
+  }
+  if (json?.status === "reverted" && json.sent === false) return "failed";
+  if (json !== undefined || TX_HASH.test(r.stderr) || TX_HASH.test(r.stdout)) return "maybe-paid";
+  return "not-sent";
+}
 
 const USDC_AMOUNT = "([0-9]+(?:\\.[0-9]{1,6})?)";
 // "send 1.351 USDC to 0x…", "send me 1.35 USDC ... to 0x…", "send $1.35 USDC (Arc Testnet) to 0x…": the amount right
@@ -144,7 +177,8 @@ export function microUsdc(usdc: string): bigint {
 /** Whether to pay one ask, as a pure function of what has been paid already. Pays an ask once: the same amount to
  *  the same address asked again (the agent repeating itself, or its final `result` restating its last message) is
  *  never paid twice. Refuses an address other than the agent's own wallet, more than 3 USDC in one payment (the pay
- *  helper's own cap), and anything that would take the total past `budget`. */
+ *  helper's own cap), and anything that would take the total past `budget`. Final wave C add-on: once a payment to
+ *  that wallet is `maybe-paid` (it may have landed), it pays nothing more there: a person checks that transaction. */
 export function decide(
   ask: FundingAsk,
   wallet: string,
@@ -158,6 +192,14 @@ export function decide(
   const pays = ledger.filter((e): e is Extract<LedgerEntry, { kind: "pay" }> => e.kind === "pay");
   if (pays.some((p) => p.address.toLowerCase() === ask.address.toLowerCase() && microUsdc(p.usdc) === amount)) {
     return { pay: false, why: "already paid this ask" };
+  }
+  const open = ledger.find(
+    (e): e is Extract<LedgerEntry, { kind: "paid" }> =>
+      e.kind === "paid" && e.address.toLowerCase() === ask.address.toLowerCase() && (e.outcome ?? payOutcome(e)) === "maybe-paid",
+  );
+  if (open !== undefined) {
+    const hash = TX_HASH.exec(`${open.stdout}\n${open.stderr}`)?.[0] ?? "(see the ledger)";
+    return { pay: false, why: `an earlier payment of ${open.usdc} USDC may have landed (tx ${hash}): a person checks it before anything more is paid` };
   }
   const total = pays.reduce((sum, p) => sum + microUsdc(p.usdc), 0n);
   if (total + amount > microUsdc(budget)) return { pay: false, why: `would exceed the ${budget} USDC budget (paid so far ${Number(total) / 1e6}): stop and report` };
@@ -288,9 +330,14 @@ export class HumanWatcher {
           child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
           child.once("exit", (exit) => resolve({ exit, stdout: stdout.trim(), stderr: stderr.trim() }));
         });
-        this.record({ t: new Date().toISOString(), kind: "paid", ...ask, ...result });
-        // Exit 1 with `"status":"pending"` means sent but unconfirmed: never resend, look the hash up instead. Any
-        // failure other than a refusal before sending is left for a person (see `isRefusalBeforeSend`).
+        const outcome = payOutcome(result);
+        this.record({ t: new Date().toISOString(), kind: "paid", ...ask, ...result, outcome });
+        // A payment that may have landed is never sent again (`decide` holds every later one to this wallet too):
+        // a person checks the hash. Only the helper's refusal before sending is retried (`isRefusalBeforeSend`).
+        if (outcome === "maybe-paid") {
+          this.record({ t: new Date().toISOString(), kind: "note", text: `maybe paid ${ask.usdc} USDC to ${ask.address}: check the transaction before paying again; nothing more is paid to it` });
+          return true;
+        }
         if (result.exit === 0 || !isRefusalBeforeSend(result.stderr) || attempt >= 3) return true;
         await new Promise((r) => setTimeout(r, 10_000 + Math.floor(Math.random() * 10_000)));
       }
