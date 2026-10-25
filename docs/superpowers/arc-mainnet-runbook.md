@@ -168,7 +168,9 @@ env "${DEPLOY_ENV[@]}" ARENA_CHAIN_ID=5042 ARENA_EXPLORER_URL=https://explorer.a
 - **Pending: a check of `explorer.arc.io`'s API.** On 2026-10-25, a scripted GET of
   `https://explorer.arc.io/api/v2/smart-contracts/verification/config` returned HTTP 403 with a Cloudflare "Just a
   moment…" challenge page. Sourcify's `/server/chains` lists 5042 ("Arc Mainnet") as supported. The script reads
-  that explorer endpoint in its first step, under `set -e`, so it will probably stop there while the block lasts.
+  that endpoint in its first step (`blockscout_compiler_version`, called bare under `set -euo pipefail`), so it stops
+  there, before Sourcify, while the block lasts. I confirmed the exit (curl status 22) by running a copy of that
+  step against the live endpoint.
   - Check the endpoint again before Task 6.
   - If it is still blocked, Sourcify's `exact_match` for both contracts is the independent proof of the source.
     Get it by running the script's Sourcify step on its own.

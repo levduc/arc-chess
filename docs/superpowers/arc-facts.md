@@ -82,8 +82,8 @@ The validator set is permissioned at launch. The network itself is public.
   Cloudflare "Just a moment…" challenge page. The T5 review saw the same 403. `explorer.testnet.arc.io` serves the
   same API to scripts (`arc-testnet-rehearsal.md` §1).
 - Sourcify's `/server/chains` lists both 5042 ("Arc Mainnet") and 5042002 as supported.
-- So on mainnet, `scripts/verify-arc.sh`'s explorer steps may be blocked, while Sourcify's still work
-  (`arc-mainnet-runbook.md` §7).
+- So on mainnet, `scripts/verify-arc.sh` stops at its first explorer step while the block lasts, and Sourcify is
+  unaffected (`arc-mainnet-runbook.md` §7).
 
 ## Other Circle contracts on mainnet
 

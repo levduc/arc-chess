@@ -228,7 +228,8 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
      (`is_fully_verified`). It is ready for mainnet pending a check of `explorer.arc.io`'s API: in the T5 review, its
      `/api/v2/smart-contracts/verification/config` answered 403 to a plain request; Sourcify lists 5042. Re-checked
      2026-10-25: still 403, a Cloudflare "Just a moment…" challenge page, and Sourcify lists 5042 as supported. The
-     script reads that endpoint first, so it will probably stop there (runbook §7). Mainnet is still to do.)
+     script reads that endpoint first, under `set -e`, so it stops there, before Sourcify (runbook §7). Mainnet is
+     still to do.)
    - [ ] **The mainnet deploy key never touches argv or the environment.** Use a Foundry encrypted keystore
      (`cast wallet import <name> --interactive`, then `forge script … --account <name> --sender <address>`, with a
      password prompt or a 0600 `--password-file`), or a hardware wallet. Never `--private-key` on the command line,
