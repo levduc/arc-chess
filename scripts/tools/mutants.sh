@@ -4,8 +4,8 @@
 # Applies each of the 18 one-line mutants from the reviewer's mutation pass (task-3-review.md) — the 6
 # already known to be caught plus the 12 that survived the original suite — and the 5 I1 mutants of the
 # hub signature-check proposal (docs/superpowers/proposals/2026-10-24-hub-signature-check.md), plus the
-# mutants of that proposal's later audit items (each registers its own IDs, below the DESC table), to a
-# throwaway copy of the whole contracts/ tree, runs the FULL test suite (every *.t.sol file, not just the invariant one) against
+# mutants of that proposal's later audit items and of the ECDSA-only change (each registers its own IDs, below
+# the DESC table), to a throwaway copy of the whole contracts/ tree, runs the FULL test suite (every *.t.sol file, not just the invariant one) against
 # each mutant, and asserts every one of them is killed (i.e. the suite fails). Running the full suite
 # matters: nearly every one of these 18 mutants already has a deterministic, non-fuzzed directed unit test
 # elsewhere in the suite (e.g. ChannelHub.limits.t.sol's test_pause_*StillWorks tests for F1/F2/C1/C2,
@@ -39,6 +39,11 @@ cp "$HUB" "$PRISTINE"
 # Mutant definitions. Each `mutant_<ID>` function edits $HUB in place with a single sed pass. IDs match
 # task-3-review.md exactly. F6/F8/F14/F15/F16 were never assigned mutants by the reviewer ("not
 # reported, pick your own if useful") and are intentionally omitted rather than invented after the fact.
+#
+# Every mutant is anchored on the text of the line it changes, never on a line number, so editing the hub
+# elsewhere cannot point one at the wrong line. The loop below checks that each mutant changed exactly the
+# number of lines it declares (LINES, default 1): an anchor that matches nothing is NOT_APPLIED, and one that
+# matches more lines than intended is MISAPPLIED. Both fail the run.
 # --------------------------------------------------------------------------------------------------
 
 mutant_C1() { # claim: pause check at the top of the function
@@ -52,7 +57,7 @@ mutant_C3() { # _finalize: committedEscrow decremented using the CURRENT fee, no
   sed -i '/^    function _finalize(/,/^    }$/s/committedEscrow -= 2 \* (p\.deposit + p\.feePerPlayer);/committedEscrow -= 2 * (p.deposit + feePerPlayer);/' "$HUB"
 }
 mutant_C4() { # challenge: StaleState check removed
-  sed -i '272s/.*/            \/\/ MUTATED: if (s.turnNum < reg || (s.turnNum == reg \&\& h != c.registeredHash)) revert StaleState();/' "$HUB"
+  sed -i '/h != c\.registeredHash)) revert StaleState();$/s/.*/            \/\/ MUTATED: if (s.turnNum < reg || (s.turnNum == reg \&\& h != c.registeredHash)) revert StaleState();/' "$HUB"
 }
 mutant_C5() { # _pay: owed[to] = amount instead of +=
   sed -i 's/owed\[to\] += amount;/owed[to] = amount;/' "$HUB"
@@ -67,34 +72,35 @@ mutant_F2() { # respond: added pause check
   sed -i '/^    function respond(bytes calldata encodedProof) external nonReentrant {$/a\        if (paused) revert Paused();' "$HUB"
 }
 mutant_F3() { # timeout: off-by-one, < -> <=, makes the exact-deadline call revert TooEarly
-  sed -i '308s/if (block\.timestamp < c\.deadline) revert TooEarly();/if (block.timestamp <= c.deadline) revert TooEarly();/' "$HUB"
+  sed -i 's/if (block\.timestamp < c\.deadline) revert TooEarly();/if (block.timestamp <= c.deadline) revert TooEarly();/' "$HUB"
 }
 mutant_F4() { # closeCooperative: NotClosable check removed (non-terminal states become closable)
-  sed -i '248s/.*/        \/\/ MUTATED: if (s.turnNum != 0 \&\& !rules.isCheckpoint(s) \&\& !rules.isGameOver(s)) revert NotClosable();/' "$HUB"
+  sed -i '/ revert NotClosable();$/s/.*/        \/\/ MUTATED: if (s.turnNum != 0 \&\& !rules.isCheckpoint(s) \&\& !rules.isGameOver(s)) revert NotClosable();/' "$HUB"
 }
 mutant_F5() { # deposit: AlreadyFunded check removed
-  sed -i '196s/.*/        \/\/ MUTATED: if (c.funded[i]) revert AlreadyFunded();/' "$HUB"
+  sed -i '/^        if (c\.funded\[i\]) revert AlreadyFunded();$/s/.*/        \/\/ MUTATED: if (c.funded[i]) revert AlreadyFunded();/' "$HUB"
 }
 mutant_F7() { # _finalize: fee paid to the CURRENT feeRecipient, not the channel's own p.feeRecipient
   sed -i 's/_pay(p\.feeRecipient, fee);/_pay(feeRecipient, fee);/' "$HUB" # pattern-anchored (audit M2 moved the line)
 }
 mutant_F9() { # closeCooperative: StaleState check removed
-  sed -i '249s/.*/        \/\/ MUTATED: if (c.hasRegistered \&\& s.turnNum < c.registered.turnNum) revert StaleState();/' "$HUB"
+  sed -i '/ s\.turnNum < c\.registered\.turnNum) revert StaleState();$/s/.*/        \/\/ MUTATED: if (c.hasRegistered \&\& s.turnNum < c.registered.turnNum) revert StaleState();/' "$HUB"
 }
 mutant_F10() { # challenge: any address may challenge (NotParticipant bypassed)
-  sed -i '264s/uint8 who = _playerIndex(p, msg\.sender);/uint8 who = 0; \/\/ MUTATED: bypassed _playerIndex/' "$HUB"
+  sed -i 's/uint8 who = _playerIndex(p, msg\.sender);/uint8 who = 0; \/\/ MUTATED: bypassed _playerIndex/' "$HUB"
 }
 mutant_F11() { # timeout: TooEarly check removed entirely (timeout allowed before the deadline)
-  sed -i '308s/.*/        \/\/ MUTATED: if (block.timestamp < c.deadline) revert TooEarly();/' "$HUB"
+  sed -i '/^        if (block\.timestamp < c\.deadline) revert TooEarly();$/s/.*/        \/\/ MUTATED: if (block.timestamp < c.deadline) revert TooEarly();/' "$HUB"
 }
 mutant_F12() { # respond: DeadlinePassed check removed (respond allowed after the deadline)
-  sed -i '290s/.*/        \/\/ MUTATED: if (block.timestamp >= c.deadline) revert DeadlinePassed();/' "$HUB"
+  sed -i '/^        if (block\.timestamp >= c\.deadline) revert DeadlinePassed();$/s/.*/        \/\/ MUTATED: if (block.timestamp >= c.deadline) revert DeadlinePassed();/' "$HUB"
 }
 mutant_F13() { # closeCooperative: signature check removed
-  sed -i '246s/.*/        \/\/ MUTATED: if (!_signedBy(p.signers[0], h, ss.sigA) || !_signedBy(p.signers[1], h, ss.sigB)) revert BadSignature();/' "$HUB"
+  sed -i '/_signedBy(p\.signers\[0\], h, ss\.sigA)/s/.*/        \/\/ MUTATED: if (!_signedBy(p.signers[0], h, ss.sigA) || !_signedBy(p.signers[1], h, ss.sigB)) revert BadSignature();/' "$HUB"
 }
 mutant_F17() { # respond: does not register the new state
-  sed -i '294s/_register(c, s, h);/\/\/ MUTATED: _register(c, s, h);/' "$HUB"
+  # _register(c, s, h) is in challenge too: anchored on respond's body.
+  sed -i '/^    function respond(/,/^    }$/s/_register(c, s, h);/\/\/ MUTATED: _register(c, s, h);/' "$HUB"
 }
 
 # M1 (2026-10-23 audit): claim() pays msg.sender only. Pattern-anchored; claim kept its line count.
@@ -105,8 +111,7 @@ mutant_M1b() { # claim: Claimed event names the wrong recipient
   sed -i 's/^        emit Claimed(msg\.sender, msg\.sender, amount);$/        emit Claimed(msg.sender, address(0), amount);/' "$HUB"
 }
 
-# I1 (2026-10-23 audit): no unchecked signature bytes in proof.latest. These are anchored on patterns, not line
-# numbers, and every line they touch sits after the 18 line-numbered mutants above, inside _supported.
+# I1 (2026-10-23 audit): no unchecked signature bytes in proof.latest. Every line they touch is inside _supported.
 mutant_I1a() { # _supported: non-mover slot of a move proof no longer checked
   sed -i 's/^        if (other\.length != 0 \&\& !_signedBy(p\.signers\[1 - m\], h, other)) revert BadSignature();$/        \/\/ MUTATED: non-mover slot check removed/' "$HUB"
 }
@@ -163,7 +168,17 @@ MUTANT_IDS+=(M2a M2b)
 DESC[M2a]="renounceOwnership: inherited owner-only renounce restored"
 DESC[M2b]="renounceOwnership: silent no-op, no revert"
 
+# ECDSA-only signatures (final review A I-1, owner decision 2026-10-25). E1 restores the ERC-1271 fallback that
+# was removed, inline (the SignatureChecker import is gone), so it also turns _signedBy from pure to view: 2 lines.
+mutant_E1() { # _signedBy: an ERC-1271 fallback after a failed ECDSA check
+  sed -i -e '/^    function _signedBy(/s/ private pure returns (bool) {$/ private view returns (bool) {/' \
+    -e 's/^        return err == ECDSA\.RecoverError\.NoError \&\& recovered == signer;$/        if (err == ECDSA.RecoverError.NoError \&\& recovered == signer) return true; (bool ok, bytes memory ret) = signer.staticcall(abi.encodeWithSelector(bytes4(0x1626ba7e), hash, sig)); return ok \&\& ret.length == 32 \&\& abi.decode(ret, (bytes4)) == bytes4(0x1626ba7e);/' "$HUB"
+}
+MUTANT_IDS+=(E1)
+DESC[E1]="_signedBy: ERC-1271 fallback restored"
+
 declare -A RESULT
+declare -A LINES=([E1]=2) # lines each mutant changes, when not 1
 FAIL=0
 
 # M1 mutants, registered apart from the arrays above so that each audit item's mutants stand alone.
@@ -177,6 +192,13 @@ for id in "${MUTANT_IDS[@]}"; do
 
   if cmp -s "$PRISTINE" "$HUB"; then
     RESULT[$id]="NOT_APPLIED"
+    FAIL=1
+    continue
+  fi
+  # Lines present only in the mutant: one per replaced or added line.
+  changed="$(diff "$PRISTINE" "$HUB" | grep -c '^>' || true)"
+  if [[ "$changed" -ne "${LINES[$id]:-1}" ]]; then
+    RESULT[$id]="MISAPPLIED"
     FAIL=1
     continue
   fi

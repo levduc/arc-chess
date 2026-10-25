@@ -2,7 +2,6 @@
 pragma solidity ^0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {Params, State, SignedState, Proof} from "../src/ArenaTypes.sol";
 import {ChannelHub} from "../src/ChannelHub.sol";
 import {ChessRules} from "../src/chess/ChessRules.sol";
@@ -11,24 +10,19 @@ import {MockUSDC} from "../src/dev/MockUSDC.sol";
 import {ChessTestUtils} from "../test/helpers/ChessTestUtils.sol";
 
 /// @notice Forwards a call so `msg.sender`, as seen by the target, is this contract's own address rather
-/// than HubProperties'. Stands in for two independent "wallets" (deposit/payout identities) and two
-/// independent "session key" identities, none of which can be produced by real ECDSA signing inside
-/// Echidna's cheatcode-free EVM (see AlwaysValidSigner below).
+/// than HubProperties'. Stands in for two independent "wallets" (deposit/payout identities).
 contract Forwarder {
     function forward(address target, bytes memory data) external returns (bool ok, bytes memory ret) {
         (ok, ret) = target.call(data);
     }
 }
 
-/// @notice An ERC-1271 signer that accepts any non-empty signature unconditionally. Echidna cannot compute
-/// real ECDSA signatures (there is no vm.sign-style cheatcode), so channel session keys here are contract
-/// addresses using this fallback path of ChannelHub._signedBy instead. This only bypasses the *signature*
-/// layer -- ChessRules.validTransition (the actual chess legality and the escrow/accounting bookkeeping
-/// this harness restates as invariants) is exercised unmodified.
-contract AlwaysValidSigner is IERC1271 {
-    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
-        return IERC1271.isValidSignature.selector;
-    }
+/// @notice The hevm cheatcodes Echidna provides, at the address forge-std's `vm` uses. The hub verifies ECDSA
+/// only (final review A I-1), so the session keys here are real keys: `addr` derives their addresses and `sign`
+/// produces their 65-byte, low-s signatures.
+interface IHevm {
+    function sign(uint256 sk, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);
+    function addr(uint256 sk) external returns (address);
 }
 
 /// @notice Echidna harness for ChannelHub (Plan 4.5 Task 4). Restates invariants 1, 2, 4 and 7 of
@@ -38,9 +32,8 @@ contract AlwaysValidSigner is IERC1271 {
 ///
 /// This is a lighter second opinion on top of Task 3's deep Foundry invariant/fuzz suite (ChannelHub.
 /// invariant.t.sol + HubHandler.sol), not a replacement for it: Echidna's own coverage-guided engine explores
-/// call sequences Foundry's invariant fuzzer might weight differently, at the cost of the strictness Foundry
-/// gets from vm.sign/vm.prank/vm.warp (real signatures, real sender impersonation, real time travel), none
-/// of which exist here.
+/// call sequences Foundry's invariant fuzzer might weight differently. Its signatures are real (hevm `sign`); in
+/// place of vm.prank it uses forwarder wallets, and in place of vm.warp, Echidna's own time delays.
 contract HubProperties is ChessTestUtils {
     uint256 internal constant FEE = 5_000;
     uint256 internal constant MAX_FEE = 1_000_000;
@@ -48,7 +41,9 @@ contract HubProperties is ChessTestUtils {
     uint256 internal constant MAX_COMMITTED = 1e15;
     uint256 internal constant STAKE = 100_000;
     uint64 internal constant TIMEOUT = 600;
-    bytes internal constant DUMMY_SIG = hex"01"; // any non-empty bytes; AlwaysValidSigner accepts all of them.
+    IHevm internal constant HEVM = IHevm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
+    uint256 internal constant SIGNER0_KEY = 0xA11CE;
+    uint256 internal constant SIGNER1_KEY = 0xB0B;
 
     address internal constant FEE_RECIPIENT_A = address(0x1111);
     address internal constant FEE_RECIPIENT_B = address(0x2222);
@@ -58,8 +53,8 @@ contract HubProperties is ChessTestUtils {
     ChannelHub public hub;
     Forwarder public wallet0;
     Forwarder public wallet1;
-    AlwaysValidSigner public signer0;
-    AlwaysValidSigner public signer1;
+    address public signer0;
+    address public signer1;
 
     Params[] internal channels;
     uint256 internal nonce;
@@ -75,8 +70,8 @@ contract HubProperties is ChessTestUtils {
         hub = new ChannelHub(IERC20(address(usdc)), address(this), FEE_RECIPIENT_A, FEE, MAX_FEE, MAX_DEPOSIT, MAX_COMMITTED);
         wallet0 = new Forwarder();
         wallet1 = new Forwarder();
-        signer0 = new AlwaysValidSigner();
-        signer1 = new AlwaysValidSigner();
+        signer0 = HEVM.addr(SIGNER0_KEY);
+        signer1 = HEVM.addr(SIGNER1_KEY);
 
         usdc.mint(address(wallet0), 1e18);
         usdc.mint(address(wallet1), 1e18);
@@ -90,7 +85,7 @@ contract HubProperties is ChessTestUtils {
     function createChannel(uint256 depositSeed, uint256 windowSeed) external {
         Params memory p;
         p.participants = [address(wallet0), address(wallet1)];
-        p.signers = [address(signer0), address(signer1)];
+        p.signers = [signer0, signer1];
         p.rules = address(rules);
         p.feeRecipient = hub.feeRecipient(); // snapshot: ownerSetFee below can change this over the run
         p.feePerPlayer = hub.feePerPlayer();
@@ -130,14 +125,15 @@ contract HubProperties is ChessTestUtils {
         } catch {}
     }
 
-    /// @dev Cooperative close on the opening state (turnNum 0), signed by both mock signers.
+    /// @dev Cooperative close on the opening state (turnNum 0), with both session keys' Close signatures.
     function closeOpening(uint256 idx) external {
         (bool found, Params memory p) = _pick(idx, ChannelHub.Phase.Open);
         if (!found) (found, p) = _pick(idx, ChannelHub.Phase.Challenged);
         if (!found) return;
         bytes32 id = hub.channelId(p);
         State memory s = rules.initialState(id, p);
-        SignedState memory ss = SignedState({state: s, sigA: DUMMY_SIG, sigB: DUMMY_SIG});
+        bytes32 h = hub.hashClose(s);
+        SignedState memory ss = SignedState({state: s, sigA: _sig(SIGNER0_KEY, h), sigB: _sig(SIGNER1_KEY, h)});
         try hub.closeCooperative(abi.encode(ss)) {
             ghostEscrow -= 2 * (p.deposit + p.feePerPlayer);
             ghostCommitted -= 2 * (p.deposit + p.feePerPlayer);
@@ -280,14 +276,20 @@ contract HubProperties is ChessTestUtils {
     }
 
     /// @dev turnNum 0 (the opening) needs no signature (ChannelHub._isOpening); anything else is
-    /// "solo/both-signed" via the AlwaysValidSigner mocks, since Echidna cannot produce real ECDSA sigs.
-    function _proofFor(State memory s) internal view returns (bytes memory) {
+    /// "solo/both-signed", with both session keys' real signatures.
+    function _proofFor(State memory s) internal returns (bytes memory) {
         Proof memory pr;
         pr.latest.state = s;
         if (s.turnNum != 0) {
-            pr.latest.sigA = DUMMY_SIG;
-            pr.latest.sigB = DUMMY_SIG;
+            bytes32 h = hub.hashState(s);
+            pr.latest.sigA = _sig(SIGNER0_KEY, h);
+            pr.latest.sigB = _sig(SIGNER1_KEY, h);
         }
         return abi.encode(pr);
+    }
+
+    function _sig(uint256 key, bytes32 digest) internal returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = HEVM.sign(key, digest);
+        return abi.encodePacked(r, s, v);
     }
 }

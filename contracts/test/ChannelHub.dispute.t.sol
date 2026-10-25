@@ -6,6 +6,7 @@ import {Params, State, SignedState} from "../src/ArenaTypes.sol";
 import {ChannelHub} from "../src/ChannelHub.sol";
 import {ChessBoard as B} from "../src/chess/ChessBoard.sol";
 import {HubFixture} from "./helpers/HubFixture.sol";
+import {AcceptAllERC1271} from "./helpers/AcceptAllERC1271.sol";
 
 contract ChannelHubDisputeTest is HubFixture {
     Params internal p;
@@ -424,6 +425,112 @@ contract ChannelHubDisputeTest is HubFixture {
         bytes memory solo = _soloProof(emitted.state, emitted.sigA, emitted.sigB);
         vm.prank(bob);
         hub.challenge(solo);
+        assertEq(hub.registeredState(id).turnNum, 2);
+    }
+
+    // Final review A I-1 (owner decision 2026-10-25): the hub verifies ECDSA only. Before, a signer whose code accepts
+    // any bytes (a contract, or a session key under an EIP-7702 delegation, which Arc supports) could put junk in its
+    // own slot: the hub accepted it through ERC-1271, and no client could verify it. The review's PoC used that to
+    // lock a channel that only the griefer could unlock.
+
+    /// The review's PoC (`LockPoC.t.sol`), now a regression: the griefer's signer is an accept-anything contract.
+    function test_ecdsaOnly_acceptAllSigner_junkRefused() public {
+        AcceptAllERC1271 griefSigner = new AcceptAllERC1271();
+        Params memory g = _params();
+        g.signers[1] = address(griefSigner); // bob = griefer
+        bytes32 gid = _open(g);
+        State memory g0 = rules.initialState(gid, g);
+        State memory g1 = _play(g0, g, uci("e2e4")); // alice's move, relayed with her ECDSA signature
+        bytes memory a1 = _sign(aliceKey, g1);
+        State memory g2 = _play(g1, g, uci("e7e5")); // bob's move, "signed" with one byte no client can verify
+        bytes memory chal = _moveProof(g1, a1, "", g2, "", hex"01");
+        vm.prank(bob);
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.challenge(chal);
+
+        // Nor can junk ride in his slot next to Alice's real signature: as a non-mover co-signature, or on a
+        // both-signed state.
+        bytes memory coSigned = _moveProof(g0, "", "", g1, a1, hex"02");
+        vm.prank(bob);
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.challenge(coSigned);
+        bytes memory solo = _soloProof(g1, a1, hex"02");
+        vm.prank(bob);
+        vm.expectRevert(ChannelHub.Unsupported.selector);
+        hub.challenge(solo);
+        assertFalse(hub.channelInfo(gid).hasRegistered);
+
+        // Alice's own exit works as for any channel: her move, endorsed by the opening.
+        bytes memory exit = _moveProof(g0, "", "", g1, a1, "");
+        vm.prank(alice);
+        hub.challenge(exit);
+        vm.warp(block.timestamp + TIMEOUT);
+        uint256 before = usdc.balanceOf(alice);
+        hub.timeout(gid);
+        assertEq(usdc.balanceOf(alice), before + DEPOSIT + STAKE); // bob, on move, forfeits
+    }
+
+    /// A session key under an EIP-7702 delegation keeps working with real ECDSA signatures (they are checked against
+    /// its address), while the junk its delegate would accept is refused. Modelled by etching accept-anything code
+    /// onto Bob's session key, as `ChannelHub.erc1271.t.sol` does for ruling R13.
+    function test_ecdsaOnly_delegatedSessionKey_realSignaturesOnly() public {
+        vm.etch(bobSigner, type(AcceptAllERC1271).runtimeCode);
+        assertGt(bobSigner.code.length, 0);
+        bytes memory s1SigA = _sign(aliceKey, s1);
+        bytes memory junk = _moveProof(s1, s1SigA, "", s2, "", hex"01");
+        vm.prank(bob);
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.challenge(junk);
+        bytes memory s2SigB = _sign(bobKey, s2);
+        bytes memory real = _moveProof(s1, s1SigA, "", s2, "", s2SigB);
+        vm.prank(bob);
+        hub.challenge(real);
+        assertEq(hub.registeredState(id).turnNum, 2);
+
+        // The PoC's lock is gone. Alice answers with s3 and Bob goes silent: the proof her SDK builds from his
+        // verified signature on s2 (the event's) is accepted, and Bob, on move, forfeits.
+        bytes memory s3SigA = _sign(aliceKey, s3);
+        bytes memory answer = _moveProof(s2, "", "", s3, s3SigA, "");
+        vm.prank(alice);
+        hub.respond(answer);
+        bytes memory fromEvent = _moveProof(s2, "", s2SigB, s3, s3SigA, "");
+        vm.prank(alice);
+        hub.challenge(fromEvent);
+        assertEq(hub.registeredState(id).turnNum, 3);
+        vm.warp(block.timestamp + TIMEOUT);
+        hub.timeout(id);
+        assertEq(usdc.balanceOf(alice), 100e6 - FEE + STAKE);
+        assertEq(usdc.balanceOf(bob), 100e6 - FEE - STAKE);
+    }
+
+    /// The same for `closeCooperative`: the delegated key's junk Close signature is refused, its real one closes.
+    function test_ecdsaOnly_delegatedSessionKey_closeNeedsRealSignature() public {
+        vm.etch(bobSigner, type(AcceptAllERC1271).runtimeCode);
+        bytes memory junk = abi.encode(_ss(s0, _signClose(aliceKey, s0), hex"01"));
+        vm.expectRevert(ChannelHub.BadSignature.selector);
+        hub.closeCooperative(junk);
+        bytes memory real = abi.encode(_ss(s0, _signClose(aliceKey, s0), _signClose(bobKey, s0)));
+        hub.closeCooperative(real);
+        assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Finalized));
+    }
+
+    /// The hub's ECDSA rule is OpenZeppelin's: a high-s twin of a valid signature, or v as 0/1, is refused, though the
+    /// same key made it. The SDK refuses both too (`session.ts` `signedBy`), so it never stores one the hub refuses.
+    function test_ecdsaOnly_malleableFormsRefused() public {
+        _challengeS1();
+        bytes32 h = hub.hashState(s2);
+        (uint8 v, bytes32 r, bytes32 sg) = vm.sign(bobKey, h);
+        uint256 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+        bytes[2] memory bad =
+            [abi.encodePacked(r, bytes32(n - uint256(sg)), v == 27 ? uint8(28) : uint8(27)), abi.encodePacked(r, sg, v - 27)];
+        assertEq(ecrecover(h, v == 27 ? 28 : 27, r, bytes32(n - uint256(sg))), bobSigner, "the twin is a valid ecrecover");
+        for (uint256 i; i < bad.length; ++i) {
+            bytes memory proof = _moveProof(s1, "", "", s2, "", bad[i]);
+            vm.expectRevert(ChannelHub.BadSignature.selector);
+            hub.respond(proof);
+        }
+        bytes memory good = _moveProof(s1, "", "", s2, "", abi.encodePacked(r, sg, v));
+        hub.respond(good);
         assertEq(hub.registeredState(id).turnNum, 2);
     }
 }

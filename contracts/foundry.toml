@@ -47,7 +47,7 @@ fail_on_revert = true
 [profile.deep.fuzz]
 runs = 20000
 
-# Fast profile used only by scripts/tools/mutants.sh, so 18 mutants can each get a full test run without
+# Fast profile used only by scripts/tools/mutants.sh, so every mutant can get a full test run without
 # the mutation sweep itself taking 10+ minutes.
 [profile.mutation.invariant]
 runs = 128
