@@ -34,18 +34,13 @@ the key from its 0600 file into a shell variable inside the one command that ran
 written anywhere. Even so, for as long as forge runs, a key on argv can be read by any local process of the same
 user, through `ps` or `/proc/<pid>/cmdline`.
 
-**For mainnet (Task 6):** use the same script and the same env vars, but never `--private-key` on argv, and never an
-exported environment variable. Use a Foundry encrypted keystore instead, or a hardware wallet:
-
-```
-cast wallet import arena-mainnet-deployer --interactive          # once: prompts for the key and a password
-forge script script/Deploy.s.sol --rpc-url <mainnet RPC> \
-  --account arena-mainnet-deployer --sender <deployer address> \
-  --broadcast --with-gas-price 40000000000 --priority-gas-price 1000000000 --timeout 120
-```
-
-forge then prompts for the keystore password. The only non-interactive alternative is `--password-file <file>`, with
-the file at mode 0600. This is a checkbox in `mainnet-gates.md`, item 4.
+**For mainnet (Task 6):** follow `docs/superpowers/arc-mainnet-runbook.md`, which is self-contained. Do not adapt
+the command above. The runbook differs from it in four ways:
+- the key is a Foundry keystore (`--account`) or a hardware wallet, never `--private-key`;
+- it has the mainnet env and the launch limits;
+- the chain id and the nonce are asserted before the dry run and again before the broadcast;
+- the deployer deploys as owner, then hands ownership to the multisig with `transferOwnership` and the multisig's
+  own `acceptOwnership()` on Arc.
 
 A dry run (same command without `--broadcast`) was run first and succeeded, estimating 6,390,739 gas and
 0.1278 USDC at a 20 gwei quote. The real run cost less than that estimate (0.1032 USDC, below) even though the
@@ -239,7 +234,7 @@ So the testnet deployment above was replaced before the rehearsal was rerun on i
 `e8fa69f` and used the command in "Command" above, unchanged: same env vars, `--with-gas-price 40000000000
 --priority-gas-price 1000000000`. The key was passed as before: read from its file inside the one forge command, and
 given to it as `--private-key`. That is acceptable for this testnet key only; see "For mainnet (Task 6)" under
-"Command".
+"Command", and `arc-mainnet-runbook.md`.
 
 Steps, in order:
 1. `eth_chainId` was asserted to be 5042002, and the deployer's nonce was asserted to be 4 at both `latest` and
@@ -313,6 +308,11 @@ verification started"). The script read `is_verified` once, at once, saw `false`
 `ChannelHub`, although `ChessRules` showed verified seconds later. It now polls for up to 90 s; `ChannelHub` verified
 after 5 s. Mainnet runs it the same way. Pass the deploy's own `ARENA_MAX_DEPOSIT_PER_PLAYER` and
 `ARENA_MAX_COMMITTED_ESCROW`: the script's defaults are the mainnet ones, and the constructor args must match.
+
+**Pending: one more redeploy (ECDSA-only hub).** On 2026-10-25 the owner decided that the hub verifies ECDSA only
+(final review A I-1, commit `aa5ddfc`). That changes the hub's bytecode, so the deployment above is superseded once
+the new hub is redeployed here and the rehearsal is rerun on it (`mainnet-gates.md` item 4). Until then,
+`0x9b8B…bA41` still accepts ERC-1271 signatures.
 
 ## 2. The rehearsal, first run on the pre-hardening hub (2026-10-24, 15:18–15:42 UTC)
 

@@ -1,6 +1,9 @@
 # Proposal: three hub changes before the mainnet deploy (audit I1, M2 and M1)
 
 - **Status:** proposal for the owner to decide, item by item. Nothing here is merged.
+  - *Update 2026-10-25:* all three items were adopted and merged (`750e280`), and deployed on Arc testnet.
+  - Final review A then found that §1.7's "closed on-chain, whatever client" did not hold against a signer that has
+    code. The owner's fix, ECDSA-only signatures, is §7. §1.3 and §1.7 carry corrections, marked as such.
 - **Branch:** `proposal/hub-hardening`. It was cut from `proposal/hub-sig-check` at `0695737`, which was cut from
   `feat/arc-launch` at `a7b27da`. `proposal/hub-sig-check` itself is unchanged; it is checked out in another
   worktree.
@@ -110,6 +113,11 @@ now gets a revert. The shipped SDK never does this; see §1.5.
   EIP-7702 delegation) can still make *its own* slot large, if its `isValidSignature` accepts arbitrary bytes.
   The shipped SDK verifies with ECDSA only, so it would refuse such a state as unverifiable. The daemon side of
   the audit's oversized-event item (spec §12 item 18) still applies to this case.
+  - *Correction, 2026-10-25 (final review A I-1):* the residual is not only about size. Even one junk byte in the
+    griefer's own slot gives a state the victim's SDK cannot verify, and the review's PoC used it to lock a channel
+    that only the griefer could unlock (§7.1).
+  - Arc supports EIP-7702, so any session key can gain such code at any time after its channel opens.
+  - Closed by §7.
 - **Residual, already present.** A contract signer can revoke an ERC-1271 signature after it was emitted. This
   change does not alter that.
 
@@ -198,6 +206,15 @@ The mutants are **I1a** (drop the non-mover check), **I1b** (verify the non-move
   at most 640 bytes for EOA signers. The griefing ransom and the oversized-event attack on daemons are closed
   on-chain, whatever client a player uses. It costs the gas above, one testnet redeploy and one more pass of the
   gates and the rehearsal (§5), shared with M2 and M1.
+  - *Correction, 2026-10-25 (final review A I-1):* "closed on-chain, whatever client" held only for griefers whose
+    signer has no code.
+  - "Verified" meant ECDSA *or* ERC-1271. A griefer could delegate its session key, with EIP-7702, to code that
+    accepts anything. It would then still sign ECDSA off-chain, so play looked normal. On-chain, though, its own slot
+    could carry any bytes, from one byte to about 1 MB, and the hub accepted them through ERC-1271. No client can
+    verify those bytes.
+  - That gave a lock only the griefer could lift (proven by a PoC), and a stake taken at a new-game boundary.
+  - The owner closed both on 2026-10-25 by making the hub ECDSA-only (§7). With that change, the sentence above
+    holds for every signer.
 - **If not adopted:** the SDK fix alone protects players on the shipped client, but only players who have
   upgraded to it. A third-party or older client can still be held to ransom. A griefer can still emit events of
   hundreds of KB, which every daemon must ingest, so spec §12 item 18's "never advance past an event it failed to
@@ -527,3 +544,160 @@ itself with `claim()`.
   code path uses it.
 - All three together cost one testnet redeploy of about 0.10 USDC, one gate pass and one rehearsal re-run, done
   once (§5).
+
+## 7. Follow-up, 2026-10-25: ECDSA-only signatures (final review A I-1)
+
+### 7.1 The gap
+
+`_signedBy` tried ECDSA first and then ERC-1271 (`SignatureChecker.isValidERC1271SignatureNow`). The attacker is an
+ordinary session key with an EIP-7702 delegation to code whose `isValidSignature` accepts anything. Arc supports
+EIP-7702, and one type-4 transaction can set the delegation at any time after the channel opens. Offers, acceptances
+and relay joins are ECDSA-verified, so a plain contract signer could never be matched; a delegated session key can.
+
+Final review A's PoC (`LockPoC.t.sol`, ported as a regression test, §7.4) showed shape (a), a lock:
+1. Bob challenges with his move and one junk byte as his signature. The hub accepts it through ERC-1271.
+2. Alice's SDK cannot verify the byte. After its fallback adopts the move unsigned from the hub's storage, she
+   answers it.
+3. Bob goes silent. Every proof Alice's SDK can build is then refused (`Unsupported`). Only Bob can re-register the
+   state and resume the game, so he holds leverage over her deposit.
+
+The review also traced shape (b): at a new-game boundary, the same kind of junk lets the griefer forfeit the victim's
+new game, which takes one stake.
+
+### 7.2 The decision
+
+The owner chose the review's recommended fix: verify state and Close signatures with ECDSA only. The alternative
+was SDK and daemon changes (un-parking h1-rereview N-2 and N-3). Those would have turned (b) into (a), but the lock
+in (a) would have stayed as a documented residual for launch.
+
+### 7.3 The change (`aa5ddfc`)
+
+```diff
+-import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+@@ _signedBy
+-    function _signedBy(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
++    function _signedBy(address signer, bytes32 hash, bytes memory sig) private pure returns (bool) {
+         if (sig.length == 0) return false;
+         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
+-        if (err == ECDSA.RecoverError.NoError && recovered == signer) return true;
+-        return SignatureChecker.isValidERC1271SignatureNow(signer, hash, sig);
++        return err == ECDSA.RecoverError.NoError && recovered == signer;
+     }
+```
+
+- **NatSpec.** The comments on `_signedBy` and `_supported` are rewritten, not shown.
+- **`RenounceDisabled` moves back to the error block.** It sat next to `renounceOwnership` only so that
+  `mutants.sh`'s line numbers would not move (§2.2), and the script no longer uses line numbers (§7.6).
+- **No ABI change.** The error set is the same, and `packages/sdk/src/abi.ts` still matches the build: `abi.test.ts`
+  passes, and the file is unchanged.
+
+**What it closes, for every signer, code or none:**
+- Every non-empty slot the hub stores or emits is a 65-byte, low-`s` ECDSA signature by that slot's signer. That is
+  exactly what the SDK verifies, so both shapes above are closed.
+- Every emitted `SignedState` is at most 640 bytes. That closes the oversized-event residual of §1.3 (parent spec
+  item 18's liveness risk, h1-rereview N-5 and N-6) for every client.
+
+**What still works:**
+- A session key under an EIP-7702 delegation. Its ECDSA signatures are checked against its address, and gaining
+  code cannot revoke them (ruling R13; `test_ecdsaSignatureSurvivesSignerGainingCode` is unchanged).
+
+**What is lost:**
+- A contract signer (an ERC-1271 smart account) can no longer sign states or Close intents. The shipped client
+  never used one: offers and relay joins already required ECDSA from the signer. A channel that names one can still
+  settle, because a challenge on the opening state needs no signature (`test_contractSignerRefused`).
+
+**Found while checking the SDK against the new rule (fixed, `aeed9dc`).** viem's `recoverTypedDataAddress` also
+recovers a signature's high-`s` twin, and a `v` of 0 or 1. OpenZeppelin's `ECDSA.tryRecover`, and so the hub,
+refuses both.
+- The risk: a griefer could relay a malleated signature on a move. The SDK would store it as verified, and every
+  proof that carries it would then be refused. That is the same lock as (a), with no delegation needed.
+- The fix: `recoverStateSigner` and `recoverCloseSigner` now throw unless the signature is 65 bytes, with `v` 27 or
+  28 and a low `s`. Every signature the SDK itself makes already has this form.
+- The hub-side pin is `test_ecdsaOnly_malleableFormsRefused`.
+- `apps/server/src/relay.ts` uses the same function, so the relay now refuses such a signature as "state not signed
+  by sender".
+
+### 7.4 Tests
+
+Four tests in `ChannelHub.dispute.t.sol`. The first three fail on the previous hub, as does
+`test_contractSignerRefused`. The fourth passes on both, since OpenZeppelin's rules did not change.
+- **`test_ecdsaOnly_acceptAllSigner_junkRefused`.** The PoC, as a regression test, with Bob's signer an
+  accept-anything contract (`helpers/AcceptAllERC1271.sol`).
+  - Junk in his slot is refused in each form: as the mover's signature (`BadSignature`), as a non-mover
+    co-signature (`BadSignature`), and on a both-signed state (`Unsupported`).
+  - Alice's own exit then settles normally.
+- **`test_ecdsaOnly_delegatedSessionKey_realSignaturesOnly`.** Accept-anything code is etched onto Bob's session key.
+  - His junk is refused, and his real ECDSA signature is accepted.
+  - The PoC's lock is gone: Alice answers, Bob goes silent, and the proof built from his verified signature registers
+    her state. Bob, on move, forfeits.
+- **`test_ecdsaOnly_delegatedSessionKey_closeNeedsRealSignature`.** The same delegated key's junk Close signature is
+  refused; its real one closes.
+- **`test_ecdsaOnly_malleableFormsRefused`.** A high-`s` twin and `v` as 0/1 are refused, though `ecrecover` maps the
+  twin to the signer.
+
+`ChannelHub.erc1271.t.sol`'s `test_contractSignerAccepted` becomes `test_contractSignerRefused`.
+
+The SDK adds three tests (`eip712.test.ts`, `session.test.ts`), and all three fail on the previous SDK:
+- recovery refuses the twin, `v` as 0/1, and 64- and 66-byte signatures;
+- a session refuses them in a relayed move and in a Close signature;
+- `challengeProof()` leaves out a lone opening signature (final review A m-3).
+
+### 7.5 Gas and size
+
+Measured with forge 1.8.3 on the standard EVM, before (`f1f7e83`) and after (`aa5ddfc`):
+
+| Measure | Before | After | Change |
+|---|---:|---:|---:|
+| `challenge`, heaviest stalemate (`Gas.t.sol`) | 2,023,651 | 2,023,507 | −144 |
+| `respond`, heaviest stalemate | 1,860,614 | 1,860,470 | −144 |
+| `respond`, heaviest stalemate, co-signed `latest` | 1,866,470 | 1,866,278 | −192 |
+| `respond` median, `ChannelHub.dispute.t.sol`'s 26 earlier tests (`--gas-report`) | 129,624 | 129,576 | −48 |
+| `closeCooperative` median, `ChannelHub.close.t.sol` | 72,735 | 69,851 | −2,884 |
+| Runtime size | 13,026 B | 12,927 B | −99 B |
+| Initcode size | 14,016 B | 13,917 B | −99 B |
+| Deploy `gasUsed`, local stock anvil, same constructor arguments | 3,024,892 | 3,003,483 | −21,409 |
+
+- **Valid signatures cost slightly less.** The ECDSA path is unchanged, and the fallback's code is gone.
+- **Refused signatures cost much less.** An invalid signature no longer pays for a `staticcall` to the signer: a cold
+  account access, and a copy of the bytes. Two figures show it. The `closeCooperative` median falls by 2,884 because
+  the suite includes refused Close signatures. The 200 KB junk challenge in `test_I1_challenge_…` reverts at 995,640
+  gas instead of 1,266,623.
+- **The worst case is unchanged in practice:** $2{,}023{,}507 / 30{,}000{,}000 \approx 6.7\%$ of Arc's block.
+
+### 7.6 Mutants
+
+`scripts/tools/mutants.sh` now anchors every mutant on the text of the line it changes. Removing the import shifts every line
+below it, which would have moved the 10 mutants still addressed by line number (§2.2). Seven of those rewrite the
+whole line at their number, so they would have silently mutated a different line.
+
+Each mutant also declares how many lines it changes (default 1). The run fails, as `NOT_APPLIED` or `MISAPPLIED`, if
+the diff against the pristine hub does not match.
+
+New mutant **E1** restores the ERC-1271 fallback inline. It changes two lines, because `_signedBy` also turns from
+`pure` to `view`. It is killed by exactly the four I-1 tests: `test_contractSignerRefused` and the first three of
+§7.4.
+
+### 7.7 Gates, run on `aa5ddfc`–`aeed9dc`
+
+| Gate | Result |
+|---|---|
+| `forge test --root contracts` | **169 passed, 0 failed** (19 suites): 164 before, plus 4 I-1 tests and `Deploy.t.sol` |
+| Mutants (`scripts/tools/mutants.sh`, profile `mutation`, seed `0x1`) | **28/28 killed**, 10m58s (27 before, plus E1) |
+| Slither (`scripts/tools/slither.sh`) | **0 High, 0 Medium**, exit 0. 2 informational, both in chess code, as before |
+| Echidna 2.3.3 (`scripts/tools/echidna.sh`) | **4/4 properties pass**, 50,105 calls, seed 7006971862442609919. The harness now signs with real keys (hevm `sign`). Its old accept-all ERC-1271 signers would have made every signed action revert silently, so the properties would have passed vacuously. A probe run (20,222 calls) confirmed that `closeCooperative`, a signed `challenge`, `respond` and `timeout` each succeed |
+| Deep profile (`ARENA_DEEP_VECTORS=1 FOUNDRY_PROFILE=deep forge test --root contracts`) | **244 passed, 0 failed, 126 skipped (370)**, on the existing deep vectors (generated 2026-09-28; the chess code has not changed since 2026-09-25) |
+| `packages/sdk` (`vitest run`, under `flock /tmp/claude-1000/arena-8546.lock`) | **15 files, 250 tests passed**. That includes the lifecycle tests against this hub on anvil, and `abi.test.ts` |
+
+`test:cli`, `test:server`, `test:system` and `test:arc` were not run for this change. The controller runs them on the
+release commit (gates item 9).
+
+### 7.8 Redeploy
+
+- **The hub's bytecode changed, so the testnet hub needs a redeploy.**
+  - The current testnet hub, `0x9b8B…bA41`, still has the ERC-1271 fallback.
+  - The redeploy costs about 0.10 USDC, like §5.2's, since `ChessRules` is redeployed with the hub.
+  - Then the rehearsal is rerun on the new hub (`mainnet-gates.md` item 4).
+  - The controller does both, with the testnet deployer as the only sender.
+- **Nothing was deployed or sent for this change.** The only chains used were forge's in-process EVM and a
+  throwaway local anvil, for the deploy-gas figure.
+- **The mainnet steps are in `docs/superpowers/arc-mainnet-runbook.md`.**

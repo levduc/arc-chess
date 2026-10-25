@@ -2,7 +2,7 @@
 
 On-chain half of the Agent Chess Arena (spec: `docs/superpowers/specs/2026-09-24-agent-chess-arena-design.md`).
 
-- `ChannelHub` — escrow, EIP-712 signature checks (ECDSA + ERC-1271), force-move disputes, fee payout.
+- `ChannelHub` — escrow, EIP-712 signature checks (ECDSA only), force-move disputes, fee payout.
 - `IGameRules` — game template interface. `ChessRules` — chess template.
 - `ChessBoard` / `ChessMoves` — packed encoding and legality (see the encodings below).
 
@@ -12,7 +12,8 @@ On-chain half of the Agent Chess Arena (spec: `docs/superpowers/specs/2026-09-24
     pnpm test:contracts          # vectors + full forge test suite
     pnpm analyze:slither         # Slither static analysis on src/ (scripts/tools/slither.sh)
     pnpm fuzz:echidna            # Echidna property fuzzing on ChannelHub (scripts/tools/echidna.sh)
-    forge script script/Deploy.s.sol --rpc-url <rpc> --broadcast --private-key <key>
+    forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast --private-key <anvil dev key>
+                                 # local anvil only; Arc: docs/superpowers/arc-mainnet-runbook.md (keystore, never --private-key)
 
 `pnpm analyze:slither` runs Slither (via `uvx`, pinned in the script) against `contracts/src/`, excluding
 `lib/`, `test/`, `script/` and `echidna/`. Pass bar: zero High or Medium findings on `src/` (excluding
@@ -25,14 +26,15 @@ use) against `contracts/echidna/HubProperties.sol`, a self-contained harness (it
 ChessRules and ChannelHub) that restates invariants 1, 2, 4 and 7 of `ChannelHub.invariant.t.sol` as
 `echidna_*` properties over `deposit`/`fund`/`reclaim`/close-on-opening/`challenge`/`respond`/`timeout`
 actions. It is a second, coverage-guided opinion alongside Task 3's deep Foundry invariant/fuzz suite, not a
-replacement for it — Echidna has no `vm.sign`/`vm.prank`/`vm.warp` equivalent, so the harness stands in with
-mock ERC-1271 "always valid" signers and forwarder "wallet" contracts instead of real signatures and sender
-impersonation. It requires `forge` on PATH; the script itself writes a repo-local, pinned `crytic-compile`
+replacement for it. Its signatures are real: the session keys are fixed private keys, signed with hevm's `sign`
+cheatcode, which Echidna provides (the hub accepts ECDSA only). In place of sender impersonation it uses forwarder
+"wallet" contracts. It requires `forge` on PATH; the script itself writes a repo-local, pinned `crytic-compile`
 wrapper into the gitignored `tools/bin/` (which runs it via `uvx` on demand) rather than installing anything
 globally.
 
 Deploy env: `ARENA_OWNER`, `ARENA_FEE_RECIPIENT`, `ARENA_TOKEN` (required on every chain except the local
-chain 31337, where MockUSDC is deployed if it is unset; elsewhere the script reverts without it),
+chain 31337, where MockUSDC is deployed if it is unset; elsewhere the script reverts without it; on Arc, 5042 and
+5042002, it must be USDC `0x3600000000000000000000000000000000000000`, or the script reverts),
 `ARENA_FEE_PER_PLAYER` (default 5000 = $0.005), `ARENA_MAX_FEE_PER_PLAYER` (default 1000000),
 `ARENA_MAX_DEPOSIT_PER_PLAYER` (default 10000000 = 10 USDC), `ARENA_MAX_COMMITTED_ESCROW` (default
 1000000000 = 1,000 USDC). The last two are the spec §13 launch limits (see "Admin surface" below); they are
@@ -57,9 +59,19 @@ Output: `deployments/<chainId>.json` → `{ token, chessRules, channelHub }`.
 
 ## Signatures
 
-`ChannelHub` verifies signatures ECDSA-first: `ECDSA.tryRecover` against the signer, and only if that fails
-an ERC-1271 `isValidSignature` call on the signer. A session key that later gains code (e.g. an EIP-7702
-delegation) therefore cannot revoke ECDSA signatures it already produced, while contract signers still work.
+`ChannelHub` verifies every state and Close signature with ECDSA only: OpenZeppelin's `ECDSA.tryRecover` must
+recover the slot's signer from a 65-byte signature with `v` 27 or 28 and a low `s`. An empty slot is never a
+signature. There is no ERC-1271 fallback (owner decision 2026-10-25, final review A I-1).
+
+- **Why.** A signer whose code accepts any bytes could otherwise put signatures in a proof that no client can
+  verify, and lock a channel that only it could unlock. Such a signer is a contract, or a session key under an
+  EIP-7702 delegation, which Arc supports.
+- **A session key that gains code still works.** An EIP-7702-delegated key's ECDSA signatures are checked against
+  its address, so they verify as before, and gaining code cannot revoke a signature already made (ruling R13).
+- **A contract cannot be a signer.** A channel that names one can still settle: a challenge on the opening state
+  needs no signature.
+- **The SDK checks the same form** (`recoverStateSigner`, `recoverCloseSigner`). So a session never stores a
+  signature the hub would refuse.
 
 ## Trust assumptions
 

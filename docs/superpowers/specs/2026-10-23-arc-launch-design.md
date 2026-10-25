@@ -114,17 +114,20 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
 ## 5. Mainnet deploy (gated)
 
 - **Owner inputs, at that step:**
-  - the owner address (multisig if available) and the fee recipient;
+  - the multisig address, which must exist on Arc mainnet, and the fee recipient;
   - the limits and fee;
   - a funded deployer: the owner's own wallet or a fresh key, holding a few USDC on Arc;
   - an explicit "go".
-- **Then:**
-  - deploy with the same script, with the key in a Foundry encrypted keystore (`--account`) or a hardware wallet:
-    never `--private-key` on argv, never an exported variable (mainnet-gates item 4);
-  - verify the source;
-  - commit `contracts/deployments/5042.json`;
-  - pin `KNOWN_DEPLOYMENTS[5042]`;
-  - if the owner is a multisig, complete the `Ownable2Step` acceptance.
+- **Then, following `docs/superpowers/arc-mainnet-runbook.md`:**
+  - deploy with the same script, with `ARENA_OWNER` set to the **deployer**, and with the key in a Foundry encrypted
+    keystore (`--account`) or a hardware wallet: never `--private-key` on argv, never an exported variable
+    (mainnet-gates item 4). The chain id (5042) is asserted before the dry run and again before the broadcast;
+  - reconcile the dry run's `deployments/5042.json` with the broadcast, then verify the source;
+  - hand ownership to the multisig: the deployer calls `transferOwnership(multisig)`, and the multisig itself calls
+    `acceptOwnership()` on Arc. The constructor sets `ARENA_OWNER` as owner directly, so this two-step hand-over is
+    what proves the multisig can transact on Arc before it holds the pause key. Renouncing is disabled;
+  - confirm `owner()` is the multisig, then commit `contracts/deployments/5042.json` and pin
+    `KNOWN_DEPLOYMENTS[5042]`.
 - **Production server config template:** `docs/deploy/arc-mainnet.server.json.example` with Arc mainnet values,
   the launch limits, and `cli` and `xmtp` left for the owner to fill in once those exist.
 

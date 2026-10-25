@@ -53,14 +53,37 @@ The validator set is permissioned at launch. The network itself is public.
   | `deposit` | 394k (first) / 76k (second) |
 
   The 2.02M figure above is the worst-case budget.
+- **`eth_getLogs` response times** (added 2026-10-25; h3-rereview M-f, final reviews A and C). Each was a single
+  read-only call:
+  - **Mainnet** (`rpc.mainnet.arc.io`): the USDC contract `0x3600…` over 1,000 blocks returned 565 logs in
+    **0.087 s**.
+  - **Testnet**: the hub `0x9b8B…` with 7 topics, over blocks 68,935,011–68,936,010, returned HTTP 200 in
+    **0.077 s**. The window held 0 logs, so this is a lower bound.
+
+  Both are far under the SDK transport's 5 s per-attempt timeout. Other requests from the same IP were answered 429
+  / `-32005` in about 0.06 s, because a live stack shared the public RPC. Repeat the measurement on the RPC the
+  mainnet host will use, at deploy (`arc-mainnet-runbook.md` §9).
 
 ## Other differences
 
 - `PREVRANDAO` = 0. We use no on-chain randomness.
 - Blob transactions are not supported.
 - SELFDESTRUCT follows EIP-6780, plus Arc's native-value rules.
-- Most contracts deploy unchanged; Arc targets the Osaka baseline.
+- Most contracts deploy unchanged; Arc targets the Osaka baseline. That includes EIP-7702 set-code transactions:
+  "Arc targets the Osaka hard fork as its baseline, including features such as EIP-7702 (set-code transactions)…
+  behave as on Ethereum" (`evm-differences.md`, as quoted in final review A). Any session key can therefore gain
+  code. This is why the hub verifies ECDSA only, with no ERC-1271 fallback (final review A I-1, owner decision
+  2026-10-25).
 - For Arc-accurate local tests, use Arc Foundry (`arc-anvil --network arc`, `arc-forge`, `arc-cast`). Standard `anvil` does not model native USDC.
+
+## Explorer and source verification (checked 2026-10-25)
+
+- `explorer.arc.io` answers a scripted GET of `/api/v2/smart-contracts/verification/config` with HTTP 403: a
+  Cloudflare "Just a moment…" challenge page. The T5 review saw the same 403. `explorer.testnet.arc.io` serves the
+  same API to scripts (`arc-testnet-rehearsal.md` §1).
+- Sourcify's `/server/chains` lists both 5042 ("Arc Mainnet") and 5042002 as supported.
+- So on mainnet, `scripts/verify-arc.sh`'s explorer steps may be blocked, while Sourcify's still work
+  (`arc-mainnet-runbook.md` §7).
 
 ## Other Circle contracts on mainnet
 

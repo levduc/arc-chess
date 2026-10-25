@@ -151,8 +151,8 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   a watchtower.
 - **H4 (agent journey, from the live run's frictions).** `arena fund` leads with `tellYourHuman` and a `disclosure`;
   `arena daemon --detach` keeps the daemon alive past the agent's tool session; skill.md picks a random matching
-  offer and explains `chainStale`. Open: a detached daemon keeps running after the agent finishes (by design);
-  `arena daemon stop` is being added so an agent under a narrow tool allowlist can stop or restart it.
+  offer and explains `chainStale`. A detached daemon keeps running after the agent finishes (by design);
+  `arena daemon stop` (`8e7eb93`) lets an agent under a narrow tool allowlist stop or restart it.
 - [ ] **Re-run the live agent test after H4** and check: each agent writes the funding ask in its own reply before
   `wallet --wait-for-usdc`; it states the audit text and caps before funding; `daemon --detach` survives the session;
   concurrent agents pick different offers.
@@ -210,23 +210,38 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
      mainnet 5042 pin is Task 6's, after the mainnet deploy.)
    - Offer signature verified on accept (m6).
    - A supervisor or auto-restart is documented, and memory stays flat over 60 min (I3).
-4. **Deployment and ownership.**
-   - `ARENA_TOKEN` is set explicitly to Arc USDC (the script reverts on non-local chains without it; confirm the value).
-   - `ARENA_OWNER` is a multisig. `ARENA_FEE_RECIPIENT` is set.
+4. **Deployment and ownership.** The steps are in `docs/superpowers/arc-mainnet-runbook.md`, which is self-contained.
+   - [ ] **The ECDSA-only hub is redeployed on Arc testnet and the rehearsal rerun on it.** On 2026-10-25 the owner
+     decided that the hub verifies ECDSA only (final review A I-1, `aa5ddfc`). The bytecode changed, so the testnet
+     hub `0x9b8B…bA41` still has the ERC-1271 fallback. The controller redeploys after the final fix wave, with the
+     testnet deployer as the only sender. Then it reruns the rehearsal and updates `contracts/deployments/5042002.json`
+     and `KNOWN_DEPLOYMENTS[5042002]`.
+   - `ARENA_TOKEN` is set explicitly to Arc USDC. The script reverts without it on any chain but 31337, and on 5042 and
+     5042002 it reverts for any token but `0x3600…0000` (`21bd2da`, final review A m-1).
+   - The owner ends as a multisig that exists on Arc (last bullet). `ARENA_FEE_RECIPIENT` is set, to an address that
+     can transact on Arc, since only it can `claim()` a payout deferred to it.
    - The fee and max fee, and the launch limits (10 USDC / 1,000 USDC suggested), are signed off.
    - Source is verified on the explorer, and `deployments/<chainId>.json` is committed. (Testnet done in Plan 6 Task
      5: both contracts are verified on `explorer.testnet.arc.io`, and `contracts/deployments/5042002.json` is committed
      (rehearsal report §1). That includes the hardened-hub redeploy (`0x9b8B…bA41`, I1/M1/M2), whose `ChannelHub`
      verified cold through `scripts/verify-arc.sh`'s Sourcify import. The script now requires a full match
      (`is_fully_verified`). It is ready for mainnet pending a check of `explorer.arc.io`'s API: in the T5 review, its
-     `/api/v2/smart-contracts/verification/config` answered 403 to a plain request; Sourcify lists 5042. Mainnet is
-     still to do.)
+     `/api/v2/smart-contracts/verification/config` answered 403 to a plain request; Sourcify lists 5042. Re-checked
+     2026-10-25: still 403, a Cloudflare "Just a moment…" challenge page, and Sourcify lists 5042 as supported. The
+     script reads that endpoint first, so it will probably stop there (runbook §7). Mainnet is still to do.)
    - [ ] **The mainnet deploy key never touches argv or the environment.** Use a Foundry encrypted keystore
      (`cast wallet import <name> --interactive`, then `forge script … --account <name> --sender <address>`, with a
      password prompt or a 0600 `--password-file`), or a hardware wallet. Never `--private-key` on the command line,
      never an exported variable. The testnet deploys used `--private-key` (rehearsal report §1, "For mainnet
-     (Task 6)").
-   - Ownership acceptance (`Ownable2Step`) is completed and tested.
+     (Task 6)"); mainnet follows the runbook's §2.
+   - [ ] **Ownership is handed to the multisig on Arc** (runbook §8).
+     - Deploy with `ARENA_OWNER` set to the deployer. The deployer then calls `transferOwnership(multisig)`, and the
+       multisig itself calls `acceptOwnership()` on Arc. That is the multisig's own transaction there, which proves
+       it can transact on Arc before it holds the pause key.
+     - Afterwards `owner()` reads the multisig and `pendingOwner()` reads zero. Record both transaction hashes.
+     - Deploying with `ARENA_OWNER` set to the multisig would skip that proof, because the constructor sets the
+       owner directly and there is nothing to accept. A Safe that exists only on another chain, or a typo, could
+       then be fixed only by a redeploy. Renouncing is disabled (audit M2).
 5. **Host production config.**
    - WS and HTTP limits come from load data (m8).
    - `fundingWindow` ≤ 7200.
@@ -242,14 +257,15 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
    - The multisig pause procedure and who can sign within minutes.
    - The cap-raise policy.
    - Incident response for a suspected hub defect: pause, let channels settle, redeploy.
-   - Key custody. Never renounce ownership (m15).
+   - Key custody. Never renounce ownership (m15); the hub enforces this on-chain (audit M2).
 8. **Docs.**
    - The spec's Plan 4.5 refinement block and the `TxSender` contract (I1).
    - skill.md's Arc gas wording (m11) and the settle/`wait` guidance (m4). (Arc wording: done in hardening wave H2, `2bbdf58`; spec §12 item 66. Still to do: read it back from the deployed mainnet host before launch.)
-   - The spec's Plan 6 refinement block (spec §12 items 60–66). (Done in H2.)
+   - The spec's Plan 6 refinement block (spec §12 items 60–68). (Done in H2.)
    - The admin-surface caveats (m13, m14).
 9. **A final test gate on the release commit.**
-   - `test:contracts`, plus the deep profile, mutants 18/18, Slither 0 High/Medium, and Echidna.
+   - `test:contracts`, plus the deep profile, mutants 28/28 (`scripts/tools/mutants.sh`: the original 18, I1a–I1e,
+     M2a–M2b, M1a–M1b and E1), Slither 0 High/Medium, and Echidna.
    - `test:sdk`, `test:cli` and `test:server`, each run on its own.
    - `test:system` twice.
    - A 60-minute soak.
