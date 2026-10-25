@@ -607,7 +607,7 @@ describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
     const refused = proc.daemon.withdraw({ amount: 1_000_000n });
     await expect(refused).rejects.toMatchObject({ code: 409 });
     await expect(refused).rejects.toThrow(`offer ${own} was matched`);
-    await expect(refused).rejects.toThrow(/funding window has closed\. If this persists, restart the daemon\.$/);
+    await expect(refused).rejects.toThrow(/funding window has closed\. If this persists, restart the daemon once no channel is live \(otherwise tell your human\)\.$/);
     expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
   });
 
@@ -629,7 +629,7 @@ describe("withdraw never starves a pending deposit (Review Focus 4)", () => {
     const refused = proc.daemon.withdraw({ amount: 1_000_000n });
     await expect(refused).rejects.toMatchObject({ code: 409 });
     await expect(refused).rejects.toThrow(offerId);
-    await expect(refused).rejects.toThrow("If this persists, restart the daemon.");
+    await expect(refused).rejects.toThrow("If this persists, restart the daemon once no channel is live (otherwise tell your human).");
 
     const givingUp = () => logs.filter((l) => l.startsWith(`giving up on the match for offer ${offerId}`));
     await waitFor(() => givingUp().length > 0, 30_000, "the capped match given up");

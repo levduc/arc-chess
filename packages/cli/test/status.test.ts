@@ -298,6 +298,26 @@ describe("buildStatus", () => {
     expect(view(a, rec(0), none).suggestedActions).toEqual(["wait: the channel is being funded"]);
     expect(view(a, { ...rec(0), finalized: true }, none).suggestedActions[0]).toMatch(/^done: the funding window closed/);
   });
+
+  it("final fix wave B (m-3, m-5): a lobby refusal never leads a finalized record; on a live one, the restart waits for no live channel", async () => {
+    const { a, rec } = await sessions();
+    const lobbyError = "too many watched offers";
+    const at = (record: ChannelRecord, chain: ChainView) =>
+      buildStatus({ record, snapshot: a.snapshot(), myTurn: a.isMyTurn(), chain, lastError: null, lobbyError });
+    // Retired (None/Funding, finalized) or settled: the first suggested action is still `done:` (skill.md's rule).
+    for (const phase of ["None", "Funding", "Finalized", "Reclaimed"]) {
+      const s = at({ ...rec(0), finalized: true }, { ...OPEN, phase, funded: [false, false] });
+      expect(s.suggestedActions[0], phase).toMatch(/^done: /);
+      expect(s.suggestedActions.join("\n"), phase).not.toMatch(/restart/);
+      expect(s.lobbyError).toBe(lobbyError); // still reported
+    }
+    // A live channel: named first, and only once no channel is live.
+    expect(at(rec(0), OPEN).suggestedActions[0]).toBe(
+      'restart this daemon once no channel is live ("arena daemon stop", then "arena daemon --detach"; until then keep ' +
+        `playing, and tell your human if it persists): the host refused a subscribe (${lobbyError}) -- new offers/accepts ` +
+        "are refused until then",
+    );
+  });
 });
 
 // Plan 6 hardening H2 (audit-journey I-2): on Arc, session-gas-low is worded in USDC, with the amount to send.

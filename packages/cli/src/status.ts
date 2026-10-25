@@ -405,8 +405,14 @@ export function buildStatus(input: StatusInput): ChannelStatus {
           : "; if they cannot, take the seat back (arena handoff agent) and move"),
     );
   }
-  if (input.lobbyError) {
-    suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
+  // Final fix wave B (m-3): never on a finalized record (a retired channel is still in `live` for a while): its first
+  // action stays `done:`. m-5: `daemon stop` refuses while any channel is live, so the restart waits for that.
+  if (input.lobbyError && !record.finalized) {
+    suggestedActions.unshift(
+      `restart this daemon once no channel is live ("arena daemon stop", then "arena daemon --detach"; until then keep ` +
+        `playing, and tell your human if it persists): the host refused a subscribe (${input.lobbyError}) -- new ` +
+        "offers/accepts are refused until then",
+    );
   }
   if (gasLow) suggestedActions.unshift(sessionGasLowAction(record.channelId, gasLow, input.gasFunding, input.sessionGasLowCause));
   // H1 fix round 1 (review m-2): a skipped block is shown from the record, whatever `lastError` says.

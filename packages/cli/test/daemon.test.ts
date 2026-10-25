@@ -153,9 +153,11 @@ describe("ArenaDaemon core", () => {
     const status = await pair.alice.daemon.status(id);
     expect(status.lobbyError).toBe("too many watched offers");
     expect(status.suggestedActions[0]).toMatch(/restart this daemon.*too many watched offers/);
+    // Final fix wave B (m-5): `daemon stop` refuses while a channel is live, so the restart says it waits for that.
+    expect(status.suggestedActions[0]).toMatch(/^restart this daemon once no channel is live \("arena daemon stop", then "arena daemon --detach"; until then keep playing, and tell your human if it persists\)/);
     await expect(
       pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n }),
-    ).rejects.toThrow(/too many watched offers/);
+    ).rejects.toThrow(/too many watched offers\); restart this daemon to recover, once no channel is live \(otherwise tell your human\)$/);
     const { offerId: secondOfferId } = await pair.bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await expect(pair.alice.daemon.acceptOffer(secondOfferId)).rejects.toThrow(/too many watched offers/);
   });

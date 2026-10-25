@@ -1030,7 +1030,8 @@ export class ArenaDaemon {
           `${awaiting.reasons.join("; ")} -- a withdraw now could leave it without the USDC to deposit. Retry once it is ` +
             "funded, or once its funding window has closed" +
             // Fix round 4 (N3): a retried match that keeps failing holds withdraws up until MAX_MATCH_RETRIES drops it.
-            (awaiting.retriedMatches > 0 ? ". If this persists, restart the daemon." : ""),
+            // Final fix wave B (m-5): `daemon stop` refuses while a channel is live, so the restart waits for that.
+            (awaiting.retriedMatches > 0 ? ". If this persists, restart the daemon once no channel is live (otherwise tell your human)." : ""),
         );
       }
 
@@ -1738,7 +1739,8 @@ export class ArenaDaemon {
     if (this.lobbyError) {
       throw new DaemonError(
         503,
-        `the host refused this connection's last subscribe (${this.lobbyError}); restart this daemon to recover`,
+        `the host refused this connection's last subscribe (${this.lobbyError}); restart this daemon to recover, once no ` +
+          "channel is live (otherwise tell your human)",
       );
     }
   }
