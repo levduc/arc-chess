@@ -2,7 +2,7 @@
  * `pnpm testnet:up [--port 8090] [--rpc URL] [--public-rpc URL] [--house-bots 2] [--bot-usdc 2.5] [--bot-deposit 1]
  *   [--bot-stake 0.1] [--bot-timeout SECONDS] [--xmtp-bots] [--limits JSON] [--start-block N] [--dir PATH]`
  * `pnpm testnet:down [--withdraw] [--settle-seconds 120] [--dir PATH]`
- * `<dir>/bin/pay <agent address> <usdc>` | `<dir>/bin/pay balance` (also `pnpm testnet:up pay ...`)
+ * `<dir>/human/pay <agent address> <usdc>` | `<dir>/human/pay balance` (also `pnpm testnet:up pay ...`)
  *
  * T5b: a persistent Agent Chess Arena stack on Arc TESTNET (chain 5042002), for testing by hand with real agents and
  * faucet USDC. The counterpart of `pnpm dev:up` (scripts/dev-up.ts), minus Anvil and the deployment: the contracts are
@@ -25,12 +25,12 @@
  *     refused, because the server's database and every bot home are bound to the old one (and may hold funds). Every
  *     existing bot home is checked here too, before anything starts: its hub, and `--bot-timeout` against its own
  *     `minChallengeTimeout` (a bot asked for offers below it exits at once).
- *  4. Writes `<dir>/bin/arena` (the CLI wrapper, advertised as the server's `cliCommand`) and `<dir>/bin/pay` (the
+ *  4. Writes `<dir>/bin/arena` (the CLI wrapper, advertised as the server's `cliCommand`) and `<dir>/human/pay` (the
  *     human's funding helper, see below), then starts the host server with `xmtp: {env: "dev"}`, no faucet, and
  *     per-IP limits sized for a loopback-only server (`TESTNET_SERVER_LIMITS`, overridable with `--limits`).
  *  5. `--house-bots` house bots, each in its own ARENA_HOME `<dir>/house-bots/house-<i>`: `arena init` once (owner
  *     recorded as the deployer, so `withdraw` pays back there), then `arena bot --allow-real-chain`. Once its API
- *     answers, the bot is topped up through `<dir>/bin/pay` to `--bot-usdc` counted over everything it holds: its
+ *     answers, the bot is topped up through `<dir>/human/pay` to `--bot-usdc` counted over everything it holds: its
  *     wallet, its share of every channel that is not finalized, and the session gas not yet swept back. A restart
  *     mid-game pays nothing for the escrow. `--bot-usdc 0` funds nothing. `--xmtp-bots` also runs `arena xmtp
  *     enable` (one install, symlinked into every other bot home). A bot that exits before `up` is ready fails `up`.
@@ -53,7 +53,12 @@
  * `arena withdraw --all`: the bot's USDC goes to its owner, the deployer. A channel in the middle of a game is never
  * closed; it is listed.
  *
- * `<dir>/bin/pay` sends testnet USDC (a native transfer: on Arc, USDC is the gas token, one balance) from the
+ * Every child (the server, the bots, each CLI call, the pay helper) gets an allowlist of this process's environment
+ * (`arc-rehearsal-lib.ts`'s `childEnv`: `PATH`, the locale, proxies, `NODE_*`, …) plus `HOME` and its `ARENA_HOME`,
+ * never the whole of it: a key exported in the operator's shell never reaches them, nor the `npm install` (and its
+ * third-party postinstall scripts) that `arena xmtp enable` runs.
+ *
+ * `<dir>/human/pay` sends testnet USDC (a native transfer: on Arc, USDC is the gas token, one balance) from the
  * deployer to an agent. It reads the deployer key from `~/.config/arena-deploy/arc-testnet-deployer.json` itself,
  * inside its own process, at call time: the key is never printed, logged, written under `--dir`, or put on a
  * command line. It asserts chain 5042002 (twice: before it reads the key and right before it sends), refuses more
@@ -76,6 +81,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -111,6 +117,7 @@ import {
 import { oneBalanceOpenNeed } from "../packages/cli/src/funding.js";
 import { channelHubAbi } from "../packages/sdk/src/abi.js";
 import { writeArenaWrapper } from "../tests/system/claude-sandbox.js";
+import { childEnv as allowlistedEnv } from "./arc-rehearsal-lib.js";
 
 // ------------------------------------------------------------------------------------------------- constants
 
@@ -515,15 +522,30 @@ export function buildServerConfig(o: {
 
 // ------------------------------------------------------------------------------------------- pay helper
 
-/** Writes `<dir>/bin/pay`, the human's funding helper: a wrapper that runs this file's `pay` subcommand, through
- *  the stack's `--rpc` when that is not the public one. It names only this script and that RPC; the key is read by
- *  that process itself (see `loadDeployer`). Single-quoted like `writeArenaWrapper`. */
+/** Writes `path` (mode 700) by a rename, so a shell still reading the old file keeps reading the old file. */
+function writeScript(path: string, lines: string[]): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, lines.join("\n"), { mode: 0o700 });
+  chmodSync(tmp, 0o700);
+  renameSync(tmp, path);
+}
+
+/**
+ * Writes `<dir>/human/pay`, the human's funding helper: a wrapper that runs this file's `pay` subcommand, through the
+ * stack's `--rpc` when that is not the public one. It names only this script and that RPC; the key is read by that
+ * process itself (see `loadDeployer`). Single-quoted like `writeArenaWrapper`.
+ *
+ * Final review C m-8: not in `<dir>/bin/`, which `claude-opponent.ts` puts on the agent's PATH for the `arena`
+ * wrapper. There, an agent allowed more than its tool list could pay itself from the deployer, and skip the "ask your
+ * human" step this stack exists to test. A `bin/pay` an earlier run wrote is replaced by a stub that pays nothing and
+ * says where the helper went.
+ */
 export function writePayWrapper(dir: string, rpcUrl: string = RPC_URL): string {
-  const binDir = join(dir, "bin");
-  mkdirSync(binDir, { recursive: true });
-  const path = join(binDir, "pay");
+  const humanDir = join(dir, "human");
+  mkdirSync(humanDir, { recursive: true, mode: 0o700 });
+  const path = join(humanDir, "pay");
   const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-  writeFileSync(
+  writeScript(
     path,
     [
       "#!/bin/sh",
@@ -532,9 +554,18 @@ export function writePayWrapper(dir: string, rpcUrl: string = RPC_URL): string {
       "#   pay balance                  show the deployer's balance",
       `exec ${sq(process.execPath)} ${sq(TSX_CLI)} ${sq(SELF)} pay ${rpcUrl !== RPC_URL ? `--rpc ${sq(rpcUrl)} ` : ""}"$@"`,
       "",
-    ].join("\n"),
+    ],
   );
-  chmodSync(path, 0o700);
+  const old = join(dir, "bin", "pay");
+  if (existsSync(old)) {
+    writeScript(old, [
+      "#!/bin/sh",
+      "# testnet:up's funding helper moved out of bin/ (bin/ is on the agent's PATH). This stub pays nothing.",
+      `echo ${sq(`pay moved: run ${path} instead (the human's helper is kept off the agent's PATH)`)} >&2`,
+      "exit 1",
+      "",
+    ]);
+  }
   return path;
 }
 
@@ -902,10 +933,17 @@ export function unlessExits<T>(child: ChildProcess, label: string, work: Promise
 /** Children that are still running a one-shot CLI command (init, owner, channels, ...): stopped by teardown too. */
 const inflight = new Set<ChildProcess>();
 
+/** Final review C m-9: a child's environment (see this file's docstring): the allowlist of `parent`, plus `HOME` --
+ *  the real one: the pay helper finds the deployer key under it, and npm its cache -- and, for an `arena` process,
+ *  its `ARENA_HOME`. */
+export function testnetChildEnv(home?: string, parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return allowlistedEnv(parent, { HOME: parent.HOME ?? homedir(), ARENA_HOME: home });
+}
+
 /** Runs a one-shot command to completion, capturing its output (never its environment). */
 function run(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; timeoutMs: number }): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, args, { cwd: REPO_ROOT, env: opts.env ?? process.env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd: REPO_ROOT, env: opts.env ?? testnetChildEnv(), stdio: ["ignore", "pipe", "pipe"] });
     inflight.add(child);
     let stdout = "";
     let stderr = "";
@@ -926,20 +964,20 @@ function run(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; timeo
 }
 
 function arena(home: string, args: string[], timeoutMs = 120_000) {
-  return run(process.execPath, [CLI_BIN, ...args], { env: { ...process.env, ARENA_HOME: home }, timeoutMs });
+  return run(process.execPath, [CLI_BIN, ...args], { env: testnetChildEnv(home), timeoutMs });
 }
 
 /** A pay helper call that is still running: teardown waits for it (it may already have broadcast). */
 let payInFlight: Promise<unknown> | undefined;
 
 /**
- * Fix round 1 (m-4): runs `<dir>/bin/pay` detached (a terminal Ctrl-C never reaches it), its stderr -- the hash and
+ * Fix round 1 (m-4): runs `<dir>/human/pay` detached (a terminal Ctrl-C never reaches it), its stderr -- the hash and
  * explorer link as soon as it sends -- streamed straight to ours, and registered so teardown waits for it instead of
  * killing a transfer mid-flight. It is bounded by its own receipt wait.
  */
 function runPay(payPath: string, to: Address, usdc: string): Promise<{ code: number | null; stdout: string }> {
   const p = new Promise<{ code: number | null; stdout: string }>((resolvePromise, reject) => {
-    const child = spawn(payPath, [to, usdc], { cwd: REPO_ROOT, detached: true, stdio: ["ignore", "pipe", "inherit"] });
+    const child = spawn(payPath, [to, usdc], { cwd: REPO_ROOT, env: testnetChildEnv(), detached: true, stdio: ["ignore", "pipe", "inherit"] });
     let stdout = "";
     child.stdout?.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
     child.once("error", reject);
@@ -1294,7 +1332,7 @@ async function up(args: UpArgs): Promise<void> {
   const serverLog = join(logsDir, "server.log");
   process.stderr.write(`testnet-up: starting the host server on 127.0.0.1:${args.port} (logging to ${serverLog})\n`);
   const serverFd = openSync(serverLog, "a");
-  server = spawn(process.execPath, [SERVER_BIN, "--config", configPath], { cwd: REPO_ROOT, detached: true, stdio: ["ignore", serverFd, serverFd] });
+  server = spawn(process.execPath, [SERVER_BIN, "--config", configPath], { cwd: REPO_ROOT, env: testnetChildEnv(), detached: true, stdio: ["ignore", serverFd, serverFd] });
   server.on("exit", (code, signal) => {
     if (!shuttingDown) process.stderr.write(`testnet-up: the server exited (code=${code} signal=${signal}); see ${serverLog}\n`);
   });
@@ -1388,7 +1426,7 @@ async function up(args: UpArgs): Promise<void> {
         "--idle-close-seconds", HOUSE_BOT_IDLE_CLOSE_SECONDS,
         ...(args.botTimeout !== undefined ? ["--timeout", String(args.botTimeout)] : []),
       ],
-      { cwd: REPO_ROOT, env: { ...process.env, ARENA_HOME: home }, detached: true, stdio: ["ignore", fd, fd] },
+      { cwd: REPO_ROOT, env: testnetChildEnv(home), detached: true, stdio: ["ignore", fd, fd] },
     );
     bot.on("exit", (code, signal) => {
       if (!shuttingDown) process.stderr.write(`testnet-up: house bot ${name} exited (code=${code} signal=${signal}); see ${log}\n`);
@@ -1598,7 +1636,7 @@ async function withdrawHome(name: string, home: string, logsDir: string): Promis
   say(`testnet-down: ${name}: starting its daemon to sweep and withdraw\n`);
   mkdirSync(logsDir, { recursive: true });
   const fd = openSync(join(logsDir, `${name}-withdraw.log`), "a");
-  const daemon = spawn(process.execPath, [CLI_BIN, "daemon"], { cwd: REPO_ROOT, env: { ...process.env, ARENA_HOME: home }, stdio: ["ignore", "pipe", fd] });
+  const daemon = spawn(process.execPath, [CLI_BIN, "daemon"], { cwd: REPO_ROOT, env: testnetChildEnv(home), stdio: ["ignore", "pipe", fd] });
   try {
     const started = await new Promise<boolean>((resolvePromise) => {
       const timer = setTimeout(() => resolvePromise(false), 60_000);

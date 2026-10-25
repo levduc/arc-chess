@@ -27,7 +27,9 @@
  *  7. Collection: every transaction sent by the deployer, the two wallets and the six session keys during the run
  *     (Blockscout's address listing, checked against each sender's nonce), each receipt's gasUsed x
  *     effectiveGasPrice, the hub-side payouts against the expected ones, and a wallet-side reconciliation to the wei.
- *     Written to `<dir>/result.json` and `<dir>/report-fragment.md`.
+ *     Written to `<dir>/result.json` and `<dir>/report-fragment.md`. Every nonce, balance, listing and hub read is
+ *     taken at the run's last block (`state.json`'s `endBlock`), so `--collect-only` rebuilds the same tables after
+ *     the deployer has sent more, as long as the RPC still serves state that old (it fails naming the block if not).
  *
  * Safety:
  * - The RPC is hard-coded to Arc testnet, and `eth_chainId` is asserted to be 0x4cef52 before every transaction the
@@ -52,7 +54,7 @@
  * that is still running, and its message names the pid. A channel step that was half done resumes from the chain and
  * the daemons' state. One that cannot, such as an offer posted with no channel recorded, stops with "settle it by hand".
  */
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
@@ -74,7 +76,7 @@ import {
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { channelHubAbi } from "../packages/sdk/src/abi.js";
-import { childEnv as allowlistedEnv, isOurs, procStartTime, type ProcEntry } from "./arc-rehearsal-lib.js";
+import { childEnv as allowlistedEnv, checkoutNow, isOurs, procStartTime, sentInRange, type ListedTx, type ProcEntry } from "./arc-rehearsal-lib.js";
 
 // ------------------------------------------------------------------------------------------------- constants
 
@@ -387,21 +389,9 @@ async function cliJson(name: Name, args: string[], timeoutMs?: number, retryRate
   }
 }
 
-/** The checkout's HEAD and its uncommitted source files right now: other agents commit to this checkout while a run
- *  is going, and a child runs whatever is on disk when it is spawned. */
-function checkoutNow(): string {
-  // trimEnd, not trim: porcelain lines start with a status column that may be a space.
-  const git = (args: string[]) => spawnSync("git", args, { cwd: REPO_ROOT, encoding: "utf8" }).stdout.trimEnd();
-  const dirty = git(["status", "--porcelain", "--", "packages", "apps", "contracts/src", "scripts"])
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.slice(3));
-  return `${git(["rev-parse", "--short", "HEAD"])}${dirty.length > 0 ? ` + uncommitted: ${dirty.join(", ")}` : ""}`;
-}
-
 /** Starts a detached long-lived child (its own process group), logging to `logs/<label>.log`. */
 function spawnDetached(label: string, args: string[], env: NodeJS.ProcessEnv): ChildProcess {
-  const checkout = checkoutNow();
+  const checkout = checkoutNow(REPO_ROOT, childEnv());
   state.spawns = [...(state.spawns ?? []), { label, at: new Date().toISOString(), checkout }];
   save();
   progress("spawn", { label, checkout });
@@ -1300,18 +1290,17 @@ type TxRow = {
   value: string;
 };
 
-async function blockscoutFrom(address: Address, fromBlock: bigint): Promise<Hex[]> {
+/** The run's transactions from `address`: Blockscout's listing, kept to blocks `fromBlock`..`toBlock` (final review C
+ *  m-12: never what the address sent after the run). */
+async function blockscoutFrom(address: Address, fromBlock: bigint, toBlock: bigint): Promise<Hex[]> {
   const base = `${EXPLORER}/api/v2/addresses/${address}/transactions?filter=from`;
   const out: Hex[] = [];
   let url = base;
   for (let page = 0; page < 50; page++) {
     const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!res.ok) throw new Error(`blockscout ${url}: ${res.status}`);
-    const d = (await res.json()) as { items: Array<{ hash: Hex; block_number?: number; block?: number; from?: { hash: string } }>; next_page_params: Record<string, unknown> | null };
-    for (const t of d.items) {
-      const b = BigInt(t.block_number ?? t.block ?? 0);
-      if (b >= fromBlock && t.from?.hash?.toLowerCase() === address.toLowerCase()) out.push(t.hash);
-    }
+    const d = (await res.json()) as { items: ListedTx[]; next_page_params: Record<string, unknown> | null };
+    out.push(...sentInRange(d.items, address, fromBlock, toBlock));
     if (!d.next_page_params) break;
     url = `${base}&${new URLSearchParams(Object.entries(d.next_page_params).map(([k, v]) => [k, String(v)]))}`;
   }
@@ -1321,6 +1310,21 @@ async function blockscoutFrom(address: Address, fromBlock: bigint): Promise<Hex[
 async function collect(): Promise<void> {
   if (!state.startBlock || !state.deployerBefore) throw new Error("no run to collect: state.json has no start block");
   const startBlock = BigInt(state.startBlock);
+  // Final review C m-12: every nonce, balance, listing and hub read below is taken at the run's own last block, so a
+  // `--collect-only` rerun after the deployer (or an agent home) has sent anything more still adds up. A run that
+  // stopped before recording one is collected at the current head, and the result says so.
+  const atBlock = state.endBlock !== undefined ? BigInt(state.endBlock) : await pub.getBlockNumber();
+  if (state.endBlock === undefined) state.notes.push(`collected at head ${atBlock}: the run recorded no end block`);
+  const at = async <T>(what: string, fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await read(fn);
+    } catch (err) {
+      throw new Error(
+        `cannot read ${what} at block ${atBlock}, the run's end (does this RPC keep state that old?): ` +
+          `${err instanceof Error ? err.message.split("\n")[0] : String(err)}`,
+      );
+    }
+  };
 
   // Who is who.
   const label = new Map<string, string>([[DEPLOYER.toLowerCase(), "deployer"], [HUB.toLowerCase(), "hub"], [USDC.toLowerCase(), "USDC"]]);
@@ -1348,11 +1352,11 @@ async function collect(): Promise<void> {
   const hashes = new Map<Hex, string>();
   const nonceCheck: Array<{ sender: string; label: string; listed: number; nonceDelta: number; ok: boolean }> = [];
   for (const s of senders) {
-    const nonceEnd = await pub.getTransactionCount({ address: s, blockTag: "latest" });
+    const nonceEnd = await at(`${label.get(s)}'s nonce`, () => pub.getTransactionCount({ address: s, blockNumber: atBlock }));
     const nonceStart = s === DEPLOYER.toLowerCase() ? (state.deployerNonceBefore ?? 0) : 0;
     let listed: Hex[] = [];
     for (let attempt = 0; attempt < 20; attempt++) {
-      listed = await blockscoutFrom(s, startBlock);
+      listed = await blockscoutFrom(s, startBlock, atBlock);
       if (listed.length >= nonceEnd - nonceStart) break;
       await sleep(15_000);
     }
@@ -1446,23 +1450,23 @@ async function collect(): Promise<void> {
   }
   rows.sort((x, y) => (BigInt(x.block) < BigInt(y.block) ? -1 : BigInt(x.block) > BigInt(y.block) ? 1 : 0));
 
-  // Balances now.
+  // Balances at the run's end.
   const balances: Record<string, string> = {};
-  for (const s of senders) balances[label.get(s)!] = (await nativeBalance(s)).toString();
+  for (const s of senders) balances[label.get(s)!] = (await at(`${label.get(s)}'s balance`, () => pub.getBalance({ address: s, blockNumber: atBlock }))).toString();
   const owedNow: Record<string, string> = {};
   for (const s of senders) {
-    const o = (await pub.readContract({ address: HUB, abi: channelHubAbi, functionName: "owed", args: [s] })) as bigint;
+    const o = (await at(`owed(${label.get(s)})`, () => pub.readContract({ address: HUB, abi: channelHubAbi, functionName: "owed", args: [s], blockNumber: atBlock }))) as bigint;
     if (o !== 0n) owedNow[label.get(s)!] = o.toString();
   }
-  const committedEscrow = ((await pub.readContract({ address: HUB, abi: channelHubAbi, functionName: "committedEscrow" })) as bigint).toString();
+  const committedEscrow = ((await at("committedEscrow", () => pub.readContract({ address: HUB, abi: channelHubAbi, functionName: "committedEscrow", blockNumber: atBlock }))) as bigint).toString();
 
   // The hardened hub's surface (audit M1, M2), simulated with eth_call -- nothing is sent. claim() takes no recipient
   // and pays msg.sender: with nothing owed it reverts NothingToClaim; renounceOwnership() always reverts.
   const simulate = async (from: Address, functionName: "claim" | "renounceOwnership"): Promise<string> => {
     try {
       // renounceOwnership is `pure` in the hardened hub (it only reverts), so it is read, not simulated.
-      if (functionName === "renounceOwnership") await pub.readContract({ account: from, address: HUB, abi: channelHubAbi, functionName });
-      else await pub.simulateContract({ account: from, address: HUB, abi: channelHubAbi, functionName });
+      if (functionName === "renounceOwnership") await pub.readContract({ account: from, address: HUB, abi: channelHubAbi, functionName, blockNumber: atBlock });
+      else await pub.simulateContract({ account: from, address: HUB, abi: channelHubAbi, functionName, blockNumber: atBlock });
       return "succeeded";
     } catch (err) {
       const name = (err as { cause?: { data?: { errorName?: string } } }).cause?.data?.errorName;
@@ -1546,7 +1550,7 @@ async function collect(): Promise<void> {
     residual: (BigInt(state.deployerBefore) - heldAll - totalGas).toString(),
   };
 
-  const result = { generatedAt: new Date().toISOString(), hub: HUB, rules: RULES, startBlock: state.startBlock, endBlock: state.endBlock, nonceCheck, rows, balances, owedNow, committedEscrow, hubChecks, hardening, recon, system, channels: state.channels, measures: state.measures, notes: state.notes, withdraws: state.withdraws, spawns: state.spawns ?? [], rateLimited: state.rateLimited ?? {} };
+  const result = { generatedAt: new Date().toISOString(), hub: HUB, rules: RULES, startBlock: state.startBlock, endBlock: state.endBlock, collectedAtBlock: atBlock.toString(), nonceCheck, rows, balances, owedNow, committedEscrow, hubChecks, hardening, recon, system, channels: state.channels, measures: state.measures, notes: state.notes, withdraws: state.withdraws, spawns: state.spawns ?? [], rateLimited: state.rateLimited ?? {} };
   writeFileSync(join(DIR, "result.json"), `${JSON.stringify(result, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2)}\n`);
   writeFileSync(join(DIR, "report-fragment.md"), fragment(result));
   progress("collected", { txs: rows.length, totalGasUsdc: formatUnits(totalGas, 18), systemOk: system.ok, reconOk: recon.every((r) => r.ok), hubOk: hubChecks.every((c) => c.ok), hardeningOk: hardening.every((c) => c.ok), nonceOk: nonceCheck.every((c) => c.ok) });

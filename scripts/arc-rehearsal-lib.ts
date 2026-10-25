@@ -1,7 +1,9 @@
 /**
  * The parts of `scripts/arc-rehearsal.ts` that touch nothing on import, so `tests/system/arc-rehearsal.test.ts` can
- * test them: the environment every child process gets, and how a recorded pid is matched to the process it was.
+ * test them: the environment every child process gets, how a recorded pid is matched to the process it was, the
+ * checkout a child runs, and which explorer-listed transactions belong to the run.
  */
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
 /**
@@ -103,4 +105,36 @@ export function isOurs(entry: ProcEntry | number | undefined, args: readonly str
   if (procState(entry.pid) === "Z") return false;
   const cmd = procArgs(entry.pid);
   return args.every((a) => cmd.includes(a));
+}
+
+/**
+ * The checkout's HEAD and its uncommitted source files right now: other agents commit to this checkout while a run is
+ * going, and a child runs whatever is on disk when it is spawned. Final review C (t5-rereview): `git` runs with `env`,
+ * the same allowlist as every other child, never this process's whole environment.
+ */
+export function checkoutNow(repoRoot: string, env: NodeJS.ProcessEnv): string {
+  // trimEnd, not trim: porcelain lines start with a status column that may be a space.
+  const git = (args: string[]) => spawnSync("git", args, { cwd: repoRoot, env, encoding: "utf8" }).stdout.trimEnd();
+  const dirty = git(["status", "--porcelain", "--", "packages", "apps", "contracts/src", "scripts"])
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => l.slice(3));
+  return `${git(["rev-parse", "--short", "HEAD"])}${dirty.length > 0 ? ` + uncommitted: ${dirty.join(", ")}` : ""}`;
+}
+
+/** One transaction of a Blockscout address listing (`/api/v2/addresses/<a>/transactions`), as far as it is read. */
+export type ListedTx = { hash: `0x${string}`; block_number?: number; block?: number; from?: { hash: string } };
+
+/**
+ * Final review C m-12: the hashes in one listing page that `address` sent in blocks `fromBlock`..`toBlock`, both
+ * included. The run's own window: a transaction the deployer sends after the run (another stack paying with the same
+ * key) is not the run's, and a `--collect-only` rerun days later must not count it.
+ */
+export function sentInRange(items: readonly ListedTx[], address: string, fromBlock: bigint, toBlock: bigint): Array<`0x${string}`> {
+  const out: Array<`0x${string}`> = [];
+  for (const t of items) {
+    const b = BigInt(t.block_number ?? t.block ?? 0);
+    if (b >= fromBlock && b <= toBlock && t.from?.hash?.toLowerCase() === address.toLowerCase()) out.push(t.hash);
+  }
+  return out;
 }

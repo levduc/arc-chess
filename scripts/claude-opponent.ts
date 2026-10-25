@@ -77,7 +77,7 @@ Testnet live runs (a "pnpm testnet:up" stack has no faucet, so the agent must as
   --prompt        the whole prompt instead of the one built from --server/--games/--stake (e.g. the agent message
                   testnet:up prints); with --resume, the human's reply
   --owner         appended to the prompt as the human's cash-out address on Arc
-  --human-pay     the stack's pay helper (<testnet dir>/bin/pay): plays the human, paying exactly what the agent
+  --human-pay     the stack's pay helper (<testnet dir>/human/pay): plays the human, paying exactly what the agent
                   asks for in its own text ("send X USDC to 0x…"), once per ask, to the agent's own wallet only
                   (read with "arena wallet"); every decision goes to DIR/human.jsonl
   --human-budget  the most --human-pay pays this agent in total, across resumes (default 3 USDC)
@@ -188,6 +188,14 @@ async function main(): Promise<void> {
 
   if (args.humanPay !== undefined && !existsSync(args.humanPay)) throw new Error(`--human-pay ${args.humanPay} does not exist`);
   if (args.humanPay !== undefined && args.dir === undefined) throw new Error("--human-pay needs --dir (its ledger lives there)");
+  // Final review C m-8: the agent's PATH holds the --cli wrapper's directory, so a pay helper there (an older
+  // testnet:up's <dir>/bin/pay) is one an agent allowed more than its tool list could run itself.
+  if (args.humanPay !== undefined && resolve(dirname(args.humanPay)) === resolve(dirname(args.cli))) {
+    console.log(
+      `[claude-opponent] note: --human-pay ${args.humanPay} is on the agent's PATH (beside --cli). Rerun testnet:up: it ` +
+        "moves the helper to <testnet dir>/human/pay, off that PATH",
+    );
+  }
 
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   // Deliberately not initialized: no `arena init` call here -- see this script's own docstring. The agent reads

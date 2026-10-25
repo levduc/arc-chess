@@ -1,11 +1,11 @@
 /**
- * T5b: `scripts/testnet-up.ts` (`pnpm testnet:up` / `testnet:down` / `<dir>/bin/pay`). Nothing here touches Arc: the
+ * T5b: `scripts/testnet-up.ts` (`pnpm testnet:up` / `testnet:down` / `<dir>/human/pay`). Nothing here touches Arc: the
  * chain-id refusals run against local Anvils (ports 8700-8799) and a stub RPC, and the pay helper runs against a local
  * Anvil through the script's test hook (`ARENA_TESTNET_TEST_OVERRIDE`, honoured only for a loopback Anvil at chain
  * 31337), with a throwaway key in a temporary key file shaped like the real one.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer, type Server } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +38,7 @@ import {
   redact,
   shownUrl,
   testOverride,
+  testnetChildEnv,
   topUpAmount,
   unlessExits,
   writePayWrapper,
@@ -720,6 +721,35 @@ describe("the pay helper", () => {
     for (const f of walk(stateDir)) expect(readFileSync(f, "utf8").toLowerCase()).not.toContain(hex);
   });
 
+  it("final review C m-8: the helper is <dir>/human/pay, never in bin/ (the agent's PATH); an old bin/pay becomes a stub", () => {
+    const d = join(root, "moved");
+    mkdirSync(join(d, "bin"), { recursive: true });
+    const oldPay = join(d, "bin", "pay");
+    writeFileSync(oldPay, "#!/bin/sh\nexec true pay \"$@\"\n", { mode: 0o700 });
+    const arena = join(d, "bin", "arena");
+    writeFileSync(arena, "#!/bin/sh\n", { mode: 0o700 });
+
+    const path = writePayWrapper(d);
+    expect(path).toBe(join(d, "human", "pay"));
+    expect(readFileSync(path, "utf8")).toMatch(/testnet-up\.ts' pay "\$@"/);
+    expect(statSync(path).mode & 0o777).toBe(0o700);
+    expect(statSync(join(d, "human")).mode & 0o077).toBe(0);
+    // bin/ (beside the arena wrapper) holds no way to pay: the stub only says where the helper went.
+    const stub = readFileSync(oldPay, "utf8");
+    expect(stub).not.toContain("testnet-up.ts");
+    expect(stub).not.toContain(" pay ");
+    const r = spawnSync(oldPay, ["0x" + "11".repeat(20), "1"], { encoding: "utf8" });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr.trim()).toBe(`pay moved: run ${path} instead (the human's helper is kept off the agent's PATH)`);
+    expect(readdirSync(join(d, "bin")).sort()).toEqual(["arena", "pay"]);
+
+    // A fresh directory gets no bin/pay at all.
+    const fresh = join(root, "fresh");
+    writePayWrapper(fresh);
+    expect(existsSync(join(fresh, "bin", "pay"))).toBe(false);
+  });
+
   it("the wrapper passes the stack's own --rpc only when it is not the public one", () => {
     const d = join(root, "rpc-wrapper");
     expect(readFileSync(writePayWrapper(d), "utf8")).not.toContain("--rpc");
@@ -731,6 +761,44 @@ describe("the pay helper", () => {
     for (const a of [d.hub, d.rules, d.usdc]) expect(() => checkPayRequest(a, "1", d, DEPLOYER)).toThrow(/refusing: .* is the/);
     expect(() => checkPayRequest(DEPLOYER, "1", d, DEPLOYER)).toThrow(/deployer itself/);
     expect(checkPayRequest(sender.toLowerCase(), "2.5", d, DEPLOYER)).toEqual({ to: sender, wei: parseUnits("2.5", 18) });
+  });
+});
+
+// ------------------------------------------------------------------------------------------- child environment
+
+describe("final review C m-9: every child gets an allowlisted environment", () => {
+  const KEY_SHAPED = `0x${"11".repeat(32)}`;
+  it("keeps PATH, the real HOME and the bot's ARENA_HOME; drops secrets and everything not on the allowlist", () => {
+    const parent = {
+      PATH: "/usr/bin",
+      HOME: "/home/op",
+      LANG: "C.UTF-8",
+      NODE_OPTIONS: "--max-old-space-size=2048",
+      ARENA_DEPLOYER_KEY: KEY_SHAPED,
+      ALCHEMY_API_KEY: "abc",
+      ARENA_TESTNET_TEST_OVERRIDE: '{"rpcUrl":"http://127.0.0.1:1","chainId":31337,"keyFile":"/k"}',
+      SOMETHING_ELSE: "1",
+    };
+    expect(testnetChildEnv("/x/house-1", parent)).toEqual({
+      PATH: "/usr/bin",
+      HOME: "/home/op",
+      LANG: "C.UTF-8",
+      NODE_OPTIONS: "--max-old-space-size=2048",
+      ARENA_HOME: "/x/house-1",
+    });
+    // The server and the pay helper: no ARENA_HOME at all.
+    expect(testnetChildEnv(undefined, parent)).not.toHaveProperty("ARENA_HOME");
+    expect(testnetChildEnv(undefined, { PATH: "/usr/bin" }).HOME).toBe(homedir());
+  });
+
+  it("no spawn in testnet-up or the human watcher passes this process's whole environment", () => {
+    for (const f of ["scripts/testnet-up.ts", "scripts/claude-human-watcher.ts"]) {
+      const src = readFileSync(join(REPO_ROOT, f), "utf8");
+      expect(src).not.toMatch(/\.\.\.process\.env\b/);
+      expect(src).not.toMatch(/env: [^,}]*\?\? process\.env/);
+      // Every spawn names its env.
+      for (const call of src.match(/\bspawn(?:Sync)?\([^;]*?\{[^;]*?\}\)/gs) ?? []) expect(call).toMatch(/\benv\b/);
+    }
   });
 });
 

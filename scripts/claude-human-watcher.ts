@@ -3,7 +3,7 @@
  *
  * On a testnet stack (`pnpm testnet:up`) there is no faucet: the agent must ask its human for USDC, exactly as a
  * real user's agent would. This watcher plays that human. It tails the session's `stream-json` log and pays, once,
- * exactly what the agent asks to be sent to its own wallet, through the stack's pay helper (`<dir>/bin/pay <address>
+ * exactly what the agent asks to be sent to its own wallet, through the stack's pay helper (`<dir>/human/pay <address>
  * <usdc>`, which signs from the testnet deployer; this file never sees that key). An ask is either:
  *  - in the agent's own text (assistant text blocks and the final `result`): "send X USDC to 0x…"; or
  *  - `arena fund`'s own `message` in a tool result, once the agent goes on to `wallet --wait-for-usdc` -- the agent
@@ -16,13 +16,15 @@
  *
  * Every decision is appended to a JSON-lines ledger, with an ISO timestamp, *before* the pay helper runs, so a
  * resumed session (`--resume`) or a crash mid-payment can never pay the same ask twice. Node built-ins only, like
- * `tests/system/claude-sandbox.ts`.
+ * `tests/system/claude-sandbox.ts` (and `arc-rehearsal-lib.ts`, whose allowlist is the environment of both children,
+ * the CLI's `wallet` and the pay helper: never this process's whole environment, final review C m-9).
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { childEnv } from "./arc-rehearsal-lib.js";
 
 /** One "send X USDC to 0x…" the agent put in front of its human. */
 export type FundingAsk = { usdc: string; address: string };
@@ -209,7 +211,7 @@ export class HumanWatcher {
   private walletAddress(): string | undefined {
     if (this.wallet !== undefined) return this.wallet;
     const r = spawnSync(this.o.cli, ["wallet"], {
-      env: { ...process.env, ARENA_HOME: this.o.arenaHome },
+      env: childEnv(process.env, { HOME: process.env.HOME ?? homedir(), ARENA_HOME: this.o.arenaHome }),
       encoding: "utf8",
       timeout: 60_000,
     });
@@ -277,7 +279,9 @@ export class HumanWatcher {
     try {
       for (let attempt = 1; ; attempt++) {
         const result = await new Promise<{ exit: number | null; stdout: string; stderr: string }>((resolve) => {
-          const child = spawn(this.o.pay, [ask.address, ask.usdc], { stdio: ["ignore", "pipe", "pipe"] });
+          // The real HOME: the pay helper reads the deployer key under it, itself.
+          const env = childEnv(process.env, { HOME: process.env.HOME ?? homedir() });
+          const child = spawn(this.o.pay, [ask.address, ask.usdc], { env, stdio: ["ignore", "pipe", "pipe"] });
           let stdout = "";
           let stderr = "";
           child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));

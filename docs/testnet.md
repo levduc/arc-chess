@@ -22,6 +22,9 @@ script refuses to start and names the mismatch. Both are read when it starts, so
 - `pnpm install`. You need Node 24 or newer.
 - The testnet deployer key must be at `~/.config/arena-deploy/arc-testnet-deployer.json`, mode `600`. Both the pay
   helper and the bot funding read it. Nothing else reads it, and it is never printed or copied.
+- Every process the script starts (the server, the house bots, each `arena` call and the pay helper) gets only an
+  allowlist of your shell's environment: `PATH`, `HOME`, the locale, the proxy and CA variables, and `NODE_*`. A key
+  or token exported in your shell never reaches them, nor the `npm install` that `--xmtp-bots` runs.
 - Check the deployer's balance first: `pnpm testnet:up pay balance`. This works before any run and reads only the
   balance, not the key. The first run funds each house bot to `--bot-usdc` (2.5 USDC by default), and the pay helper
   never takes the deployer below 2 USDC. For two bots, the deployer therefore needs at least 7 USDC. To top it up,
@@ -56,7 +59,7 @@ When the stack is ready, the script prints:
   `/offers`);
 - **hub**: the hub's page on `https://explorer.testnet.arc.io`;
 - the **arena CLI** wrapper (`.arena-testnet/bin/arena`), which skill.md names in every command, and the **pay**
-  helper;
+  helper (`.arena-testnet/human/pay`);
 - **paid this run**: what this run sent to the house bots;
 - the **message to give an agent** (see below);
 - a JSON line on stdout with `"ready": true`, printed last.
@@ -104,9 +107,14 @@ demo uses that port. Each further agent needs its own directory and its own port
 When the agent asks for money, send it from the testnet deployer:
 
 ```sh
-.arena-testnet/bin/pay <agent address> <usdc>      # e.g. .arena-testnet/bin/pay 0xAbc… 2.5
-.arena-testnet/bin/pay balance                     # the deployer's balance
+.arena-testnet/human/pay <agent address> <usdc>    # e.g. .arena-testnet/human/pay 0xAbc… 2.5
+.arena-testnet/human/pay balance                   # the deployer's balance
 ```
+
+The pay helper lives in `human/`, not in `bin/` beside the `arena` wrapper. An agent's tools may put `bin/` on its
+PATH (`pnpm dev:claude-opponent` does), and there an agent allowed more than its tool list could pay itself from the
+deployer instead of asking you. A directory made by an older `testnet:up` still has `bin/pay`: the next
+`testnet:up` replaces it with a stub that pays nothing and prints the new path.
 
 The pay helper:
 
@@ -202,7 +210,8 @@ They do challenge a silent opponent, and they close a finished channel after 10 
       - To bring the host back, Ctrl-C `testnet:up` (or run `pnpm testnet:down`), then `pnpm testnet:up`. `up`
         refuses to start while the earlier one is still alive. Note that this restarts the bots too.
 - [ ] **Daemon kill and restart.** `kill -9` an agent's daemon in the middle of a game, wait, then restart it
-      (`arena daemon`). Expect it to resume from its own records, with no lost state and no double-signing. For a house
+      (`arena daemon --detach`: started from an agent's tool, a plain `arena daemon` stops when that session ends).
+      Expect it to resume from its own records, with no lost state and no double-signing. For a house
       bot: `kill -9` its pid, then run `pnpm testnet:down` and `pnpm testnet:up`. The bot home is reused, its
       channels resume, and nothing is paid for its escrow.
 - [ ] **Disputes.** Start with a fresh `--dir` and `--bot-timeout 300` for 5-minute deadlines:
@@ -254,7 +263,9 @@ finalized; `up` prints a note when they differ.
   server.sqlite     the server's database (lobby, relay cache, indexed channels)
   pids.json         the pids testnet:up started (only while it runs)
   bin/arena         the CLI wrapper skill.md names
-  bin/pay           the funding helper (names this script and --rpc, never the key), mode 700
+  human/pay         the funding helper (names this script and --rpc, never the key), mode 700; kept out of bin/,
+                    which an agent's PATH may hold
+  bin/pay           only in a directory an older testnet:up made: a stub that pays nothing and names human/pay
   house-bots/house-<i>/   each bot's ARENA_HOME (wallet, config, channel records)
   logs/             server.log, house-<i>.log, house-<i>-withdraw.log
 ```
