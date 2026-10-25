@@ -35,6 +35,9 @@ export interface ChainReader {
    *  was last opened against). Used at startup to detect a database that belongs to a different chain/deployment
    *  than the one this config points at. */
   genesisHash(): Promise<Hex>;
+  /** Final review C m-5: the RPC's own `eth_chainId`, read once at startup and compared with the config's `chainId`
+   *  (a mainnet config pointed at a testnet RPC would otherwise index nothing, silently). */
+  chainId(): Promise<number>;
   /** The hash of the canonical block at `block` (null if there is none) -- the indexer asks before unwinding an
    *  event that vanished from `getLogs`, to tell a reorg from a lagging log index. Optional: without it, a
    *  vanished event is always treated as reorged out. */
@@ -126,6 +129,10 @@ export class RpcChainReader implements ChainReader {
 
   clientVersion(): Promise<string> {
     return this.client.request({ method: "web3_clientVersion" });
+  }
+
+  chainId(): Promise<number> {
+    return this.client.getChainId();
   }
 
   /** Immutable once the chain exists, so memoized forever like `timeoutBounds` -- with the same un-stick-on-

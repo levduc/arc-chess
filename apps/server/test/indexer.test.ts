@@ -449,6 +449,19 @@ describe("H1 (review m-11): the indexer never wedges on one oversized event", ()
     expect(repo.cursor()).toBe(45n);
   });
 
+  it("final review C m-3: /metrics reports the skipped block, and says a skip is permanent", async () => {
+    const { cfg, chain, fx } = oversized({ alone: true });
+    server = await startServer(cfg, { chain });
+    const skipped = async () => /^arena_indexer_skipped_blocks (\d+)$/m.exec(await (await fetch(`${server!.url}/metrics`)).text())?.[1];
+    expect(await skipped()).toBe("0");
+    for (let i = 0; i < INDEXER_UNREADABLE_POLLS; i++) await server.indexer.poll();
+    expect(server.indexer.skippedBlocks()).toEqual([15n]);
+    expect(await skipped()).toBe("1");
+    expect(server.repo.channelRow(fx.id)?.challenges).toEqual([0, 0]);
+    const text = await (await fetch(`${server.url}/metrics`)).text();
+    expect(text).toMatch(/^# HELP arena_indexer_skipped_blocks .*since this process started.*A skip is permanent/m);
+  });
+
   it("an RPC that refuses every read (down) never skips a block, and keeps the cursor", async () => {
     const { repo, chain, indexer } = oversized({ alone: false });
     await indexer.poll();
@@ -477,7 +490,7 @@ describe("H3 fix round 1 (review I2): H1's probes, when the RPC refuses the prob
       throw Object.assign(new Error("requested range too large"), { code: -32012 });
     };
     const logs: string[] = [];
-    return { repo, reads, logs, indexer: new Indexer(repo, chain, cfg, (l) => logs.push(l)) };
+    return { repo, chain, reads, logs, indexer: new Indexer(repo, chain, cfg, (l) => logs.push(l)) };
   }
 
   it("a multi-block range: the probe is refused too, so the range is neither split nor counted", async () => {
@@ -488,6 +501,25 @@ describe("H3 fix round 1 (review I2): H1's probes, when the RPC refuses the prob
     expect(indexer.skippedBlocks()).toEqual([]);
     expect(repo.cursor()).toBeNull();
     expect(logs.every((l) => /^indexer: .*requested range too large/.test(l))).toBe(true);
+    // Final review C m-2: the wedge says what to change.
+    expect(logs).toHaveLength(INDEXER_UNREADABLE_POLLS + 1);
+    for (const l of logs) {
+      expect(l).toMatch(
+        /^indexer: the RPC refuses blocks 0-9 even without their dispute events \(requested range too large\): it likely caps getLogs ranges below indexer\.chunkBlocks \(10\); lower indexer\.chunkBlocks/,
+      );
+    }
+    repo.close();
+  });
+
+  it("final review C m-2: a probe that is rate-limited, not refused, keeps the plain message (no chunkBlocks hint)", async () => {
+    const { repo, chain, logs, indexer } = refusesEverything(10);
+    chain.hubEvents = async (_from: bigint, _to: bigint, o?: { kinds?: readonly HubEvent["kind"][] }) => {
+      if (o?.kinds !== undefined) throw Object.assign(new Error("rate limit exceeded"), { code: -32005 });
+      throw Object.assign(new Error("requested range too large"), { code: -32012 });
+    };
+    await indexer.poll();
+    expect(logs).toEqual(["indexer: requested range too large"]);
+    expect(indexer.skippedBlocks()).toEqual([]);
     repo.close();
   });
 

@@ -152,8 +152,18 @@ export class Indexer {
             if (!contentRefused) {
               try {
                 await this.chain.hubEvents(r.fromBlock, r.toBlock, { kinds: OTHER_KINDS });
-              } catch {
-                this.log(`indexer: ${msg}`);
+              } catch (probeErr) {
+                // Final review C m-2: refused even without its dispute events, the range itself is what the RPC refuses
+                // -- an RPC that caps getLogs ranges below `chunkBlocks` (free provider tiers often do). That wedges the
+                // indexer here on every poll, so the log says what to change. A probe that failed otherwise (a rate
+                // limit) says nothing about the range.
+                this.log(
+                  isRangeRefusal(probeErr)
+                    ? `indexer: the RPC refuses blocks ${r.fromBlock}-${r.toBlock} even without their dispute events (${msg}): ` +
+                        `it likely caps getLogs ranges below indexer.chunkBlocks (${this.cfg.indexer.chunkBlocks}); lower ` +
+                        "indexer.chunkBlocks, or use an RPC that serves this range. Indexing is stalled until then"
+                    : `indexer: ${msg}`,
+                );
                 return;
               }
               contentRefused = true;
@@ -201,8 +211,11 @@ export class Indexer {
   }
 
   /** H1 (review m-11): the blocks whose `Challenged`/`Responded` events the indexer skipped because the RPC refused
-   *  to serve them (oldest first), for operators and `/metrics`. A block leaves the list once a later read of it
-   *  succeeds (within the rescan window). */
+   *  to serve them (oldest first), for operators and `/metrics`. Final review C m-1 (h1-rereview N-6): a skip is
+   *  permanent in practice. The list is kept in memory only, so it starts empty on every restart, and a block leaves
+   *  it once a later read inside the 32-block rescan window succeeds -- but `apply` drops any of that read's dispute
+   *  events older than a row's `lastEvent` (one of the block's other events, or a later one, applied meanwhile), so
+   *  the affected rows can stay stale. An empty list does not mean nothing was ever skipped. */
   skippedBlocks(): readonly bigint[] {
     return [...this.skipped];
   }

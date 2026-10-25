@@ -177,6 +177,26 @@ describe("config", () => {
       const base = validBase();
       expect(parseServerConfig({ ...base, xmtp: { env: "local", foo: 1 } }).xmtp).toEqual({ env: "local" });
     });
+    it("final review C m-6: on Arc mainnet (5042) only env \"production\" is accepted; Arc testnet keeps \"dev\"", () => {
+      const mainnet = { ...validBase(), chainId: 5042, audit: "unaudited; guarded launch", indexer: { startBlock: "1000" } };
+      expect(() => parseServerConfig({ ...mainnet, xmtp: { env: "dev" } })).toThrow(/^xmtp\.env: must be "production" on Arc mainnet \(chainId 5042\), not "dev"/);
+      expect(() => parseServerConfig({ ...mainnet, xmtp: { env: "local" } })).toThrow(/^xmtp\.env: must be "production"/);
+      expect(parseServerConfig({ ...mainnet, xmtp: { env: "production" } }).xmtp).toEqual({ env: "production" });
+      expect(parseServerConfig(mainnet).xmtp).toBeUndefined(); // no xmtp at all is still allowed
+      expect(parseServerConfig({ ...mainnet, chainId: 5042002, xmtp: { env: "dev" } }).xmtp).toEqual({ env: "dev" });
+    });
+  });
+
+  it("final review C m-4: on Arc mainnet (5042) indexer.startBlock is required, and is not 0", () => {
+    const mainnet = { ...validBase(), chainId: 5042, audit: "unaudited; guarded launch" };
+    const why = /^indexer\.startBlock: is required on Arc mainnet \(chainId 5042\): set it to the hub's deploy block/;
+    expect(() => parseServerConfig(mainnet)).toThrow(why);
+    expect(() => parseServerConfig({ ...mainnet, indexer: { pollMs: 3000 } })).toThrow(why);
+    expect(() => parseServerConfig({ ...mainnet, indexer: { startBlock: 0 } })).toThrow(why);
+    expect(parseServerConfig({ ...mainnet, indexer: { startBlock: "27000000" } }).indexer.startBlock).toBe(27_000_000n);
+    // Other chains keep the default of 0.
+    expect(parseServerConfig({ ...mainnet, chainId: 5042002 }).indexer.startBlock).toBe(0n);
+    expect(parseServerConfig(validBase()).indexer.startBlock).toBe(0n);
   });
 });
 
@@ -934,7 +954,14 @@ describe("http foundation", () => {
       expect(recipe).toMatch(/cannot be cancelled, but it expires at its `expiresAt`/);
       expect(recipe).toMatch(/keep repeating `wait`\s+and checking `channels` until `expiresAt` has passed, and play any channel that appears\s+\(step 6\)/);
       // H4 fix round 2 (m4): settled includes a channel retired at its funding deadline (a `done:` action).
-      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not settled \(`Finalized`, `Reclaimed`, or a first\s+suggested action starting with `done:`\), tell your human you found no opponent, offer them `withdraw --all`\s+\(step 8\), then stop\./);
+      expect(recipe).toMatch(/Once\s+`expiresAt` has passed and `channels` lists no channel that is not settled \(`Finalized`, `Reclaimed`, or a\s+suggested action starting with `done:`\), tell your human you found no opponent, offer them `withdraw --all`\s+\(step 8\), then stop\./);
+      // Final review C m-15 (h4 r2): any suggested action, not the first: a host refusal can be listed before `done:`.
+      // And a deposit that never lands is the human's to look at: `daemon stop` refuses while that channel is live.
+      for (const page of [text, skillMd(testConfig(), URL)]) {
+        expect(page).not.toMatch(/first\s+suggested\s+action/);
+        expect(page).toMatch(/a channel awaiting this wallet's own deposit \(409\) needs a\s+retry once that deposit lands, or tell your human if it persists\./);
+        expect(page).not.toMatch(/daemon\s+restart\s+if\s+it\s+persists/);
+      }
       expect(text).not.toMatch(/stop waiting/);
       expect(text).toMatch(/minutes unmatched, tell your human, and keep waiting until your offer's `expiresAt` has passed/);
       // Fix round 1 N-3: a timed-out funding wait offers back what did arrive.
@@ -1060,7 +1087,7 @@ describe("http foundation", () => {
       const step8 = stepOf(recipeOf(text), "8. Ask your human whether to withdraw now", "**Troubleshooting:**");
       // Fix round 1 (M5): and once any offer you posted has expired.
       // Fix round 2 (m4): settled includes a retired channel (a `done:` first action).
-      expect(step8).toMatch(new RegExp(`Last, once every channel is settled -- \`Finalized\` or \`Reclaimed\`, or its first suggested action starts with\\s+\`done:\` \\(a funding window that closed without it opening\\) -- with \`swept\` set, any offer you posted has passed\\s+its \`expiresAt\`, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
+      expect(step8).toMatch(new RegExp(`Last, once every channel is settled -- \`Finalized\` or \`Reclaimed\`, or one of its suggested actions starts with\\s+\`done:\` \\(a funding window that closed without it opening\\) -- with \`swept\` set, any offer you posted has passed\\s+its \`expiresAt\`, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
       expect(step8.indexOf("daemon stop")).toBeGreaterThan(step8.indexOf("withdraw --all"));
       expect(step8).toMatch(/Never override that\s+refusal yourself: stopping a daemon that guards a live channel is your human's decision\./);
       // m2: the override flag is the human's, named in the README only, never on this page.
@@ -1140,6 +1167,56 @@ describe("http foundation", () => {
     const templates = (await res.json()) as Array<{ limits: unknown }>;
     expect(templates[0].limits).toBeNull();
   });
+  it("final review C m-7: /templates never waits on a stalled limits read: it serves the last good value, else null", async () => {
+    const chain = new FakeChain();
+    chain.hubLimits = { maxDepositPerPlayer: 2_000_000n, maxCommittedEscrow: 50_000_000n, committedEscrow: 0n, paused: false };
+    let calls = 0;
+    let stall = false;
+    const realLimits = chain.limits.bind(chain);
+    // A rate-limited RPC under viem's retries: a read that does not come back for over a minute.
+    chain.limits = () => {
+      calls++;
+      return stall ? new Promise(() => {}) : realLimits();
+    };
+    const templatesNow = async () => {
+      const t0 = Date.now();
+      const res = await fetch(`${server!.url}/templates`);
+      const body = (await res.json()) as Array<{ limits: unknown }>;
+      return { status: res.status, limits: body[0].limits, ms: Date.now() - t0 };
+    };
+    const good = { maxDepositPerPlayer: "2000000", maxCommittedEscrow: "50000000", committedEscrow: "0", paused: false };
+
+    server = await startServer(testConfig(), { chain, templateLimitsWaitMs: 300 });
+    expect((await templatesNow()).limits).toEqual(good); // read once when the server started
+    const callsBefore = calls;
+    expect((await templatesNow()).limits).toEqual(good); // under 5 s old: served at once, no new read
+    expect(calls).toBe(callsBefore);
+
+    // The value ages past 5 s, and the next read stalls: served after the 300 ms bound, from the last good value.
+    stall = true;
+    const realNow = Date.now;
+    Date.now = () => realNow() + 5_100;
+    try {
+      const [a, b] = await Promise.all([templatesNow(), templatesNow()]);
+      for (const r of [a, b]) {
+        expect(r.status).toBe(200);
+        expect(r.limits).toEqual(good);
+        expect(r.ms).toBeLessThan(3_000);
+      }
+      expect(calls).toBe(callsBefore + 1); // concurrent requests share one read
+    } finally {
+      Date.now = realNow;
+    }
+    await server.close();
+
+    // A server that never read the limits answers null after the bound, not after the read.
+    server = await startServer(testConfig(), { chain, templateLimitsWaitMs: 300 });
+    const first = await templatesNow();
+    expect(first.status).toBe(200);
+    expect(first.limits).toBeNull();
+    expect(first.ms).toBeLessThan(3_000);
+  });
+
   it("Plan 5.6 Task 4 (spec §3): /templates carries cli when configured, and has no cli key otherwise", async () => {
     const cli = { package: "@x/arena", version: "0.3.0" };
     server = await startServer(testConfig({ cli, cliCommand: "npx -y @x/arena@0.3.0" }), { chain: new FakeChain() });
@@ -1235,5 +1312,10 @@ describe("http foundation", () => {
     for (const m of ["arena_ws_connections", "arena_relay_messages_total", "arena_offers_open", "arena_indexer_block", "arena_indexer_lag_blocks"]) {
       expect(text).toContain(m);
     }
+    // Final review C m-1/m-3: the skip gauge, its type, and a HELP text that says it counts since this process started
+    // and that a skip is permanent.
+    expect(text).toMatch(/^# HELP arena_indexer_skipped_blocks .*since this process started.*A skip is permanent: the affected channel rows may stay stale/m);
+    expect(text).toMatch(/^# TYPE arena_indexer_skipped_blocks gauge$/m);
+    expect(text).toMatch(/^arena_indexer_skipped_blocks 0$/m);
   });
 });
