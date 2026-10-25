@@ -471,7 +471,9 @@ export async function startApi(
         // A throw after headers already went out (e.g. mid-SSE) must never re-writeHead -- that throws its own
         // ERR_HTTP_HEADERS_SENT and crashes this handler instead of just ending the one response.
         if (res.headersSent) return void res.end();
-        if (err instanceof DaemonError) return send(res, err.code, { error: err.message });
+        if (err instanceof DaemonError) {
+          return send(res, err.code, err.hashes !== undefined ? { error: err.message, hashes: err.hashes } : { error: err.message });
+        }
         const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
         // H3 (Arc testnet rehearsal §8.2, §8.3): a rate limit that outlasted the daemon's own retries is named as one,
         // so the agent knows the fix is to wait -- viem's own words ("HTTP request failed.") do not say so.

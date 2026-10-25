@@ -202,6 +202,14 @@ block inflow, or Arc's USDC gas, can skew a delta either way); `usdcAfter` can b
 balance can't be re-read right after a confirmed send. Funds escrowed in open channels are not in the wallet:
 close them first.
 
+A transfer that went out but could not be confirmed (its receipt read failed on a rate-limited or timed-out RPC,
+it is still pending, or the daemon stopped meanwhile) is answered `502` (`503` while stopping) naming its
+transaction hashes, in the message and as `hashes`: check them on an explorer, or the balances, before retrying
+(final fix wave B, I-1). It is recorded in `ARENA_HOME/withdraw-pending.json`, and the next withdraw, through this
+daemon or a new one, checks it first. If it landed, that withdraw sends nothing and says the owner was paid; the
+one after goes ahead. While it may still land, every withdraw is refused (`409`), until another transaction takes
+its nonce or 10 minutes have passed since it was sent.
+
 **Honesty note.** The owner lock stops a confused or prompt-injected agent from redirecting funds through the CLI
 or the daemon API — it cannot, by itself, send to any address but the recorded owner. It is **not** a defence
 against code that can read `ARENA_HOME/wallet.json` (the raw private key) or hand-edit `ARENA_HOME/config.json`.

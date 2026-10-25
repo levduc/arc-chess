@@ -1,11 +1,13 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
+import { rmSync } from "node:fs";
 import {
   createPublicClient,
   defineChain,
   erc20Abi,
   parseEventLogs,
   TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
   type Address,
   type Chain,
   type Hex,
@@ -70,6 +72,7 @@ import {
 } from "./config.js";
 import { chainProfile, weiToUsdc6Up, type ChainProfile } from "./chains.js";
 import { FileSessionStore } from "./fileStore.js";
+import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import { FUND_TX_GAS_UNITS, formatUsdc6, oneBalanceOpenNeed } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
@@ -82,6 +85,8 @@ export class DaemonError extends Error {
   constructor(
     readonly code: number,
     message: string,
+    /** Final fix wave B (I-1): the transactions a failed withdraw may have sent, answered as the body's `hashes`. */
+    readonly hashes?: Hex[],
   ) {
     super(message);
     this.name = "DaemonError";
@@ -626,25 +631,49 @@ export function confirmsTransfer(logs: Log[], t: { token: Address; from: Address
  * - `TxStuckError` / `TxDroppedError`: still pending, or no longer known to this node; a retry replaces it at the
  *   same nonce (at most one of the two lands), but it may land first.
  * - `TxWaitAbortedError`: the daemon is stopping (503); the transaction may still land.
- * Any other error is returned unchanged.
+ * Final fix wave B (I-1): any other error, when `sent` -- the transactions this wallet's sender started tracking
+ * during the withdraw -- is not empty: the transfer went out (or may have) and its wait failed for a reason that
+ * says nothing about it (a rate-limited or timed-out receipt read, a 5xx). A 502 naming them, never H3's 503 "retry".
+ * An error with nothing sent happened before the send, and is returned unchanged. Every 502 and 503 here carries its
+ * hashes (`DaemonError.hashes`), and `withdraw()` holds the next withdraw back until they are resolved.
  */
-export function withdrawWaitError(err: unknown, amount: bigint, owner: Address): unknown {
+export function withdrawWaitError(err: unknown, amount: bigint, owner: Address, sent: Hex[] = []): unknown {
   const what = `the transfer of ${formatUsdc6(amount)} USDC to ${owner}`;
-  const check = `check the owner's balance or an explorer before retrying: a retry can pay the owner twice`;
+  const check = `check the owner's balance, an explorer or "${selfCommand()} wallet" before retrying: a retry can pay the owner twice`;
+  const all = (hashes: Hex[]) => [...new Set([...hashes, ...sent])];
   if (err instanceof TxReceiptMissingError) {
-    return new DaemonError(502, `${what} was mined (tx ${err.hash}, block ${err.blockNumber}) but its receipt could not be read; ${check}`);
+    const hashes = all([err.hash]);
+    return new DaemonError(502, `${what} was mined (tx ${err.hash}, block ${err.blockNumber}) but its receipt could not be read; ${check}`, hashes);
   }
   if (err instanceof TxStuckError) {
-    return new DaemonError(502, `${what} is still pending (tx ${err.hashes.join(", ")}); it may still land: ${check}`);
+    const hashes = all(err.hashes);
+    return new DaemonError(502, `${what} is still pending (tx ${hashes.join(", ")}); it may still land: ${check}`, hashes);
   }
   if (err instanceof TxDroppedError) {
-    return new DaemonError(502, `${what} (tx ${err.hash}) is no longer known to the RPC and was not seen mined; it may still land: ${check}`);
+    const hashes = all([err.hash]);
+    return new DaemonError(502, `${what} (tx ${hashes.join(", ")}) is no longer known to the RPC and was not seen mined; it may still land: ${check}`, hashes);
   }
   if (err instanceof TxWaitAbortedError) {
-    return new DaemonError(503, `the daemon is stopping: ${what} (tx ${err.hashes.join(", ")}) was sent and may still land; ${check}`);
+    const hashes = all(err.hashes);
+    return new DaemonError(503, `the daemon is stopping: ${what} (tx ${hashes.join(", ")}) was sent and may still land; ${check}`, hashes);
+  }
+  if (sent.length > 0) {
+    const why = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
+    return new DaemonError(502, `${what} may have been sent (tx ${sent.join(", ")}), but could not be confirmed (${why}); ${check}`, sent);
   }
   return err;
 }
+
+/** Final fix wave B (I-1): how long, in wall-clock ms after it was sent, a withdraw that may have gone out unconfirmed
+ *  (`PendingWithdraw`) holds back the next one -- unless that one is resolved first. Persisted, so a fresh in-process
+ *  daemon (`arena withdraw` with no daemon running) holds back too. After it, the next send from this wallet replaces
+ *  a transfer still pending at its nonce (the sender adopts a pending nonce it did not send, on an RPC whose pending
+ *  count shows it), so at most one of the two lands. */
+export const WITHDRAW_UNCONFIRMED_HOLD_MS = 10 * 60_000;
+
+/** Final fix wave B (I-1): `<home>/withdraw-pending.json` -- a withdraw answered 502/503 with its `hashes`. Each tx's
+ *  `nonce` is the wallet nonce it was sent at, when known. */
+export type PendingWithdraw = { to: Address; amount: bigint; at: number; txs: Array<{ hash: Hex; nonce?: number }> };
 
 /** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
@@ -994,6 +1023,7 @@ export class ArenaDaemon {
       }
 
       const usdc = this.opts.config.usdc;
+      await this.resolvePendingWithdraw(usdc);
       const balance = await this.usdcBalance(usdc);
       // Plan 6 (spec §2.1, Review Focus 1): 0 on a native-gas chain; on Arc, the USDC gas every unsettled channel and
       // this wallet's own transactions may still need.
@@ -1026,12 +1056,27 @@ export class ArenaDaemon {
         );
       }
       if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
+      // Final fix wave B (I-1), as the sweep does: every hash the wallet's sender already tracks, so a failed wait
+      // below names only what was sent during this withdraw. A raw failure of the wait (a rate-limited receipt read)
+      // releases the transfer's entry, hash kept; a refill or deposit sent meanwhile is named too, which errs safe.
+      const earlier = new Set(this.wallet.tracked().flatMap((t) => t.hashes));
       let receipt: Awaited<ReturnType<HubClient["transfer"]>>;
       try {
         receipt = await this.hub.transfer(this.wallet, usdc, owner, amount);
       } catch (err) {
         if (err instanceof HubRevertError) throw new DaemonError(409, `the USDC transfer to ${owner} was refused: ${err.message}`);
-        throw withdrawWaitError(err, amount, owner);
+        const nonces = new Map<Hex, number>();
+        for (const t of this.wallet.tracked()) for (const h of t.hashes) if (!earlier.has(h)) nonces.set(h, t.nonce);
+        const mapped = withdrawWaitError(err, amount, owner, [...nonces.keys()]);
+        if (mapped instanceof DaemonError && mapped.hashes !== undefined) {
+          const typedNonce = (err as { nonce?: unknown }).nonce;
+          const txs = mapped.hashes.map((hash) => {
+            const nonce = nonces.get(hash) ?? (typeof typedNonce === "number" ? typedNonce : undefined);
+            return nonce !== undefined ? { hash, nonce } : { hash };
+          });
+          this.savePendingWithdraw({ to: owner, amount, at: Date.now(), txs });
+        }
+        throw mapped;
       }
       const txHash = receipt.transactionHash;
       // Task 3 fix round 4 (N4, N5; spec §4.4): a mined, successful transfer is not proof the money moved -- a token
@@ -1039,7 +1084,7 @@ export class ArenaDaemon {
       // Transfer(wallet -> owner, amount) log from the configured USDC, never a balance delta: a same-block inflow (a
       // settlement payout, a top-up) or, on Arc, USDC gas skews those both ways (fix round 1's M3 check, replaced).
       if (!confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: owner, amount })) {
-        throw new DaemonError(502, `could not confirm the transfer in tx ${txHash}; check it before retrying`);
+        throw new DaemonError(502, `could not confirm the transfer in tx ${txHash}; check it before retrying`, [txHash]);
       }
       this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
       // For display only: the transfer is confirmed, so a read that fails now (an RPC blip) must not turn it into an
@@ -1086,6 +1131,100 @@ export class ArenaDaemon {
   /** The wallet's USDC balance at the latest block. */
   private usdcBalance(usdc: Address): Promise<bigint> {
     return this.client.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [this.wallet.address] });
+  }
+
+  /** Final fix wave B (I-1): records a withdraw that may have gone out unconfirmed. A failed write is logged: the
+   *  502 still names the hashes. */
+  private savePendingWithdraw(p: PendingWithdraw): void {
+    try {
+      writeJsonAtomic(arenaPaths(this.opts.home).withdrawPending, p);
+    } catch (err) {
+      this.log(`withdraw: could not record the unconfirmed transfer (tx ${p.txs.map((t) => t.hash).join(", ")}): ${errorText(err)}`);
+    }
+  }
+
+  /**
+   * Final fix wave B (I-1): before a withdraw sends anything, an earlier one that may have gone out unconfirmed
+   * (`PendingWithdraw`) is resolved from the chain:
+   * - one of its transactions mined with the Transfer to the owner: it landed. Cleared, and this withdraw is refused
+   *   (409), so a retry of it is never a second payment; the next withdraw goes ahead;
+   * - every one of them mined without that Transfer, or never mined while its nonce has been used by another one:
+   *   none can pay. Cleared, and this withdraw goes ahead;
+   * - otherwise (still pending, unknown with its nonce free, or mined with its receipt unreadable): refused (409),
+   *   kept -- until the hold is over: then cleared, and this withdraw goes ahead (its send replaces a transfer still
+   *   pending at its nonce). A landed one is reported whatever its age.
+   * A read that fails is a 503: retry shortly. An unreadable file is ignored (logged).
+   */
+  private async resolvePendingWithdraw(usdc: Address): Promise<void> {
+    const path = arenaPaths(this.opts.home).withdrawPending;
+    let p: PendingWithdraw | null;
+    try {
+      p = readJson<PendingWithdraw>(path);
+    } catch (err) {
+      this.log(`withdraw: ignoring an unreadable ${path}: ${errorText(err)}`);
+      return;
+    }
+    if (p === null) return;
+    const clear = () => rmSync(path, { force: true });
+    const ageMs = Date.now() - p.at;
+    const hashes = p.txs.map((t) => t.hash);
+    const what = `an earlier withdraw of ${formatUsdc6(p.amount)} USDC to ${p.to}`;
+    const unresolved: Hex[] = [];
+    try {
+      let latest: number | undefined;
+      for (const t of p.txs) {
+        const receipt = await this.client.getTransactionReceipt({ hash: t.hash }).catch((err: unknown) => {
+          if (err instanceof TransactionReceiptNotFoundError) return null;
+          throw err;
+        });
+        if (receipt !== null) {
+          const paid =
+            receipt.status === "success" &&
+            confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: p.to, amount: p.amount });
+          if (paid) {
+            clear();
+            throw new DaemonError(
+              409,
+              `${what} landed (tx ${t.hash}, block ${receipt.blockNumber}): the owner has been paid, so nothing was sent ` +
+                "now. Run withdraw again only to send more",
+              [t.hash],
+            );
+          }
+          continue; // mined, and paid nothing: its nonce is used
+        }
+        const tx = await this.client.getTransaction({ hash: t.hash }).catch((err: unknown) => {
+          if (err instanceof TransactionNotFoundError) return null;
+          throw err;
+        });
+        if (tx !== null && tx.blockNumber !== null) {
+          unresolved.push(t.hash); // mined, its receipt not readable yet
+          continue;
+        }
+        latest ??= await this.client.getTransactionCount({ address: this.wallet.address, blockTag: "latest" });
+        if (t.nonce !== undefined && latest > t.nonce) continue; // another transaction took its nonce: it can never land
+        unresolved.push(t.hash);
+      }
+    } catch (err) {
+      if (err instanceof DaemonError) throw err;
+      throw new DaemonError(
+        503,
+        `${what} (tx ${hashes.join(", ")}) may have been sent, and it could not be checked (${rpcErrorSummary(err)}): nothing ` +
+          "was sent now; retry in a few seconds",
+        hashes,
+      );
+    }
+    if (unresolved.length === 0) return clear();
+    if (!(ageMs < WITHDRAW_UNCONFIRMED_HOLD_MS)) {
+      this.log(`withdraw: ${what} (tx ${unresolved.join(", ")}) is still not confirmed, past its hold: sending`);
+      return clear();
+    }
+    throw new DaemonError(
+      409,
+      `${what} was sent ${Math.round(ageMs / 1000)} s ago (tx ${unresolved.join(", ")}) and is not confirmed: it may still land, ` +
+        `so nothing was sent now. Check the owner's balance, an explorer or "${selfCommand()} wallet". The next withdraw says ` +
+        `so if it landed, and sends once it can no longer land, or ${WITHDRAW_UNCONFIRMED_HOLD_MS / 60_000} minutes after it was sent`,
+      unresolved,
+    );
   }
 
   /** The owner `withdraw()` pays, read from config.json now (never from `opts.config`, which is the config at

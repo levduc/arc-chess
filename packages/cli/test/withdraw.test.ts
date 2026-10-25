@@ -1,31 +1,44 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  createPublicClient,
   createTestClient,
   encodeAbiParameters,
   encodeEventTopics,
   erc20Abi,
   http,
+  LimitExceededRpcError,
   pad,
   toHex,
   type Address,
   type Hex,
   type Log,
+  type PublicClient,
 } from "viem";
 import { foundry } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TxDroppedError, TxReceiptMissingError, TxStuckError, TxWaitAbortedError, type LobbyClient, type RelayClient } from "@arena/sdk";
+import {
+  HubClient,
+  TxDroppedError,
+  TxReceiptMissingError,
+  TxStuckError,
+  TxWaitAbortedError,
+  rpcTransport,
+  type LobbyClient,
+  type RelayClient,
+} from "@arena/sdk";
 import {
   ArenaDaemon,
   DaemonError,
   KNOWN_DEPLOYMENTS,
   MAX_MATCH_RETRIES,
   RecordStore,
+  WITHDRAW_UNCONFIRMED_HOLD_MS,
   arenaPaths,
   confirmsTransfer,
   initHome,
@@ -42,6 +55,7 @@ import {
   type ArenaConfig,
   type CliIo,
   type DaemonProcess,
+  type PendingWithdraw,
 } from "../src/index.js";
 import { CHAIN_PROFILES, chainProfile, type ChainProfile } from "../src/chains.js";
 import { ownerChangeMessage, setOwner } from "../src/owner.js";
@@ -1025,10 +1039,15 @@ describe("H1 (audit-daemon M-6): a transfer whose wait ended without a receipt i
       expect(mapped.code).toBe(code);
       expect(mapped.message).toMatch(text);
       expect(mapped.message).toContain(`the transfer of 3.000000 USDC to ${OWNER}`);
-      expect(mapped.message).toMatch(/check the owner's balance or an explorer before retrying: a retry can pay the owner twice/);
+      expect(mapped.message).toMatch(/check the owner's balance, an explorer or "arena wallet" before retrying: a retry can pay the owner twice/);
+      expect(mapped.hashes?.length).toBeGreaterThan(0); // Final fix wave B (I-1): answered as the body's `hashes`
     }
     const other = new Error("socket hang up");
-    expect(withdrawWaitError(other, 1n, OWNER)).toBe(other); // anything else, unchanged
+    expect(withdrawWaitError(other, 1n, OWNER)).toBe(other); // anything else, with nothing sent, unchanged
+    // Final fix wave B (I-1): the same error with a transaction sent during the withdraw is a 502 naming it.
+    const sent = withdrawWaitError(other, 1n, OWNER, [H2]) as DaemonError;
+    expect([sent.code, sent.hashes]).toEqual([502, [H2]]);
+    expect(sent.message).toMatch(/may have been sent \(tx 0x2{64}\), but could not be confirmed \(socket hang up\); check/);
   });
 
   it("withdraw() answers 502 with the hash when the transfer's receipt went missing (in-process daemon)", async () => {
@@ -1042,5 +1061,158 @@ describe("H1 (audit-daemon M-6): a transfer whose wait ended without a receipt i
     expect(err).toBeInstanceOf(DaemonError);
     expect(err.code).toBe(502);
     expect(err.message).toMatch(/was mined \(tx 0x1{64}, block 9\) but its receipt could not be read; check/);
+  });
+});
+
+// ------------------------------------------------------------------ Final fix wave B (I-1): a sent, unconfirmed withdraw
+
+/**
+ * Routes `daemon`'s USDC transfer (`hub.transfer`) through viem's real HTTP transport (`rpcTransport`, retries shortened)
+ * over a fake fetch in front of Anvil that answers every `eth_getTransactionReceipt` with an HTTP 429 -- the rate limit
+ * Arc's public RPC answers (rehearsal §8.2) -- while it lets the simulate through. The send itself goes out through the
+ * daemon's own wallet sender, on Anvil, and is mined at once: only its receipt cannot be read.
+ */
+function rateLimitedReceipts(daemon: ArenaDaemon) {
+  const state = { receiptReads: 0 };
+  const fetchFn = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const req = JSON.parse(String(init?.body)) as { method: string };
+    if (req.method === "eth_getTransactionReceipt") {
+      state.receiptReads++;
+      return new Response("Too Many Requests", { status: 429 });
+    }
+    return fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: init?.body });
+  };
+  const client = createPublicClient({ transport: rpcTransport(RPC, { fetchFn, retryDelay: 1 }) }) as PublicClient;
+  const fake = new HubClient(daemon.hub.hub, client);
+  const real = daemon.hub.transfer.bind(daemon.hub);
+  daemon.hub.transfer = fake.transfer.bind(fake);
+  return { state, restore: () => void (daemon.hub.transfer = real) };
+}
+
+const HASH_RE = /0x[0-9a-f]{64}/;
+
+describe("Final fix wave B (I-1): a withdraw that was sent and whose receipt read failed is never answered 'retry'", () => {
+  it("through the API: a 502 naming the hash, never H3's 503; the next withdraw finds it landed and sends nothing; the one after sends", async () => {
+    const port = await freePort();
+    const { env, home } = await walletHome({ port });
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    const limited = rateLimitedReceipts(proc.daemon);
+    const post = (body: unknown) =>
+      fetch(`${proc.apiUrl}/withdraw`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${loadToken(home)}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: JSON.stringify(body),
+      });
+    const res = await post({ amount: "3000000" });
+    // Before: 503 "the RPC is rate-limiting (HTTP 429): wait a few seconds, then retry", with no hash.
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { error: string; hashes: Hex[] };
+    expect(limited.state.receiptReads).toBeGreaterThan(0);
+    expect(body.hashes).toHaveLength(1);
+    const [hash] = body.hashes as [Hex];
+    expect(body.error).toBe(
+      `the transfer of 3.000000 USDC to ${owner} may have been sent (tx ${hash}), but could not be confirmed (the RPC is ` +
+        `rate-limiting (HTTP 429)); check the owner's balance, an explorer or "arena wallet" before retrying: a retry can pay ` +
+        "the owner twice",
+    );
+    expect(body.error).not.toMatch(/then retry/);
+    // It did go out (Anvil mined it), and the wallet's sender still holds it.
+    expect(await usdcBalance(env.usdc, owner)).toBe(3_000_000n);
+    expect((await publicClient().getTransactionReceipt({ hash })).status).toBe("success");
+    expect(existsSync(arenaPaths(home).withdrawPending)).toBe(true);
+
+    // The agent retries anyway, the RPC serving again: refused, saying it landed -- the owner is not paid twice.
+    limited.restore();
+    const again = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "3"], again.io)).toBe(1);
+    expect(again.err.join("\n")).toMatch(
+      new RegExp(`^error: an earlier withdraw of 3\\.000000 USDC to ${owner} landed \\(tx ${hash}, block \\d+\\): the owner has been paid, so nothing was sent now`),
+    );
+    expect(again.out).toEqual([]);
+    expect(await usdcBalance(env.usdc, owner)).toBe(3_000_000n);
+    expect(existsSync(arenaPaths(home).withdrawPending)).toBe(false);
+    // Resolved: the next withdraw sends.
+    const third = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "3"], third.io), third.err.join("\n")).toBe(0);
+    expect(await usdcBalance(env.usdc, owner)).toBe(6_000_000n);
+  });
+
+  it("the CLI prints the hash; with no daemon left running, the in-process daemon of the next withdraw still holds it back", async () => {
+    const port = await freePort();
+    const { env, home } = await walletHome({ port });
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    rateLimitedReceipts(proc.daemon);
+    const t = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "2"], t.io)).toBe(1);
+    const printed = t.err.join("\n");
+    expect(printed).toMatch(new RegExp(`^error: the transfer of 2\\.000000 USDC to ${owner} may have been sent \\(tx 0x[0-9a-f]{64}\\)`));
+    expect(printed).toContain("a retry can pay the owner twice");
+    const hash = HASH_RE.exec(printed)![0];
+    expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
+    await proc.stop();
+    expect(livePidHoldingLock(home)).toBeNull();
+
+    // Before: a fresh in-process daemon tracked nothing and sent the transfer again, at the next nonce.
+    const retry = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "2"], retry.io)).toBe(1);
+    expect(retry.err.join("\n")).toContain(`landed (tx ${hash}, block`);
+    expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
+    expect(livePidHoldingLock(home)).toBeNull();
+    const next = cliIo(home);
+    expect(await runCli(["withdraw", "--amount", "2"], next.io), next.err.join("\n")).toBe(0);
+    expect(await usdcBalance(env.usdc, owner)).toBe(4_000_000n);
+  });
+
+  it("an unconfirmed transfer that may still land holds withdraws back until its nonce is used or its hold is over; a failed check is a 503", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    const path = arenaPaths(home).withdrawPending;
+    const unknown = `0x${randomBytes(32).toString("hex")}` as Hex; // never sent: no receipt, unknown to the node
+    const pending = (p: Partial<PendingWithdraw>) =>
+      writeJsonAtomic(path, { to: owner, amount: 1_000_000n, at: Date.now(), txs: [{ hash: unknown, nonce: 0 }], ...p } satisfies PendingWithdraw);
+    expect(await publicClient().getTransactionCount({ address: wallet })).toBe(0);
+
+    // Nonce 0 is still free: it may land. Refused, nothing sent, kept.
+    pending({});
+    const held = (await proc.daemon.withdraw({ amount: 1_000_000n }).catch((e: unknown) => e)) as DaemonError;
+    expect([held.code, held.hashes]).toEqual([409, [unknown]]);
+    expect(held.message).toMatch(
+      new RegExp(`^an earlier withdraw of 1\\.000000 USDC to ${owner} was sent \\d+ s ago \\(tx ${unknown}\\) and is not confirmed: it may still land, so nothing was sent now`),
+    );
+    expect(await usdcBalance(env.usdc, owner)).toBe(0n);
+    expect(existsSync(path)).toBe(true);
+
+    // A read that fails is a 503 naming it, and nothing is sent.
+    const realReceipt = proc.daemon.client.getTransactionReceipt.bind(proc.daemon.client);
+    proc.daemon.client.getTransactionReceipt = (async () => {
+      throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+    }) as typeof realReceipt;
+    const unread = (await proc.daemon.withdraw({ amount: 1_000_000n }).catch((e: unknown) => e)) as DaemonError;
+    expect([unread.code, unread.hashes]).toEqual([503, [unknown]]);
+    expect(unread.message).toMatch(/could not be checked \(-32005 "rate limit exceeded"\): nothing was sent now; retry in a few seconds$/);
+    proc.daemon.client.getTransactionReceipt = realReceipt;
+
+    // Past its hold: cleared, and this withdraw sends (at nonce 0, which a transfer still pending there would share).
+    pending({ at: Date.now() - WITHDRAW_UNCONFIRMED_HOLD_MS - 1 });
+    expect((await proc.daemon.withdraw({ amount: 1_000_000n })).amount).toBe(1_000_000n);
+    expect(existsSync(path)).toBe(false);
+    expect(await usdcBalance(env.usdc, owner)).toBe(1_000_000n);
+
+    // Its nonce (0) is now used by another transaction: it can never land. Cleared, and this withdraw sends.
+    pending({});
+    expect((await proc.daemon.withdraw({ amount: 1_000_000n })).amount).toBe(1_000_000n);
+    expect(existsSync(path)).toBe(false);
+    expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
+
+    // With its nonce unknown, only its hold ends it.
+    pending({ txs: [{ hash: unknown }] });
+    expect(((await proc.daemon.withdraw({ amount: 1_000_000n }).catch((e: unknown) => e)) as DaemonError).code).toBe(409);
+    expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
   });
 });

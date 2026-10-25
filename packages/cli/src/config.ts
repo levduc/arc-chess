@@ -270,6 +270,8 @@ export function arenaPaths(home: string) {
     config: join(home, "config.json"),
     wallet: join(home, "wallet.json"),
     token: join(home, "token.json"),
+    /** Final fix wave B (I-1): a withdraw that may have been sent unconfirmed (`PendingWithdraw`, daemon.ts). */
+    withdrawPending: join(home, "withdraw-pending.json"),
     channels: join(home, "channels"),
     offers: join(home, "offers"),
     channelRecord: (id: Hex) => join(home, "channels", canonical(id), "record.json"),
