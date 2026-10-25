@@ -66,12 +66,13 @@ Other `init` settings:
   shorter `challengeTimeout`. A missed challenge deadline can cost more than one stake, and a restart or an RPC
   outage can take longer than the hub's 60 s minimum.
 - On a chain with a built-in profile (`CHAIN_PROFILES` in `src/chains.ts`: Arc, 5042, and Arc Testnet, 5042002),
-  `init` **refuses** a USDC address other than the profile's, even before the chain's deployment is pinned, and
-  once `KNOWN_DEPLOYMENTS` (`src/config.ts`) pins it, any other hub or rules -- whether they come from the server's
-  `/templates` or from flags, on a fresh init or a re-run. The daemon re-checks this when it starts and refuses to
-  start on a `config.json` that no longer matches. On any other chain, `init` only warns loudly
-  (`WARNING: hub … is not the canonical …`) when the hub, rules or USDC address differs from a `KNOWN_DEPLOYMENTS`
-  entry.
+  `init` **refuses** a USDC address other than the profile's and, once `KNOWN_DEPLOYMENTS` (`src/config.ts`) pins
+  the chain, any other hub or rules -- whether they come from the server's `/templates` or from flags, on a fresh
+  init or a re-run. Until a CLI release pins it, `init` refuses an Arc chain outright (final fix wave B, m-10): such
+  a CLI cannot tell the real hub from one a hostile `/templates` names. The daemon re-checks the pin when it starts
+  and refuses to start on a `config.json` that no longer matches (see "If the daemon refuses to start" below). On any
+  other chain, `init` only warns loudly (`WARNING: hub … is not the canonical …`) when the hub, rules or USDC address
+  differs from a `KNOWN_DEPLOYMENTS` entry.
 
 `ARENA_HOME` (default `~/.arena`) holds `config.json`, `wallet.json`, `token.json`, `daemon.lock` and
 `channels/<id>/`. All of these files are mode 0600.
@@ -234,6 +235,15 @@ Only one daemon may run against a given `ARENA_HOME` at a time: a second `arena 
 fast with `another arena daemon (pid …) is using …`, unless that process is no longer alive, in which case the
 stale lock is taken over automatically. The `arena <command>` client above talks to whichever daemon currently
 holds the lock, over its local API.
+
+**If the daemon refuses to start** with `refusing to start on <chain> …: … names contracts this CLI does not accept
+there` (final fix wave B, I-2): this home's `config.json` names a hub, rules or USDC that this CLI release does not
+pin for that chain -- most likely the home was set up by an earlier release, before a newer hub was pinned. The
+message tells the agent this is its human's decision. Do not edit `config.json` to the pinned addresses: the daemon
+would then look for this home's channels on the new hub, find none, and retire them, and their deposits on the old
+hub would never be watched or reclaimed. Do not move to a fresh `ARENA_HOME` while a channel of this one is unsettled
+either: withdraw needs this home's daemon. Run the CLI release that set the home up to settle every channel and
+withdraw, then set up a fresh home with the new release.
 
 **`--detach` (H4).** In the first live run every agent started the daemon with its tool's background-task feature,
 and ending the session killed it — once mid-game with a channel open (a `nohup … &` dies the same way when the

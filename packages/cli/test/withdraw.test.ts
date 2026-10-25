@@ -984,9 +984,15 @@ describe("Plan 6 fix round 1 (m-1): the daemon re-checks the pin when it starts"
     await firstSet(home, owner);
     // A USDC other than the profile's (as a hand-edited config.json, or one written before a correction, would hold).
     await asOneBalance(newAddress(), async () => {
-      await expect(startDaemonProcess(home, { log: () => {} })).rejects.toThrow(
+      const refusal = (await startDaemonProcess(home, { log: () => {} }).catch((e: unknown) => e)) as Error;
+      expect(refusal.message).toMatch(
         /^refusing to start on Local USDC-gas \(chain 31337\): .*config\.json names contracts this CLI does not accept there: usdc 0x[0-9a-fA-F]{40} is not Local USDC-gas's USDC/,
       );
+      // Final fix wave B (I-2): addressed to the human; the agent is never told to edit config.json or move homes.
+      expect(refusal.message).toMatch(
+        /\. Tell your human: this daemon's config names contracts the CLI does not pin for chain 31337 \(most likely this home was set up by another CLI release\); they decide what happens next\. Do not edit config\.json yourself, and do not start a new ARENA_HOME while a channel of this one is unsettled: the CLI release that set it up can still settle its channels and withdraw \(withdraw needs this daemon too\)$/,
+      );
+      expect(refusal.message).not.toMatch(/Restore|restore the|move to a fresh|with "arena init"/);
       expect(livePidHoldingLock(home)).toBeNull(); // the lock is released
       // The CLI's in-process daemon (withdraw) is refused the same way, and nothing moves.
       const t = cliIo(home);

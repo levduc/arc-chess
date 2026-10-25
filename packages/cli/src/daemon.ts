@@ -830,14 +830,20 @@ export class ArenaDaemon {
     // Plan 6 fix round 1 (m-1, spec §2.5): `init` refuses a non-pinned USDC, hub or rules on a chain with a profile,
     // but config.json can be edited by hand, or written before the chain's deployment was pinned. Re-checked here,
     // before anything subscribes or reads the chain: on such a chain this daemon deposits only to the pinned hub.
+    // Final fix wave B (I-2): `--detach`, `withdraw` and `bot` show this to the agent, so it is the human's to act on.
+    // The likely cause is a CLI release that pinned a newer hub, not a hand edit: restoring the pinned addresses would
+    // read this home's channels on the wrong hub (and retire them), and a fresh home would leave this wallet's funds
+    // behind. The release that set the home up can still settle and withdraw.
     const c = this.opts.config;
     const pinned = pinnedDeploymentRefusals(c.chainId, { hub: c.hub, rules: c.rules, usdc: c.usdc });
     if (pinned.length > 0) {
       const name = chainProfile(c.chainId)?.name ?? `chain ${c.chainId}`;
       throw new Error(
         `refusing to start on ${name} (chain ${c.chainId}): ${arenaPaths(this.opts.home).config} names contracts this CLI does ` +
-          `not accept there: ${pinned.join("; ")}. Deposits go to the hub config.json names. Restore the pinned addresses ` +
-          `in config.json (withdraw needs the daemon too), or move to a fresh ARENA_HOME with "${selfCommand()} init"`,
+          `not accept there: ${pinned.join("; ")}. Tell your human: this daemon's config names contracts the CLI does not ` +
+          `pin for chain ${c.chainId} (most likely this home was set up by another CLI release); they decide what happens ` +
+          "next. Do not edit config.json yourself, and do not start a new ARENA_HOME while a channel of this one is " +
+          "unsettled: the CLI release that set it up can still settle its channels and withdraw (withdraw needs this daemon too)",
       );
     }
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => this.fireAndForget("onMatch", this.onMatch(m))));

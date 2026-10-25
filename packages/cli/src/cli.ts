@@ -737,9 +737,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const rules = asAddress("rules", rulesRaw);
         // Plan 6 (spec §2.5, Review Focus 3): on a chain with a built-in profile (Arc), only the profile's USDC and, once
         // the chain's deployment is pinned, only its hub and rules -- whether they came from /templates or from flags.
+        // Final fix wave B (m-10): an Arc chain with no pin yet is refused outright.
         // On every init, fresh or re-run, before any network call (other than a --server's /templates) and before
         // anything is written. Other chains keep the warnings below (`knownDeploymentWarnings`).
-        const pinnedRefusals = pinnedDeploymentRefusals(chainId, { hub, rules, usdc });
+        const pinnedRefusals = pinnedDeploymentRefusals(chainId, { hub, rules, usdc }, { requirePin: true });
         if (pinnedRefusals.length > 0) {
           const name = chainProfile(chainId)?.name ?? `chain ${chainId}`;
           throw new Error(
@@ -769,7 +770,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown }>(arenaPaths(home).config);
         } catch (err) {
           throw new Error(
-            `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}): fix or remove it first`,
+            `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}). Tell ` +
+              "your human: only they repair it (never you), and this home's wallet and owner depend on it",
           );
         }
         if (prior !== null) {

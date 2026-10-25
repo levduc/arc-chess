@@ -187,7 +187,7 @@ describe("arena owner (spec §4.3)", () => {
       expect(r.err.split("\n")).toHaveLength(1); // one line of explanation
       expect(r.err).toMatch(/^error: the owner is already set to .*signature/);
       // Fix round 2: a smart-contract owner cannot sign here; the refusal says the only route is a hand edit.
-      expect(r.err).toMatch(/smart-contract wallet, the only way to change it is to hand-edit .*config\.json/);
+      expect(r.err).toMatch(/smart-contract wallet, the only way to change it is to hand-edit .*config\.json: your human's step, never yours$/m);
       expect(ownerOnDisk(home)).toBe(OWNER_A);
       expect(nonceOnDisk(home)).toBe(0);
       // The library builds the same text the spec pins.
@@ -409,6 +409,9 @@ describe("arena owner (spec §4.3)", () => {
       const t = ownerIo(home);
       expect(await runCli(initArgs(walletKey), t.io)).toBe(1);
       expect(t.err.join("\n")).toMatch(/config\.json/);
+      // Final fix wave B (I-2 sweep): the human repairs it; the agent is never told to fix or remove it.
+      expect(t.err.join("\n")).toMatch(/Tell your human: only they repair it \(never you\)/);
+      expect(t.err.join("\n")).not.toMatch(/fix or remove/);
       expect(readFileSync(arenaPaths(home).config, "utf8")).toBe("{ not json");
     });
   });

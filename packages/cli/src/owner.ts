@@ -120,7 +120,7 @@ export function readRecordedOwner(home: string): string | null {
   } catch (err) {
     throw new Error(
       `cannot read ${path} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}), so cannot tell whether an ` +
-        "owner is recorded in it: fix or remove it first",
+        "owner is recorded in it. Tell your human: only they repair it (never you)",
     );
   }
   const raw = cfg?.owner;
@@ -219,7 +219,7 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
   // A change. `current` is non-null here; if it is not an address at all, nobody can sign for it.
   if (current === null || !isAddress(current, { strict: false })) {
     throw new Error(
-      `the recorded owner ${JSON.stringify(current)?.slice(0, 60)} is not an address, so nobody can sign a change: only a hand edit of ${path} can fix it`,
+      `the recorded owner ${JSON.stringify(current)?.slice(0, 60)} is not an address, so nobody can sign a change: only your human can fix it, by hand-editing ${path} (never you)`,
     );
   }
   const currentOwner = getAddress(current);
@@ -231,7 +231,7 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
       `the owner is already set to ${currentOwner}: changing it needs that owner's signature. Ask your human to sign ` +
         "messageToSign (printed above) with the current owner's wallet (EIP-191 personal_sign), then run the command with it. " +
         `The signature is checked locally, so only an ordinary key can sign: if ${currentOwner} is a smart-contract ` +
-        `wallet, the only way to change it is to hand-edit ${path}`,
+        `wallet, the only way to change it is to hand-edit ${path}: your human's step, never yours`,
     );
   }
   if (!/^0x([0-9a-fA-F]{2})+$/.test(signature)) {
