@@ -322,7 +322,14 @@ USDC. Sections 2–9 are that run; §10 is the rerun on the hardened hub. Rerun 
 step. A run that stopped leaves its server and daemons running on purpose, so the watchtowers keep watching. Before
 resuming, stop them by the pids in `<dir>/state.json` (`kill <pid>`, once no channel needs them). The script refuses
 to start over one that is still running, and says which pid. It recognises its own processes by pid, start time and
-command line, and never signals anything else. `--collect-only` rebuilds the tables from the chain. It never deploys. Its header lists every safety rule. In short:
+command line, and never signals anything else.
+
+`--collect-only` rebuilds the tables from the chain, and it never deploys. Since final wave C (`fe5fe67`) it reads
+everything at the run's recorded end block: nonces, balances, `owed`, `committedEscrow` and the hub simulations. It
+keeps the Blockscout listing to the run's own block range. A later transaction from the deployer therefore no longer
+changes a collected table. A run with no recorded end block is collected at head, with a note saying so.
+
+The script's header lists every safety rule. In short:
 
 - The RPC is hard-coded to `https://rpc.testnet.arc.io`. `eth_chainId == 0x4cef52` is asserted before every deployer
   transaction.

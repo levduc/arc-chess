@@ -249,6 +249,14 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
    - `trustProxy` is set correctly behind the proxy.
    - A fresh `dbPath` records the identity on first start.
    - `audit` is truthful (m21). `publicRpcUrl` is an RPC you run or trust.
+   - The server enforces three checks on Arc mainnet, and refuses to start if one fails (final wave C, `4184a16`):
+     - `indexer.startBlock` must be set to the hub's deploy block (runbook §9); from 0 the indexer would need days to
+       catch up;
+     - `xmtp.env` must be `"production"` when XMTP is configured;
+     - the RPC's `eth_chainId` must equal the config's `chainId`, which the server checks at every startup.
+   - The `eth_getLogs` timing is repeated on the mainnet RPC the host will use, at deploy (h3-rereview M-f). The
+     reference is 0.087 s for 1,000 blocks (565 USDC logs) on `rpc.mainnet.arc.io`, measured 2026-10-25
+     (`arc-facts.md`), against the SDK's 5 s per-attempt timeout.
 6. **Monitoring and alerting.**
    - `committedEscrow` against the cap and against game activity (m13 squatting).
    - Every `Challenged`, `PayoutDeferred`/`owed`, `Paused`/`LimitsUpdated` event, and ownership events.

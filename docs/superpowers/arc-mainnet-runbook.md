@@ -218,7 +218,9 @@ The hub emitted `OwnershipTransferred(DEPLOYER, MULTISIG)`. Record both transact
   - both deploy transaction hashes, the block, gas used and cost;
   - the verification links;
   - the `transferOwnership` and `acceptOwnership` hashes, and the pause drill's hashes if it was run.
-- **The production server config** (`docs/deploy/arc-mainnet.server.json.example`) sets `indexer.startBlock` to
-  the deploy block (final review C m-4).
+- **The production server config** (`docs/deploy/arc-mainnet.server.json.example`, Task 6) sets
+  `indexer.startBlock` to the deploy block, and `xmtp.env` to `"production"` if XMTP is configured. On chain 5042 the
+  server refuses to start without either (final wave C, `4184a16`). It also refuses an `rpcUrl` whose `eth_chainId`
+  is not the config's `chainId`.
 - **Time `eth_getLogs` on the RPC the server will use** (h3-rereview M-f). The 2026-10-25 reference is in
   `arc-facts.md`.
