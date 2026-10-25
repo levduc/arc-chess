@@ -223,12 +223,25 @@ describe("H3 fix round 2 (re-review M-g): a respond is never broadcast past its 
   it("reads that end past the deadline (plus the margin): nothing is sent, and the respond error says so", async () => {
     const { alice, id, l, sent } = await challengedAlice();
     const { deadline } = await alice.daemon.hub.channelInfo(id);
-    skew(alice.daemon, deadline, 1n, 1_000 + RESPOND_SEND_MARGIN_MS + 500); // give-up in 1 s, notAfter in 4 s
+    skew(alice.daemon, deadline, 1n, 1_000 + RESPOND_SEND_MARGIN_MS + 500); // give-up in 1 s, notAfter in 16 s
     await alice.daemon.move(id, "Nf3", { actor: "agent" });
     // Before: the respond went out regardless, to revert on-chain and burn gas.
     expect(sent.at).toBeUndefined();
     expect(l.lastError).toBe("respond: the transaction was ready only past its give-up time: not sent");
     expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Challenged");
+  });
+
+  it("final fix wave B (m-6, h3 M-i): reads that end past the give-up time but inside the 15 s margin: still sent", async () => {
+    expect(RESPOND_SEND_MARGIN_MS).toBe(15_000);
+    const { alice, id, sent } = await challengedAlice();
+    const { deadline } = await alice.daemon.hub.channelInfo(id);
+    // Give-up in 1 s; the reads end 8.5 s after them, 7.5 s past the give-up time and 7.5 s before notAfter. The block
+    // time read is skewed only: on the chain the deadline is minutes away, so the respond lands. With the 3 s margin
+    // of H3 fix round 2 it was held back; the costs are lopsided (a forfeit against about 0.008 USDC of gas).
+    skew(alice.daemon, deadline, 1n, 8_500);
+    await alice.daemon.move(id, "Nf3", { actor: "agent" });
+    expect(sent.at).toBeDefined();
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Open");
   });
 
   it("reads that end before the deadline: the respond is sent and answers the challenge", async () => {
