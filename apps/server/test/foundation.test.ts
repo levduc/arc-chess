@@ -1100,6 +1100,8 @@ describe("http foundation", () => {
       expect(step8).toMatch(new RegExp(`Last, once every channel is settled -- \`Finalized\` or \`Reclaimed\`, or one of its suggested actions starts with\\s+\`done:\` \\(a funding window that closed without it opening\\) -- with \`swept\` set, any offer you posted has passed\\s+its \`expiresAt\`, and the withdraw is done[^]*run \`${PINNED.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} daemon stop\``));
       expect(step8.indexOf("daemon stop")).toBeGreaterThan(step8.indexOf("withdraw --all"));
       expect(step8).toMatch(/Never override that\s+refusal yourself: stopping a daemon that guards a live channel is your human's decision\./);
+      // Final fix wave B (m-4): a channel no daemon watches cannot be settled by the agent.
+      expect(step8).toMatch(/settle it first \(step 6\), or run `stop` again in a\s+minute if one has only just settled\. For a channel it says no daemon watches, tell your human\./);
       // m2: the override flag is the human's, named in the README only, never on this page.
       expect(text).not.toContain("--yes-i-understand");
       const setup = stepOf(text, "## Setup (once)", "## Find an opponent");
