@@ -94,24 +94,30 @@ export function processState(pid: number, source: ProcessSource = existsSync("/p
   return r.stdout.trim().startsWith("Z") ? "zombie" : "running";
 }
 
-/** What `identify` learned about the process `daemon.lock` names. */
+/** What `identify` learned about the process `daemon.lock` names. `definite` (final fix wave B, m-2): a `silent` that
+ *  waiting does not change -- an answer without identity, or a lock no answer can match -- unlike one that does not
+ *  answer (yet). `degraded` (m-4): the channels the confirmed daemon does not watch. */
 export type Identity =
-  | { state: "confirmed"; pid: number; role: string }
-  | { state: "silent"; why: string }
+  | { state: "confirmed"; pid: number; role: string; degraded: string[] }
+  | { state: "silent"; why: string; definite?: true }
   | { state: "other"; why: string };
 
 /**
  * H4 fix round 2 (N1, N3): who answers this home's API, and whether it is the process `daemon.lock` names -- asked of
- * the daemon itself, with no clock. `GET /health` with this home's bearer token answers `{pid, lock, role}`: its own
- * pid, the random nonce its `acquireHomeLock` wrote into `daemon.lock`, and the command running it. `confirmed` only
- * when that pid is the lock's pid and that nonce the lock's nonce (a lock from an older CLI has no nonce: the
- * authenticated pid alone then). `silent` when nothing answers, or the answer names no process (another home's
- * daemon on that port, without this token, or an older CLI's); `other` when this home's token is answered by a
- * different pid or nonce than the lock's.
+ * the daemon itself, with no clock. `GET /health` with this home's bearer token answers `{pid, lock, role, degraded}`:
+ * its own pid, the random nonce its `acquireHomeLock` wrote into `daemon.lock`, the command running it, and the
+ * channels it does not watch. `confirmed` only when that pid is the lock's pid, that nonce the lock's nonce, and a
+ * role is named. Final fix wave B (m-1): a lock with no nonce (written by an older CLI) is never confirmed -- only the
+ * nonce proves anything, and any loopback listener can echo a pid. `silent` when nothing answers, or the answer names
+ * no process (another home's daemon on that port, without this token, or an older CLI's); `other` when this home's
+ * token is answered by a different pid or nonce than the lock's.
  */
 export async function identify(home: string, api: string | null, lock: { pid: number; nonce?: string }, fetchFn: typeof fetch): Promise<Identity> {
   if (api === null) return { state: "silent", why: "cannot be asked: this home's port is 0" };
-  let body: { pid?: unknown; lock?: unknown; role?: unknown };
+  if (lock.nonce === undefined) {
+    return { state: "silent", why: "its daemon.lock has no nonce (an older CLI wrote it), so no answer can confirm it", definite: true };
+  }
+  let body: { pid?: unknown; lock?: unknown; role?: unknown; degraded?: unknown };
   try {
     const res = await fetchFn(`${api}/health`, {
       headers: { authorization: `Bearer ${loadToken(home)}` },
@@ -123,12 +129,25 @@ export async function identify(home: string, api: string | null, lock: { pid: nu
     return { state: "silent", why: `does not answer on ${api}` };
   }
   if (typeof body.pid !== "number") {
-    return { state: "silent", why: `does not say on ${api} which process it is (a daemon of another home, or of an older CLI)` };
+    return { state: "silent", why: `a daemon from an older CLI (or another home) answers on ${api} without saying which process it is`, definite: true };
   }
-  if (body.pid !== lock.pid || (lock.nonce !== undefined && body.lock !== lock.nonce)) {
+  if (body.pid !== lock.pid || body.lock !== lock.nonce) {
     return { state: "other", why: `${api} is answered with this home's token by pid ${body.pid}, not by the daemon.lock's writer` };
   }
-  return { state: "confirmed", pid: body.pid, role: typeof body.role === "string" ? body.role : "daemon" };
+  if (typeof body.role !== "string") {
+    return { state: "silent", why: `${api} answers for pid ${body.pid} without saying which command it runs`, definite: true };
+  }
+  const degraded = Array.isArray(body.degraded) ? body.degraded.filter((d): d is string => typeof d === "string") : [];
+  return { state: "confirmed", pid: body.pid, role: body.role, degraded };
+}
+
+/** Final fix wave B (m-2): what a holder this CLI cannot identify, and will not signal, needs: the human's manual stop. */
+function unidentifiedHolder(pid: number, home: string, why: string, log: string): string {
+  return (
+    `pid ${pid} holds ${home}, but ${why}: this CLI cannot confirm it is this home's daemon. Tell your human: pid ${pid}, ` +
+    `its log ${log}; if it is this home's daemon from before a CLI upgrade, they stop it by hand (the CLI README, ` +
+    `"Stopping a daemon by hand")`
+  );
 }
 
 /**
@@ -158,6 +177,8 @@ async function alreadyHeld(
       );
     }
     if (id.state === "other") throw new Error(`pid ${pid} holds ${home}, but ${id.why}: tell your human (pid ${pid}, log ${ctx.log})`);
+    // Final fix wave B (m-2): an answer that will not change is not waited on until the deadline.
+    if (id.definite === true) throw new Error(`${unidentifiedHolder(pid, home, id.why, ctx.log)}. Do not start another daemon`);
     why = id.why;
     await sleep(DETACH_POLL_MS);
   } while (Date.now() < ctx.deadline);
@@ -295,10 +316,18 @@ export const STOP_WAIT_DEFAULT_S = 60;
  * `Funding` the hub opens the channel by itself on the opponent's deposit, which would then run with no watchtower; a
  * deposit past the funding deadline needs this daemon to reclaim it. `finalized` is set only once a channel is settled,
  * reclaimed, or retired with none of our money in it (`ArenaDaemon.markFinalized`), so a retired record, which keeps
- * `None` or `Funding` as its final phase, does not count. Unreadable records are not counted: no daemon can watch them.
+ * `None` or `Funding` as its final phase, does not count. Final fix wave B (m-4): a record that cannot be read counts
+ * (`unreadable`), as in init's RPC check -- it cannot be shown to be settled, and its funds may still be in a channel.
  */
 export function liveChannelIds(home: string): string[] {
-  return new RecordStore(home).channels().filter((r) => !r.finalized).map((r) => r.channelId);
+  return liveChannels(home).map((c) => c.channelId);
+}
+
+function liveChannels(home: string): Array<{ channelId: string; unreadable: boolean }> {
+  return new RecordStore(home)
+    .scanChannels()
+    .filter((e) => e.record === null || e.record.finalized !== true)
+    .map((e) => ({ channelId: e.channelId, unreadable: e.record === null }));
 }
 
 /**
@@ -306,8 +335,9 @@ export function liveChannelIds(home: string): string[] {
  * `waitMs` until it has exited. The pid comes from `daemon.lock`, and is signalled (SIGTERM, the daemon's own clean
  * shutdown) only after the daemon's own API, asked with this home's token in this same call, said it is that pid and
  * holds that lock's nonce (`identify`) -- checked again right before the signal. A lock pid that does not answer is
- * never signalled, whatever it is: the error says to wait and retry, then tell the human. Refuses while any channel
- * record is not finalized (`liveChannelIds`) unless `override`: with no daemon, nothing answers a challenge.
+ * never signalled, whatever it is: the error says to wait and retry, then tell the human; one that answers without an
+ * identity, or a lock with no nonce, says to tell the human at once (m-2). Refuses while any channel record is not
+ * finalized (`liveChannelIds`) unless `override`: with no daemon, nothing answers a challenge.
  */
 export async function stopDaemon(
   home: string,
@@ -330,6 +360,7 @@ export async function stopDaemon(
   const check = async () => {
     const id = await identify(home, api, lock, opts.fetch);
     if (id.state === "other") throw new Error(`pid ${pid} holds ${home}, but ${id.why}: not signalling anything. Tell your human (pid ${pid}, log ${log})`);
+    if (id.state === "silent" && id.definite === true) throw new Error(`${unidentifiedHolder(pid, home, id.why, log)}. Not signalling anything`);
     if (id.state === "silent") {
       throw new Error(
         `the daemon daemon.lock names (pid ${pid}) ${id.why}, so it is not signalled: it may still be starting, be stuck, ` +
@@ -343,19 +374,36 @@ export async function stopDaemon(
           (id.role === "withdraw" ? " (a withdraw ends by itself in seconds)" : ""),
       );
     }
+    return id;
   };
-  await check();
-  const live = liveChannelIds(home);
+  const { degraded } = await check();
+  const liveEntries = liveChannels(home);
+  const live = liveEntries.map((c) => c.channelId);
   if (live.length > 0) {
     if (!opts.override) {
+      // Final fix wave B (m-4): a channel no daemon watches -- degraded (its record or session would not load), or its
+      // record unreadable -- cannot be settled with `close`: named apart, as the human's.
+      const unwatched = liveEntries.filter((c) => c.unreadable || degraded.includes(c.channelId));
+      const settleable = live.filter((id) => !unwatched.some((c) => c.channelId === id));
+      const parts: string[] = [];
+      if (settleable.length > 0) {
+        parts.push(
+          `channels are live (${settleable.join(", ")}: their records are not finalized): settle first (${opts.command} close ` +
+            `--channel <id>, then wait for Finalized; a channel still being funded settles by itself at its funding deadline) ` +
+            `or run the daemon elsewhere -- with no daemon, nothing answers a challenge before its deadline, and a channel ` +
+            `being funded can open with nobody watching it. If one has only just settled, run "${opts.command} daemon stop" ` +
+            `again in a minute`,
+        );
+      }
+      if (unwatched.length > 0) {
+        const what = unwatched.map((c) => `${c.channelId} (${c.unreadable ? "its record cannot be read" : "degraded"})`);
+        parts.push(
+          `channel(s) ${what.join(", ")} are not finalized and not watched by any daemon: close cannot settle them, so ` +
+            "tell your human (they may still hold funds)",
+        );
+      }
       // m2: the override is the human's to give: it is named in the README, never in this message.
-      throw new Error(
-        `channels are live (${live.join(", ")}: their records are not finalized): settle first (${opts.command} close ` +
-          `--channel <id>, then wait for Finalized; a channel still being funded settles by itself at its funding deadline) ` +
-          `or run the daemon elsewhere -- with no daemon, nothing answers a challenge before its deadline, and a channel ` +
-          `being funded can open with nobody watching it. If one has only just settled, run "${opts.command} daemon stop" ` +
-          `again in a minute. Stopping it anyway is your human's decision, not yours`,
-      );
+      throw new Error(`${parts.join(". ")}. Stopping it anyway is your human's decision, not yours`);
     }
     opts.warn(`note: stopping with ${live.length} live channel(s) (${live.join(", ")}): nothing answers a challenge until a daemon runs again`);
   }

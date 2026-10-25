@@ -255,7 +255,8 @@ tool kills its process group). `arena daemon --detach [--timeout SECONDS]`:
   home's `arena daemon` prints `{"alreadyRunning":true,"healthy":true,"pid":…,"api":…,"log":…}` and exits 0. A lock
   pid that never answers -- still starting, stuck, or a pid since reused by another program -- exits 1 with "not
   answering": wait, check `channels` in a minute, then tell the human (the pid and the log). An `arena bot`, a
-  withdraw, or an answer that is not the lock's writer each exit 1 with what to do next. None of them sends the agent
+  withdraw, an answer that is not the lock's writer, and a holder this CLI cannot identify (m-2, below) each exit 1
+  with what to do next. None of them sends the agent
   back to `--detach` as is, and none calls a lock stale while its pid lives;
 - re-runs this same CLI directly — `<node> <node flags> <entry script> daemon`, never a wrapper or `npx` again:
   the `.arena-dev/bin/arena` and `.arena-testnet/bin/arena` wrappers `exec` node, and under `npx` the entry script
@@ -287,9 +288,22 @@ home may already be set up (skip init), and names `daemon stop` for a re-init.
 with a fresh random nonce. Asked `GET /health` with this home's bearer token, the daemon's API answers
 `{"ok":true,"pid":…,"lock":<that nonce>,"role":"daemon"|"bot"|"withdraw"}`; without the token, still the bare
 `{"ok":true}`. `daemon stop` and `daemon --detach` call the holder "this home's daemon" only when that answer's pid
-and nonce are the lock's (a lock written by an older CLI has no nonce: the authenticated pid alone then). No clock
-and no `/proc` are involved, so it works the same on Linux and macOS, across wall-clock steps, and a reused pid --
-which answers nothing -- can never pass. Both commands find the API at the home's configured port; a home whose
+and nonce are the lock's. A lock written by an older CLI has no nonce, and its holder is never confirmed (final fix
+wave B, m-1): any process listening on the port could echo a pid, and only the nonce, in the 0600 lock, proves
+anything. No clock and no `/proc` are involved, so it works the same on Linux and macOS, across wall-clock steps, and
+a reused pid -- which answers nothing -- can never pass. A holder that answers without saying which process it is (a
+daemon from an older CLI, or another home's on the same port), or a lock with no nonce, is an answer that waiting
+does not change: `--detach` and `stop` exit 1 at once, telling the agent to tell its human (m-2; before, `--detach`
+waited out its whole `--timeout`). The authenticated answer also lists the channels the daemon does not watch
+(`degraded`).
+
+**Stopping a daemon by hand (for the human).** After a CLI upgrade, a daemon still running from the older release
+cannot be identified by the new `daemon stop`, and is never signalled by it; neither is a stuck one that does not
+answer. Stop it yourself, only when no channel of the home is live (or you accept that nothing answers a challenge
+until a daemon runs again): read the pid from `ARENA_HOME/daemon.lock` (or the daemon's start line in
+`ARENA_HOME/daemon.log`), check that it is an arena daemon (`ps -o args= -p <pid>` ends in `daemon`), then
+`kill <pid>` (SIGTERM, a clean shutdown that releases the lock). Start the new release's daemon with
+`arena daemon --detach`. Both commands find the API at the home's configured port; a home whose
 `config.json` has port 0 (tests only: `init` always writes a real port) cannot be asked, so its holder never counts
 as answering.
 
@@ -308,9 +322,12 @@ It also refuses while any channel record of the home is not `finalized`, whateve
 `None` this wallet's deposit may be in flight; in `Funding` the hub opens the channel by itself when the opponent
 deposits, and it would then run with nobody watching; a deposit past its funding deadline needs this daemon to
 reclaim it. A record is finalized once the channel is settled, reclaimed, or retired with none of this wallet's
-money in it, so a retired record (it keeps `None` or `Funding` as its final phase) never blocks. The message names
-the live channels and says to settle first or run the daemon elsewhere, and that stopping anyway is the human's
-decision; it does not print the override. **`--yes-i-understand`** is that override, for a human only: it skips this
+money in it, so a retired record (it keeps `None` or `Funding` as its final phase) never blocks. A record that cannot
+be read blocks too (final fix wave B, m-4), as in `init`'s RPC check: it cannot be shown to be settled. The message
+names the live channels and says to settle first or run the daemon elsewhere, and that stopping anyway is the human's
+decision; it does not print the override. Channels no daemon watches -- an unreadable record, or one the daemon
+reports degraded (its session would not load, or it failed to open too often) -- are named apart: `close` cannot
+settle them, so the agent is told to tell its human. **`--yes-i-understand`** is that override, for a human only: it skips this
 check (never the identity one) and prints a note naming the live channels. skill.md never names it, and tells the
 agent to keep the daemon and tell its human when `stop` refuses. The recipe ends with `daemon stop`, once every
 channel is settled and swept, any offer the agent posted has expired, and the withdraw is done. A daemon run under

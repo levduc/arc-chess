@@ -761,7 +761,7 @@ describe("local API", () => {
 });
 
 describe("H4 fix round 2: /health names the process to this home's token", () => {
-  it("with the token: {ok, pid, lock, role}; without it, or without an identity, the bare {ok}", async () => {
+  it("with the token: {ok, pid, lock, role, degraded}; without it, or without an identity, the bare {ok}", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);
     const lockNonce = "ab".repeat(16);
@@ -774,9 +774,14 @@ describe("H4 fix round 2: /health names the process to this home's token", () =>
     };
     const health = async (url: string, tok?: string) =>
       (await fetch(`${url}/health`, tok !== undefined ? { headers: { authorization: `Bearer ${tok}` } } : {})).json();
-    expect(await health(named.url, token)).toEqual({ ok: true, pid: process.pid, lock: lockNonce, role: "daemon" });
+    expect(await health(named.url, token)).toEqual({ ok: true, pid: process.pid, lock: lockNonce, role: "daemon", degraded: [] });
     expect(await health(named.url)).toEqual({ ok: true });
     expect(await health(named.url, "wrong")).toEqual({ ok: true });
     expect(await health(bare.url, loadToken(pair.bob.home))).toEqual({ ok: true });
+    // Final fix wave B (m-4): a channel the daemon does not watch is named, to the token only.
+    const broken = `0x${"cd".repeat(32)}`;
+    (pair.alice.daemon as unknown as { markDegraded(id: string, error: string): void }).markDegraded(broken, "session.json is unreadable");
+    expect(((await health(named.url, token)) as { degraded: string[] }).degraded).toEqual([broken]);
+    expect(await health(named.url)).toEqual({ ok: true });
   });
 });

@@ -128,22 +128,23 @@ function runBin(home: string, args: string[]): Promise<{ code: number | null; ou
 
 /**
  * A stand-in for a lock holder (H4 fix round 2): a node process that writes `home`'s `daemon.lock` itself, as
- * `acquireHomeLock` does ({pid, nonce}), unless `lock: false`. With `answer`, it also answers `GET /health` on `home`'s
- * configured port as a daemon's API does: asked with this home's token, `{ok, pid, lock, role}`; otherwise `{ok}`.
- * `answer.pid`, `answer.nonce` and `answer.token` make it lie about the pid, report another nonce, or expect another
- * home's token.
+ * `acquireHomeLock` does ({pid, nonce}), unless `lock: false` -- or, with `nonceless`, an older CLI's `{pid}`. With
+ * `answer`, it also answers `GET /health` on `home`'s configured port as a daemon's API does: asked with this home's
+ * token, `{ok, pid, lock, role, degraded}`; otherwise `{ok}`. `answer.pid`, `answer.nonce` and `answer.token` make it
+ * lie about the pid, report another nonce, or expect another home's token; `answer.degraded` names channels it does
+ * not watch.
  */
 async function standIn(
   home: string,
-  opts: { lock?: boolean; answer?: { role?: string; pid?: number; nonce?: string; token?: string } } = {},
+  opts: { lock?: boolean; nonceless?: boolean; answer?: { role?: string; pid?: number; nonce?: string; token?: string; degraded?: string[] } } = {},
 ): Promise<{ child: ChildProcess; nonce: string }> {
   const nonce = Math.random().toString(16).slice(2).padEnd(32, "0");
   const script =
     'const fs = require("node:fs"); const e = process.env;' +
-    'if (e.FAKE_LOCK === "1") fs.writeFileSync(e.FAKE_HOME + "/daemon.lock", JSON.stringify({ pid: process.pid, nonce: e.FAKE_NONCE }));' +
+    'if (e.FAKE_LOCK === "1") fs.writeFileSync(e.FAKE_HOME + "/daemon.lock", JSON.stringify(e.FAKE_NONCELESS === "1" ? { pid: process.pid } : { pid: process.pid, nonce: e.FAKE_NONCE }));' +
     "if (e.FAKE_PORT) require(\"node:http\").createServer((q, r) => r.end(JSON.stringify(" +
     'q.url === "/health" && q.headers.authorization === "Bearer " + e.FAKE_TOKEN' +
-    "  ? { ok: true, pid: Number(e.FAKE_PID || process.pid), lock: e.FAKE_REPORT_NONCE || e.FAKE_NONCE, role: e.FAKE_ROLE }" +
+    "  ? { ok: true, pid: Number(e.FAKE_PID || process.pid), lock: e.FAKE_REPORT_NONCE || e.FAKE_NONCE, role: e.FAKE_ROLE, degraded: JSON.parse(e.FAKE_DEGRADED) }" +
     '  : { ok: true }))).listen(Number(e.FAKE_PORT), "127.0.0.1");' +
     "else setInterval(() => {}, 1000);";
   const port = readConfig(home).config.port;
@@ -158,6 +159,8 @@ async function standIn(
       FAKE_ROLE: opts.answer?.role ?? "daemon",
       FAKE_PID: opts.answer?.pid !== undefined ? String(opts.answer.pid) : "",
       FAKE_REPORT_NONCE: opts.answer?.nonce ?? "",
+      FAKE_NONCELESS: opts.nonceless === true ? "1" : "0",
+      FAKE_DEGRADED: JSON.stringify(opts.answer?.degraded ?? []),
     },
     stdio: "ignore",
   });
@@ -277,7 +280,9 @@ describe("H4: arena daemon --detach", () => {
     const port = await freePort(); // nothing answers there
     const home = bareHome(port);
     // A daemon stuck in start(): it took the lock (the first thing startDaemonProcess does), and its API never listens.
-    const takeLock = 'require("node:fs").writeFileSync(process.env.ARENA_HOME + "/daemon.lock", JSON.stringify({ pid: process.pid }))';
+    // With a nonce, as this CLI's acquireHomeLock writes it (final fix wave B, m-1: a nonceless lock is an older CLI's).
+    const takeLock =
+      'require("node:fs").writeFileSync(process.env.ARENA_HOME + "/daemon.lock", JSON.stringify({ pid: process.pid, nonce: "a".repeat(32) }))';
     const self = { cmd: process.execPath, args: ["-e", `${takeLock}; setInterval(() => {}, 1000)`] };
     const result = await startDetachedDaemon(home, { env: { ARENA_HOME: home }, fetch, waitMs: 1_500, command: "arena", self });
     expect(result).toMatchObject({ detached: true, healthy: false, api: `http://127.0.0.1:${port}`, log: join(home, "daemon.log") });
@@ -349,11 +354,11 @@ describe("H4: arena daemon --detach", () => {
   });
 
   it("fix round 2: the holder's own API names it -- this home's daemon is alreadyRunning; a bot, a withdraw, a stranger are named", async () => {
-    const answering = async (answer: { role?: string; pid?: number; nonce?: string; token?: string }) => {
+    const answering = async (answer: { role?: string; pid?: number; nonce?: string; token?: string }, timeout = "1") => {
       const home = bareHome(await freePort());
       const holder = await standIn(home, { answer });
       const t = cliIo(home);
-      const code = await runCli(["daemon", "--detach", "--timeout", "1"], t.io);
+      const code = await runCli(["daemon", "--detach", "--timeout", timeout], t.io);
       return { home, holder, code, out: t.out.join("\n"), err: t.err.join("\n") };
     };
     const daemon = await answering({ role: "daemon" });
@@ -375,12 +380,43 @@ describe("H4: arena daemon --detach", () => {
     const other = await answering({ nonce: "e".repeat(32) });
     expect(other.code).toBe(1);
     expect(other.err).toMatch(/is answered with this home's token by pid \d+, not by the daemon\.lock's writer: tell your human/);
-    // Another home's daemon on this port: it answers, but not with this home's identity -- not answering, as above.
-    const stranger = await answering({ token: "0".repeat(64) });
+    // Another home's daemon on this port (or an older CLI's): it answers, but not with this home's identity. Final fix
+    // wave B (m-2): a definite answer, so it fails at once -- before, it was polled until the deadline -- and says
+    // how the human stops it by hand.
+    const started = Date.now();
+    const stranger = await answering({ token: "0".repeat(64) }, "30");
+    expect(Date.now() - started).toBeLessThan(10_000);
     expect(stranger.code).toBe(1);
-    expect(stranger.err).toMatch(/does not say on http:\/\/127\.0\.0\.1:\d+ which process it is \(a daemon of another home, or of an older CLI\)/);
+    expect(stranger.err).toContain(
+      `pid ${stranger.holder.child.pid} holds ${stranger.home}, but a daemon from an older CLI (or another home) answers on ` +
+        `http://127.0.0.1:${readConfig(stranger.home).config.port} without saying which process it is: this CLI cannot confirm it ` +
+        `is this home's daemon. Tell your human: pid ${stranger.holder.child.pid}, its log ${join(stranger.home, "daemon.log")}; ` +
+        `if it is this home's daemon from before a CLI upgrade, they stop it by hand (the CLI README, "Stopping a daemon by ` +
+        `hand"). Do not start another daemon`,
+    );
     for (const c of [daemon, bot, withdraw, other, stranger]) expect(running(c.holder.child)).toBe(true);
     for (const c of [daemon, bot, withdraw, other, stranger]) expect(existsSync(join(c.home, "daemon.log"))).toBe(false);
+  });
+
+  it("final fix wave B (m-1): a lock with no nonce is never confirmed, even by a listener that echoes its pid -- nothing is signalled", async () => {
+    // A {pid} lock (an older CLI's, or a stuck one's whose pid was reused) and a listener on the home's port that
+    // answers this home's token with that pid and role "daemon". Before: --detach reported it alreadyRunning, and
+    // daemon stop SIGTERMed it, on the pid alone.
+    const home = bareHome(await freePort());
+    const holder = await standIn(home, { nonceless: true, answer: {} });
+    expect(readLockFile(home)).toEqual({ pid: holder.child.pid });
+    const detach = cliIo(home);
+    expect(await runCli(["daemon", "--detach", "--timeout", "30"], detach.io)).toBe(1);
+    const why = "its daemon.lock has no nonce (an older CLI wrote it), so no answer can confirm it: this CLI cannot confirm it is this home's daemon";
+    expect(detach.err.join("\n")).toContain(`pid ${holder.child.pid} holds ${home}, but ${why}. Tell your human:`);
+    expect(detach.out).toEqual([]);
+    const stop = cliIo(home);
+    expect(await runCli(["daemon", "stop"], stop.io)).toBe(1);
+    expect(stop.err.join("\n")).toContain(`but ${why}`);
+    expect(stop.err.join("\n")).toMatch(/Not signalling anything$/m);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(running(holder.child)).toBe(true);
+    expect(existsSync(join(home, "daemon.log"))).toBe(false); // nothing spawned
   });
 
   it("fix round 1 (I3, M4): init on a home a daemon holds says to skip init, and names daemon stop -- never kill", async () => {
@@ -501,6 +537,37 @@ describe("H4 add-on: arena daemon stop (fix round 2: the daemon's own API names 
     expect(daemon.child.signalCode).toBe("SIGTERM");
   });
 
+  it("final fix wave B (m-4): an unreadable or degraded record blocks stop too, named as not watched by any daemon -- the human's, never close", async () => {
+    const home = bareHome(await freePort());
+    const open = writeRecord(home, 1, false);
+    const degraded = writeRecord(home, 2, false); // readable, but the daemon could not load its session
+    const unreadable = `0x${(3).toString(16).padStart(64, "0")}`;
+    mkdirSync(join(home, "channels", unreadable), { recursive: true });
+    writeFileSync(join(home, "channels", unreadable, "record.json"), "{ not json");
+    writeRecord(home, 4, true, "Finalized");
+    const daemon = await standIn(home, { answer: { degraded: [degraded] } });
+    const t = cliIo(home);
+    expect(await runCli(["daemon", "stop"], t.io)).toBe(1);
+    const err = t.err.join("\n");
+    // Before: the unreadable record did not count at all, and the degraded one was told to `close`.
+    expect(err).toContain(`channels are live (${open}: their records are not finalized): settle first (arena close --channel <id>`);
+    expect(err).toContain(
+      `channel(s) ${degraded} (degraded), ${unreadable} (its record cannot be read) are not finalized and not watched by any ` +
+        "daemon: close cannot settle them, so tell your human (they may still hold funds). Stopping it anyway is your human's decision, not yours",
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    expect(running(daemon.child)).toBe(true);
+    // Only unwatched ones: no "settle first" at all.
+    const onlyUnwatched = bareHome(await freePort());
+    mkdirSync(join(onlyUnwatched, "channels", unreadable), { recursive: true });
+    writeFileSync(join(onlyUnwatched, "channels", unreadable, "record.json"), "{ not json");
+    await standIn(onlyUnwatched, { answer: {} });
+    const u = cliIo(onlyUnwatched);
+    expect(await runCli(["daemon", "stop"], u.io)).toBe(1);
+    expect(u.err.join("\n")).toMatch(new RegExp(`^error: channel\\(s\\) ${unreadable} \\(its record cannot be read\\) are not finalized`));
+    expect(u.err.join("\n")).not.toContain("settle first");
+  });
+
   it("with only finalized records (settled, reclaimed, retired) it stops without the override -- and on the ps path, with no /proc", async () => {
     const home = bareHome(await freePort());
     writeRecord(home, 1, true, "Finalized");
@@ -508,7 +575,7 @@ describe("H4 add-on: arena daemon stop (fix round 2: the daemon's own API names 
     const daemon = await standIn(home, { answer: {} });
     const lock = readLockFile(home)!;
     expect(lock).toEqual({ pid: daemon.child.pid, nonce: daemon.nonce });
-    expect(await identify(home, `http://127.0.0.1:${readConfig(home).config.port}`, lock, fetch)).toEqual({ state: "confirmed", pid: daemon.child.pid, role: "daemon" });
+    expect(await identify(home, `http://127.0.0.1:${readConfig(home).config.port}`, lock, fetch)).toEqual({ state: "confirmed", pid: daemon.child.pid, role: "daemon", degraded: [] });
     expect(processState(daemon.child.pid!, "ps")).toBe("running");
     expect(processState(daemon.child.pid!, "proc")).toBe("running");
     const result = await stopDaemon(home, { fetch, waitMs: 10_000, command: "arena", override: false, warn: () => {}, processSource: "ps" });

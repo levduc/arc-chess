@@ -359,13 +359,14 @@ export async function startApi(
         const route = `${req.method} ${url.pathname}`;
         // H4 fix round 2 (N1, N3): asked with this home's token, /health also says which process answers -- its pid
         // and the nonce of the daemon.lock it wrote -- so `daemon stop` and `daemon --detach` identify the lock's
-        // writer without any clock. Without the token it stays the bare liveness probe it always was.
+        // writer without any clock. Without the token it stays the bare liveness probe it always was. Final fix wave B
+        // (m-4): and the channels it does not watch (degraded), which `daemon stop` names as the human's to handle.
         if (route === "GET /health") {
           return send(
             res,
             200,
             opts.identity !== undefined && authorized(req, opts.token)
-              ? { ok: true, pid: process.pid, lock: opts.identity.lockNonce, role: opts.identity.role }
+              ? { ok: true, pid: process.pid, lock: opts.identity.lockNonce, role: opts.identity.role, degraded: daemon.degradedChannelIds() }
               : { ok: true },
           );
         }

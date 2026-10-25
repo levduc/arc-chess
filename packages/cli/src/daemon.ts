@@ -4150,6 +4150,12 @@ export class ArenaDaemon {
     this.log(`channel ${channelId} is degraded and not watched: ${error}`);
   }
 
+  /** Final fix wave B (m-4): the channels this daemon could not load and does not watch (`markDegraded`), for the
+   *  authenticated `/health` -- so `daemon stop` names them, without a chain read. */
+  degradedChannelIds(): string[] {
+    return [...this.degraded.keys()];
+  }
+
   protected log(line: string): void {
     (this.opts.log ?? (() => undefined))(line);
   }
