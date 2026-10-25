@@ -387,8 +387,10 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     // Plan 6 hardening H2 (audit-journey M-9): the CLI pins this network's contracts.
     ...(arc
       ? [
-          `- \`init\` refused with \`refusing to init on ${arc.name}\`: this host's contracts are not the ones this CLI pins.`,
-          "  Do not retry with other flags, another package or another version: stop and tell your human.",
+          // Final fix wave B (m-10): the same refusal when this CLI pins no deployment on that network yet.
+          `- \`init\` refused with \`refusing to init on ${arc.name}\`: this host's contracts are not the ones this CLI pins`,
+          "  (or this CLI pins none there yet). Do not retry with other flags, another package or another version: stop",
+          "  and tell your human.",
         ]
       : []),
     // Plan 5.7 Task 2 (spec §5): only when this host publishes `xmtp` -- same undefined-key-style gating as the

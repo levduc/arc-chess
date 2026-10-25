@@ -993,7 +993,11 @@ describe("http foundation", () => {
       // C-1 troubleshooting: check the hash on the explorer; never recover it yourself.
       expect(text).toContain("it on the explorer (`https://explorer.arc.io/tx/<hash>`). If it was sent on a different network, it will never");
       // M-9, I-6, M-1, M-2.
-      expect(text).toContain("- `init` refused with `refusing to init on Arc`: this host's contracts are not the ones this CLI pins.");
+      expect(text).toContain(
+        "- `init` refused with `refusing to init on Arc`: this host's contracts are not the ones this CLI pins\n" +
+          "  (or this CLI pins none there yet). Do not retry with other flags, another package or another version: stop\n" +
+          "  and tell your human.",
+      );
       expect(text).toMatch(/only for a key that is used for nothing else, ever: the daemon replaces any pending transaction on that key/);
       expect(text).toMatch(/`336000000000000000` is 0\.336 USDC/);
       expect(text).toMatch(/any amount an error gives\s+in `wei` are native units with 18 decimals; on Arc, where gas is USDC, 10\^18 wei = 1 USDC\./);
