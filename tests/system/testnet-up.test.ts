@@ -10,12 +10,13 @@ import { createServer as createHttpServer, type Server } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { createPublicClient, http, parseUnits, type Address, type Hex } from "viem";
+import { HttpRequestError, TransactionReceiptNotFoundError, createPublicClient, http, parseUnits, type Address, type Hex, type TransactionReceipt } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { parseServerConfig } from "../../apps/server/src/config.js";
 import {
   CHAIN_ID,
   DEPLOYER,
+  PAY_RECEIPT_TIMEOUT_MS,
   FORBIDDEN_PORTS,
   RPC_URL,
   TESTNET_SERVER_LIMITS,
@@ -32,6 +33,7 @@ import {
   isOurs,
   openNeedWei,
   parseDownArgs,
+  payUnconfirmed,
   parseUpArgs,
   procStartTime,
   readDeployment,
@@ -41,8 +43,10 @@ import {
   testnetChildEnv,
   topUpAmount,
   unlessExits,
+  waitForPayReceipt,
   writePayWrapper,
 } from "../../scripts/testnet-up.js";
+import { isRefusalBeforeSend } from "../../scripts/claude-human-watcher.js";
 import { freeTcpPort, isPortFree } from "./harness.js";
 
 const REPO_ROOT = join(import.meta.dirname, "../..");
@@ -581,6 +585,58 @@ describe("the pay helper", () => {
   );
 
   it(
+    "final wave C add-on (live run #2): a receipt read that fails is retried, not taken for the end of the wait",
+    async () => {
+      // A loopback proxy in front of Anvil whose first two receipt reads fail the way a load-balanced RPC's do. Before,
+      // viem's waitForTransactionReceipt gave up at the first one and pay said "no receipt within 180s".
+      let receiptReads = 0;
+      const proxy = createHttpServer((req, res) => {
+        let body = "";
+        req.on("data", (c: Buffer) => (body += c.toString("utf8")));
+        req.on("end", () => {
+          const msg = JSON.parse(body) as { id: number; method: string };
+          if (msg.method === "eth_getTransactionReceipt" && ++receiptReads <= 2) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "header not found" } }));
+            return;
+          }
+          void fetch(anvil.url, { method: "POST", headers: { "content-type": "application/json" }, body }).then(async (r) => {
+            res.writeHead(r.status, { "content-type": "application/json" });
+            res.end(await r.text());
+          });
+        });
+      });
+      await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
+      try {
+        const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+        const to = privateKeyToAccount(generatePrivateKey()).address;
+        // Not spawnSync: the proxy runs on this process's event loop.
+        const r = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+          const c = spawn(payPath, [to, "0.5"], {
+            cwd: REPO_ROOT,
+            env: { ...process.env, ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: url, chainId: 31337, keyFile }) },
+          });
+          let stdout = "";
+          let stderr = "";
+          c.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+          c.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+          c.once("exit", (status) => resolve({ status, stdout, stderr }));
+        });
+        printed.push(r.stdout, r.stderr);
+        expect(r.status, r.stderr).toBe(0);
+        expect(receiptReads).toBeGreaterThanOrEqual(3);
+        const out = JSON.parse(r.stdout.trim().split("\n").at(-1)!) as Record<string, unknown>;
+        expect(out).toMatchObject({ sent: true, status: "success", to });
+        expect(r.stderr).not.toMatch(/no receipt/);
+        expect(await pub.getBalance({ address: to })).toBe(parseUnits("0.5", 18));
+      } finally {
+        await new Promise<void>((r) => proxy.close(() => r()));
+      }
+    },
+    90_000,
+  );
+
+  it(
     "refuses more than 3 USDC, and a bad amount or recipient, before sending anything",
     async () => {
       const to = privateKeyToAccount(generatePrivateKey()).address;
@@ -754,6 +810,81 @@ describe("the pay helper", () => {
     const d = join(root, "rpc-wrapper");
     expect(readFileSync(writePayWrapper(d), "utf8")).not.toContain("--rpc");
     expect(readFileSync(writePayWrapper(d, "https://example.invalid/arc"), "utf8")).toMatch(/ pay --rpc 'https:\/\/example\.invalid\/arc' "\$@"/);
+  });
+
+  describe("final wave C add-on (live run #2): the receipt wait runs its full deadline, and an open outcome never reads as unsent", () => {
+    const HASH = `0x${"ab".repeat(32)}` as Hex;
+    const receipt = { status: "success" } as TransactionReceipt;
+    const rateLimited = () => new HttpRequestError({ url: "https://rpc.testnet.arc.io", status: 429, body: { method: "eth_getTransactionReceipt" } });
+    /** A fake clock: `sleep` only moves `now`, so 180 s of waiting take no time. */
+    function fakeClock() {
+      let t = 0;
+      return { now: () => t, sleep: async (ms: number) => void (t += ms), get t() { return t; } };
+    }
+    function fakePub(answer: (read: number, t: number) => TransactionReceipt | Error, clock: { now(): number }) {
+      const reads: number[] = [];
+      return {
+        reads,
+        getTransactionReceipt: async () => {
+          reads.push(clock.now());
+          const a = answer(reads.length, clock.now());
+          if (a instanceof Error) throw a;
+          return a;
+        },
+      };
+    }
+
+    it("a rate-limited RPC is read again until a receipt comes, even 170 s in (the live run gave up at ~33 s)", async () => {
+      const clock = fakeClock();
+      const pub = fakePub((_n, t) => (t < 170_000 ? rateLimited() : receipt), clock);
+      const got = await waitForPayReceipt(pub, HASH, PAY_RECEIPT_TIMEOUT_MS, clock);
+      expect(got.receipt).toBe(receipt);
+      expect(clock.t).toBeGreaterThanOrEqual(170_000);
+      // backs off 2, 4, 8, then 10 s between failed reads, never more
+      const gaps = pub.reads.slice(1).map((t, i) => t - pub.reads[i]!);
+      expect(gaps.slice(0, 4)).toEqual([2_000, 4_000, 8_000, 10_000]);
+      expect(Math.max(...gaps)).toBe(10_000);
+    });
+
+    it("gives up only at the deadline, with a read made at the deadline itself and the last reason", async () => {
+      const clock = fakeClock();
+      const pub = fakePub(() => rateLimited(), clock);
+      const got = await waitForPayReceipt(pub, HASH, PAY_RECEIPT_TIMEOUT_MS, clock);
+      expect(got).toEqual({ receipt: null, why: expect.stringMatching(/^the RPC is rate-limiting \(HTTP 429\)$/) });
+      expect(pub.reads.at(-1)).toBe(PAY_RECEIPT_TIMEOUT_MS);
+      expect(PAY_RECEIPT_TIMEOUT_MS).toBe(180_000);
+    });
+
+    it("a receipt not there yet is polled every 2 s; another failure says its receipt could not be read", async () => {
+      const clock = fakeClock();
+      const notYet = new TransactionReceiptNotFoundError({ hash: HASH });
+      const pub = fakePub((n) => (n < 4 ? notYet : receipt), clock);
+      expect((await waitForPayReceipt(pub, HASH, PAY_RECEIPT_TIMEOUT_MS, clock)).receipt).toBe(receipt);
+      expect(pub.reads).toEqual([0, 2_000, 4_000, 6_000]);
+
+      const clock2 = fakeClock();
+      const odd = Object.assign(new Error("header not found"), { code: -32000 });
+      const got = await waitForPayReceipt(fakePub(() => odd, clock2), HASH, 30_000, clock2);
+      expect(got).toEqual({ receipt: null, why: expect.stringMatching(/^its receipt could not be read \(/) });
+      expect(clock2.t).toBe(30_000);
+    });
+
+    it("an open outcome names the hash and its explorer link, says to check before paying again, and never says unsent", () => {
+      const to = "0x00000000000000000000000000000000000000b1" as Address;
+      for (const sentKnown of [true, false]) {
+        const out = payUnconfirmed({ hash: HASH, to, wei: parseUnits("1.25", 18), sentKnown, why: "the RPC is rate-limiting (HTTP 429)", timeoutMs: 180_000 });
+        expect(out.stderr).toContain(HASH);
+        expect(out.stderr).toContain(`https://explorer.testnet.arc.io/tx/${HASH}`);
+        expect(out.stderr).toMatch(/check .* before paying again\n$/);
+        expect(out.stderr).toContain(sentKnown ? "It was sent and may have landed" : "It may have been sent and may have landed");
+        expect(out.stderr).toContain("within 180s (the RPC is rate-limiting (HTTP 429))");
+        // The watcher retries only a refusal before sending: an open outcome is never paid again.
+        expect(isRefusalBeforeSend(out.stderr)).toBe(false);
+        const json = JSON.parse(out.stdout) as Record<string, unknown>;
+        expect(json).toMatchObject({ sent: sentKnown ? true : "unknown", confirmed: false, status: "pending", txHash: HASH, usdc: "1.25", to });
+        expect(json.sent).not.toBe(false);
+      }
+    });
   });
 
   it("checkPayRequest refuses the hub, rules and USDC contracts as recipients", () => {

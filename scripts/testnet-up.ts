@@ -64,7 +64,10 @@
  * command line. It asserts chain 5042002 (twice: before it reads the key and right before it sends), refuses more
  * than `PAY_MAX_USDC` per call and refuses to take the deployer below `DEPLOYER_FLOOR_USDC`, refuses while the
  * deployer has a pending transaction (another sender is using the key), pays a 40 gwei fee cap (Arc drops anything
- * under 20 gwei), waits for the receipt and checks its status. A mixed-case address must carry a valid checksum.
+ * under 20 gwei), waits for the receipt and checks its status. A mixed-case address must carry a valid checksum. The
+ * receipt wait polls until its full 180 s have passed, whatever a read answers meanwhile (a rate limit, a timeout); when
+ * it ends without a receipt, it prints the hash and its explorer link and says to check before paying again -- never
+ * that nothing was sent.
  *
  * Test hook (`pay` only): `ARENA_TESTNET_TEST_OVERRIDE`, a JSON object `{rpcUrl, chainId, keyFile}`, all three
  * required. Only tests set it (tests/system/testnet-up.test.ts). It is refused outright unless `rpcUrl` is a loopback
@@ -102,6 +105,9 @@ import {
   type Address,
   type Hex,
   type PublicClient,
+  type TransactionReceipt,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { DEFAULT_LIMITS } from "../apps/server/src/config.js";
@@ -116,6 +122,7 @@ import {
 } from "../packages/cli/src/config.js";
 import { oneBalanceOpenNeed } from "../packages/cli/src/funding.js";
 import { channelHubAbi } from "../packages/sdk/src/abi.js";
+import { isRateLimited, rpcErrorSummary, rpcTransport } from "../packages/sdk/src/rpc.js";
 import { writeArenaWrapper } from "../tests/system/claude-sandbox.js";
 import { childEnv as allowlistedEnv } from "./arc-rehearsal-lib.js";
 
@@ -149,7 +156,12 @@ export const DEPLOYER_FLOOR_USDC = "2";
 const PAY_MAX_FEE = 40_000_000_000n;
 const PAY_TIP = 1_000_000_000n;
 const TRANSFER_GAS = 21_000n;
-const PAY_RECEIPT_TIMEOUT_MS = 180_000;
+export const PAY_RECEIPT_TIMEOUT_MS = 180_000;
+/** The receipt wait's poll, and the most it backs off to after failed reads (see `waitForPayReceipt`). */
+const PAY_RECEIPT_POLL_MS = 2_000;
+const PAY_RECEIPT_BACKOFF_MAX_MS = 10_000;
+/** One receipt read, its retries included, never takes longer than this, so the wait ends near its deadline. */
+const PAY_RECEIPT_READ_TOTAL_MS = 20_000;
 
 /** A top-up below this (0.001 USDC) is skipped: not worth a transaction. */
 const TOP_UP_DUST_WEI = 10n ** 15n;
@@ -647,6 +659,58 @@ async function deployerState(pub: PublicClient, address: Address): Promise<{ bal
   }
 }
 
+/** What the receipt wait found: the receipt, or, once its time is up, the last reason it had none. */
+export type PayReceiptWait = { receipt: TransactionReceipt } | { receipt: null; why: string };
+
+/**
+ * Final wave C add-on (live run #2): the pay helper's receipt wait, polled by hand until its deadline. viem's
+ * `waitForTransactionReceipt` gave up at the first read that still failed after the transport's retries (a rate-limited
+ * receipt read, about 30 s in), and the helper then printed "no receipt within 180s" for a top-up that had mined. Here a
+ * read that fails -- a rate limit (`isRateLimited`), a timeout, a 5xx, anything -- is retried, backing off from 2 s to
+ * 10 s, until `timeoutMs` has passed; a read is made at the deadline itself. Reads only: nothing is ever re-sent.
+ */
+export async function waitForPayReceipt(
+  pub: Pick<PublicClient, "getTransactionReceipt">,
+  hash: Hex,
+  timeoutMs: number = PAY_RECEIPT_TIMEOUT_MS,
+  clock: { now(): number; sleep(ms: number): Promise<void> } = { now: () => Date.now(), sleep },
+): Promise<PayReceiptWait> {
+  const deadline = clock.now() + timeoutMs;
+  let why = "not mined yet";
+  for (let failures = 0; ; ) {
+    try {
+      return { receipt: await pub.getTransactionReceipt({ hash }) };
+    } catch (err) {
+      if (err instanceof TransactionReceiptNotFoundError) {
+        why = "not mined yet";
+        failures = 0;
+      } else {
+        why = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : `its receipt could not be read (${rpcErrorSummary(err)})`;
+        failures++;
+      }
+    }
+    const left = deadline - clock.now();
+    if (left <= 0) return { receipt: null, why };
+    const wait = failures === 0 ? PAY_RECEIPT_POLL_MS : Math.min(PAY_RECEIPT_POLL_MS * 2 ** (failures - 1), PAY_RECEIPT_BACKOFF_MAX_MS);
+    await clock.sleep(Math.min(wait, left));
+  }
+}
+
+/** What `pay` prints when its outcome is not known: no receipt by the deadline. It may have landed, so it names the
+ *  transaction and says to check it before paying again; `sent` is `true` when the RPC took it, `"unknown"` when the
+ *  send's own answer was lost. Never `sent: false`: that would invite a second payment. */
+export function payUnconfirmed(o: { hash: Hex; to: Address; wei: bigint; sentKnown: boolean; why: string; timeoutMs: number }): { stderr: string; stdout: string } {
+  const explorer = `${EXPLORER}/tx/${o.hash}`;
+  const usdc = formatUnits(o.wei, 18);
+  return {
+    stderr:
+      `pay: ${usdc} USDC to ${o.to}: no receipt for ${o.hash} within ${o.timeoutMs / 1000}s (${o.why}). It ` +
+      `${o.sentKnown ? "was sent" : "may have been sent"} and may have landed: check ${explorer} (or "pay balance") before ` +
+      "paying again\n",
+    stdout: `${JSON.stringify({ sent: o.sentKnown ? true : "unknown", confirmed: false, usdc, to: o.to, txHash: o.hash, explorer, status: "pending", why: o.why })}\n`,
+  };
+}
+
 /** `pay`: see this file's docstring. Prints one JSON line on stdout; refusals go to stderr with exit 1. */
 async function pay(argvIn: string[]): Promise<number> {
   // `--rpc URL`, first, only from the wrapper: any RPC will do, since the chain is asserted and the transaction is
@@ -719,29 +783,37 @@ async function pay(argvIn: string[]): Promise<number> {
     nonce: latest,
   });
   const hash = keccak256(serialized);
+  let sentKnown = true;
   try {
     await pub.sendRawTransaction({ serializedTransaction: serialized });
   } catch (err) {
     await sleep(3_000);
+    // Only "no such transaction" says it is not there. A lookup that itself fails (a rate limit) says nothing, so the
+    // receipt wait below decides.
     const seen = await pub.getTransaction({ hash }).then(
-      () => true,
-      () => false,
+      () => "yes" as const,
+      (e: unknown) => (e instanceof TransactionNotFoundError ? ("no" as const) : ("unknown" as const)),
     );
-    if (!seen) throw new Error(`the send failed and ${hash} is not on the chain: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+    if (seen === "no") throw new Error(`the send failed and ${hash} is not on the chain: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+    sentKnown = seen === "yes";
   }
   const explorer = `${EXPLORER}/tx/${hash}`;
-  process.stderr.write(`pay: sent ${formatUnits(request.wei, 18)} USDC to ${request.to}: ${explorer}\n`);
-  let status: string;
-  try {
-    status = (await pub.waitForTransactionReceipt({ hash, timeout: PAY_RECEIPT_TIMEOUT_MS })).status;
-  } catch {
-    process.stderr.write(`pay: no receipt within ${PAY_RECEIPT_TIMEOUT_MS / 1000}s; do not resend until ${hash} confirms or drops\n`);
-    process.stdout.write(`${JSON.stringify({ sent: false, to: request.to, txHash: hash, explorer, status: "pending" })}\n`);
+  process.stderr.write(`pay: ${sentKnown ? "sent" : "may have sent (the send's answer was lost)"} ${formatUnits(request.wei, 18)} USDC to ${request.to}: ${explorer}\n`);
+  // Its own client: the same RPC through the SDK's transport, each read capped at PAY_RECEIPT_READ_TOTAL_MS with its
+  // retries, so the wait's deadline holds.
+  const receipts = createPublicClient({ chain, transport: rpcTransport(rpcUrl, { totalTimeoutMs: PAY_RECEIPT_READ_TOTAL_MS }) });
+  const waited = await waitForPayReceipt(receipts, hash);
+  if (waited.receipt === null) {
+    const out = payUnconfirmed({ hash, to: request.to, wei: request.wei, sentKnown, why: waited.why, timeoutMs: PAY_RECEIPT_TIMEOUT_MS });
+    process.stderr.write(out.stderr);
+    process.stdout.write(out.stdout);
     return 1;
   }
-  const after = await pub.getBalance({ address: account.address });
+  const status = waited.receipt.status;
+  // Best effort: the payment's outcome is already known, so a failed balance read must not turn it into an error.
+  const after = await pub.getBalance({ address: account.address }).catch(() => null);
   process.stdout.write(
-    `${JSON.stringify({ sent: status === "success", usdc: formatUnits(request.wei, 18), to: request.to, txHash: hash, explorer, status, deployerUsdc: formatUnits(after, 18) })}\n`,
+    `${JSON.stringify({ sent: status === "success", usdc: formatUnits(request.wei, 18), to: request.to, txHash: hash, explorer, status, deployerUsdc: after === null ? null : formatUnits(after, 18) })}\n`,
   );
   return status === "success" ? 0 : 1;
 }
