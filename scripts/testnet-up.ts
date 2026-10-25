@@ -1519,7 +1519,10 @@ async function up(args: UpArgs): Promise<void> {
       );
       const p = await runPay(payPath, address, due);
       if (p.code === 0) paidWei += parseUnits(due, 18);
-      else process.stderr.write(`testnet-up: funding ${name} failed (exit ${p.code}); see above\n`);
+      else if (/"status":"pending"/.test(p.stdout)) {
+        // Sent (or maybe sent), with no receipt yet: not a failure to retry, and not counted as paid either.
+        process.stderr.write(`testnet-up: funding ${name} is not confirmed yet; see above, and check it before paying again\n`);
+      } else process.stderr.write(`testnet-up: funding ${name} failed (exit ${p.code}); see above\n`);
     }
     if (shuttingDown) return;
     const unsettled = channels.filter((c) => !c.degraded && !SETTLED_PHASES.has(c.phase ?? "")).length;
