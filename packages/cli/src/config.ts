@@ -106,9 +106,9 @@ export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc
  *   **refuses** a hub, rules (or USDC, where listed) that differ from the entry here (`pinnedDeploymentRefusals`).
  * - On any other chain it only warns (`knownDeploymentWarnings`), as before.
  *
- * Arc's entries are pinned once each deployment is verified; until then the chain has no entry, and `init` on it
- * only checks the profile's USDC and that the addresses hold code. Never add a placeholder address: an entry here
- * refuses every other hub on its chain.
+ * Arc's entries are pinned once each deployment is verified; until then the chain has no entry, and `init` on it is
+ * refused (final fix wave B, m-10; before, it only checked the profile's USDC and that the addresses hold code). Never
+ * add a placeholder address: an entry here refuses every other hub on its chain.
  */
 export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {
   // 5042: Arc mainnet -- pinned by Plan 6 Task 6, after the gated mainnet deploy (contracts/deployments/5042.json).
@@ -124,16 +124,26 @@ export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {
 };
 
 /**
+ * Final fix wave B (m-10): the chains a test may `init` with a `nativeIsUsdc` profile and no `KNOWN_DEPLOYMENTS` entry
+ * (`pinnedDeploymentRefusals`' `requirePin`). Test-only: no flag, environment variable or file of this CLI writes it,
+ * so in production it is always empty, and `init` refuses such a chain until a release pins its deployment.
+ */
+export const UNPINNED_INIT_ALLOWED_FOR_TESTS = new Set<number>();
+
+/**
  * Plan 6 (spec §2.5, Review Focus 3): why `init` must refuse `addresses` on `chainId` -- empty when it may go on.
  * Only for a chain with a built-in profile (any other chain gets `knownDeploymentWarnings`):
  * - a USDC other than the profile's is always refused, even before the chain's deployment is pinned;
- * - once `table` pins the chain, a hub or rules (or a listed USDC) other than the pinned one is refused.
+ * - once `table` pins the chain, a hub or rules (or a listed USDC) other than the pinned one is refused;
+ * - final fix wave B (m-10), with `requirePin` (`init` only): a `nativeIsUsdc` chain `table` does not pin is refused,
+ *   whatever the addresses -- a CLI published before a chain's pin would otherwise take any hub a hostile /templates
+ *   names there. Never in `start()`: a home set up before then is not stranded by it.
  * The check runs on the resolved addresses, so it holds whether they came from /templates or from explicit flags.
  */
 export function pinnedDeploymentRefusals(
   chainId: number,
   addresses: { hub: Address; rules: Address; usdc: Address },
-  opts: { profiles?: Record<number, ChainProfile>; table?: Record<number, KnownDeployment> } = {},
+  opts: { profiles?: Record<number, ChainProfile>; table?: Record<number, KnownDeployment>; requirePin?: boolean } = {},
 ): string[] {
   const profiles = opts.profiles ?? CHAIN_PROFILES;
   const table = opts.table ?? KNOWN_DEPLOYMENTS;
@@ -143,6 +153,9 @@ export function pinnedDeploymentRefusals(
   const wrongUsdc = profile.usdc.toLowerCase() !== addresses.usdc.toLowerCase();
   if (wrongUsdc) out.push(`usdc ${addresses.usdc} is not ${profile.name}'s USDC ${profile.usdc}`);
   const known = Object.hasOwn(table, chainId) ? table[chainId] : undefined;
+  if (!known && opts.requirePin === true && profile.nativeIsUsdc && !UNPINNED_INIT_ALLOWED_FOR_TESTS.has(chainId)) {
+    out.push(`this CLI pins no arena deployment on ${profile.name} yet, so it cannot tell its hub from any other: a CLI release that pins it is needed`);
+  }
   if (known) {
     for (const field of ["hub", "rules", "usdc"] as const) {
       const want = known[field];

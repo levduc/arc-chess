@@ -6,7 +6,7 @@ import { offerId as computeOfferId, signOffer, toWire, type Offer } from "@arena
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
-import { KNOWN_DEPLOYMENTS, arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
+import { KNOWN_DEPLOYMENTS, UNPINNED_INIT_ALLOWED_FOR_TESTS, arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
 import { computeFundingNeed, fundDisclosure, fundMessage } from "../src/funding.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = [], opts: { chainId?: number } = {}) {
@@ -757,8 +757,24 @@ function arcContracts(chainId: number): { hub: string; rules: string } {
 }
 
 /** An Arc home (chain `chainId`, its profile's USDC), written by an explicit-flag init: no /templates, and only the
- *  chain-id and code checks over the RPC, which `io()` answers. */
+ *  chain-id and code checks over the RPC, which `io()` answers. Final fix wave B (m-10): on an Arc chain with no pin
+ *  yet (5042 until Task 6), init needs the test-only override. */
 async function initArcHome(chainId = 5042002) {
+  return unpinnedAllowed(chainId, () => initArcHomeWith(chainId));
+}
+
+/** Runs `body` with the test-only m-10 override for `chainId` when the table does not pin it. */
+async function unpinnedAllowed<T>(chainId: number, body: () => Promise<T>): Promise<T> {
+  const unpinned = !Object.hasOwn(KNOWN_DEPLOYMENTS, chainId);
+  if (unpinned) UNPINNED_INIT_ALLOWED_FOR_TESTS.add(chainId);
+  try {
+    return await body();
+  } finally {
+    if (unpinned) UNPINNED_INIT_ALLOWED_FOR_TESTS.delete(chainId);
+  }
+}
+
+async function initArcHomeWith(chainId: number) {
   const home = mkdtempSync(join(tmpdir(), "arena-cli-arc-"));
   const { hub, rules } = arcContracts(chainId);
   const args = [
@@ -957,7 +973,7 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
         "--rules", rules, "--server", "http://127.0.0.1:3000", "--port", "7010",
         "--session-gas-wei", "10000000000000000", "--fee-ceiling-wei", "40000000000", "--owner", OWNER,
       ];
-      expect(await runCli(args, t.io), t.err.join("\n")).toBe(0);
+      expect(await unpinnedAllowed(chainId, () => runCli(args, t.io)), t.err.join("\n")).toBe(0);
       expect((JSON.parse(t.out.join("\n")) as { owner: string }).owner.toLowerCase()).toBe(OWNER);
       return t.err;
     };

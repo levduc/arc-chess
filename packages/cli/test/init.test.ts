@@ -7,6 +7,7 @@ import {
   KNOWN_DEPLOYMENTS,
   RPC_CALL_RETRY_DELAYS_MS,
   RPC_TIMEOUT_MS,
+  UNPINNED_INIT_ALLOWED_FOR_TESTS,
   arenaPaths,
   feeCeilingOf,
   livePidHoldingLock,
@@ -386,10 +387,13 @@ describe("arena init --server", () => {
       }
     };
     // Plan 6 Task 5: these cases use synthetic addresses, so they run with Arc's real pins (5042002 since Task 5, 5042
-    // once Task 6 pins it) taken out of the table, and put back after each one. The real pin is tested below.
+    // once Task 6 pins it) taken out of the table, and put back after each one. The real pin is tested below. Final
+    // fix wave B (m-10): with no pin, init refuses an Arc chain outright, so these cases also set the test-only
+    // override (refused without it: tested in "no pin at all" below).
     const realPins = new Map<number, (typeof KNOWN_DEPLOYMENTS)[number]>();
     beforeEach(() => {
       for (const chainId of [5042, 5042002]) {
+        UNPINNED_INIT_ALLOWED_FOR_TESTS.add(chainId);
         if (!Object.hasOwn(KNOWN_DEPLOYMENTS, chainId)) continue;
         realPins.set(chainId, KNOWN_DEPLOYMENTS[chainId]);
         delete KNOWN_DEPLOYMENTS[chainId];
@@ -398,6 +402,27 @@ describe("arena init --server", () => {
     afterEach(() => {
       for (const [chainId, entry] of realPins) KNOWN_DEPLOYMENTS[chainId] = entry;
       realPins.clear();
+      UNPINNED_INIT_ALLOWED_FOR_TESTS.clear();
+    });
+
+    it("final fix wave B (m-10): no pin at all -- without the test-only override, init refuses the chain whatever the addresses, before any RPC call", async () => {
+      UNPINNED_INIT_ALLOWED_FOR_TESTS.clear();
+      for (const [chainId, name] of [[5042, "Arc"], [5042002, "Arc Testnet"]] as const) {
+        for (const [how, args, stub] of [
+          ["templates", fromServer, stubFetch({ templates: templatesResponse({ chainId, usdc: ARC_USDC }), ...arcChain(chainId) })],
+          ["flags", explicit({ chainId }), stubFetch(arcChain(chainId))],
+        ] as const) {
+          const home = freshHome();
+          const r = await run(home, [...args], stub);
+          expect(r.code, `${name} ${how}`).toBe(1);
+          expect(r.err).toContain(
+            `refusing to init on ${name} (chain ${chainId}): this CLI pins no arena deployment on ${name} yet, so it cannot ` +
+              "tell its hub from any other: a CLI release that pins it is needed",
+          );
+          expect(r.calls.filter((c) => c.method !== undefined), `${name} ${how}`).toEqual([]); // no RPC call at all
+          expect(existsSync(home), `${name} ${how}`).toBe(false);
+        }
+      }
     });
 
     it("a USDC other than the profile's is refused -- from /templates or from --usdc, on 5042 and 5042002 -- before any RPC call, writing nothing", async () => {
@@ -420,7 +445,7 @@ describe("arena init --server", () => {
       }
     });
 
-    it("with no pinned deployment, the profile's USDC (any case) is accepted with any hub and rules that hold code", async () => {
+    it("with no pinned deployment and the test-only override, the profile's USDC (any case) is accepted with any hub and rules that hold code", async () => {
       const home = freshHome();
       const r = await run(home, fromServer, stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC.toUpperCase().replace("0X", "0x") }), ...arcChain(5042002) }));
       expect(r.code, r.err).toBe(0);
