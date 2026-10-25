@@ -7,9 +7,11 @@
 # proxy, one balance, exact settlement with gas, the 20 gwei floor and the blocklist.
 #
 # Every other suite (`pnpm test:sdk`, `pnpm test:cli`, `pnpm test:contracts`, `pnpm test:system`) is untouched
-# -- those overrides default to unset, which is today's behaviour exactly. This script needs no `flock`: its
-# ports are distinct from the SDK/CLI suites' shared :8546, and from standard anvil, so it can run in parallel
-# with them.
+# -- those overrides default to unset, which is today's behaviour exactly. Its ports are its own (distinct from
+# the SDK/CLI suites' shared :8546, and from standard anvil), but RUN IT ALONE, never beside another suite: its
+# sdk/cli/system steps build into the same contracts/out and contracts/cache as every other suite's `forge
+# build` (packages/sdk/test/global-setup.ts), and two builds at once can fail with a transient ENOENT
+# (reproduced in the Plan 6 Task 4 review; the ledger's ruling is to serialize test:arc). See the NOTE below.
 #
 # Usage: pnpm test:arc
 set -uo pipefail # not -e: every step must run so every Arc-semantics failure is recorded, not just the first

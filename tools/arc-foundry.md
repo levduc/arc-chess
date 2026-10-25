@@ -108,7 +108,8 @@ avoids the shared `contracts/out`/`contracts/cache`. The sdk/cli/system steps st
 this task, required by hardcoded paths in e.g. `packages/sdk/test/helpers/chain.ts`) -- so `pnpm test:arc` run
 concurrently with `pnpm test:sdk`/`pnpm test:cli` (or another agent's run of either, in a shared checkout)
 can still race on `contracts/out`, exactly as any two of today's existing suites already could. This is not
-new risk this task introduced, and it is not fixable from this task's files alone.
+new risk this task introduced, and it is not fixable from this task's files alone. The race was reproduced in the
+Task 4 review, so the ruling is: **run `pnpm test:arc` alone**, with no other suite running in the checkout.
 
 ## Notable local-simulation gaps found while installing
 

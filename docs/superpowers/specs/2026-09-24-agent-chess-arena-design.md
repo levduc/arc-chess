@@ -698,9 +698,13 @@ The stream closes on client disconnect, daemon stop, or server close.
     - When adoption is impossible, the daemon raises the attention `challenge-unseen`. It names the turn and the
       deadline. The fix is the human's: switch `rpcUrl` and restart the daemon.
     - The server indexer applies the same split-and-skip, skipping only a refused block's `Challenged`/`Responded`
-      events. It reports the count as `arena_indexer_skipped_blocks` on `/metrics`.
-    - The contract proposal on branch `proposal/hub-hardening` (audit I1) caps emitted signed states. With it, an
-      oversized event cannot arise from a daemon-signed state.
+      events. It reports the count as `arena_indexer_skipped_blocks` on `/metrics`: the blocks skipped since that
+      process started. A skip is permanent in practice. The count starts at 0 on a restart, and a later read of the
+      block can drop it from the count without applying its dispute events (`apply` ignores an event older than a
+      row's `lastEvent`), so the affected rows may stay stale (final review C m-1).
+    - The hardened hub (audit I1; `proposal/hub-hardening`, merged in `750e280` and deployed on Arc testnet) verifies
+      every signature slot it re-emits. So an oversized event cannot arise from a daemon-signed state; it needs an RPC
+      that refuses, or lies about, an ordinary one.
 19. **Host connection lifecycle (CLI).**
     - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
       or the local API. A failed join is recorded as the channel's `lastError`.
@@ -1118,7 +1122,7 @@ with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch 
 
 See `docs/superpowers/specs/2026-10-23-arc-launch-design.md` for the design and `docs/superpowers/arc-facts.md` for
 the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2; item 67,
-hardening wave H3.
+hardening wave H3; item 68, hardening wave H4.
 
 60. **Chain profiles.** `CHAIN_PROFILES` (`packages/cli/src/chains.ts`) is built into the CLI and keyed by chain id;
     nothing in it is ever taken from the host. Arc (5042) and Arc Testnet (5042002) each have `usdc`
@@ -1154,7 +1158,9 @@ hardening wave H3.
 65. **Arc test subset.** `pnpm test:arc` (`scripts/test-arc.sh`) runs the contract suite, the SDK and CLI
     money-moving tests (deposit, close, dispute, sweep, top-up, withdraw) and the system dispute e2e against
     Arc Foundry's `arc-anvil --network arc`, pinned at `v0.8.0-2` with verified checksums (`tools/arc-foundry.md`).
-    Each step uses its own port, so the subset can run alongside the standard suites, which stay on standard anvil.
+    Each step uses its own port, but the subset must run alone: its SDK, CLI and system steps build into the same
+    `contracts/out` as the standard suites (which stay on standard anvil), and two builds at once can fail (the race
+    was reproduced in the Task 4 review; the ledger's ruling is to serialize it).
     `arc-anvil` answers a below-floor send with an error (`-32003`, at chain ids 31337 and 5042) instead of
     dropping it silently, so the silent drop itself is asserted at sender level.
 66. **The agent journey on Arc (hardening wave H2, audit-journey).**
@@ -1168,8 +1174,8 @@ hardening wave H3.
     - `/skill.md` on 5042 and 5042002 uses only `usdc.*` and `--wait-for-usdc`; reads the profit and loss only
       once `status.swept` is set, or after a bounded wait and `arena sweep`, and counts the USDC spent on gas;
       confirms the amount, owner and network before `withdraw --all`; after about 30 minutes unmatched, tells its
-      human but keeps waiting, and plays any late match, until the offer's `expiresAt` (1 h; there is no cancel)
-      has passed; offers back, with `withdraw --all`, whatever arrived when a funding wait times out; and leaves
+      human but keeps waiting, and plays any late match, until the offer's `expiresAt` (30 minutes: the recipe
+      posts `--ttl 1800`; there is no cancel) has passed; offers back, with `withdraw --all`, whatever arrived when a funding wait times out; and leaves
       funding to the human, on Arc only.
     - `buildStatus` takes optional `gasFunding` `{chainId, sessionGasWei, feeCeilingWei}`, which the daemon's
       `statusOf` passes (`cb142ea`). With it, on Arc,
@@ -1200,8 +1206,9 @@ hardening wave H3.
         abandoned, no retry starts whose wait would end past it, and the last error is thrown, so a rate limit stays a
         rate limit. A respond makes 11 requests one after another before its send (counted on the real path by
         `h3-ratelimit.test.ts`), and the send is one attempt of at most 10 s: 11 × 20 s + 10 s = 230 s, inside
-        `autoReturnSecondsOf` (300 s at the 900 s default window). Each transaction the session key still tracks adds a
-        receipt read.
+        `autoReturnSecondsOf` (300 s at the 900 s default window). The session key's tracker adds reads to that count:
+        up to two per hash it still tracks (each replacement adds a hash), a receipt read and, for a released entry
+        with fees, a transaction read (`prune`, `knowsAny`). Arc's tracker is normally empty at a respond.
       - The server's and `LocalKeyTxSender`'s own clients keep viem's retries and its 10 s: about 75 s per read.
       A send is never retried: viem issues `eth_sendRawTransaction` with `retryCount: 0`, and the capped transport
       excludes the send methods by name. A `SerialTxSender` send answered "nonce too low" whose own hash cannot be read
@@ -1293,8 +1300,9 @@ hardening wave H3.
       overrides that check alone. `stop` waits up to 60 s by default for the process to exit, then prints
       `{stopped: true, pid}`. `/skill.md`: a restart is `daemon stop`, then
       `daemon --detach`; if `stop` refuses, keep the running daemon and tell the human (m3). Step 8 ends the recipe
-      with `daemon stop` once every channel is settled -- `Finalized`, `Reclaimed`, or a `done:` first suggested
-      action, which includes a retired channel (m4) -- and swept, any offer the agent posted has expired (M5), and
+      with `daemon stop` once every channel is settled -- `Finalized`, `Reclaimed`, or a suggested action starting
+      with `done:`, which includes a retired channel (m4; "a", not "the first": a host refusal can be listed before
+      it, final review C m-15) -- and swept, any offer the agent posted has expired (M5), and
       the withdraw is done, and says overriding a refusal is the human's decision. skill.md never names the flag.
     - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
       loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
