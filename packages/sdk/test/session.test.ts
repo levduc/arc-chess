@@ -26,7 +26,7 @@ import {
   type SessionStore,
   type SignedState,
 } from "../src/index.js";
-import { SCHOLARS_MATE, makeParams } from "./helpers/fixtures.js";
+import { SCHOLARS_MATE, highSTwin, makeParams, vAsParity } from "./helpers/fixtures.js";
 
 const domain: ArenaDomain = { chainId: 31337, hub: "0x000000000000000000000000000000000000beef" };
 
@@ -1083,5 +1083,38 @@ describe("H1 fix round 1: adoptRegistered and the signature an event later suppl
     expect(a.snapshot().prev).toEqual({ state: e5.state, sigA: "0x", sigB: e5.sigB });
     expect(store.snapshots.length).toBe(saves + 1);
     expect(a.challengeProof().prev.sigB).toBe(e5.sigB);
+  });
+});
+
+// Final review A: the hub verifies ECDSA only, with OpenZeppelin's rules. A session stores a signature only in the form
+// the hub accepts, so no signature it holds can sink a proof.
+describe("final review A: signatures only in the hub's form", () => {
+  it("refuses the opponent's move and Close signatures in a form the hub refuses", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    for (const sigA of [highSTwin(e4.sigA), vAsParity(e4.sigA)]) {
+      await expect(b.receive({ ...e4, sigA })).rejects.toThrow(/missing or invalid opponent signature/);
+    }
+    expect(await b.receive(e4)).toBe("move");
+    await a.receive(await b.resign());
+    const ca = await a.signClose();
+    await expect(b.receiveClose({ ...ca, sig: highSTwin(ca.sig) })).rejects.toThrow(/invalid close signature/);
+    await b.receiveClose(ca);
+  });
+
+  it("m-3: challengeProof() leaves a lone opening signature out, as the hub supports the opening with none or both", async () => {
+    const { a, cfgA, keys } = await setup();
+    const opening = a.latest.state;
+    const lone = { state: opening, sigA: "0x" as Hex, sigB: await signState(keys[1], opening, domain) };
+    const store = new MemoryStore();
+    await store.save({ ...structuredClone(a.snapshot()), latest: lone });
+    const restored = await ChannelSession.open({ ...cfgA, store });
+    expect(restored.latest).toEqual(lone); // a valid signature survives the restore
+    expect(restored.challengeProof()).toMatchObject({ hasPrev: false, latest: { state: opening, sigA: "0x", sigB: "0x" } });
+    // A co-signed opening keeps both: the hub's both-signed rule supports it.
+    const both = { ...lone, sigA: await signState(keys[0], opening, domain) };
+    const store2 = new MemoryStore();
+    await store2.save({ ...structuredClone(a.snapshot()), latest: both });
+    expect((await ChannelSession.open({ ...cfgA, store: store2 })).challengeProof().latest).toEqual(both);
   });
 });

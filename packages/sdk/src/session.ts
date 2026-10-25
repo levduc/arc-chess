@@ -572,8 +572,11 @@ export class ChannelSession {
   challengeProof(): Proof {
     const latest = this.data.latest;
     const fullySigned = latest.sigA !== NO_SIG && latest.sigB !== NO_SIG;
-    if (latest.state.turnNum === 0n || fullySigned) {
-      return structuredClone({ hasPrev: false, prev: EMPTY_SIGNED, latest });
+    if (fullySigned) return structuredClone({ hasPrev: false, prev: EMPTY_SIGNED, latest });
+    if (latest.state.turnNum === 0n) {
+      // The hub supports the opening with both slots empty, or both valid (audit I1). A lone signature -- which a
+      // snapshot or event from the pre-I1 hub can leave -- is left out, so the proof is never one the hub refuses.
+      return structuredClone({ hasPrev: false, prev: EMPTY_SIGNED, latest: unsigned(latest.state) });
     }
     const prev = this.data.prev;
     if (!prev) throw new ArenaProtocolError("no endorsed predecessor for the latest state");
@@ -648,9 +651,11 @@ export class ChannelSession {
    * Accepted only as the canonical successor of `latest`: exactly the next turn, chaining from it, recomputed by the
    * rules, not a checkpoint, the opponent's move, and hashing to `registeredHash` (which the caller reads from the
    * hub). It is stored with no signature -- none was verified -- so it is provable only while it is registered:
-   * after this player's respond, a later challenge needs the opponent's signature, which a later event that can be
-   * read supplies (`ingestOnChain` repairs it). An RPC that lies about both reads can at worst make this player sign
-   * a move no proof accepts. Returns false, changing nothing, for anything else.
+   * after this player's respond, a later challenge needs the opponent's signature. The hub verifies ECDSA only, so
+   * the event that registered the move carries that signature in a form this SDK verifies, and once it can be read
+   * `ingestOnChain` repairs the state. An RPC that lies about both reads can make this player sign a move no proof
+   * accepts: a liveness cost, or at worst the current game, as an RPC that hides a challenge already can (h1-rereview
+   * N-1). Returns false, changing nothing, for anything else.
    */
   adoptRegistered(state: State, registeredHash: Hex): Promise<boolean> {
     return this.lock(async () => {

@@ -56,11 +56,32 @@ export function signClose(key: Hex, s: State, d: ArenaDomain): Promise<Hex> {
   });
 }
 
-export function recoverStateSigner(s: State, sig: Hex, d: ArenaDomain): Promise<Address> {
+/** secp256k1's group order, halved: OpenZeppelin's `ECDSA.tryRecover` refuses any larger `s`. */
+const HALF_ORDER = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+
+/**
+ * Throws unless `sig` has the one form the hub's ECDSA check (OpenZeppelin `ECDSA.tryRecover`) accepts: 65 bytes,
+ * `v` 27 or 28, and a low `s`. viem also recovers the high-`s` twin of a signature and a `v` of 0 or 1, both of which
+ * the hub refuses: a signature checked by viem alone could be stored as verified and then sink every proof that
+ * carries it. Every signature the SDK itself makes already has this form.
+ */
+function assertHubForm(sig: Hex): void {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(sig)) throw new Error("signature must be 65 bytes");
+  const v = Number.parseInt(sig.slice(130), 16);
+  if ((v !== 27 && v !== 28) || BigInt(`0x${sig.slice(66, 130)}`) > HALF_ORDER) {
+    throw new Error("signature is not in the form the hub accepts (v 27 or 28, low s)");
+  }
+}
+
+/** The state's signer, for a signature the hub would also accept; throws otherwise (see `assertHubForm`). */
+export async function recoverStateSigner(s: State, sig: Hex, d: ArenaDomain): Promise<Address> {
+  assertHubForm(sig);
   return recoverTypedDataAddress({ domain: domain(d), types: STATE_TYPES, primaryType: "State", message: s, signature: sig });
 }
 
-export function recoverCloseSigner(s: State, sig: Hex, d: ArenaDomain): Promise<Address> {
+/** The Close intent's signer, for a signature the hub would also accept; throws otherwise. */
+export async function recoverCloseSigner(s: State, sig: Hex, d: ArenaDomain): Promise<Address> {
+  assertHubForm(sig);
   return recoverTypedDataAddress({
     domain: domain(d),
     types: CLOSE_TYPES,
