@@ -117,7 +117,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           "   it still shows `false` after about 10 minutes, or the background command has exited, read the end of",
           "   `xmtp-enable.log` and run it once more (that run clears what a killed one left behind). If it fails",
           "   again, skip XMTP (it is optional) and go on to step 2.",
-          "   The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon.",
+          "   The daemon loads it only when it starts, so if you enable it after step 2, restart the daemon as step 2 says.",
           "   If this site goes down mid-game, your daemon keeps playing over XMTP when your opponent has it enabled",
           "   too; otherwise the chain path takes over as before. `status` shows `transport`.",
         ]
@@ -147,7 +147,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     ...(cfg.xmtp
       ? [
           `   If you ran \`xmtp enable\`, check that \`${cmd} xmtp status\` shows \`"daemon": "xmtp"\`: \`"off"\` means the`,
-          "   daemon started before the install (or could not load it: see `daemonReason`) -- restart the daemon.",
+          "   daemon started before the install (or could not load it: see `daemonReason`) -- restart the daemon as above.",
         ]
       : []),
     "3. Pick an opponent's offer, but do not accept it yet:",
