@@ -1215,10 +1215,13 @@ hardening wave H3; item 68, hardening wave H4.
       (a rate-limited check) is kept at its nonce with that hash, released, on every path (a fresh send, a replacement
       of a released entry, the wait's own replacement), and never re-sent at the next nonce. Every path checks a
       request's `notAfter` right before it transmits: `waitOrReplace` sets it to its `giveUpAt` on a replacement, and a
-      respond sets it to its give-up time plus 3 s (`RESPOND_SEND_MARGIN_MS`), so a respond whose reads end past its
-      deadline is not broadcast (it could only revert). The give-up time is never earlier than the last moment a block
-      could still take the respond (it is computed from the latest block's timestamp, which is not ahead of the
-      chain's clock); the margin covers Arc's 1 s timestamps and a proposer clock up to 2 s ahead.
+      respond sets it to its give-up time plus 15 s (`RESPOND_SEND_MARGIN_MS`; 3 s before final fix wave B, m-6), so a
+      respond whose reads end well past its deadline is not broadcast (it could only revert). The give-up time is never
+      earlier than the last moment a block could still take the respond (it is computed from the latest block's
+      timestamp, which is not ahead of the chain's clock). The margin is wide because the costs are lopsided: a respond
+      held back that would have landed forfeits the game, one sent too late costs about 0.008 USDC of gas. It covers
+      Arc's 1 s timestamps, a proposer clock running ahead, and this machine's wall clock stepping forward by up to
+      15 s between the read and the send (both times are `Date.now()`).
     - **CLI one-shot calls** (`rpcCall`: `init`, `wallet`, `fund`). An HTTP 429 or 5xx, or a JSON-RPC rate limit, is
       retried after 1, 2, 4 and 8 s. One that persists fails with "the RPC is rate-limiting: … wait a minute, then
       retry the command".
