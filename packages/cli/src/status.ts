@@ -116,6 +116,9 @@ export type ChannelStatus = {
    *  read, and `chainStaleReason` says why they could not be read again. A `GET /status` never sets it. */
   chainStale?: true;
   chainStaleReason?: string;
+  /** Final fix wave B (m-7): set with `chainStale` when the action's own transaction (a challenge, a reclaim) was mined
+   *  but its receipt could not be read -- whether it succeeded is not known yet. The text says so, with the hash. */
+  unconfirmed?: string;
 };
 
 export type StatusInput = {

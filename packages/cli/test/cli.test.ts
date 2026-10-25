@@ -193,6 +193,11 @@ describe("arena CLI", () => {
     const fresh = io(home, [{ status: 200, body: { channelId: "0xaa", turnNum: "1" } }]);
     expect(await runCli(["move", "e4"], fresh.io)).toBe(0);
     expect(fresh.err).toEqual([]);
+    // Final fix wave B (m-7): a challenge mined with its receipt unreadable did not "take effect": its outcome is unknown.
+    const reason = `the challenge transaction 0x${"ab".repeat(32)} was mined (block 42), but its receipt could not be read: whether it succeeded is not known yet; check status`;
+    const mined = io(home, [{ status: 200, body: { channelId: "0xaa", chainStale: true, chainStaleReason: reason, unconfirmed: reason } }]);
+    expect(await runCli(["challenge"], mined.io)).toBe(0);
+    expect(mined.err).toEqual([`note: challenge was mined, but whether it succeeded is not known yet (${reason}): run "arena status" to check`]);
   });
 
   it("reports API errors and usage errors", async () => {

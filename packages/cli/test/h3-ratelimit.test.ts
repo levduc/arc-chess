@@ -6,7 +6,16 @@
  */
 import { LimitExceededRpcError, createPublicClient, type Hex, type PublicClient } from "viem";
 import { afterEach, describe, expect, it } from "vitest";
-import { HubClient, RPC_RETRY_COUNT, RPC_RETRY_DELAY_MS, TxReceiptMissingError, ZERO_HASH, rpcTransport } from "@arena/sdk";
+import {
+  HubClient,
+  RPC_RETRY_COUNT,
+  RPC_RETRY_DELAY_MS,
+  TxFeeCapError,
+  TxInsufficientFundsError,
+  TxReceiptMissingError,
+  ZERO_HASH,
+  rpcTransport,
+} from "@arena/sdk";
 import type { ArenaDaemon } from "../src/index.js";
 import {
   DAEMON_RPC_TIMEOUT_MS,
@@ -272,5 +281,32 @@ describe("H3 fix round 1 (review M4): a reclaim mined with no readable receipt w
       throw new Error("execution reverted");
     };
     await expect(alice.daemon.reclaim(id)).rejects.toThrow(/execution reverted/); // any other failure still fails
+  });
+});
+
+describe("final fix wave B (m-8, h3 M-d): a close the wallet cannot pay for names that cause", () => {
+  it("close() still answers (the Close is signed and relayed); lastError says the wallet cannot pay, or the fee is over its ceiling", async () => {
+    const { alice, bob, id } = await matched();
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 20_000, "draw seen");
+    await bob.daemon.close(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "close-requested", 10_000, "close requested");
+    bob.client.disconnect(); // Bob never sees Alice's Close: only her own submission could settle it
+    await parked(alice.daemon);
+    const l = alice.daemon.handle(id);
+    for (const [err, want] of [
+      [new TxInsufficientFundsError(alice.daemon.wallet.address), /^close: this wallet cannot pay the close transaction's gas \(0x[0-9a-fA-F]{40} cannot pay/],
+      [new TxFeeCapError(3, 40n), /^close: the close transaction's fee is over this wallet's fee ceiling \(replacing the transaction at nonce 3/],
+    ] as const) {
+      alice.daemon.hub.closeCooperative = async () => {
+        throw err;
+      };
+      await alice.daemon.close(id, "agent"); // before and after: answered, not failed
+      expect(l.lastError).toMatch(want);
+      expect(l.lastError).toContain("the watchtower retries every pass, and the opponent can submit the close too");
+    }
+    expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Open");
   });
 });

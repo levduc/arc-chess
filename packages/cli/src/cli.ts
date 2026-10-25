@@ -1828,9 +1828,16 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       return 1;
     }
     io.out(JSON.stringify(payload, null, 2));
-    // H3 (Arc testnet rehearsal §8.2): the action took effect; only the chain read after it failed.
-    const stale = payload as { chainStale?: unknown; chainStaleReason?: unknown };
-    if (stale.chainStale === true) {
+    // H3 (Arc testnet rehearsal §8.2): the action took effect; only the chain read after it failed. Final fix wave B
+    // (m-7): except a challenge or reclaim mined with its receipt unreadable -- the chain was read, the outcome is not
+    // known.
+    const stale = payload as { chainStale?: unknown; chainStaleReason?: unknown; unconfirmed?: unknown };
+    if (typeof stale.unconfirmed === "string") {
+      io.err(
+        `note: ${cmd} was mined, but whether it succeeded is not known yet (${String(stale.chainStaleReason)}): run ` +
+          `"${CLI_COMMAND} status" to check`,
+      );
+    } else if (stale.chainStale === true) {
       io.err(
         `note: ${cmd} took effect, but the chain could not be read afterwards (${String(stale.chainStaleReason)}): ` +
           `the chain fields above may be stale; run "${CLI_COMMAND} status" for a fresh view`,

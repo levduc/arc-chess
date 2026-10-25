@@ -223,6 +223,7 @@ describe("local API", () => {
     expect(ch.body.chainStaleReason).toMatch(
       /^the challenge transaction 0x[0-9a-f]{64} was mined \(block \d+\), but its receipt could not be read: whether it succeeded is not known yet; check status$/,
     );
+    expect(ch.body.unconfirmed).toBe(ch.body.chainStaleReason); // final fix wave B (m-7): the CLI's note keys on it
     alice.daemon.hub.challenge = realChallenge;
 
     // M4, close: Bob accepts the draw (answering the challenge) and closes; Alice's close is signed and relayed, and

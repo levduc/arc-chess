@@ -3062,8 +3062,17 @@ export class ArenaDaemon {
       if (l.lastError?.startsWith("close:")) l.lastError = null;
     } catch (err) {
       if (err instanceof HubRevertError) l.closeRetryAt = Date.now() + CLOSE_RETRY_BACKOFF_MS;
+      // Final fix wave B (m-8, h3 M-d): a wallet that cannot pay for the close is named as such -- `close()` answers 200
+      // either way (the Close is signed and relayed, and the opponent can submit it too).
+      const retried = "the watchtower retries every pass, and the opponent can submit the close too";
+      const why =
+        err instanceof TxInsufficientFundsError
+          ? `this wallet cannot pay the close transaction's gas (${errorText(err)}); ${retried}. If it persists, tell your human the wallet needs gas`
+          : err instanceof TxFeeCapError
+            ? `the close transaction's fee is over this wallet's fee ceiling (${errorText(err)}); ${retried}`
+            : errorText(err);
       // Once settled (the watchtower may have marked it meanwhile), nothing would ever clear the error again.
-      if (!l.record.finalized) l.lastError = `close: ${errorText(err)}`;
+      if (!l.record.finalized) l.lastError = `close: ${why}`;
       this.log(`channel ${l.record.channelId}: submitting the cooperative close failed (the watchtower retries): ${errorText(err)}`);
       throw err;
     } finally {
@@ -3649,6 +3658,13 @@ export class ArenaDaemon {
     } catch (err) {
       this.log(`channel ${id}: reading the registered state to adopt it failed (retried on the next pass): ${errorText(err)}`);
     }
+    // Final fix wave B (m-9, h1 N-7): `latest` was read before the awaits above. A relay or a move ingested meanwhile
+    // may already hold the registered turn -- the reason an adopt was refused -- and then nothing is unseen.
+    if (registered.turnNum <= l.session.latest.state.turnNum) {
+      if (u.raised) this.notify();
+      l.unseenRegistered = null;
+      return;
+    }
     if (!u.raised) {
       u.raised = true;
       this.log(
@@ -3885,7 +3901,12 @@ export class ArenaDaemon {
     }
     // Fix round 1 (review M4): a transaction mined with no readable receipt went through, but is unconfirmed.
     if (outcome.unconfirmed !== undefined) {
-      st = { ...st, chainStale: true, chainStaleReason: [outcome.unconfirmed, st.chainStaleReason].filter(Boolean).join("; ") };
+      st = {
+        ...st,
+        chainStale: true,
+        chainStaleReason: [outcome.unconfirmed, st.chainStaleReason].filter(Boolean).join("; "),
+        unconfirmed: outcome.unconfirmed,
+      };
     }
     return st;
   }

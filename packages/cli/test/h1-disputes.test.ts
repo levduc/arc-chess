@@ -282,6 +282,42 @@ describe("H1 fix round 1 (review I-1): a challenge whose event cannot be read is
   });
 });
 
+describe("final fix wave B (m-9, h1 N-7): a registered turn ingested during the adopt attempt is never raised as unseen", () => {
+  it("the adopt is refused because the relay delivered that turn meanwhile: no challenge-unseen, nothing kept", async () => {
+    const m = await matched();
+    const { alice, id } = m;
+    await parked(alice.daemon);
+    const l = alice.daemon.handle(id);
+    const before = l.session.latest;
+    const registered = { turnNum: before.state.turnNum + 1n } as Awaited<ReturnType<HubClient["registeredState"]>>;
+    const info = { phase: "Challenged", deadline: 4_000_000_000n } as Awaited<ReturnType<HubClient["channelInfo"]>>;
+    // The hub reads Challenged with a registered state, and the adopt is refused: while it was being tried, a relayed
+    // move (modelled by `latest` advancing) brought the session to that very turn.
+    let delivered = false;
+    Object.defineProperty(l.session, "latest", {
+      configurable: true,
+      get: () => (delivered ? { ...before, state: { ...before.state, turnNum: registered.turnNum } } : before),
+    });
+    const realInfo = alice.daemon.hub.channelInfo.bind(alice.daemon.hub);
+    alice.daemon.hub.channelInfo = async () => ({ ...info, hasRegistered: true, registeredHash: ZERO_HASH }) as typeof info;
+    l.session.adoptRegistered = async () => {
+      delivered = true;
+      return false;
+    };
+    // At the last debounced pass: the next one raises.
+    l.unseenRegistered = { key: `${info.deadline}:${registered.turnNum}`, turn: registered.turnNum, deadline: info.deadline, passes: UNSEEN_REGISTERED_PASSES - 1, raised: false };
+    try {
+      await (alice.daemon as unknown as { handleUnseenRegistered(l: unknown, i: unknown, r: unknown): Promise<void> }).handleUnseenRegistered(l, info, registered);
+    } finally {
+      alice.daemon.hub.channelInfo = realInfo;
+      delete (l.session as unknown as { latest?: unknown }).latest;
+    }
+    expect(delivered).toBe(true);
+    // Before: the `latest` read before the awaits was kept, and challenge-unseen was raised (one spurious wake).
+    expect(l.unseenRegistered).toBeNull();
+  });
+});
+
 /** Stops `daemon`'s periodic passes, so every scan below is one the test drives. */
 async function parked(daemon: ArenaDaemon) {
   clearInterval((daemon as unknown as { timer?: NodeJS.Timeout }).timer);
