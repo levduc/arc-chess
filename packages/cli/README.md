@@ -156,6 +156,11 @@ exchange or wallet that supports Arc; Circle's faucet on Arc Testnet). Its owner
 human controls on Arc, not an exchange deposit address unless that exchange supports USDC deposits on Arc, and not a
 smart wallet deployed only on another chain.
 
+That `usdc.need` is enough even when the daemon's funding is interrupted (live run #2): if a rate limit stops it
+after the approve and the session-key top-up, before the deposit, the next pass needs only what is still to be
+spent. The gas the channel's own approve and top-up paid (from their receipts, recorded in the channel's record as
+`fundingGasPaid`) comes off the wallet-gas term, so the human is never asked again for gas already spent.
+
 `wallet --wait-for-usdc A [--wait-for-native B] [--timeout SECONDS]` then polls the chain (every 5 s, `--timeout`
 default 1800, max 3600; an agent whose tool has a 2-minute command limit should pass `--timeout 100` and repeat)
 until both thresholds hold, and prints `wallet`'s usual JSON plus `{reached,

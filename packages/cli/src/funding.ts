@@ -39,6 +39,10 @@ export type OneBalanceFundingInput = Omit<FundingInput, "usdcHave" | "nativeHave
  * `ownGasWei` is the session gas this channel still has to receive (a whole `sessionGasWei` before its top-up). The
  * last two terms are `withdrawReserve` of the other channels; the gas is rounded up once, as a sum, so `arena fund`
  * and the daemon's gates agree to the micro-USDC.
+ * Live run #2 (f)1: `paidWei` is the gas this channel's own funding transactions already paid (a pass resumed after
+ * its approve and top-up), at most `FUND_TX_GAS_UNITS x feeCeilingWei`, the term it came out of. It is rounded UP
+ * and taken off separately: on Arc the balance is the native one rounded down, so a wallet that held exactly the
+ * first pass's need, less that gas, still meets the resumed need to the micro-USDC.
  */
 export function oneBalanceOpenNeed(i: {
   deposit: bigint;
@@ -47,10 +51,13 @@ export function oneBalanceOpenNeed(i: {
   otherChannels: number;
   sessionGasWei: bigint;
   feeCeilingWei: bigint;
+  paidWei?: bigint;
 }): bigint {
   if (i.otherChannels < 0 || !Number.isInteger(i.otherChannels)) throw new RangeError("otherChannels must be a non-negative integer");
-  const gasWei = i.ownGasWei + BigInt(i.otherChannels) * i.sessionGasWei + FUND_TX_GAS_UNITS * i.feeCeilingWei;
-  return i.deposit + i.feePerPlayer + weiToUsdc6Up(gasWei);
+  const ownTxWei = FUND_TX_GAS_UNITS * i.feeCeilingWei;
+  const gasWei = i.ownGasWei + BigInt(i.otherChannels) * i.sessionGasWei + ownTxWei;
+  const paid = i.paidWei === undefined || i.paidWei <= 0n ? 0n : i.paidWei < ownTxWei ? i.paidWei : ownTxWei;
+  return i.deposit + i.feePerPlayer + weiToUsdc6Up(gasWei) - weiToUsdc6Up(paid);
 }
 
 const short = (have: bigint, need: bigint): Amounts => ({ have, need, shortfall: need > have ? need - have : 0n });

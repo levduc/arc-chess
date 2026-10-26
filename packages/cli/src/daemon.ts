@@ -13,6 +13,7 @@ import {
   type Hex,
   type Log,
   type PublicClient,
+  type TransactionReceipt,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
@@ -1369,13 +1370,20 @@ export class ArenaDaemon {
    * a chain whose gas is native. `exclude` is the channel being funded, which is not one of the "others". The balance
    * is the ERC-20 `balanceOf`, the figure `withdraw()` uses (on Arc, the native balance rounded down).
    */
-  private async openingShortfall(o: { deposit: bigint; feePerPlayer?: bigint; ownGasWei: bigint; exclude?: Hex }): Promise<string | null> {
+  private async openingShortfall(o: {
+    deposit: bigint;
+    feePerPlayer?: bigint;
+    ownGasWei: bigint;
+    exclude?: Hex;
+    /** Live run #2 (f)1: the gas this channel's own funding transactions already paid (`fund()` only). */
+    paidWei?: bigint;
+  }): Promise<string | null> {
     const profile = chainProfile(this.opts.config.chainId);
     if (profile?.nativeIsUsdc !== true) return null;
     const feePerPlayer = o.feePerPlayer ?? (await this.hub.feeConfig()).feePerPlayer;
     const others = this.unsettledChannelCount(o.exclude);
     const gas = { sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling };
-    const need = oneBalanceOpenNeed({ deposit: o.deposit, feePerPlayer, ownGasWei: o.ownGasWei, otherChannels: others, ...gas });
+    const need = oneBalanceOpenNeed({ deposit: o.deposit, feePerPlayer, ownGasWei: o.ownGasWei, otherChannels: others, ...gas, paidWei: o.paidWei });
     const balance = await this.usdcBalance(this.opts.config.usdc);
     if (balance >= need) return null;
     const reserve = withdrawReserve({ profile, unsettledChannels: others, ...gas });
@@ -1870,11 +1878,16 @@ export class ArenaDaemon {
     if (chainProfile(this.opts.config.chainId)?.nativeIsUsdc === true) {
       const target = this.opts.config.sessionGasWei;
       const keyBalance = target > 0n ? await this.client.getBalance({ address: l.sessionSender.address }) : 0n;
+      // Live run #2 (f)1: a pass resumed after this channel's approve and top-up (the deposit stopped by a rate limit)
+      // needs only what is still to be spent: the top-up is out of `ownGasWei` once the key holds it, and the gas those
+      // two paid is credited. Before, it needed the whole wallet-gas term again, and the human was asked to top up the
+      // gas the pass had already spent (0.002189 USDC in the run).
       const why = await this.openingShortfall({
         deposit: p.deposit,
         feePerPlayer: p.feePerPlayer,
         ownGasWei: keyBalance < target ? target - keyBalance : 0n,
         exclude: l.record.channelId,
+        paidWei: l.record.fundingGasPaid,
       });
       if (why !== null) return this.backOffFunding(l, `funding: ${why}`, { log: true });
     }
@@ -1893,14 +1906,17 @@ export class ArenaDaemon {
       // Final review I2: exactly what this deposit pulls, never an unlimited allowance. The hub address may come from
       // the host's /templates; a wrong or hostile "hub" given maxUint256 could take the whole wallet, not one deposit.
       // Costs one approve per channel.
-      await this.hub.approve(this.wallet, this.opts.config.usdc, p.deposit + p.feePerPlayer);
+      this.recordFundingGas(l, await this.hub.approve(this.wallet, this.opts.config.usdc, p.deposit + p.feePerPlayer));
     }
     if (this.stopped) return;
     // I1: top up only the shortfall, and only while the session key is actually below the target -- otherwise a
     // deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever. Shared
     // with the refill (final review C1), so the two never both send one.
     try {
-      await this.sharedTopUp(l, () => this.topUpSession(l));
+      await this.sharedTopUp(l, async () => {
+        const receipt = await this.topUpSession(l);
+        if (receipt !== null) this.recordFundingGas(l, receipt);
+      });
     } catch (err) {
       // Plan 6 Task 2 (audit-daemon I-1): a top-up mined and reverted reached nothing, and the next pass would send
       // (and pay for) the same revert: funding backs off like a launch-limit revert below, and no deposit goes in
@@ -1922,6 +1938,17 @@ export class ArenaDaemon {
     }
     l.fundBlockedUntil = null;
     if (l.lastError?.startsWith("funding:")) l.lastError = null;
+  }
+
+  /** Live run #2 (f)1: adds what one of this channel's funding transactions paid in gas to its record, on disk, so a
+   *  resumed (or restarted) pass credits it. A failed write is logged: the credit is then only missing. */
+  private recordFundingGas(l: ChannelHandle, receipt: { gasUsed: bigint; effectiveGasPrice: bigint }): void {
+    l.record.fundingGasPaid = (l.record.fundingGasPaid ?? 0n) + receipt.gasUsed * receipt.effectiveGasPrice;
+    try {
+      this.records.saveChannel(l.record);
+    } catch (err) {
+      this.log(`channel ${l.record.channelId}: could not record the funding gas paid: ${errorText(err)}`);
+    }
   }
 
   /** Backs `fund()` off for `FUND_BACKOFF_SECONDS` of chain time, with `message` as the channel's `lastError`. H1
@@ -1953,13 +1980,14 @@ export class ArenaDaemon {
   /**
    * Sends the session key the shortfall up to `sessionGasWei` from the wallet, if it is below it. The balance is read
    * afresh right before the send (a resend after a reported drop included), so a top-up that landed after all is
-   * never paid twice, and a resend replaces the dropped attempt at its nonce. Resolves true if it sent one.
+   * never paid twice, and a resend replaces the dropped attempt at its nonce. Resolves with the top-up's receipt if it
+   * sent one (live run #2: `fund()` records its gas), else null.
    */
-  private async topUpSession(l: ChannelHandle): Promise<boolean> {
+  private async topUpSession(l: ChannelHandle): Promise<TransactionReceipt | null> {
     const target = this.opts.config.sessionGasWei;
-    if (target <= 0n || this.stopped) return false;
+    if (target <= 0n || this.stopped) return null;
     const balance = await this.client.getBalance({ address: l.sessionSender.address });
-    if (balance >= target || this.stopped) return false;
+    if (balance >= target || this.stopped) return null;
     // Fix round (minor, "a failed fee estimate also raises session-gas-low"): checked as its own step, so a
     // failure here is unambiguously a `SessionGasEstimateError` -- rather than some other, harder-to-classify
     // error shape surfacing from deep inside the sender's own send path (`SerialTxSender.sendFresh`'s internal
@@ -1981,7 +2009,7 @@ export class ArenaDaemon {
       if (isInsufficientFundsError(err)) throw new TxInsufficientFundsError(this.wallet.address, err);
       throw new SessionGasEstimateError(err, "gas");
     }
-    if (this.stopped) return false;
+    if (this.stopped) return null;
     const req = { to: l.sessionSender.address, data: "0x" as Hex, value, gas: topUpGasLimit(estimated) };
     // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
     // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
@@ -1992,7 +2020,7 @@ export class ArenaDaemon {
     // Plan 6 Task 2 (audit-daemon I-1): a mined revert moved nothing. Before, it was counted as a refill, cleared the
     // back-off and was sent again on the next pass. The receipt may be a replacement's: it is named by its own hash.
     if (receipt.status !== "success") throw new TopUpRevertedError(receipt.transactionHash);
-    return true;
+    return receipt;
   }
 
   /**
@@ -2037,7 +2065,7 @@ export class ArenaDaemon {
         return;
       }
       try {
-        if (await this.topUpSession(l)) {
+        if ((await this.topUpSession(l)) !== null) {
           l.refills++;
           this.log(`channel ${l.record.channelId}: refilled the session key's dispute gas (it was at ${balance} wei, floor ${floor})`);
         }

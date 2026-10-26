@@ -58,6 +58,7 @@ import {
   type PendingWithdraw,
 } from "../src/index.js";
 import { CHAIN_PROFILES, chainProfile, type ChainProfile } from "../src/chains.js";
+import { oneBalanceOpenNeed } from "../src/funding.js";
 import { ownerChangeMessage, setOwner } from "../src/owner.js";
 import { RPC, deployArena, increaseTime, mintUsdc, publicClient, setEthBalance, usdcBalance } from "../../sdk/test/helpers/chain.js";
 import { startPair, waitFor } from "./helpers/harness.js";
@@ -942,6 +943,54 @@ describe("Plan 6 fix round 1 (I-5): on a nativeIsUsdc chain, opening a channel n
     const b = await waitFor(() => pair.bob.daemon.channelIds().find((id) => id !== pair.a), 20_000, "channel B");
     await waitFor(async () => (await pair.bob.daemon.hub.channelInfo(b)).phase === "Open", 30_000, "B open");
     expect(await usdcBalance(pair.env.usdc, pair.bob.address)).toBe(0n);
+  });
+});
+
+describe("live run #2 (f)1: a funding pass resumed after its approve and top-up needs only what is still to be spent", () => {
+  it("the deposit stopped by a rate limit: the next pass credits the gas already paid and deposits -- no second ask for it", async () => {
+    const pair = await startPair();
+    cleanups.push(() => pair.cleanup());
+    const bob = pair.bob.daemon;
+    // Bob holds exactly what `fund` asks for one channel and nothing else: deposit + fee + ceil((session gas + 500,000 x
+    // his 100 gwei ceiling) / 10^12) -- 1.065 USDC.
+    const deposit = 1_000_000n;
+    const ask = oneBalanceOpenNeed({ deposit, feePerPlayer: 5_000n, ownGasWei: 10n ** 16n, otherChannels: 0, sessionGasWei: 10n ** 16n, feeCeilingWei: bob.wallet.feeCeiling });
+    expect(ask).toBe(1_065_000n);
+    await firstSet(pair.bob.home, newAddress());
+    await bob.withdraw({ amount: (await usdcBalance(pair.env.usdc, pair.bob.address)) - ask });
+    await asOneBalance(pair.env.usdc, async () => {
+      // Arc's one balance, on anvil: what the wallet pays in native (the top-up's value and every gas) leaves its USDC too.
+      // The ERC-20 reads as the native balance does on Arc, rounded down: less ceil(native spent / 10^12).
+      const nativeAtStart = await publicClient().getBalance({ address: pair.bob.address });
+      const daemon = bob as unknown as { usdcBalance(usdc: Address): Promise<bigint> };
+      const real = daemon.usdcBalance.bind(daemon);
+      const spy = vi.spyOn(daemon, "usdcBalance").mockImplementation(async (usdc) => {
+        const spent = nativeAtStart - (await publicClient().getBalance({ address: pair.bob.address }));
+        return (await real(usdc)) - (spent + 10n ** 12n - 1n) / 10n ** 12n;
+      });
+      cleanups.push(() => spy.mockRestore());
+      // The rehearsal's rate limit: the approve and the top-up went out, then the deposit's first try failed.
+      const realDeposit = bob.hub.deposit.bind(bob.hub);
+      let refusedOnce = false;
+      bob.hub.deposit = async (...args: Parameters<typeof realDeposit>) => {
+        if (!refusedOnce) {
+          refusedOnce = true;
+          throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+        }
+        return realDeposit(...args);
+      };
+      const { offerId } = await bob.createOffer({ deposit, stakePerGame: 100_000n, challengeTimeout: 600n });
+      await pair.alice.daemon.acceptOffer(offerId);
+      const id = await waitFor(() => bob.channelIds()[0], 20_000, "the channel");
+      // Before: the next pass needed the whole 0.05 wallet-gas term again, backed off "… USDC short of the 1.055000 USDC
+      // this channel needs", and only a second ask to the human could fund it.
+      await waitFor(async () => (await bob.hub.channelInfo(id)).phase === "Open", 30_000, `the channel to open (${bob.handle(id).lastError})`);
+      expect(refusedOnce).toBe(true);
+      const record = bob.handle(id).record;
+      expect(record.fundingGasPaid).toBeGreaterThan(0n); // the approve's and the top-up's gas, from their receipts
+      expect(new RecordStore(pair.bob.home).channel(id)?.fundingGasPaid).toBe(record.fundingGasPaid); // on disk
+      expect(bob.handle(id).lastError ?? "").not.toMatch(/^funding:/);
+    });
   });
 });
 

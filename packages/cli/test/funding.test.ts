@@ -184,6 +184,25 @@ describe("computeOneBalanceFundingNeed (nativeIsUsdc)", () => {
     expect(() => oneBalanceOpenNeed({ ...base, ownGasWei: 0n, otherChannels: 0.5 })).toThrow(RangeError);
   });
 
+  it("live run #2 (f)1: the gas a channel's own funding already paid is credited -- rounded up, at most the wallet-gas term", () => {
+    // Live run #2, agent C, on Arc: fund asked 1.361 (1 deposit + 0.005 fee + 0.336 session gas + 0.02 wallet gas); the
+    // approve and the top-up paid 0.002189 between them, then a rate limit stopped the deposit.
+    const arc = { deposit: 1_000_000n, feePerPlayer: 5_000n, otherChannels: 0, sessionGasWei: 336_000_000_000_000_000n, feeCeilingWei: 40_000_000_000n };
+    const first = oneBalanceOpenNeed({ ...arc, ownGasWei: arc.sessionGasWei });
+    expect(first).toBe(1_361_000n);
+    const paidWei = 2_188_412_345_678_901n; // not a multiple of 10^12, as real gas is not
+    // On Arc the balance is the native one rounded down: 1.361 - 0.336 - that gas.
+    const balance = (first * 10n ** 12n - arc.sessionGasWei - paidWei) / 10n ** 12n;
+    expect(balance).toBe(1_022_811n); // "this wallet holds 1.022811 USDC"
+    // Before: 1.025, 0.002189 short. Now: exactly the balance -- the human is never asked for gas already spent.
+    expect(oneBalanceOpenNeed({ ...arc, ownGasWei: 0n })).toBe(1_025_000n);
+    expect(oneBalanceOpenNeed({ ...arc, ownGasWei: 0n, paidWei })).toBe(balance);
+    // Never more than the wallet-gas term it came out of (500,000 x 40 gwei = 0.02), and nothing for none or a negative.
+    expect(oneBalanceOpenNeed({ ...arc, ownGasWei: 0n, paidWei: 10n ** 18n })).toBe(1_005_000n);
+    expect(oneBalanceOpenNeed({ ...arc, ownGasWei: 0n, paidWei: 0n })).toBe(1_025_000n);
+    expect(oneBalanceOpenNeed({ ...arc, ownGasWei: 0n, paidWei: -1n })).toBe(1_025_000n);
+  });
+
   it("the deposit rules are computeFundingNeed's own", () => {
     expect(computeOneBalanceFundingNeed({ ...ONE, games: 20n }).deposit).toBe(10_000_000n);
     expect(computeOneBalanceFundingNeed({ ...ONE, deposit: 2_000_000n }).deposit).toBe(2_000_000n);
