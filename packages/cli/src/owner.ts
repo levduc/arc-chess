@@ -41,8 +41,23 @@ export type OwnerIo = {
 /** The error `withdraw` gives (CLI and daemon alike) when no owner is recorded. One line, naming `owner set`. */
 export function noOwnerMessage(cmd = "arena"): string {
   return (
-    "no owner is set, so a withdraw has nowhere to go: ask your human for the address to return funds to, then run " +
-    `"${cmd} owner set <address>"`
+    "no owner is set, so a withdraw has nowhere to go: ask your human for an address they control on this wallet's " +
+    `chain to return funds to, then run "${cmd} owner set <address>"`
+  );
+}
+
+/**
+ * Plan 6 hardening H2 (audit-journey C-2): the confirmation `owner set` adds on stderr on a chain with a built-in
+ * profile (Arc). `withdraw` pays the owner there only, in one irreversible transfer, so an exchange deposit address
+ * that does not credit that network, or a smart wallet deployed only on another chain, loses the funds -- and a wrong
+ * owner cannot be undone by the agent.
+ */
+export function ownerNetworkNote(networkName: string, chainId: number): string {
+  return (
+    `owner set: withdraw pays this address on ${networkName} (chain id ${chainId}) only, in one irreversible transfer. ` +
+    `It must be an address your human controls on ${networkName}: never an exchange deposit address unless that ` +
+    `exchange supports USDC deposits on ${networkName}, and never a smart wallet deployed only on another chain. ` +
+    "If your human is not sure, ask them now, before any withdraw."
   );
 }
 
@@ -105,7 +120,7 @@ export function readRecordedOwner(home: string): string | null {
   } catch (err) {
     throw new Error(
       `cannot read ${path} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}), so cannot tell whether an ` +
-        "owner is recorded in it: fix or remove it first",
+        "owner is recorded in it. Tell your human: only they repair it (never you)",
     );
   }
   const raw = cfg?.owner;
@@ -204,7 +219,7 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
   // A change. `current` is non-null here; if it is not an address at all, nobody can sign for it.
   if (current === null || !isAddress(current, { strict: false })) {
     throw new Error(
-      `the recorded owner ${JSON.stringify(current)?.slice(0, 60)} is not an address, so nobody can sign a change: only a hand edit of ${path} can fix it`,
+      `the recorded owner ${JSON.stringify(current)?.slice(0, 60)} is not an address, so nobody can sign a change: only your human can fix it, by hand-editing ${path} (never you)`,
     );
   }
   const currentOwner = getAddress(current);
@@ -216,7 +231,7 @@ export async function setOwner(home: string, addr: string, io: OwnerIo, cmd: str
       `the owner is already set to ${currentOwner}: changing it needs that owner's signature. Ask your human to sign ` +
         "messageToSign (printed above) with the current owner's wallet (EIP-191 personal_sign), then run the command with it. " +
         `The signature is checked locally, so only an ordinary key can sign: if ${currentOwner} is a smart-contract ` +
-        `wallet, the only way to change it is to hand-edit ${path}`,
+        `wallet, the only way to change it is to hand-edit ${path}: your human's step, never yours`,
     );
   }
   if (!/^0x([0-9a-fA-F]{2})+$/.test(signature)) {

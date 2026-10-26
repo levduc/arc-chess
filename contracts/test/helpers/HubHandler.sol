@@ -172,7 +172,7 @@ contract HubHandler is Test, ChessTestUtils {
         }
     }
 
-    /// @dev Unblocks the recipient first (claim always pays `to == msg.sender`), so a real claim, not just
+    /// @dev Unblocks the recipient first (claim pays `msg.sender` only), so a real claim, not just
     /// an attempt, actually goes through — the original design could populate `owed` and then never be
     /// able to drain it, undercounting how often the claim path truly executes.
     function claim(uint256 seed) external {
@@ -181,7 +181,7 @@ contract HubHandler is Test, ChessTestUtils {
         if (amount == 0) return;
         IBlockableToken(address(token)).setBlocked(addr, false);
         vm.prank(addr);
-        try hub.claim(addr) {
+        try hub.claim() {
             if (ghostOwed[addr] != amount) payoutMismatch = true;
             ghostOwed[addr] = 0;
         } catch (bytes memory reason) {
@@ -322,7 +322,7 @@ contract HubHandler is Test, ChessTestUtils {
         address addr = knownAddrs[seed % knownAddrs.length];
         if (hub.owed(addr) == 0) {
             vm.prank(addr);
-            (bool ok, bytes memory ret) = address(hub).call(abi.encodeCall(hub.claim, (addr)));
+            (bool ok, bytes memory ret) = address(hub).call(abi.encodeCall(hub.claim, ()));
             if (!ok) _checkNotPaused(ret);
         }
         uint256 n = channels.length;
@@ -525,7 +525,7 @@ contract HubHandler is Test, ChessTestUtils {
         address addr = knownAddrs[seed % knownAddrs.length];
         if (hub.owed(addr) != 0) return;
         vm.prank(addr);
-        try hub.claim(addr) {
+        try hub.claim() {
             adversarialViolation = true;
         } catch (bytes memory reason) {
             _checkNotPaused(reason);

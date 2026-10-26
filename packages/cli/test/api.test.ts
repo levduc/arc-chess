@@ -1,6 +1,8 @@
 import { request as httpRequest } from "node:http";
 import { connect as netConnect, type AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
+import { LimitExceededRpcError, type Hex } from "viem";
+import { TxReceiptMissingError } from "@arena/sdk";
 import { loadToken, startApi } from "../src/index.js";
 import { startPair, waitFor } from "./helpers/harness.js";
 
@@ -129,6 +131,131 @@ describe("local API", () => {
     expect((await call(url, token, "POST", "/handoff", { to: "human", note: "lone\rcr" })).status).toBe(400);
   });
 
+  it("H3: an action that took effect answers 200 with chainStale when only the chain read after it fails; a rate limit is a 503", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    const bobToken = loadToken(pair.bob.home);
+    const bobApi = await startApi(pair.bob.daemon, { port: 0, token: bobToken });
+    stop = async () => {
+      server.close();
+      bobApi.server.close();
+      await pair.cleanup();
+    };
+    const call = async (base: string, tok: string, method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+      const res = await fetch(`${base}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${tok}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const offer = await call(url, token, "POST", "/offers", { deposit: "1000000", stakePerGame: "100000", challengeTimeout: "600" });
+    await call(bobApi.url, bobToken, "POST", "/offers/accept", { offerId: offer.body.offerId });
+    await waitFor(async () => (await call(url, token, "GET", "/status")).body.phase === "Open", 30_000, "open");
+    // Arc's RPC rate-limits the chain read that follows the move (rehearsal §8.2), and only that read.
+    const d = pair.alice.daemon;
+    const limit = { on: false };
+    const realInfo = d.hub.channelInfo.bind(d.hub);
+    d.hub.channelInfo = async (id: Hex) => {
+      if (limit.on) throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      return realInfo(id);
+    };
+    const realMove = d.move.bind(d);
+    d.move = async (...args: Parameters<typeof d.move>) => {
+      await realMove(...args);
+      limit.on = true;
+    };
+    const moved = await call(url, token, "POST", "/move", { move: "e4" });
+    // Before H3: a 500, although the move had been signed and relayed.
+    expect(moved.status).toBe(200);
+    expect(moved.body.chainStale).toBe(true);
+    // Fix round 1 (review M6): the RPC's own answer, not viem's first line.
+    expect(moved.body.chainStaleReason).toBe('the RPC is rate-limiting (-32005 "rate limit exceeded")');
+    expect(moved.body.turnNum).toBe("1");
+    expect(moved.body.lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
+    expect((await call(bobApi.url, bobToken, "GET", "/wait?timeout=10")).body.reason).toBe("your-turn"); // it took effect
+    // A read-only route has nothing to fall back on: it fails, but as a rate limit, with what to do.
+    const st = await call(url, token, "GET", "/status");
+    expect(st.status).toBe(503);
+    expect(st.body.error).toMatch(/^the RPC is rate-limiting \(-32005 "rate limit exceeded"\): wait a few seconds/);
+    // An action that fails is still an error.
+    expect((await call(url, token, "POST", "/move", { move: "d4" })).status).toBe(409);
+    limit.on = false;
+    const fresh = await call(url, token, "GET", "/status");
+    expect(fresh.status).toBe(200);
+    expect(fresh.body.chainStale).toBeUndefined();
+  });
+
+  it("H3 fix round 1 (review M4, M5): a close whose submission is rate-limited, and a mined challenge with no receipt, took effect", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const call = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+      const res = await fetch(`${url}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-arena-actor": "agent" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const { alice, bob } = pair;
+    const { offerId } = await alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
+    await bob.daemon.acceptOffer(offerId);
+    const id = await waitFor(() => alice.daemon.channelIds()[0], 20_000, "match");
+    await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Open", 30_000, "open");
+
+    // M4, challenge: mined, its receipt unreadable -- a 200 that says so, never a 500.
+    await alice.daemon.move(id, "e4", { actor: "agent", offerDraw: true });
+    const realChallenge = alice.daemon.hub.challenge.bind(alice.daemon.hub);
+    alice.daemon.hub.challenge = async (...args: Parameters<typeof realChallenge>) => {
+      const r = await realChallenge(...args);
+      throw new TxReceiptMissingError(r.transactionHash, r.blockNumber);
+    };
+    const ch = await call("POST", "/challenge");
+    expect(ch.status).toBe(200);
+    expect(ch.body.phase).toBe("Challenged");
+    expect(ch.body.chainStale).toBe(true);
+    expect(ch.body.chainStaleReason).toMatch(
+      /^the challenge transaction 0x[0-9a-f]{64} was mined \(block \d+\), but its receipt could not be read: whether it succeeded is not known yet; check status$/,
+    );
+    expect(ch.body.unconfirmed).toBe(ch.body.chainStaleReason); // final fix wave B (m-7): the CLI's note keys on it
+    alice.daemon.hub.challenge = realChallenge;
+
+    // M4, close: Bob accepts the draw (answering the challenge) and closes; Alice's close is signed and relayed, and
+    // only its on-chain submission is rate-limited.
+    await waitFor(() => bob.daemon.handle(id).session.isMyTurn(), 10_000, "bob's turn");
+    await bob.daemon.acceptDraw(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "game-over", 20_000, "draw seen");
+    await bob.daemon.close(id, "agent");
+    await waitFor(async () => (await alice.daemon.status(id)).attention === "close-requested", 10_000, "close requested");
+    const limit = { on: true };
+    const realInfo = alice.daemon.hub.channelInfo.bind(alice.daemon.hub);
+    alice.daemon.hub.channelInfo = async (cid: Hex) => {
+      if (limit.on) throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      return realInfo(cid);
+    };
+    const closed = await call("POST", "/close");
+    // Before: a 503 for a Close that had been signed and relayed.
+    expect(closed.status).toBe(200);
+    expect(closed.body.chainStale).toBe(true);
+    expect(closed.body.lastError).toMatch(/^close: Request exceeds defined limit/);
+    limit.on = false;
+    await waitFor(async () => (await realInfo(id)).phase === "Finalized", 30_000, "settled by the watchtower's retry (or Bob's)");
+
+    // M5: the host's own 429 is no RPC error: named as either.
+    alice.daemon.listOffers = async () => {
+      throw new Error("rate limited"); // as host.ts throws the host's 429
+    };
+    const offers = await call("GET", "/offers");
+    expect(offers.status).toBe(503);
+    expect(offers.body.error).toMatch(/^rate-limited \(RPC or host\) \(rate limited\): wait a few seconds/);
+  });
+
   it("Plan 5 Task 1: POST /offers without challengeTimeout defaults to minChallengeTimeoutOf(config)", async () => {
     const pair = await startPair({ aliceConfig: { minChallengeTimeout: 1800n } });
     const token = loadToken(pair.alice.home);
@@ -146,6 +273,42 @@ describe("local API", () => {
     const body = (await res.json()) as { offerId: string };
     const listed = await pair.alice.daemon.listOffers();
     expect(listed.find((o) => o.offerId === body.offerId)!.offer.challengeTimeout).toBe(1800n);
+  });
+
+  it("H1: POST /offers takes ttl (seconds) for the offer's signed expiresAt; out of range or malformed is 400", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
+    stop = async () => {
+      server.close();
+      await pair.cleanup();
+    };
+    const post = (body: Record<string, unknown>) =>
+      fetch(`${url}/offers`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ deposit: "1000000", stakePerGame: "100000", ...body }),
+      });
+    const before = (await pair.alice.daemon.client.getBlock()).timestamp;
+    const res = await post({ ttl: "120" });
+    expect(res.status).toBe(200);
+    const { offerId } = (await res.json()) as { offerId: string };
+    const after = (await pair.alice.daemon.client.getBlock()).timestamp;
+    const offer = (await pair.alice.daemon.listOffers()).find((o) => o.offerId === offerId)!.offer;
+    expect(offer.expiresAt >= before + 120n && offer.expiresAt <= after + 120n).toBe(true);
+    for (const ttl of ["59", "3601"]) {
+      const bad = await post({ ttl });
+      expect(bad.status).toBe(400);
+      expect(((await bad.json()) as { error: string }).error).toMatch(/ttl must be between 60 and 3600 seconds/);
+    }
+    // Without ttl, the lifetime is the default, unchanged: an hour.
+    const dflt = (await (await post({})).json()) as { offerId: string };
+    const now = (await pair.alice.daemon.client.getBlock()).timestamp;
+    const d = (await pair.alice.daemon.listOffers()).find((o) => o.offerId === dflt.offerId)!.offer;
+    expect(d.expiresAt > now + 3500n && d.expiresAt <= now + 3600n).toBe(true);
+    const malformed = await post({ ttl: 120 });
+    expect(malformed.status).toBe(400);
+    expect(((await malformed.json()) as { error: string }).error).toBe("ttl must be a decimal string of seconds");
   });
 
   it("Plan 5 Task 2 fix round, minor 2: a malformed request target is 400, not 500", async () => {
@@ -595,5 +758,31 @@ describe("local API", () => {
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ results: [], remaining: 0 }); // no settled channels yet
+  });
+});
+
+describe("H4 fix round 2: /health names the process to this home's token", () => {
+  it("with the token: {ok, pid, lock, role, degraded}; without it, or without an identity, the bare {ok}", async () => {
+    const pair = await startPair();
+    const token = loadToken(pair.alice.home);
+    const lockNonce = "ab".repeat(16);
+    const named = await startApi(pair.alice.daemon, { port: 0, token, identity: { lockNonce, role: "daemon" } });
+    const bare = await startApi(pair.bob.daemon, { port: 0, token: loadToken(pair.bob.home) });
+    stop = async () => {
+      named.server.close();
+      bare.server.close();
+      await pair.cleanup();
+    };
+    const health = async (url: string, tok?: string) =>
+      (await fetch(`${url}/health`, tok !== undefined ? { headers: { authorization: `Bearer ${tok}` } } : {})).json();
+    expect(await health(named.url, token)).toEqual({ ok: true, pid: process.pid, lock: lockNonce, role: "daemon", degraded: [] });
+    expect(await health(named.url)).toEqual({ ok: true });
+    expect(await health(named.url, "wrong")).toEqual({ ok: true });
+    expect(await health(bare.url, loadToken(pair.bob.home))).toEqual({ ok: true });
+    // Final fix wave B (m-4): a channel the daemon does not watch is named, to the token only.
+    const broken = `0x${"cd".repeat(32)}`;
+    (pair.alice.daemon as unknown as { markDegraded(id: string, error: string): void }).markDegraded(broken, "session.json is unreadable");
+    expect(((await health(named.url, token)) as { degraded: string[] }).degraded).toEqual([broken]);
+    expect(await health(named.url)).toEqual({ ok: true });
   });
 });

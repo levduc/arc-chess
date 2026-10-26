@@ -10,7 +10,7 @@ import {
   type PublicClient,
 } from "viem";
 import { foundry } from "viem/chains";
-import { HubClient, mockUsdcAbi, type HubEvent } from "@arena/sdk";
+import { HubClient, mockUsdcAbi, rpcTransport, type HubEvent } from "@arena/sdk";
 import type { ServerConfig } from "./config.js";
 
 export type Limits = {
@@ -25,7 +25,8 @@ export interface ChainReader {
   feeConfig(): Promise<{ feePerPlayer: bigint; feeRecipient: Address }>;
   timeoutBounds(): Promise<{ min: bigint; max: bigint }>;
   head(): Promise<bigint>;
-  hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]>;
+  /** Plan 6 hardening H1 (review m-11): `kinds`, when given, reads only those events (see `HubClient.hubEvents`). */
+  hubEvents(fromBlock: bigint, toBlock: bigint, opts?: { kinds?: readonly HubEvent["kind"][] }): Promise<HubEvent[]>;
   /** The hub's current launch limits (spec §13): the two owner-set caps, the live commitment, and the pause
    *  flag. `RpcChainReader` caches this for `LIMITS_CACHE_MS`. */
   limits(): Promise<Limits>;
@@ -34,6 +35,9 @@ export interface ChainReader {
    *  was last opened against). Used at startup to detect a database that belongs to a different chain/deployment
    *  than the one this config points at. */
   genesisHash(): Promise<Hex>;
+  /** Final review C m-5: the RPC's own `eth_chainId`, read once at startup and compared with the config's `chainId`
+   *  (a mainnet config pointed at a testnet RPC would otherwise index nothing, silently). */
+  chainId(): Promise<number>;
   /** The hash of the canonical block at `block` (null if there is none) -- the indexer asks before unwinding an
    *  event that vanished from `getLogs`, to tell a reorg from a lagging log index. Optional: without it, a
    *  vanished event is always treated as reorged out. */
@@ -67,7 +71,8 @@ export class RpcChainReader implements ChainReader {
       nativeCurrency: { name: "Native", symbol: "NATIVE", decimals: 18 },
       rpcUrls: { default: { http: [cfg.rpcUrl] } },
     });
-    this.client = createPublicClient({ chain, transport: http(cfg.rpcUrl) });
+    // H3: a rate-limited read is retried with back-off (Arc's public RPC limits a modest load: rehearsal §8.2).
+    this.client = createPublicClient({ chain, transport: rpcTransport(cfg.rpcUrl) });
     this.hub = hub ?? new HubClient(cfg.hub, this.client);
   }
 
@@ -110,8 +115,8 @@ export class RpcChainReader implements ChainReader {
     return value;
   }
 
-  hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
-    return this.hub.hubEvents(fromBlock, toBlock);
+  hubEvents(fromBlock: bigint, toBlock: bigint, opts?: { kinds?: readonly HubEvent["kind"][] }): Promise<HubEvent[]> {
+    return this.hub.hubEvents(fromBlock, toBlock, opts);
   }
 
   async blockHash(block: bigint): Promise<Hex | null> {
@@ -124,6 +129,10 @@ export class RpcChainReader implements ChainReader {
 
   clientVersion(): Promise<string> {
     return this.client.request({ method: "web3_clientVersion" });
+  }
+
+  chainId(): Promise<number> {
+    return this.client.getChainId();
   }
 
   /** Immutable once the chain exists, so memoized forever like `timeoutBounds` -- with the same un-stick-on-

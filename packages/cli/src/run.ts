@@ -24,6 +24,10 @@ export type DaemonProcess = {
   stop(): Promise<void>;
 };
 
+/** H4 fix round 2: which command runs this daemon -- reported by the authenticated `/health`, so `daemon stop` stops
+ *  only `arena daemon` itself, never `arena bot` or the short-lived daemon inside `withdraw`. */
+export type DaemonRole = "daemon" | "bot" | "withdraw";
+
 /** Plan 5.7: seams for tests -- the SDK loader and the transport factory (defaults: the real ones). */
 export type XmtpWiring = {
   load?: (home: string) => Promise<XmtpSdkLoad>;
@@ -37,7 +41,7 @@ export type XmtpWiring = {
  */
 export async function startDaemonProcess(
   home: string,
-  opts: { log?: (l: string) => void; host?: HostOptions; xmtp?: XmtpWiring } = {},
+  opts: { log?: (l: string) => void; host?: HostOptions; xmtp?: XmtpWiring; role?: DaemonRole } = {},
 ): Promise<DaemonProcess> {
   const lock = acquireHomeLock(home);
   let host: HostConnection | undefined;
@@ -110,7 +114,7 @@ export async function startDaemonProcess(
 
     // 127.0.0.1 only: `host` is deliberately not configurable here (spec §6.1) -- `arena daemon` never exposes
     // a host override.
-    const api = await startApi(daemon, { port: config.port, token });
+    const api = await startApi(daemon, { port: config.port, token, identity: { lockNonce: lock.nonce, role: opts.role ?? "daemon" } });
     server = api.server;
 
     let stopped = false;

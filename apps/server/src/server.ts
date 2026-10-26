@@ -17,10 +17,14 @@ export type Metrics = {
   relayMessages: number;
   indexerBlock: bigint | null;
   indexerLag: bigint | null;
+  /** H1 fix round 1: blocks whose dispute events the RPC refused to serve, even alone (`Indexer.skippedBlocks()`):
+   *  since this process started, and a skip is permanent (final review C m-1). */
+  indexerSkippedBlocks?: number;
 };
 
-/** `wsPingMs` overrides the app-level `/ws` ping interval (25 s), for tests. */
-export type ServerDeps = { chain?: ChainReader; log?: (line: string) => void; wsPingMs?: number };
+/** `wsPingMs` overrides the app-level `/ws` ping interval (25 s), and `templateLimitsWaitMs` how long `/templates`
+ *  waits for a limits read (5 s), for tests. */
+export type ServerDeps = { chain?: ChainReader; log?: (line: string) => void; wsPingMs?: number; templateLimitsWaitMs?: number };
 
 export type ArenaServer = {
   url: string;
@@ -121,29 +125,68 @@ async function withLobbyErrors(res: http.ServerResponse, fn: () => Promise<void>
   }
 }
 
-/** Task 2 (spec §13): the current launch limits for /templates, as decimal strings and a boolean, or `null` if
- *  the chain read fails -- a host outage must not take down the whole route (the rest of the entry is still
- *  useful, and is otherwise all static config). */
-async function templateLimits(chain: ChainReader): Promise<{
-  maxDepositPerPlayer: string;
-  maxCommittedEscrow: string;
-  committedEscrow: string;
-  paused: boolean;
-} | null> {
-  try {
-    const l = await chain.limits();
-    return {
-      maxDepositPerPlayer: decStr(l.maxDepositPerPlayer),
-      maxCommittedEscrow: decStr(l.maxCommittedEscrow),
-      committedEscrow: decStr(l.committedEscrow),
-      paused: l.paused,
-    };
-  } catch {
-    return null;
-  }
+/** The launch limits as `/templates` publishes them: decimal strings and a boolean. */
+type TemplateLimits = { maxDepositPerPlayer: string; maxCommittedEscrow: string; committedEscrow: string; paused: boolean };
+
+/** Final review C m-7: how long `/templates` waits for a limits read before it answers without one, and how long a
+ *  value read counts as current (`RpcChainReader`'s own cache time). */
+const TEMPLATE_LIMITS_WAIT_MS = 5_000;
+const TEMPLATE_LIMITS_FRESH_MS = 5_000;
+
+/**
+ * Task 2 (spec §13): the current launch limits for /templates, or `null` when none could be read -- a host outage
+ * must not take down the whole route (the rest of the entry is still useful, and is otherwise all static config).
+ *
+ * Final review C m-7: a read on a rate-limited RPC can take about 75 s (viem's retries, spec §12 item 67), which
+ * outlasted the CLI's 30 s fetch of `/templates`, so `init` and `fund` failed with a bare timeout. So the last good
+ * value is kept with the time it was read:
+ * - read less than `TEMPLATE_LIMITS_FRESH_MS` ago, it is served at once;
+ * - otherwise `/templates` waits at most `waitMs` for a new read, then serves the last good value (`null` if there
+ *   is none). A read that fails serves it too. The read keeps going, and updates the value when it lands.
+ * Concurrent requests share one read, and `refresh` starts one when the server starts, so the first agent to arrive
+ * finds a value.
+ */
+function templateLimitsSource(chain: ChainReader, waitMs: number): { get(): Promise<TemplateLimits | null>; refresh(): void } {
+  let last: { value: TemplateLimits; at: number } | undefined;
+  let inflight: Promise<TemplateLimits | null> | undefined;
+  const read = (): Promise<TemplateLimits | null> => {
+    inflight ??= chain
+      .limits()
+      .then((l) => {
+        const value = {
+          maxDepositPerPlayer: decStr(l.maxDepositPerPlayer),
+          maxCommittedEscrow: decStr(l.maxCommittedEscrow),
+          committedEscrow: decStr(l.committedEscrow),
+          paused: l.paused,
+        };
+        last = { value, at: Date.now() };
+        return value;
+      })
+      .catch(() => last?.value ?? null)
+      .finally(() => {
+        inflight = undefined;
+      });
+    return inflight;
+  };
+  return {
+    refresh: () => void read(),
+    async get() {
+      if (last !== undefined && Date.now() - last.at < TEMPLATE_LIMITS_FRESH_MS) return last.value;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waited = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), waitMs);
+      });
+      try {
+        const got = await Promise.race([read(), waited]);
+        return got === "timeout" ? (last?.value ?? null) : got;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
 }
 
-async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader, faucetEnabled: boolean) {
+async function templateEntry(cfg: ServerConfig, url: string, limits: () => Promise<TemplateLimits | null>, faucetEnabled: boolean) {
   return {
     id: "chess",
     version: "1",
@@ -160,7 +203,7 @@ async function templateEntry(cfg: ServerConfig, url: string, chain: ChainReader,
     fundingWindow: decStr(cfg.fundingWindow),
     skillUrl: `${url}/templates/chess/skill.md`,
     audit: cfg.audit,
-    limits: await templateLimits(chain),
+    limits: await limits(),
     // Plan 5.5 Task 1 (Global Constraints): advertised only once the three-way guard has confirmed the faucet is
     // actually enabled -- `undefined` here is dropped by `toWire`'s JSON.stringify, so a disabled faucet leaves
     // no `faucet` key at all, not a null or false one a careless client might still act on.
@@ -193,6 +236,13 @@ function renderMetrics(m: Metrics, offersOpen: number): string {
       "Chain head minus the indexer's processed block.",
       "gauge",
       m.indexerLag === null ? "NaN" : m.indexerLag.toString(),
+    ) +
+    line(
+      "arena_indexer_skipped_blocks",
+      "Blocks whose dispute events the RPC refused to serve, even alone, since this process started (monitor: should " +
+        "stay 0). A skip is permanent: the affected channel rows may stay stale, even once this drops back.",
+      "gauge",
+      m.indexerSkippedBlocks ?? 0,
     )
   );
 }
@@ -207,11 +257,62 @@ function canonicalChannelId(raw: string): Hex | null {
   return HEX32_ROUTE_RE.test(raw) ? (raw.toLowerCase() as Hex) : null;
 }
 
+/**
+ * Final review C N-6: `text` with this config's RPC URLs shown as their scheme and host only. A provider URL can carry
+ * an API key in its path or query, and viem quotes a failed request's URL in full in its error messages (it strips
+ * only a username and password). Every startup error and every log line of the server goes through this.
+ */
+export function redactRpcUrls(text: string, cfg: Pick<ServerConfig, "rpcUrl" | "publicRpcUrl">): string {
+  let out = text;
+  // Longest first, so a URL that is a prefix of the other one never leaves the rest of it behind.
+  for (const url of [cfg.rpcUrl, cfg.publicRpcUrl].filter((u) => u !== "").sort((a, b) => b.length - a.length)) {
+    let shown: string;
+    try {
+      const u = new URL(url);
+      shown = `${u.protocol}//${u.host}`;
+    } catch {
+      shown = "(the RPC URL)";
+    }
+    out = out.split(url).join(shown);
+  }
+  return out;
+}
+
+/** The text of `err`, with the RPC URLs redacted (`redactRpcUrls`). */
+function errorText(err: unknown, cfg: Pick<ServerConfig, "rpcUrl" | "publicRpcUrl">): string {
+  return redactRpcUrls(err instanceof Error ? err.message : String(err), cfg);
+}
+
+/** Final review C N-7: a failed startup read may be the RPC's passing trouble, not the config. */
+const STARTUP_READ_HINT = "The RPC may be down or rate-limiting: retry, or check rpcUrl";
+
 export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Promise<ArenaServer> {
   const repo = new SqliteRepo(cfg.dbPath, (p) => channelId(cfg.chainId, cfg.hub, p));
   // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
-  const log = deps.log ?? ((line: string) => console.log(line));
+  const rawLog = deps.log ?? ((line: string) => console.log(line));
+  const log = (line: string) => rawLog(redactRpcUrls(line, cfg));
+
+  // Final review C m-5: the RPC must serve the chain this config names. Checked first: a 5042 config pointed at a
+  // testnet RPC would otherwise index nothing, silently, and a new database would record the wrong genesis hash. The
+  // RPC URL itself is never quoted (a provider URL can carry an API key): N-6, `errorText`.
+  let rpcChainId: number;
+  try {
+    rpcChainId = await chain.chainId();
+  } catch (err) {
+    repo.close();
+    throw new Error(
+      `could not read the RPC's chain id (eth_chainId) to check it against chainId ${cfg.chainId}: ${errorText(err, cfg)}. ` +
+        STARTUP_READ_HINT,
+    );
+  }
+  if (rpcChainId !== cfg.chainId) {
+    repo.close();
+    throw new Error(
+      `rpcUrl serves chain id ${rpcChainId}, but this config's chainId is ${cfg.chainId}: point rpcUrl at an RPC of ` +
+        `chain ${cfg.chainId}, or fix chainId. Nothing was started`,
+    );
+  }
 
   // Product hardening: a database recorded against one chain/deployment (chain id, hub address, and the chain's
   // own genesis hash -- chain id alone cannot tell a redeployed local chain apart from the one the database was
@@ -223,7 +324,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     genesisHash = await chain.genesisHash();
   } catch (err) {
     repo.close();
-    throw new Error(`could not read the chain's genesis block to verify database identity: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`could not read the chain's genesis block to verify database identity: ${errorText(err, cfg)}. ${STARTUP_READ_HINT}`);
   }
   const recorded = repo.identity();
   if (recorded === null) {
@@ -293,10 +394,13 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   const FAUCET_COOLDOWN_MS = 10 * 60 * 1000;
   const faucetLastRequest = new Map<string, number>();
 
-  const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null };
+  const metrics: Metrics = { wsConnections: 0, relayMessages: 0, indexerBlock: null, indexerLag: null, indexerSkippedBlocks: 0 };
 
   const postLimiter = new RateLimiter(cfg.limits.httpPostBurst, cfg.limits.httpPostPerSec);
   const getLimiter = new RateLimiter(cfg.limits.httpGetBurst, cfg.limits.httpGetPerSec);
+
+  const templateLimits = templateLimitsSource(chain, deps.templateLimitsWaitMs ?? TEMPLATE_LIMITS_WAIT_MS);
+  templateLimits.refresh();
 
   const lobby = new Lobby(repo, chain, cfg);
   const relay = new Relay(repo, cfg, metrics, log);
@@ -317,6 +421,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
       const offersOpen = repo.openOfferTotal(await chain.now());
       metrics.indexerBlock = repo.cursor() ?? 0n;
       metrics.indexerLag = await indexer.lag();
+      metrics.indexerSkippedBlocks = indexer.skippedBlocks().length;
       ctx.res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
       ctx.res.end(renderMetrics(metrics, offersOpen));
       return true;
@@ -404,7 +509,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     },
     async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/templates") return false;
-      sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, chain, faucetEnabled)]);
+      sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, templateLimits.get, faucetEnabled)]);
       return true;
     },
     async (ctx) => {

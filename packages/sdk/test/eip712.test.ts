@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Address, Hex } from "viem";
+import { recoverAddress, type Address, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   EMPTY_SIGNED,
@@ -19,6 +19,7 @@ import {
   unsigned,
   type Params,
 } from "../src/index.js";
+import { highSTwin, vAsParity } from "./helpers/fixtures.js";
 
 const HUB: Address = "0x000000000000000000000000000000000000beef";
 const D = { chainId: 31337, hub: HUB };
@@ -45,6 +46,24 @@ describe("eip712 and abi codecs", () => {
     expect(await recoverCloseSigner(s, await signClose(key, s, D), D)).toBe(who);
     // A state signature is not a close signature.
     expect(await recoverCloseSigner(s, await signState(key, s, D), D)).not.toBe(who);
+  });
+
+  it("recovers only the form the hub's ECDSA check accepts: 65 bytes, v 27 or 28, low s", async () => {
+    const key = generatePrivateKey();
+    const who = privateKeyToAccount(key).address;
+    const s = initialState(channelId(D.chainId, HUB, P), P);
+    const sig = await signState(key, s, D);
+    const twin = highSTwin(sig);
+    // viem alone recovers the signer from the twin and from v 0/1; the hub refuses both (ChannelHub.dispute.t.sol
+    // test_ecdsaOnly_malleableFormsRefused).
+    expect(await recoverAddress({ hash: hashState(s, D), signature: twin })).toBe(who);
+    expect(await recoverAddress({ hash: hashState(s, D), signature: vAsParity(sig) })).toBe(who);
+    for (const bad of [twin, vAsParity(sig), `${sig}00` as Hex, sig.slice(0, 130) as Hex]) {
+      await expect(recoverStateSigner(s, bad, D)).rejects.toThrow(/65 bytes|form the hub accepts/);
+    }
+    const close = await signClose(key, s, D);
+    await expect(recoverCloseSigner(s, highSTwin(close), D)).rejects.toThrow(/form the hub accepts/);
+    expect(await recoverCloseSigner(s, close, D)).toBe(who);
   });
 
   it("binds the digest to chain and hub", () => {

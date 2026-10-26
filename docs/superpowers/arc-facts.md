@@ -23,21 +23,67 @@ The validator set is permissioned at launch. The network itself is public.
 
 ## Fees, blocks and finality
 
-- **EIP-1559.** The base fee has a **20 gwei floor**, and was observed flat at 20 gwei. The priority fee is tiny (about 1.15M wei). The base fee is paid to the proposer, not burned.
+- **EIP-1559.** The base fee has a **20 gwei floor**, and was observed flat at 20 gwei. The priority fee varies: about 1.15M wei on 2026-10-19, but `eth_maxPriorityFeePerGas` was 5 gwei and `eth_gasPrice` 25 gwei on 2026-10-23 (block 27,584,886, read-only calls; audit-journey I-4). The base fee is paid to the proposer, not burned.
 - The mempool **silently drops** any transaction with `maxFeePerGas` below 20 gwei. There is no error, and the transaction never appears.
 - The **block gas limit is 30M**. Our `challenge`, at 2.02M gas, fits; it costs about 0.04 USDC at 20 gwei.
-- A plain value transfer is estimated at **21,225 gas**, not 21,000, because of the EIP-7708 log.
+- A plain value transfer costs **21,000 gas**, the same as Ethereum, even though Arc also emits an EIP-7708 log. *Correction, 2026-10-24:* this file first said 21,225. That came from an estimate whose recipient was `0x…02`, the SHA-256 precompile. Twelve real transfers on mainnet and testnet show 21,000 gas limit and 21,000 gas used, and `eth_estimateGas` returns 21,000.
 - Finality is deterministic and instant on inclusion.
 - Blocks are sub-second. `block.timestamp` is non-decreasing at 1 s granularity, so several blocks can share a timestamp.
 - `eth_getTransactionCount(…, "pending")` and `eth_estimateGas(…, "pending")` both work.
+
+## RPC limits (added 2026-10-24, Plan 6 Task 5 rehearsal)
+
+- **`eth_getLogs` refuses a topic-0 OR list of more than 10 entries**, even for one block: `-32012 "requested range
+  too large"`. Probed on testnet, and with two read-only calls (10 topics, then 11) on `rpc.mainnet.arc.io`: 10 is
+  served, 11 is refused. A 10,000-block range with no topic filter is served on testnet.
+- **A `getLogs` whose `toBlock` is past the head answers `-32014 "requested data not available"`.** Seen in the T5
+  review, on testnet. A load-balanced head can run ahead of the log index, so this is transient. The SDK treats it
+  that way: `isRangeRefusal` is false for it, so it is retried and not counted as a refusal.
+- **The public testnet RPC rate-limits**: `-32005 "rate limit exceeded"` in the body, or an HTTP 429. Five seconds of
+  `eth_blockNumber` at 20 per second passed. Two daemons, a host indexer and status polling hit the limit
+  constantly. Details are in `arc-testnet-rehearsal.md` §8.
+- Measured gas on Arc testnet:
+
+  | Call | Gas |
+  |---|---|
+  | `challenge` | 177k–356k |
+  | `respond` | 200k |
+  | `timeout` | 149k |
+  | `closeCooperative` | 143k |
+  | `deposit` | 394k (first) / 76k (second) |
+
+  The 2.02M figure above is the worst-case budget.
+- **`eth_getLogs` response times** (added 2026-10-25; h3-rereview M-f, final reviews A and C). Each was a single
+  read-only call:
+  - **Mainnet** (`rpc.mainnet.arc.io`): the USDC contract `0x3600…` over 1,000 blocks returned 565 logs in
+    **0.087 s**.
+  - **Testnet**: the hub `0x9b8B…` with 7 topics, over blocks 68,935,011–68,936,010, returned HTTP 200 in
+    **0.077 s**. The window held 0 logs, so this is a lower bound.
+
+  Both are far under the SDK transport's 5 s per-attempt timeout. Other requests from the same IP were answered 429
+  / `-32005` in about 0.06 s, because a live stack shared the public RPC. Repeat the measurement on the RPC the
+  mainnet host will use, at deploy (`arc-mainnet-runbook.md` §9).
 
 ## Other differences
 
 - `PREVRANDAO` = 0. We use no on-chain randomness.
 - Blob transactions are not supported.
 - SELFDESTRUCT follows EIP-6780, plus Arc's native-value rules.
-- Most contracts deploy unchanged; Arc targets the Osaka baseline.
+- Most contracts deploy unchanged; Arc targets the Osaka baseline. That includes EIP-7702 set-code transactions:
+  "Arc targets the Osaka hard fork as its baseline, including features such as EIP-7702 (set-code transactions)…
+  behave as on Ethereum" (`evm-differences.md`, as quoted in final review A). Any session key can therefore gain
+  code. This is why the hub verifies ECDSA only, with no ERC-1271 fallback (final review A I-1, owner decision
+  2026-10-25).
 - For Arc-accurate local tests, use Arc Foundry (`arc-anvil --network arc`, `arc-forge`, `arc-cast`). Standard `anvil` does not model native USDC.
+
+## Explorer and source verification (checked 2026-10-25)
+
+- `explorer.arc.io` answers a scripted GET of `/api/v2/smart-contracts/verification/config` with HTTP 403: a
+  Cloudflare "Just a moment…" challenge page. The T5 review saw the same 403. `explorer.testnet.arc.io` serves the
+  same API to scripts (`arc-testnet-rehearsal.md` §1).
+- Sourcify's `/server/chains` lists both 5042 ("Arc Mainnet") and 5042002 as supported.
+- So on mainnet, while the block lasts, `scripts/verify-arc.sh` warns and skips its explorer steps, and verifies
+  on Sourcify alone (FW-C's `bb7acb0`; `arc-mainnet-runbook.md` §7).
 
 ## Other Circle contracts on mainnet
 
@@ -52,12 +98,18 @@ The validator set is permissioned at launch. The network itself is public.
 ## Consequences for Plan 6, found by this check
 
 1. **`fund` and `withdraw --all`.** USDC and gas are one balance on Arc. `fund` must add the gas reserve into the USDC need instead of asking for "native gas" separately. `withdrawReserve()` must keep enough USDC for each live channel's session-gas refills, or `withdraw --all` can strand a channel's dispute gas.
-2. **Session-key top-ups** hard-code `gas: 21_000` (`daemon.ts`, around "The session key is always an EOA"). That is too low on Arc (21,225). Estimate it, or use Arc's figure plus headroom.
+2. **Session-key top-ups** hard-coded `gas: 21_000` before Plan 6 Task 2 (correct on Arc; see above). They now use `estimateGas` + 20 % + 5,000 and check the receipt status.
 3. **Fee floor.** Clamp every `maxFeePerGas` to at least 20 gwei on Arc. A lower `--fee-ceiling-wei` would make transactions vanish silently.
 4. **Receipts.** A blocklist revert may produce no receipt. The bounded waits already exist; confirm the hub's payout path treats a reverting USDC `transfer` as `owed`.
-5. **Session gas sizing.** The default `sessionGasWei` is 4 × 2.1M × max(fee ceiling 100 gwei, 4 × 20 gwei), which is 0.84 USDC locked per channel until it is swept. Re-derive it for Arc's flat 20 gwei; for example, a 40 gwei ceiling gives about 0.34 USDC.
+5. **Session gas sizing.** The default formula is 4 × 2.1M × max(fee ceiling, 4 × eth_gasPrice). On Arc, `eth_gasPrice` is 20–25 gwei, so the second term is at least 80 gwei, giving at least 0.672 USDC per channel, and 0.84 USDC at 25 gwei. The ruling for Plan 6 is that on profile chains `sessionGasWei` = 4 × 2.1M × the profile ceiling (40 gwei), which is 0.336 USDC; refills cover fee spikes.
 6. **Tests.** Run the contract and daemon suites against `arc-anvil --network arc` as well as standard anvil.
 7. **Circle agent wallets on mainnet.** The CLI reference uses `--chain ARC`, and third-party reports show mainnet runs through Circle ARC wallets. Circle's Agent Stack marketing page still says "Arc testnet (mainnet coming soon)". Confirm with `circle blockchain list` once logged in.
+
+## Funding an agent on Arc (added 2026-10-24, audit-journey C-1 and C-2)
+
+- There is no faucet on mainnet. The agent's address is a plain EVM address, valid on every EVM chain, so USDC sent to it on Ethereum, Base or any other network does not arrive on Arc.
+- A human brings USDC onto Arc with Circle's CCTP V2 (TokenMessengerV2 above) from another chain, or from an exchange or wallet that supports Arc. On testnet, Circle's faucet.
+- The owner (cash-out) address must likewise be one the human controls on Arc. `fund`'s message, `owner set` and `/skill.md` say so (hardening wave H2).
 
 Sources:
 - `https://docs.arc.io/arc/references/connect-to-arc`

@@ -63,6 +63,9 @@ export type ServerConfig = {
 
 /** Anvil's chain id: the only chain where the development `audit` default is allowed. */
 const ANVIL_CHAIN_ID = 31337;
+/** Arc mainnet's chain id: XMTP must be its production network there, and the indexer must start at the hub's deploy
+ *  block (final review C m-4, m-6). */
+const ARC_MAINNET_CHAIN_ID = 5042;
 const DEV_AUDIT = "unaudited (development build)";
 
 // the daemons refuse funding deadlines further out than 7200s (maxFundingWindow); see hub.ts checkMatchParams
@@ -234,7 +237,7 @@ function httpUrl(obj: Record<string, unknown>, field: string, displayName: strin
 
 /** Plan 5.7 Task 2 (spec §5): `xmtp`, or `undefined` when the config carries none. Each violation names the
  *  offending field (`xmtp.env`/`xmtp.apiUrl`/`xmtp.gatewayHost`). */
-function parseXmtp(obj: Record<string, unknown>): XmtpConfig | undefined {
+function parseXmtp(obj: Record<string, unknown>, chainId: number): XmtpConfig | undefined {
   const raw = obj.xmtp;
   if (raw === undefined) return undefined;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail("xmtp", "must be an object");
@@ -243,6 +246,11 @@ function parseXmtp(obj: Record<string, unknown>): XmtpConfig | undefined {
   const envRaw = r.env;
   if (!isXmtpEnv(envRaw)) fail("xmtp.env", `must be one of "local", "dev", "production"`);
   const env = envRaw;
+  // Final review C m-6: on Arc mainnet, agents' fallback messages must go over XMTP's production network, never its
+  // dev (test) network or a local node.
+  if (chainId === ARC_MAINNET_CHAIN_ID && env !== "production") {
+    fail("xmtp.env", `must be "production" on Arc mainnet (chainId ${ARC_MAINNET_CHAIN_ID}), not "${env}"`);
+  }
 
   const apiUrl = r.apiUrl === undefined ? undefined : httpUrl(r, "apiUrl", "xmtp.apiUrl");
   const gatewayHost = r.gatewayHost === undefined ? undefined : httpUrl(r, "gatewayHost", "xmtp.gatewayHost");
@@ -291,7 +299,7 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   };
 
   const cli = parseCli(obj);
-  const xmtp = parseXmtp(obj);
+  const xmtp = parseXmtp(obj, chainId);
   // Plan 5.6 Task 4 (spec §3): derived only when the raw config has no `cliCommand` key at all -- an explicit
   // `cliCommand` always wins over a configured `cli`, even an empty string (`obj.cliCommand !== undefined`, not
   // `str`'s own fallback, so this distinguishes "not given" from "given but falsy").
@@ -309,6 +317,11 @@ export function parseServerConfig(raw: unknown): ServerConfig {
     chunkBlocks: num(indexerRaw, "chunkBlocks", 1000, "indexer.chunkBlocks"),
     startBlock: bigint(indexerRaw, "startBlock", 0n, "indexer.startBlock"),
   };
+  // Final review C m-4: from block 0, an indexer on Arc mainnet (millions of blocks, 1,000 per chunk, a rate-limited
+  // RPC) takes days to catch up, and `/players` and `/api/channels` stay empty meanwhile.
+  if (chainId === ARC_MAINNET_CHAIN_ID && !(indexer.startBlock > 0n)) {
+    fail("indexer.startBlock", `is required on Arc mainnet (chainId ${ARC_MAINNET_CHAIN_ID}): set it to the hub's deploy block`);
+  }
 
   const limits = parseLimits(obj);
   const trustProxy = bool(obj, "trustProxy", false);

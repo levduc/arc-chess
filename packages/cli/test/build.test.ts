@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { generatePrivateKey } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
+import { initHome, livePidHoldingLock } from "../src/index.js";
 
 // packages/cli/test -> repo root
 const REPO_ROOT = join(import.meta.dirname, "../../..");
@@ -287,4 +290,50 @@ describe("build-cli", () => {
       }
     }
   }, 60_000);
+
+  it("H4: the bundle's daemon --detach, run the way npx runs it (a node_modules/.bin link), starts the bundle itself, detached", async () => {
+    const env = await deployArena();
+    const home = freshDir("arena-cli-detach-home-");
+    initHome(
+      home,
+      {
+        rpcUrl: RPC,
+        chainId: env.domain.chainId,
+        hub: env.hub,
+        usdc: env.usdc,
+        rules: env.rules,
+        serverUrl: "http://127.0.0.1:9", // closed: the host connection only retries in the background
+        port: 0,
+        maxFeePerPlayer: 10_000n,
+        sessionGasWei: 10n ** 16n,
+        pollMs: 100,
+        minChallengeTimeout: 60n,
+      },
+      generatePrivateKey(),
+    );
+    const bin = join(freshDir("arena-cli-npx-"), "node_modules", ".bin");
+    mkdirSync(bin, { recursive: true });
+    symlinkSync(join(outDir, "arena.mjs"), join(bin, "arena"));
+    const result = await run(join(bin, "arena"), ["daemon", "--detach"], {
+      cwd: freshDir("arena-cli-run-"),
+      env: { PATH: dirname(process.execPath), ARENA_HOME: home },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const line = JSON.parse(result.stdout.trim()) as { detached: boolean; pid: number; api: string; log: string };
+    try {
+      expect(line.detached).toBe(true);
+      // The child is node running the bundle -- never the link's shell, never npx again -- in a session of its own.
+      const cmdline = readFileSync(`/proc/${line.pid}/cmdline`, "utf8").split("\0");
+      expect(cmdline[0]).toBe(process.execPath);
+      expect(realpathSync(cmdline[1]!)).toBe(realpathSync(join(outDir, "arena.mjs")));
+      expect(cmdline.slice(2)).toEqual(["daemon", ""]);
+      expect(Number(readFileSync(`/proc/${line.pid}/stat`, "utf8").split(") ")[1]!.split(" ")[3])).toBe(line.pid);
+      expect((await fetch(`${line.api}/health`)).status).toBe(200);
+    } finally {
+      if (livePidHoldingLock(home) === line.pid) process.kill(line.pid, "SIGTERM");
+      const end = Date.now() + 20_000;
+      while (livePidHoldingLock(home) === line.pid && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(livePidHoldingLock(home)).toBeNull();
+  }, 120_000);
 });

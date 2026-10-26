@@ -18,6 +18,10 @@ export type ChannelRecord = {
   finalized: boolean;
   /** I3: last block whose dispute events have all been ingested; absent = none scanned yet. */
   scannedBlock?: bigint;
+  /** Plan 6 hardening H1 ("oversized events"): blocks at or below `scannedBlock` whose dispute events for this
+   *  channel the RPC refused to serve, even alone, while it was up -- skipped so later events stay readable, and
+   *  re-read every few minutes until one reads. Absent = none. */
+  skippedEventBlocks?: bigint[];
   /** Final review I3: the on-chain phase the channel was retired in (Finalized, Reclaimed, or None/Funding for a
    *  channel that never opened), recorded with `finalized`, so its status can still be served from disk once the
    *  daemon has let go of it. Absent in records written before it existed. */
@@ -49,6 +53,10 @@ export type ChannelRecord = {
    *  set alongside `finalized`. Used to sort the settled index loaded at `start()` by settle time, newest first.
    *  Absent in records written before this field existed (sorts as the oldest). */
   settledAt?: number;
+  /** Live run #2 (f)1: the native wei (gas used x effective price, from their receipts) this channel's own funding
+   *  transactions have paid -- its approve and its first session-key top-up. `fund()` credits it against the wallet's
+   *  own-transaction gas term when a pass is resumed, so gas already spent is never asked for twice. Absent = none. */
+  fundingGasPaid?: bigint;
   /** Plan 5 Task 2: wall-clock ms at which `handoff()` last changed this record's controller/note, set alongside
    *  them. Drives `ChannelStatus.handoff.since` (null there for a channel never handed off -- still at its
    *  initial controller -- including every record written before this field existed). */

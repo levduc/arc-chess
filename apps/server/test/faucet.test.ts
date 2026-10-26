@@ -34,7 +34,9 @@ describe("dev faucet guard (stub chain)", () => {
   });
 
   it("404s when chainId is not 31337, even with devFaucet true and an Anvil-shaped clientVersion", async () => {
-    server = await startServer(testConfig({ devFaucet: true, chainId: 1 }), { chain: new FakeChain() });
+    const chain = new FakeChain();
+    chain.rpcChainId = 1;
+    server = await startServer(testConfig({ devFaucet: true, chainId: 1 }), { chain });
     const res = await postFaucet(server.url, freshAddress());
     expect(res.status).toBe(404);
   });

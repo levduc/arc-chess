@@ -7,7 +7,6 @@ import {
   TransactionReceiptNotFoundError,
   createPublicClient,
   createWalletClient,
-  http,
   keccak256,
   type Address,
   type Chain,
@@ -17,6 +16,7 @@ import {
   type WalletClient,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
+import { rpcTransport } from "./rpc.js";
 
 /** A transaction to send. `nonce`, the fee fields and `gas` are overrides. A `TxSender` MUST honour them; one that
  *  cannot MUST declare `supportsReplacement = false` (see `TxSender`), and is then never asked to replace anything.
@@ -35,6 +35,11 @@ export type TxRequest = {
   /** Gas limit. A same-nonce replacement carries its original's (Plan 4.5 Task 10 re-review 2): estimating it
    *  again would run against a pending state that already includes the original, where it can revert. */
   gas?: bigint;
+  /** H3 fix round 1 (review M3), fix round 2 (re-review M-g): wall-clock ms. A `SerialTxSender` transmits only
+   *  before it -- checked last, after every read the send makes -- and at or after it sends nothing
+   *  (`TxPastGiveUpError`). `waitOrReplace` sets it on its replacements (its `giveUpAt`); `HubClient.write` on a fresh
+   *  send when asked (`WriteOptions.notAfter`: a respond's dispute deadline). */
+  notAfter?: number;
 };
 
 /**
@@ -92,10 +97,11 @@ export class LocalKeyTxSender implements TxSender {
   /** A read client on the same RPC (a SerialTxSender around this one uses it to track its transactions). */
   readonly reader: PublicClient;
 
+  /** H3: reads are retried on a rate limit (`rpcTransport`); a send never is (viem issues it with `retryCount: 0`). */
   constructor(privateKey: Hex, rpcUrl: string, private readonly chain: Chain) {
     this.account = privateKeyToAccount(privateKey);
-    this.wallet = createWalletClient({ account: this.account, chain, transport: http(rpcUrl) });
-    this.reader = createPublicClient({ chain, transport: http(rpcUrl) }) as PublicClient;
+    this.wallet = createWalletClient({ account: this.account, chain, transport: rpcTransport(rpcUrl) });
+    this.reader = createPublicClient({ chain, transport: rpcTransport(rpcUrl) }) as PublicClient;
   }
 
   get address(): Address {
@@ -164,6 +170,15 @@ export class TxNonceUsedError extends Error {
   }
 }
 
+/** H3 fix round 1 (review M3), fix round 2 (re-review M-g): a transaction was ready only at or after its `notAfter`
+ *  (a dispute deadline, or the wait's give-up time): nothing was sent. `nonce` is undefined for a fresh send. */
+export class TxPastGiveUpError extends Error {
+  constructor(readonly nonce?: number) {
+    super(`the transaction${nonce === undefined ? "" : ` at nonce ${nonce}`} was ready only past its give-up time: not sent`);
+    this.name = "TxPastGiveUpError";
+  }
+}
+
 /** The fee needed to replace a transaction is over the sender's fee cap: nothing was sent. */
 export class TxFeeCapError extends Error {
   constructor(
@@ -204,6 +219,13 @@ export const NO_FEE_CEILING = 2n ** 128n;
 export type SerialTxSenderOptions = {
   /** The cap is max(FEE_CAP_MULTIPLIER x the current estimate, feeCeiling) per gas, on both fee fields. */
   feeCeiling?: bigint;
+  /** Plan 6 (spec §2.3, audit-daemon I-6): the chain's fee floor per gas -- on Arc the mempool silently drops a
+   *  transaction whose `maxFeePerGas` is below 20 gwei. Every fee this sender emits (a fresh send, every same-nonce
+   *  replacement) is raised to at least this as its LAST step, after the cap and the balance clamp: the floor beats
+   *  the cap (a transaction under the floor never lands, so a cap under it is no reason to send one), but never the
+   *  balance -- a key that cannot pay the floor is refused with `TxInsufficientFundsError` rather than sent a
+   *  transaction that would vanish. Default 0: no floor, and every fee is exactly as without this option. */
+  minFeePerGas?: bigint;
 };
 
 type Entry = { nonce: number; lastFees: Fees; hashes: Set<Hex>; state: "waiting" | "released"; gas?: bigint };
@@ -220,6 +242,8 @@ type Entry = { nonce: number; lastFees: Fees; hashes: Set<Hex>; state: "waiting"
  *   fresh nonce: whatever was at that nonce landed, and the caller re-reads the chain first.
  * - **Bounded fees.** No transaction goes over max(4 x the current estimate, `feeCeiling`) per gas, nor over what
  *   the balance can pay (`(balance - value) / gas`). A replacement that would need more is not sent.
+ * - **Fee floor** (Plan 6, `minFeePerGas`). No transaction goes under it either: it is applied last, after the cap
+ *   and the balance clamp, and a transaction whose balance cannot pay it is not sent (`TxInsufficientFundsError`).
  * - **Restart.** A fresh sender that finds a pending transaction on its key (none tracked, pending count above the
  *   confirmed one) adopts the lowest such nonce as released and replaces it.
  *
@@ -232,6 +256,8 @@ export class SerialTxSender implements TxSender, TxTracker {
   private readonly reader: TrackerClient | undefined;
   /** max(4 x the estimate, this) caps every fee this sender pays (see SerialTxSenderOptions). */
   readonly feeCeiling: bigint;
+  /** Plan 6: no fee this sender pays is under this per gas (0 = no floor; see SerialTxSenderOptions). */
+  readonly minFeePerGas: bigint;
 
   constructor(
     private readonly inner: TxSender,
@@ -240,6 +266,7 @@ export class SerialTxSender implements TxSender, TxTracker {
   ) {
     this.reader = reader ?? (inner as { reader?: TrackerClient }).reader;
     this.feeCeiling = opts.feeCeiling ?? DEFAULT_FEE_CEILING_WEI;
+    this.minFeePerGas = opts.minFeePerGas ?? 0n;
   }
 
   get address(): Address {
@@ -312,7 +339,10 @@ export class SerialTxSender implements TxSender, TxTracker {
 
   private async sendNow(tx: TxRequest): Promise<Hex> {
     const reader = this.reader;
-    if (!reader || !this.tracking) return this.inner.send(tx);
+    if (!reader || !this.tracking) {
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError(tx.nonce);
+      return this.inner.send(tx);
+    }
     if (tx.nonce !== undefined) return this.replaceOwn(reader, tx, tx.nonce);
     const { confirmed, pending } = await this.prune(reader);
     // Adoption (round 5, C1): a pending nonce no entry tracks holds a transaction no wait of ours owns -- left by an
@@ -390,12 +420,15 @@ export class SerialTxSender implements TxSender, TxTracker {
     const estimate = this.noted(await estimateFees(reader));
     const room = await this.room(reader, estimate, gas, tx.value ?? 0n);
     if (feeOf(estimate) > room.balance) throw new TxInsufficientFundsError(this.address);
-    const fees = clampFees(estimate, room.cap);
+    // Plan 6: the floor last -- before an entry is recorded, so a refusal leaves nothing behind.
+    const fees = this.floored(clampFees(estimate, room.cap), room);
     for (let attempt = 0; ; attempt++) {
       // Round 5 (m2): a wait may have released an entry while this send was being prepared (its release runs outside
       // this mutex): replace that one instead of going fresh behind it.
       const released = this.lowestReleased();
       if (released) return this.replaceReleased(reader, tx, released);
+      // H3 fix round 2 (re-review M-g): after every read above; before the entry, so a refusal leaves nothing behind.
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError();
       // Round 5 (I2): recorded before the send, so a transaction the node took although its response was lost is
       // still tracked (released, at its nonce, with its fees and -- when signed locally -- its hash).
       const e: Entry = { nonce, lastFees: fees, hashes: new Set(), state: "waiting", gas };
@@ -404,14 +437,18 @@ export class SerialTxSender implements TxSender, TxTracker {
       if (r.hash) e.hashes.add(r.hash);
       if (r.err === undefined) return r.hash!;
       const err = r.err;
+      // H3: a "nonce too low" whose own hash the node could not be asked about (a rate-limited read) may be this very
+      // transaction, landed through a retry below us (an RPC proxy re-sending it). It is kept, released: the next send
+      // replaces it at its nonce, and a used nonce there is TxNonceUsedError -- never a second copy at a fresh nonce.
+      const maybeOurs = r.unsure === true && isNonceUsedError(err);
       // A pure count race (another sender on this key, a lagging count): retried once, at the next nonce.
-      if (attempt === 0 && isNonceUsedError(err)) {
+      if (attempt === 0 && isNonceUsedError(err) && !maybeOurs) {
         this.entries.delete(nonce);
         this.markMined(nonce);
         nonce = Math.max(await next(), nonce + 1);
         continue;
       }
-      if (isDefinitive(err)) this.entries.delete(nonce); // refused: nothing is pending at that nonce
+      if (isDefinitive(err) && !maybeOurs) this.entries.delete(nonce); // refused: nothing is pending at that nonce
       else e.state = "released"; // it may be pending: the next send replaces it
       throw this.classify(err);
     }
@@ -420,9 +457,10 @@ export class SerialTxSender implements TxSender, TxTracker {
   /**
    * Sends `req` (nonce, gas and fees set). When the inner sender can sign locally, the hash is known before the send
    * (round 5, I2). A failed send whose transaction the node nevertheless holds (a lost response, or a transport
-   * retry of a send that went through, refused as "nonce too low" / "already known") is a success.
+   * retry of a send that went through, refused as "nonce too low" / "already known") is a success. H3: `unsure` when
+   * that check itself failed (the read was refused, e.g. rate-limited) rather than finding no such transaction.
    */
-  private async transmit(reader: TrackerClient, req: TxRequest): Promise<{ hash?: Hex; err?: unknown }> {
+  private async transmit(reader: TrackerClient, req: TxRequest): Promise<{ hash?: Hex; err?: unknown; unsure?: boolean }> {
     const inner = this.inner;
     let raw: Hex | undefined;
     let hash: Hex | undefined;
@@ -433,8 +471,13 @@ export class SerialTxSender implements TxSender, TxTracker {
     try {
       return { hash: raw ? await inner.sendRawTransaction!(raw) : await inner.send(req) };
     } catch (err) {
-      if (hash && (await reader.getTransaction({ hash }).then(() => true, () => false))) return { hash };
-      return { hash, err };
+      if (!hash) return { err };
+      const known = await reader.getTransaction({ hash }).then(
+        () => true,
+        (e: unknown) => (e instanceof TransactionNotFoundError ? false : "unknown"),
+      );
+      if (known === true) return { hash };
+      return { hash, err, unsure: known === "unknown" };
     }
   }
 
@@ -453,8 +496,10 @@ export class SerialTxSender implements TxSender, TxTracker {
     let fees = known ? replacementFees(e.lastFees, estimate) : doubled(estimate!);
     if (known) this.affordable(e.nonce, bumpFees(e.lastFees), room);
     else this.affordable(e.nonce, estimate!, room);
-    fees = clampFees(fees, bigMin(room.cap, room.balance));
+    fees = this.floored(clampFees(fees, bigMin(room.cap, room.balance)), room);
     for (;;) {
+      // H3 fix round 2 (re-review M-g): the entry stays released, as it was; the next send replaces it.
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError(e.nonce);
       const r = await this.transmit(reader, { ...tx, nonce: e.nonce, gas, ...fees });
       if (r.err === undefined) {
         e.hashes.add(r.hash!);
@@ -464,12 +509,15 @@ export class SerialTxSender implements TxSender, TxTracker {
         return r.hash!;
       }
       const err = r.err;
-      if (isNonceUsedError(err)) {
+      // H3 fix round 1 (review M1): as in `sendFresh`, a "nonce too low" whose own hash could not be read may be this
+      // very transaction, landed through a retry below us. Kept, with its hash, at its nonce (released): the next send
+      // prunes it once mined, and a caller holding the entry's hashes (a sweep) can still find its receipt.
+      if (isNonceUsedError(err) && !(r.unsure === true && r.hash)) {
         this.entries.delete(e.nonce);
         this.markMined(e.nonce);
         throw new TxNonceUsedError(e.nonce, err);
       }
-      if (!isDefinitive(err)) {
+      if (!isDefinitive(err) || isNonceUsedError(err)) {
         // Round 5 (I2): it may be pending -- still released, now with this attempt's hash and fees.
         if (r.hash) e.hashes.add(r.hash);
         e.lastFees = maxFees(e.lastFees, fees);
@@ -479,7 +527,7 @@ export class SerialTxSender implements TxSender, TxTracker {
       if (!isUnderpriced(err)) throw this.classify(err);
       // The pool holds a transaction priced above what we know: +50 %, up to the cap.
       const limit = bigMin(room.cap, room.balance);
-      const raised = clampFees(raise(fees, 3n, 2n), limit);
+      const raised = this.floored(clampFees(raise(fees, 3n, 2n), limit), room);
       if (feeOf(raised) <= feeOf(fees)) {
         throw limit < room.cap ? new TxInsufficientFundsError(this.address, err) : new TxFeeCapError(e.nonce, room.cap, undefined, err);
       }
@@ -491,12 +539,15 @@ export class SerialTxSender implements TxSender, TxTracker {
   private async replaceOwn(reader: TrackerClient, tx: TxRequest, nonce: number): Promise<Hex> {
     const e = this.entries.get(nonce);
     if (!e) {
-      // A nonce nobody tracks: sent as asked, but capped too (round 5, m4).
+      // A nonce nobody tracks: sent as asked, but capped too (round 5, m4). Plan 6 (audit-daemon I-6): and floored,
+      // after that clamp -- before, a balance under the floor was clamped into a fee the chain silently drops; now
+      // it is refused, nothing sent (the wait goes on).
       const est = this.noted(await estimateLike(reader, feesOf(tx)));
       const g = tx.gas ?? (await this.estimateGas(reader, tx, "latest"));
       const r = await this.room(reader, est, g, tx.value ?? 0n);
       const asked = hasFees(feesOf(tx)) ? feesOf(tx) : (est ?? {});
-      return this.inner.send({ ...tx, gas: g, ...clampFees(asked, bigMin(r.cap, r.balance)) });
+      if (pastNotAfter(tx)) throw new TxPastGiveUpError(nonce);
+      return this.inner.send({ ...tx, gas: g, ...this.floored(clampFees(asked, bigMin(r.cap, r.balance)), r) });
     }
     const estimate = this.noted(await estimateLike(reader, e.lastFees));
     const gas = tx.gas ?? e.gas ?? (await this.estimateGas(reader, tx, "latest"));
@@ -505,9 +556,13 @@ export class SerialTxSender implements TxSender, TxTracker {
     // Round 5 (m5): never below bump(lastFees), whatever the wait asked for -- the pool would refuse it.
     const wanted = hasFees(e.lastFees) ? maxFees(asked, bumpFees(e.lastFees)) : asked;
     if (hasFees(e.lastFees)) this.affordable(nonce, bumpFees(e.lastFees), room);
-    const fees = clampFees(wanted, bigMin(room.cap, room.balance));
+    const fees = this.floored(clampFees(wanted, bigMin(room.cap, room.balance)), room);
+    // H3 fix round 1 (review M3): the reads above can be slow (a rate-limited read is retried): no replacement goes
+    // out past the wait's give-up time.
+    if (pastNotAfter(tx)) throw new TxPastGiveUpError(nonce);
     const r = await this.transmit(reader, { ...tx, gas, ...fees });
-    if (r.err === undefined || !isDefinitive(r.err)) {
+    // H3 fix round 1 (review M1): a "nonce too low" whose own hash could not be read may be this replacement, landed.
+    if (r.err === undefined || !isDefinitive(r.err) || (r.unsure === true && isNonceUsedError(r.err))) {
       // Sent -- or maybe sent (round 5, I2): either way the wait polls it from now on.
       if (r.hash) e.hashes.add(r.hash);
       e.lastFees = maxFees(e.lastFees, fees);
@@ -543,6 +598,30 @@ export class SerialTxSender implements TxSender, TxTracker {
     if (fee > room.balance) throw new TxInsufficientFundsError(this.address);
   }
 
+  /**
+   * Plan 6 (spec §2.3, audit-daemon I-6): `fees` with the max fee (or legacy gas price) raised to `minFeePerGas`.
+   * Always the last step, after the cap and the balance clamp: it clamps up, never down. A balance that cannot pay
+   * the floor (`room.balance`, the most per gas it pays for this transaction) is refused here, so nothing is sent:
+   * on Arc a transaction under the floor is dropped without an error and never lands. The priority fee is left as
+   * is -- it is already at most the old max fee, so at most the new one. No floor (0), or no fee named at all (the
+   * inner sender then prices it from the node), leaves `fees` untouched.
+   */
+  private floored(fees: Fees, room: { balance: bigint }): Fees {
+    const min = this.minFeePerGas;
+    if (min === 0n || !hasFees(fees)) return fees;
+    if (min > room.balance) {
+      throw new TxInsufficientFundsError(
+        this.address,
+        new Error(`the balance pays at most ${room.balance} wei per gas, under this chain's fee floor of ${min}`),
+      );
+    }
+    if (fees.maxFeePerGas !== undefined) {
+      const m = bigMax(fees.maxFeePerGas, min);
+      return { maxFeePerGas: m, maxPriorityFeePerGas: bigMin(fees.maxPriorityFeePerGas ?? 0n, m) };
+    }
+    return { gasPrice: bigMax(fees.gasPrice!, min) };
+  }
+
   private estimateGas(reader: TrackerClient, tx: TxRequest, blockTag: "latest" | "pending"): Promise<bigint> {
     return reader.estimateGas({ account: this.address, to: tx.to, data: tx.data, value: tx.value, blockTag });
   }
@@ -551,6 +630,9 @@ export class SerialTxSender implements TxSender, TxTracker {
     return isInsufficientFundsError(err) ? new TxInsufficientFundsError(this.address, err) : err;
   }
 }
+
+/** H3 fix rounds 1-2: whether `tx` may no longer be sent (its `notAfter` has passed). */
+const pastNotAfter = (tx: TxRequest) => tx.notAfter !== undefined && Date.now() >= tx.notAfter;
 
 // ------------------------------------------------------------------------------------ fee helpers
 
@@ -915,7 +997,11 @@ export async function waitOrReplace(
         nonce: pending.nonce,
         gas: (pending as { gas?: bigint }).gas,
         ...replacementFees(base, await estimateLike(client, base)),
+        ...(opts.giveUpAt !== undefined ? { notAfter: opts.giveUpAt } : {}),
       };
+      // H3: the estimate is one more read, and a rate-limited read is retried for up to ~20 s (`rpcTransport`): the
+      // give-up time is checked again right before the send, so no replacement goes out past it.
+      if (pastGiveUp()) throw new TxStuckError(hashes, true, nonce, lastFees);
       // Final review m1: the entry's hashes before this send. A send that fails ambiguously (a lost response) may
       // still have added its transaction to the entry; that one is ours too (see the catch below).
       const before = new Set(tracker?.entryOf(hash)?.hashes ?? []);
@@ -936,6 +1022,8 @@ export async function waitOrReplace(
         }
         // Round 4: the replacement would go over the fee cap or the balance: nothing was sent; keep waiting.
         if (err instanceof TxFeeCapError || err instanceof TxInsufficientFundsError) continue;
+        // H3 fix round 1 (review M3): ready only past the give-up time: nothing was sent, and the wait is over.
+        if (err instanceof TxPastGiveUpError) throw new TxStuckError(hashes, true, nonce, lastFees);
         // e.g. "nonce too low": the original (or an earlier intent at this nonce) was mined after all
         const r = await minedOne();
         if (r) return r;

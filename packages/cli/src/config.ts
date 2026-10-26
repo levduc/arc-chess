@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey } from "viem/accounts";
+import { DEFAULT_FEE_CEILING_WEI } from "@arena/sdk";
+import { CHAIN_PROFILES, chainProfile, type ChainProfile } from "./chains.js";
 import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import { selfCommand } from "./version.js";
 
@@ -31,7 +33,8 @@ export type ArenaConfig = {
   /** I3: max block span per `getLogs` call when scanning dispute events (real RPCs cap the range). */
   logChunkBlocks?: number;
   /** Plan 4.5 Task 10 round 4: the fee ceiling per gas of the wallet's sender (session keys have none: round 5). A replacement
-   *  never pays more than max(4 x the node's estimate, this); default the SDK's DEFAULT_FEE_CEILING_WEI. */
+   *  never pays more than max(4 x the node's estimate, this). Default (`feeCeilingOf`): the chain profile's
+   *  `feeCeilingWei` (Plan 6: 40 gwei on Arc), else the SDK's DEFAULT_FEE_CEILING_WEI. */
   feeCeilingWei?: bigint;
   /** Final review I4: the shortest `challengeTimeout` (seconds) this daemon offers, accepts or funds; default
    *  `DEFAULT_MIN_CHALLENGE_TIMEOUT`. A missed challenge deadline can roll a channel back to an old state, so a
@@ -97,14 +100,74 @@ export function parseXmtpConfig(x: unknown): XmtpConfig {
 export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc?: Address };
 
 /**
- * Final review I2: the canonical deployments, by chain id. `arena init` warns loudly when the hub, rules (or USDC,
- * where listed) it is about to use on a listed chain differ from these -- the addresses usually come from the
- * host's /templates, and a wrong hub is where deposits go.
+ * Final review I2: the canonical deployments, by chain id -- the addresses usually come from the host's /templates,
+ * and a wrong hub is where deposits go.
+ * - Plan 6 (spec §2.5, Review Focus 3): on a chain with a built-in profile (`CHAIN_PROFILES`), `arena init`
+ *   **refuses** a hub, rules (or USDC, where listed) that differ from the entry here (`pinnedDeploymentRefusals`).
+ * - On any other chain it only warns (`knownDeploymentWarnings`), as before.
  *
- * TODO(Plan 6): add Arc mainnet (and Arc Testnet, if used) once the contracts are deployed and verified. Until then
- * the table is empty and init only checks that the addresses hold code.
+ * Arc's entries are pinned once each deployment is verified; until then the chain has no entry, and `init` on it is
+ * refused (final fix wave B, m-10; before, it only checked the profile's USDC and that the addresses hold code). Never
+ * add a placeholder address: an entry here refuses every other hub on its chain.
  */
-export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {};
+export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {
+  // 5042: Arc mainnet -- pinned by Plan 6 Task 6, after the gated mainnet deploy (contracts/deployments/5042.json).
+  // Plan 6 Task 5: the ECDSA-only hub's testnet deploy (final review A I-1, on top of audit I1, M1, M2), source-verified
+  // on explorer.testnet.arc.io (contracts/deployments/5042002.json; docs/superpowers/arc-testnet-rehearsal.md, "Redeploy
+  // #2 (ECDSA-only hub)"). Superseded and refused: the pre-hardening hub 0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893
+  // (2026-10-24) and the hardened hub with the ERC-1271 fallback 0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41 (2026-10-25).
+  5042002: {
+    name: "Arc Testnet",
+    hub: "0x3D8434455E4258a877a327De3B1201f94A558d38",
+    rules: "0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba",
+    usdc: "0x3600000000000000000000000000000000000000",
+  },
+};
+
+/**
+ * Final fix wave B (m-10): the chains a test may `init` with a `nativeIsUsdc` profile and no `KNOWN_DEPLOYMENTS` entry
+ * (`pinnedDeploymentRefusals`' `requirePin`). Test-only: no flag, environment variable or file of this CLI writes it,
+ * so in production it is always empty, and `init` refuses such a chain until a release pins its deployment.
+ */
+export const UNPINNED_INIT_ALLOWED_FOR_TESTS = new Set<number>();
+
+/**
+ * Plan 6 (spec §2.5, Review Focus 3): why `init` must refuse `addresses` on `chainId` -- empty when it may go on.
+ * Only for a chain with a built-in profile (any other chain gets `knownDeploymentWarnings`):
+ * - a USDC other than the profile's is always refused, even before the chain's deployment is pinned;
+ * - once `table` pins the chain, a hub or rules (or a listed USDC) other than the pinned one is refused;
+ * - final fix wave B (m-10), with `requirePin` (`init` only): a `nativeIsUsdc` chain `table` does not pin is refused,
+ *   whatever the addresses -- a CLI published before a chain's pin would otherwise take any hub a hostile /templates
+ *   names there. Never in `start()`: a home set up before then is not stranded by it.
+ * The check runs on the resolved addresses, so it holds whether they came from /templates or from explicit flags.
+ */
+export function pinnedDeploymentRefusals(
+  chainId: number,
+  addresses: { hub: Address; rules: Address; usdc: Address },
+  opts: { profiles?: Record<number, ChainProfile>; table?: Record<number, KnownDeployment>; requirePin?: boolean } = {},
+): string[] {
+  const profiles = opts.profiles ?? CHAIN_PROFILES;
+  const table = opts.table ?? KNOWN_DEPLOYMENTS;
+  if (!Object.hasOwn(profiles, chainId)) return [];
+  const profile = profiles[chainId];
+  const out: string[] = [];
+  const wrongUsdc = profile.usdc.toLowerCase() !== addresses.usdc.toLowerCase();
+  if (wrongUsdc) out.push(`usdc ${addresses.usdc} is not ${profile.name}'s USDC ${profile.usdc}`);
+  const known = Object.hasOwn(table, chainId) ? table[chainId] : undefined;
+  if (!known && opts.requirePin === true && profile.nativeIsUsdc && !UNPINNED_INIT_ALLOWED_FOR_TESTS.has(chainId)) {
+    out.push(`this CLI pins no arena deployment on ${profile.name} yet, so it cannot tell its hub from any other: a CLI release that pins it is needed`);
+  }
+  if (known) {
+    for (const field of ["hub", "rules", "usdc"] as const) {
+      const want = known[field];
+      if (field === "usdc" && wrongUsdc) continue; // already refused against the profile, above
+      if (want !== undefined && want.toLowerCase() !== addresses[field].toLowerCase()) {
+        out.push(`${field} ${addresses[field]} is not the pinned ${known.name} ${field} ${want}`);
+      }
+    }
+  }
+  return out;
+}
 
 /** The warnings for `addresses` on `chainId` against `table` (empty for a chain it does not list). */
 export function knownDeploymentWarnings(
@@ -149,6 +212,30 @@ export function defaultSessionGasWei(feeCeilingWei: bigint, networkGasPrice: big
   const fourX = 4n * networkGasPrice;
   const feeCap = fourX > feeCeilingWei ? fourX : feeCeilingWei;
   return SESSION_GAS_RESPONDS * RESPOND_GAS_BUDGET * feeCap;
+}
+
+/**
+ * Plan 6 (spec §2.4; audit-journey I-4 ruling): the default `sessionGasWei` on a chain with a built-in profile,
+ * k * G_respond * the profile's `feeCeilingWei` -- 4 x 2.1M x 40 gwei = 0.336 USDC on Arc. It replaces
+ * `defaultSessionGasWei` there: Arc's `eth_gasPrice` never falls under its 20 gwei floor, so 4 x it (>= 80 gwei) always
+ * beat the ceiling and locked >= 0.67 USDC per channel. A fee spike is covered by the refills, not by the first fill.
+ */
+export function profileSessionGasWei(profile: ChainProfile): bigint {
+  return SESSION_GAS_RESPONDS * RESPOND_GAS_BUDGET * profile.feeCeilingWei;
+}
+
+/** Plan 6 (spec §2.4): the wallet sender's fee ceiling per gas -- the config's `feeCeilingWei`, else the chain
+ *  profile's (40 gwei on Arc), else the SDK's default (100 gwei). The daemon's wallet sender, `arena fund` and the
+ *  withdraw reserve all read this one value, so `fund`'s ask matches the daemon's gates.
+ *  H1 (Task 2 review Minor-3): on a chain with a fee floor, never under it. `init` refuses a ceiling under the floor,
+ *  but a home written before that check, or a hand-edited config.json, can still hold one (say `1`) -- and the
+ *  withdraw reserve and `fund`'s ask, sized at 500,000 x the ceiling, would then keep almost nothing for the
+ *  wallet's own gas. Such a value is read as the floor. */
+export function feeCeilingOf(cfg: Pick<ArenaConfig, "chainId" | "feeCeilingWei">): bigint {
+  const profile = chainProfile(cfg.chainId);
+  const ceiling = cfg.feeCeilingWei ?? profile?.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
+  const floor = profile?.minFeePerGas ?? 0n;
+  return ceiling < floor ? floor : ceiling;
 }
 
 /** The config's `sessionGasFloor`, or its default: half of `sessionGasWei`. */
@@ -197,6 +284,10 @@ export function arenaPaths(home: string) {
     config: join(home, "config.json"),
     wallet: join(home, "wallet.json"),
     token: join(home, "token.json"),
+    /** Final fix wave B (I-1): a withdraw that may have been sent unconfirmed (`PendingWithdraw`, daemon.ts). */
+    withdrawPending: join(home, "withdraw-pending.json"),
+    /** Live run #2 (f)2: `fund`'s last ask with something short (`FundAsk`, cli.ts), repeated by the wait for it. */
+    fundAsk: join(home, "fund-ask.json"),
     channels: join(home, "channels"),
     offers: join(home, "offers"),
     channelRecord: (id: Hex) => join(home, "channels", canonical(id), "record.json"),

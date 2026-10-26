@@ -36,6 +36,10 @@ export class FakeChain implements ChainReader {
    *  tests of the guard's "not Anvil" branch override it (e.g. to a geth version string). */
   version = "anvil/v1.0.0";
   async clientVersion() { return this.version; }
+  /** Final review C m-5: what the RPC answers to `eth_chainId`, which `startServer` compares with the config's
+   *  `chainId`. `testConfig`'s 31337 by default; a test of another chain id sets both. */
+  rpcChainId = 31337;
+  async chainId() { return this.rpcChainId; }
 }
 
 export function testConfig(over: Partial<ServerConfig> = {}): ServerConfig {

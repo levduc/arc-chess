@@ -5,7 +5,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -107,6 +106,7 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
     error DepositTooLarge();
     error EscrowCapReached();
     error Paused();
+    error RenounceDisabled();
 
     constructor(
         IERC20 token_,
@@ -220,13 +220,13 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (c.funded[1]) _pay(p.participants[1], amount);
     }
 
-    /// @notice Withdraw payouts that could not be pushed (e.g. the recipient was blocked by the token).
-    function claim(address to) external nonReentrant {
+    /// @notice Withdraw, to the caller only, payouts that could not be pushed (audit M1: a blocked one stays here).
+    function claim() external nonReentrant {
         uint256 amount = owed[msg.sender];
         if (amount == 0) revert NothingToClaim();
         owed[msg.sender] = 0;
-        emit Claimed(msg.sender, to, amount);
-        token.safeTransfer(to, amount);
+        emit Claimed(msg.sender, msg.sender, amount);
+        token.safeTransfer(msg.sender, amount);
     }
 
     // ----------------------------------------------------------------- close
@@ -336,6 +336,12 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         emit PausedSet(paused_);
     }
 
+    /// @notice Always reverts (audit M2): an ownerless hub could never be unpaused or have its caps raised again.
+    /// Hand over with `transferOwnership` and `acceptOwnership` (Ownable2Step) instead.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
     // -------------------------------------------------------------- internal
 
     function _setFee(uint256 feePerPlayer_, address feeRecipient_) private {
@@ -409,18 +415,22 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (s.balanceA + s.balanceB != 2 * p.deposit) revert BalanceMismatch();
     }
 
-    /// @dev ECDSA first, then ERC-1271. Unlike SignatureChecker.isValidSignatureNow, a signer that later gains
-    /// code (e.g. an EIP-7702 delegation) cannot revoke its earlier ECDSA signatures (ruling R13).
-    function _signedBy(address signer, bytes32 hash, bytes memory sig) private view returns (bool) {
+    /// @dev ECDSA only: a 65-byte, low-s signature that recovers to `signer` (OpenZeppelin `ECDSA.tryRecover`). There
+    /// is no ERC-1271 fallback (owner decision 2026-10-25, final review A I-1): a signer whose code accepts any bytes,
+    /// such as a session key under an EIP-7702 delegation, could otherwise put signatures in a proof that no client
+    /// can verify. Such a key's own ECDSA signatures still verify here, since they are checked against its address,
+    /// and gaining code later cannot revoke them (ruling R13). A contract signer cannot sign at all.
+    function _signedBy(address signer, bytes32 hash, bytes memory sig) private pure returns (bool) {
         if (sig.length == 0) return false;
-        // errArg (third return) only details a failure; any failure falls through to the ERC-1271 check.
+        // errArg (third return) only details a failure; any failure is a bad signature.
         // slither-disable-next-line unused-return
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
-        if (err == ECDSA.RecoverError.NoError && recovered == signer) return true;
-        return SignatureChecker.isValidERC1271SignatureNow(signer, hash, sig);
+        return err == ECDSA.RecoverError.NoError && recovered == signer;
     }
 
     /// @dev Spec §4.3 support rule. Returns the supported latest state and its EIP-712 hash.
+    /// `challenge`/`respond` emit `proof.latest` verbatim, so each of its two slots is either empty or a valid
+    /// 65-byte ECDSA signature by that slot's signer; unchecked bytes are never accepted (audit I1).
     function _supported(Channel storage c, Params memory p, bytes32 id, Proof memory proof)
         private
         view
@@ -431,7 +441,12 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         h = hashState(s);
         IGameRules rules = IGameRules(p.rules);
         if (!proof.hasPrev) {
-            if (s.turnNum == 0 && _isOpening(rules, id, p, h)) return (s, h);
+            // The opening needs no signatures: accepted here only with both slots empty. A co-signed opening
+            // falls through to the both-signed check below.
+            if (
+                s.turnNum == 0 && proof.latest.sigA.length == 0 && proof.latest.sigB.length == 0
+                    && _isOpening(rules, id, p, h)
+            ) return (s, h);
             if (_signedBy(p.signers[0], h, proof.latest.sigA) && _signedBy(p.signers[1], h, proof.latest.sigB)) {
                 return (s, h);
             }
@@ -444,6 +459,9 @@ contract ChannelHub is EIP712, Ownable2Step, ReentrancyGuard {
         if (s.prevHash != ph || s.turnNum != prev.turnNum + 1) revert Unsupported();
         uint8 m = rules.mover(prev, p);
         if (!_signedBy(p.signers[m], h, m == 0 ? proof.latest.sigA : proof.latest.sigB)) revert BadSignature();
+        // The non-mover's slot is not needed for support, but it is emitted: empty, or a valid co-signature.
+        bytes memory other = m == 0 ? proof.latest.sigB : proof.latest.sigA;
+        if (other.length != 0 && !_signedBy(p.signers[1 - m], h, other)) revert BadSignature();
         if (!rules.validTransition(prev, s, p)) revert InvalidTransition();
 
         bool prevEndorsed = (c.hasRegistered && ph == c.registeredHash)

@@ -391,6 +391,33 @@ describe("waitOrReplace: a give-up time (Task 10 re-review I2)", () => {
     expect(n.sent).toHaveLength(1);
   });
 
+  it("H3: a fee estimate slowed past giveUpAt (a rate-limited read, retried) sends no replacement", async () => {
+    const n = stubNode();
+    const hash = await n.sender.send({ to: TO, data: "0x" });
+    const t0 = Date.now();
+    const realEstimate = n.client.estimateFeesPerGas;
+    n.client.estimateFeesPerGas = (async (...args: Parameters<typeof realEstimate>) => {
+      await nap(200); // the transport's retries, past the give-up time
+      return realEstimate(...args);
+    }) as typeof realEstimate;
+    const err = await waitOrReplace(n.client, n.sender, { to: TO, data: "0x" }, hash, {
+      timeoutMs: 50,
+      pollMs: 10,
+      giveUpAt: t0 + 120,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(TxStuckError);
+    expect((err as TxStuckError).atDeadline).toBe(true);
+    expect(n.sent).toHaveLength(1); // before: the replacement went out ~80 ms past giveUpAt
+  });
+
+  it("H3 fix round 2 (re-review M-g): HubClient.write passes notAfter to the fresh send", async () => {
+    const n = stubNode();
+    const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;
+    const notAfter = Date.now() + 60_000;
+    await new HubClient(TO, client).timeout(n.sender, h(1), { receiptTimeoutMs: 50, giveUpAt: Date.now() + 100, notAfter }).catch(() => undefined);
+    expect(n.sent[0].notAfter).toBe(notAfter);
+  });
+
   it("HubClient.write passes giveUpAt through", async () => {
     const n = stubNode();
     const client = { ...n.client, call: async () => ({ data: undefined }) } as unknown as PublicClient;

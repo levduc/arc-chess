@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomInt } from "node:crypto";
 import { existsSync, mkdirSync, lstatSync, readdirSync, renameSync, rmdirSync, rmSync, type Dirent } from "node:fs";
 import { dirname, join } from "node:path";
 import { encodeFunctionData, formatUnits, parseUnits, type Address, type Hex } from "viem";
@@ -6,8 +7,10 @@ import {
   channelHubAbi,
   decodeWire,
   DEFAULT_FEE_CEILING_WEI,
+  isRateLimited,
   offerId as computeOfferId,
   parseSignedOffer,
+  RPC_RETRY_AFTER_MAX_S,
   type SignedOffer,
 } from "@arena/sdk";
 import { runBot } from "./bot.js";
@@ -22,15 +25,38 @@ import {
   minChallengeTimeoutOf,
   DEFAULT_LOG_CHUNK_BLOCKS,
   defaultSessionGasWei,
+  feeCeilingOf,
   knownDeploymentWarnings,
   parseXmtpConfig,
+  pinnedDeploymentRefusals,
+  profileSessionGasWei,
   readConfig,
   type ArenaConfig,
   type XmtpConfig,
 } from "./config.js";
-import { computeFundingNeed, formatUsdc6, fundMessage, type FundingNeed } from "./funding.js";
-import { readJson } from "./jsonfile.js";
-import { classifyOwner, forbiddenOwners, noOwnerMessage, ownerNonceOf, readRecordedOwner, setOwner, UsageError } from "./owner.js";
+import { chainProfile, weiToUsdc6Down } from "./chains.js";
+import { DETACH_WAIT_DEFAULT_S, STOP_WAIT_DEFAULT_S, startDetachedDaemon, stopDaemon } from "./detach.js";
+import {
+  computeFundingNeed,
+  computeOneBalanceFundingNeed,
+  formatUsdc6,
+  fundDisclosure,
+  fundMessage,
+  tellYourHuman,
+  type FundingNeed,
+  type OneBalanceFundingNeed,
+} from "./funding.js";
+import { readJson, writeJsonAtomic } from "./jsonfile.js";
+import {
+  classifyOwner,
+  forbiddenOwners,
+  noOwnerMessage,
+  ownerNetworkNote,
+  ownerNonceOf,
+  readRecordedOwner,
+  setOwner,
+  UsageError,
+} from "./owner.js";
 import { RecordStore } from "./records.js";
 import { startDaemonProcess } from "./run.js";
 import { cliPackage, cliVersion, hostCliVerdict, selfCommand } from "./version.js";
@@ -41,6 +67,8 @@ export type CliIo = {
   fetch: typeof fetch;
   out(s: string): void;
   err(s: string): void;
+  /** H3: how `rpcCall` waits between retries (default: a real timer); tests pass one that does not wait. */
+  sleep?(ms: number): Promise<void>;
 };
 
 /** Plan 5.6 Task 4 (ruling 3): how *this running CLI* names itself in a message a human or agent must run again
@@ -53,7 +81,10 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   init --server URL [--rpc URL --chain-id N --hub ADDR --usdc ADDR --rules ADDR] [--port N] [--wallet-key HEX]
        [--owner ADDR] [--max-fee N] [--session-gas-wei N] [--session-gas-floor N] [--poll-ms N] [--log-chunk-blocks N]
        [--fee-ceiling-wei N] [--min-challenge-timeout SECONDS] [--auto-return-on-challenge true|false] [--no-faucet]
-       (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel)
+       (--session-gas-wei defaults to 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price): dispute gas per channel;
+        on Arc, 4 x 2.1M gas x Arc's 40 gwei profile ceiling = 0.336 USDC, regardless of --fee-ceiling-wei: use
+        --session-gas-wei to change it)
+       (--fee-ceiling-wei defaults to 100 gwei; on Arc, to 40 gwei, and a value under Arc's 20 gwei fee floor is refused)
        (--auto-return-on-challenge, default true: a human-held seat that must answer a challenge goes back to the
         agent once max(60 s, challengeTimeout / 3) is left)
        (missing chain settings are filled from the server's /templates; every chain setting is checked over the RPC;
@@ -64,13 +95,30 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         --no-faucet turns this off)
        (--owner records a first owner, or repeats the recorded one; it never changes one -- that takes "owner set"
         with the current owner's signature. Re-running init keeps the recorded owner)
-  daemon [start]
+  daemon [start] [--detach [--timeout SECONDS]]
+          (--detach: starts the daemon in the background, in its own session, so it outlives this command and the
+           shell or agent tool session that ran it; it logs to <ARENA_HOME>/daemon.log. Waits until it answers
+           (--timeout, default ${DETACH_WAIT_DEFAULT_S} s), then prints {detached, healthy: true, pid, api, log}; one
+           that holds the lock but does not answer in time is left running: {detached, healthy: false, ..., hint}.
+           With this home's daemon already running and answering, starts nothing: {alreadyRunning, healthy: true,
+           pid, api, log}. All exit 0. Exit 1, with what to do, when the lock's pid is not this home's daemon (a
+           reused pid, "bot", a withdraw) or does not answer, or when the child exits or never takes the lock --
+           that child is then stopped.)
+  daemon stop [--timeout SECONDS]
+          (stops this home's running daemon with SIGTERM, a clean shutdown, and waits until it has exited (default
+           ${STOP_WAIT_DEFAULT_S} s); prints {stopped, pid}. The pid comes from daemon.lock and is signalled only after the
+           daemon's own API, asked with this home's token, names that pid and the lock's nonce, and says it is
+           "daemon" itself, not "bot" or a withdraw; one that does not answer is never signalled. Refused while any
+           channel record is not finalized -- with no daemon nothing answers a challenge; only a human overrides that.)
   board   (prints a one-time board link, valid for 2 minutes: open it in a browser on this machine; needs the daemon)
-  wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed)
+  wallet  (prints {address, usdc, native, chainId} by reading the chain directly -- no daemon needed;
+           on a chain whose gas is USDC, such as Arc, one balance: {address, chainId, usdc}, and no --wait-for-native)
           [--wait-for-usdc A] [--wait-for-native B] [--timeout SECONDS (default 1800, max 3600)]
           (with a --wait-for-* flag: polls every 5s -- ARENA_WAIT_POLL_MS overrides it, never below 200 -- until every given
            threshold holds or the timeout passes, then prints the same JSON plus {reached, waitedSeconds}.
-           Exit 0 once reached, 2 on timeout, 1 on error.)
+           Exit 0 once reached, 2 on timeout, 1 on error. A wait for exactly the usdc.need of the last fund that found
+           something short repeats that ask: on stderr before it waits, while nothing has arrived, and as the
+           tellYourHuman a timed-out result leads with.)
   faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
   fund --games N --stake X [--deposit D]  |  fund --offer OFFER_ID [--games N]
        (works out what to ask your human for: reads /templates' deposit cap and faucet, the hub's
@@ -79,10 +127,18 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         combined with --deposit or --stake), and adds {offerId, stakePerGame} to the output; an offer that is no
         longer open exits 1. Every amount, in the output and in errors, is in whole USDC.
         Calls the server's faucet once, the same way init does, if anything is short and one is advertised.
-        Prints {address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?, message}, where
-        message is a ready-to-relay sentence. faucet is present only when a faucet call was attempted: on
-        success it is {usdc, native} (the wallet's new balances, formatted like "arena faucet"); on failure
-        (unreachable, rate-limited, wrong origin, ...) it is the string "skipped: <reason>" instead, and the
+        Prints {tellYourHuman, disclosure, address, chainId, deposit, feePerPlayer, usdc, native, owner, faucet?,
+        message}, where message is a ready-to-relay sentence (on Arc it names the network, warns that USDC sent on
+        any other network never arrives, says how to get USDC onto Arc and, with no owner recorded, asks for an
+        address the human controls on Arc); disclosure says what the human is funding (the network, the hub, the
+        host's /templates audit text, the per-player deposit cap and fee per channel, and that withdrawals go only
+        to the owner); and tellYourHuman, first, tells the agent to put both in its own reply, word for word.
+        On a chain whose gas is USDC, such as Arc, there is no native: the gas is part of usdc.need, and message
+        asks for USDC only; usdc.need also keeps one session gas for each channel of this home that is not
+        finalized, shown as usdc.reserved. faucet is present only when a
+        faucet call was attempted: on success it is {usdc, native} (the wallet's new balances, formatted like
+        "arena faucet"; {usdc} alone where gas is USDC); on failure (unreachable, rate-limited, wrong origin, ...)
+        it is the string "skipped: <reason>" instead, and the
         usdc/native fields above keep reporting the shortfall as it actually stands. Exit 0 whenever the
         computation succeeds -- a shortfall is data, not an error; exit 1 if the server or the hub cannot be
         read at all (for example, a hub address with no contract code on this chain).)
@@ -92,14 +148,17 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
            changing it needs the CURRENT owner's EIP-191 signature: without --signature it prints {messageToSign,
            signer, command} and exits 1. The signature is checked locally (ECDSA, never through the RPC), so a
            smart-contract owner cannot be changed here -- only by hand-editing config.json. Never the wallet, the
-           hub, the USDC token, the rules contract, a session key or the zero address.)
+           hub, the USDC token, the rules contract, a session key or the zero address. On Arc, it must be an
+           address the human controls on Arc -- withdraw pays it there only -- and stderr says so.)
   withdraw --amount A | --all
           (sends USDC from this wallet to the recorded owner -- it takes no destination -- through the daemon:
            started in-process, and stopped again, if none is running. Refused while a channel still awaits this
            wallet's deposit. Funds escrowed in channels are not in the wallet: close open channels first. Succeeds
            only when the receipt shows the USDC Transfer to the owner. Prints {to, amount, txHash, usdcAfter}
            (usdcAfter null, with a note, if the balance cannot be read after it); a note on stderr if this wallet
-           still has open offers.)
+           still has open offers. On a chain whose gas is USDC, such as Arc, --all keeps a gas reserve for the
+           unsettled channels and the wallet's own transactions, and --amount never dips into it, so usdcAfter is
+           not 0 after --all.)
   bot [--deposit 10] [--stake 1] [--offers 1] [--timeout SECONDS] [--idle-close-seconds 120] [--allow-real-chain]
       (a long-lived process: runs the daemon in-process, keeps --offers standing offers open, and plays its own
        agent-controlled seats with a simple strategy -- mate in one, else the best qualifying capture, else
@@ -108,13 +167,18 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
        (Plan 5.7: the XMTP fallback transport's SDK -- opt-in, never bundled, loaded only once installed.
         enable installs the pinned @xmtp/node-sdk (about 480 MB, one-time) into <ARENA_HOME>/xmtp/sdk and prints
         {enabled, version, sizeMB}; a running daemon loads it only when it starts, so restart the daemon after
-        enabling. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
+        enabling. It often outlasts a 2-minute tool limit: run it in the background and poll status until enabled
+        is true. A run that was killed part-way is safe to repeat, and the next enable removes its leftover
+        <ARENA_HOME>/xmtp/.sdk-tmp-* directory. status prints {enabled, version|null, reason?, env|null, daemon, daemonReason?} without
         installing anything: daemon is what the RUNNING daemon loaded ("xmtp" or "off") or "not running".
         disable removes the installed SDK only -- it never touches <ARENA_HOME>/xmtp/db, so a channel's XMTP
         history survives a disable/enable cycle.
         ARENA_XMTP_NPM overrides the npm binary "enable" installs with -- a test hook, never set this normally:
         a stale value left in a shell or CI environment silently swaps the installer)
-  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)] | accept <offerId>
+  offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)]
+        [--ttl SECONDS (how long the offer stays matchable, 60 to 3600; default 3600)] | accept <offerId>
+        (offers lists the open offers in a fresh random order on every call, so agents that pick the first one that
+         fits do not all pick the same one)
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
   resign | accept-draw | next-game | close | challenge | reclaim | sweep [--channel ID]
@@ -122,6 +186,35 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   version  (prints this CLI's version)`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/** Live run #2 (f)2: `fund`'s last ask with something short, in `<home>/fund-ask.json`: the words to relay (the
+ *  disclosure, then the message) and the `usdc.need` they ask for, in base units. `wallet --wait-for-usdc` repeats them
+ *  when it waits for exactly that need. */
+type FundAsk = { ask: string; usdcNeed: bigint; at: number };
+
+/** Live run #2 (f)2: what `wallet --wait-for-usdc` says before it waits, and puts first in a timed-out result. One agent
+ *  of two in live run #2 still ran `fund`, then the wait, with no reply in between: the human never saw the ask. */
+export function waitReminder(ask: string): string {
+  return (
+    "Your human must see this -- if you have not written it in your reply, stop and do that now, word for word " +
+    `(they cannot see this command's output): ${ask}`
+  );
+}
+
+/** Live run #2 (f)3: `offers` in a fresh random order on every call (Fisher-Yates, `node:crypto`). Two agents asked
+ *  to "pick at random among equals" both took the same offer: a language model's pick is not random. Exported for
+ *  tests. */
+export function shuffled<T>(items: readonly T[]): T[] {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+}
+
+/** Live run #2 (f)3: what `offers` says on stderr; stdout stays the JSON array. */
+export const OFFERS_SHUFFLED_NOTE = "note: offers are listed in a fresh random order on every call: take the first one that fits";
 
 /** Final fix wave (M8): the fastest `wallet --wait-for-*` may poll, whatever `ARENA_WAIT_POLL_MS` says. */
 export const WAIT_POLL_FLOOR_MS = 200;
@@ -194,6 +287,55 @@ export function resolveNpmBinary(io: CliIo): string {
   const name = process.platform === "win32" ? "npm.cmd" : "npm";
   const candidate = join(dirname(process.execPath), name);
   return existsSync(candidate) ? candidate : "npm";
+}
+
+/** A throwaway SDK install dir's name: `.sdk-tmp-<pid>-<epoch ms>` (see `xmtp enable`). */
+const SDK_TMP_RE = /^\.sdk-tmp-(\d+)-(\d+)$/;
+
+/** Older than this, a throwaway SDK install dir is stale even if its pid is alive again (a reused pid): no real
+ *  install takes this long. */
+const SDK_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** True while `pid` names a live process (EPERM still means alive); false once it is gone. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Plan 6 hardening H2 (audit-journey I-5): removes the `.sdk-tmp-<pid>-<ms>` dirs under `xmtpDir` that an earlier
+ * `xmtp enable` left behind when it was killed part-way -- by an agent tool's command time limit, say. A kill skips
+ * `enable`'s own cleanup, so each one can leave up to ~480 MB on disk. A dir whose pid is still alive (another
+ * `enable` in progress) is left alone unless it is over a day old. Returns the names it removed; never throws -- a
+ * dir it cannot read or remove is left for the next run. Exported for tests.
+ */
+export function removeStaleSdkTmpDirs(xmtpDir: string, isAlive: (pid: number) => boolean = pidAlive, now = Date.now()): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(xmtpDir);
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const name of names) {
+    const m = SDK_TMP_RE.exec(name);
+    if (m === null) continue;
+    const pid = Number(m[1]);
+    const startedAt = Number(m[2]);
+    if (pid !== process.pid && isAlive(pid) && now - startedAt < SDK_TMP_MAX_AGE_MS) continue;
+    if (pid === process.pid && now - startedAt < SDK_TMP_MAX_AGE_MS) continue;
+    try {
+      rmSync(join(xmtpDir, name), { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+      // left for the next run
+    }
+  }
+  return removed;
 }
 
 /** The total size (bytes) of every regular file under `dir`, recursively. A symlink counts its own link size,
@@ -331,13 +473,52 @@ export function invalidOfferTimeoutReason(
  *  could hold `init` -- and the home lock it holds -- open for minutes (undici's own header and body timeouts). */
 export const RPC_TIMEOUT_MS = 30_000;
 
+/** H3 (Arc testnet rehearsal §8.3): the waits before each retry of an `rpcCall` the RPC rate-limited (an HTTP 429, a
+ *  JSON-RPC `-32005`) or answered with an HTTP 5xx -- 15 s in all. A `Retry-After` is honoured, up to
+ *  `RPC_RETRY_AFTER_MAX_S` per retry. With `RPC_TIMEOUT_MS`, one `rpcCall` takes 45 s at most, retries included. */
+export const RPC_CALL_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
+
+/** One answer `rpcCall` retries: a rate limit (`limited`) or an HTTP 5xx. */
+class RetryableRpcAnswer extends Error {
+  constructor(
+    readonly limited: boolean,
+    readonly what: string,
+    readonly retryAfterMs: number | undefined,
+  ) {
+    super(what);
+  }
+}
+
 /** One JSON-RPC call through `io.fetch` (so tests can stub it); throws on transport, HTTP or RPC errors, and when
- *  no full reply arrives within `RPC_TIMEOUT_MS`. */
+ *  no full reply arrives within `RPC_TIMEOUT_MS`. H3: a rate limit or an HTTP 5xx is retried (`RPC_CALL_RETRY_DELAYS_MS`);
+ *  one that persists fails with "the RPC is rate-limiting" and what to do. */
 async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]): Promise<unknown> {
-  const signal = AbortSignal.timeout(RPC_TIMEOUT_MS);
+  const sleep = io.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = Date.now() + RPC_TIMEOUT_MS + RPC_CALL_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await rpcCallOnce(io, url, method, params, Math.min(RPC_TIMEOUT_MS, Math.max(1, deadline - Date.now())));
+    } catch (err) {
+      if (!(err instanceof RetryableRpcAnswer)) throw err;
+      const wait = err.retryAfterMs ?? RPC_CALL_RETRY_DELAYS_MS[attempt];
+      if (attempt >= RPC_CALL_RETRY_DELAYS_MS.length || Date.now() + wait >= deadline) {
+        const tries = `${attempt + 1} tries`;
+        throw new Error(
+          err.limited
+            ? `the RPC is rate-limiting: ${url} answered ${method} with ${err.what} (${tries}); wait a minute, then retry the command`
+            : `RPC ${url} answered ${method} with ${err.what} (${tries}); wait a minute, then retry the command`,
+        );
+      }
+      await sleep(wait);
+    }
+  }
+}
+
+async function rpcCallOnce(io: CliIo, url: string, method: string, params: unknown[], timeoutMs: number): Promise<unknown> {
+  const signal = AbortSignal.timeout(timeoutMs);
   // fetch rejects with the signal's reason, a DOMException named "TimeoutError", when the signal fires.
   const timedOut = (err: unknown) => signal.aborted || (err as { name?: unknown } | null)?.name === "TimeoutError";
-  const timeoutError = () => new Error(`RPC ${url} did not answer ${method} within ${RPC_TIMEOUT_MS / 1000} s`);
+  const timeoutError = () => new Error(`RPC ${url} did not answer ${method} within ${Math.ceil(timeoutMs / 1000)} s`);
   let res: Response;
   try {
     res = await io.fetch(url, {
@@ -350,8 +531,13 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
     if (timedOut(err)) throw timeoutError();
     throw new Error(`RPC ${url} is unreachable (${method}): ${err instanceof Error ? err.message : String(err)}`);
   }
+  if (res.status === 429 || res.status >= 500) {
+    const after = res.headers.get("retry-after");
+    const retryAfterMs = after !== null && /^\s*\d+\s*$/.test(after) ? Math.min(Number(after), RPC_RETRY_AFTER_MAX_S) * 1000 : undefined;
+    throw new RetryableRpcAnswer(res.status === 429, `status ${res.status}`, retryAfterMs);
+  }
   if (!res.ok) throw new Error(`RPC ${url} answered ${method} with status ${res.status}`);
-  let body: { result?: unknown; error?: { message?: string } };
+  let body: { result?: unknown; error?: { code?: unknown; message?: string } };
   try {
     body = (await res.json()) as typeof body;
   } catch (err) {
@@ -359,7 +545,10 @@ async function rpcCall(io: CliIo, url: string, method: string, params: unknown[]
     throw new Error(`RPC ${url} answered ${method} with a body that is not JSON`);
   }
   if (body === null || typeof body !== "object") throw new Error(`RPC ${url} answered ${method} with a malformed body`);
-  if (body.error) throw new Error(`RPC ${url} refused ${method}: ${body.error.message ?? "unknown error"}`);
+  if (body.error) {
+    if (isRateLimited(body.error)) throw new RetryableRpcAnswer(true, `"${body.error.message ?? "rate limit exceeded"}"`, undefined);
+    throw new Error(`RPC ${url} refused ${method}: ${body.error.message ?? "unknown error"}`);
+  }
   return body.result;
 }
 
@@ -444,6 +633,8 @@ function parse(argv: string[]): { positional: string[]; flags: Map<string, strin
     if (a === "--offer-draw") flags.set("offer-draw", true);
     else if (a === "--no-faucet") flags.set("no-faucet", true);
     else if (a === "--allow-real-chain") flags.set("allow-real-chain", true);
+    else if (a === "--detach") flags.set("detach", true);
+    else if (a === "--yes-i-understand") flags.set("yes-i-understand", true);
     // Plan 5.6 Task 3 (fix round 1, M5): `--all` is a boolean for every command, not only `withdraw` -- a future
     // command that wants `--all <value>` must special-case it here, or it will silently get `true`.
     else if (a === "--all") flags.set("all", true);
@@ -493,9 +684,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // pid) never blocks: acquireHomeLock already takes those over the moment a daemon actually starts.
       const livePid = livePidHoldingLock(home);
       if (livePid !== null) {
+        // H4 fix round 1 (I3, M4): a detached daemon outlives the session that started it, so a new session usually
+        // finds the last one's daemon here. It may be guarding a channel: skip init rather than stop it.
         throw new Error(
-          `a live arena daemon (pid ${livePid}) already holds ${home}. Stop it first (kill ${livePid}), or ` +
-            "run init against a different ARENA_HOME.",
+          `a live arena daemon (pid ${livePid}) already holds ${home}. If this home is already set up for this server, ` +
+            `skip init: its daemon is running (check "${CLI_COMMAND} channels" for a channel to finish first). To re-run ` +
+            `init anyway, stop it first with "${CLI_COMMAND} daemon stop" (refused while a channel is live), or run init ` +
+            "against a different ARENA_HOME.",
         );
       }
       // Task 3 fix round 4 (N2, spec §4.3): init holds the home lock for its whole run. Otherwise a daemon could start,
@@ -574,6 +769,31 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const hub = asAddress("hub", hubRaw);
         const usdc = asAddress("usdc", usdcRaw);
         const rules = asAddress("rules", rulesRaw);
+        // Plan 6 (spec §2.5, Review Focus 3): on a chain with a built-in profile (Arc), only the profile's USDC and, once
+        // the chain's deployment is pinned, only its hub and rules -- whether they came from /templates or from flags.
+        // Final fix wave B (m-10): an Arc chain with no pin yet is refused outright.
+        // On every init, fresh or re-run, before any network call (other than a --server's /templates) and before
+        // anything is written. Other chains keep the warnings below (`knownDeploymentWarnings`).
+        const pinnedRefusals = pinnedDeploymentRefusals(chainId, { hub, rules, usdc }, { requirePin: true });
+        if (pinnedRefusals.length > 0) {
+          const name = chainProfile(chainId)?.name ?? `chain ${chainId}`;
+          throw new Error(
+            `refusing to init on ${name} (chain ${chainId}): ${pinnedRefusals.join("; ")}. Deposits go to the hub this ` +
+              `config names, so on ${name} only the CLI's own pinned addresses are accepted, whatever the server publishes`,
+          );
+        }
+        // Plan 6 (spec §2.3): on a chain with a profile, a fee ceiling under its fee floor is refused -- before any RPC
+        // call and before anything is written. Arc's mempool drops a transaction under the floor without an error.
+        // Absent, the ceiling is the profile's (`feeCeilingOf`), and nothing is written for it.
+        const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
+        const profile = chainProfile(chainId);
+        if (profile !== undefined && feeCeilingWei !== undefined && feeCeilingWei < profile.minFeePerGas) {
+          throw new UsageError(
+            `--fee-ceiling-wei ${feeCeilingWei} is under ${profile.name}'s fee floor of ${profile.minFeePerGas} wei per gas: ` +
+              `a transaction under it is dropped without an error and never lands. Leave it out (default ` +
+              `${profile.feeCeilingWei}), or pass at least ${profile.minFeePerGas}`,
+          );
+        }
         // Task 3 fix round 1 (I3, spec §4.3): a re-init never repoints the money. This home's wallet approves and
         // deposits to `hub` on `chainId`; letting a re-init (an injected "the arena moved: run init ...") swap the
         // hub, token, rules or chain would send deposits somewhere else, past the owner lock entirely. serverUrl may
@@ -584,7 +804,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           prior = readJson<{ chainId?: unknown; hub?: unknown; usdc?: unknown; rules?: unknown; rpcUrl?: unknown }>(arenaPaths(home).config);
         } catch (err) {
           throw new Error(
-            `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}): fix or remove it first`,
+            `cannot read ${arenaPaths(home).config} (${err instanceof Error ? err.message.split("\n")[0] : String(err)}). Tell ` +
+              "your human: only they repair it (never you), and this home's wallet and owner depend on it",
           );
         }
         if (prior !== null) {
@@ -635,9 +856,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         for (const w of knownDeploymentWarnings(chainId, { hub, rules, usdc })) io.err(w);
         // Final review C1: the session key's dispute gas is derived from the chain unless given. A key that cannot pay
         // for a respond cannot answer a stale challenge, and an unanswered one can roll the channel back.
-        const feeCeilingWei = flag("fee-ceiling-wei") !== undefined ? BigInt(flag("fee-ceiling-wei")!) : undefined;
+        // Plan 6 (spec §2.4; the audit-journey I-4 ruling): on a chain with a profile, k x G x the profile's fee ceiling
+        // -- 0.336 USDC on Arc -- with no RPC call. Arc's gas price never falls under its floor, so 4 x it always won.
         let sessionGasWei: bigint;
         if (flag("session-gas-wei") !== undefined) sessionGasWei = BigInt(flag("session-gas-wei")!);
+        else if (profile !== undefined) sessionGasWei = profileSessionGasWei(profile);
         else {
           const price = await rpcCall(io, rpcUrl, "eth_gasPrice", []);
           if (typeof price !== "string" || !/^0x[0-9a-fA-F]{1,64}$/.test(price)) {
@@ -792,6 +1015,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           }
         }
         io.out(JSON.stringify(summary, null, 2));
+        // H2 fix round 1 (review m-7): `init --owner` records the owner too, so on Arc it gets `owner set`'s note, on
+        // stderr, with the summary on stdout unchanged.
+        const initProfile = chainProfile(chainId);
+        if (ownerFlag !== undefined && initProfile !== undefined) io.err(ownerNetworkNote(initProfile.name, chainId));
         return 0;
       } finally {
         lock.release();
@@ -806,7 +1033,34 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     }
 
     if (cmd === "daemon") {
-      if (arg !== undefined && arg !== "start") throw new UsageError(`unknown daemon subcommand ${arg}`);
+      if (arg !== undefined && arg !== "start" && arg !== "stop") throw new UsageError(`unknown daemon subcommand ${arg}`);
+      const waitMs = (def: number) => {
+        const waitRaw = flag("timeout") ?? String(def);
+        if (!/^[0-9]+$/.test(waitRaw) || Number(waitRaw) < 1 || Number(waitRaw) > 600) {
+          throw new UsageError("--timeout must be a whole number of seconds from 1 to 600");
+        }
+        return Number(waitRaw) * 1000;
+      };
+      // H4 add-on: the way to stop a detached daemon -- see stopDaemon.
+      if (arg === "stop") {
+        if (flags.has("detach")) throw new UsageError("daemon stop takes no --detach");
+        const stopped = await stopDaemon(home, {
+          fetch: io.fetch,
+          waitMs: waitMs(STOP_WAIT_DEFAULT_S),
+          command: CLI_COMMAND,
+          override: flags.has("yes-i-understand"),
+          warn: io.err,
+        });
+        io.out(JSON.stringify(stopped));
+        return 0;
+      }
+      // Plan 6 hardening H4 (live run friction 4): a daemon that outlives the agent's tool session -- see
+      // startDetachedDaemon. The child it starts is this same branch without --detach.
+      if (flags.has("detach")) {
+        const started = await startDetachedDaemon(home, { env: io.env, fetch: io.fetch, waitMs: waitMs(DETACH_WAIT_DEFAULT_S), command: CLI_COMMAND });
+        io.out(JSON.stringify(started));
+        return 0;
+      }
       const proc = await startDaemonProcess(home, { log: io.err });
       // Plan 5 Task 2 fix round, CRITICAL 1: no token anywhere in this line -- see daemonStartLine's own
       // docstring. Run `arena board` for a board link with a one-time code.
@@ -839,7 +1093,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         });
       } catch {
-        throw new Error(`cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon", then run "${CLI_COMMAND} board" again`);
+        // H4 fix round 1 (M2): a daemon that keeps dying says why in its log.
+        throw new Error(
+          `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach", then run ` +
+            `"${CLI_COMMAND} board" again (if it keeps stopping, read the end of ${join(home, "daemon.log")} and tell your human)`,
+        );
       }
       const payload = (await res.json().catch(() => ({}))) as { code?: unknown; error?: string };
       if (!res.ok || typeof payload.code !== "string") {
@@ -855,19 +1113,28 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const cfg = loadConfig(home, { warn: io.err });
       const { privateKeyToAccount } = await import("viem/accounts");
       const address = privateKeyToAccount(loadWalletKey(home)).address;
+      // Plan 6 (spec §2.1, Review Focus 1): on a chain whose gas is USDC (`nativeIsUsdc`), USDC and gas are one
+      // balance. Its source of truth is the native balance (18 decimals), read alone and shown as `usdc` rounded down
+      // to 6 decimal places; there is no `native` key. Every other chain reads and prints both, exactly as before.
+      const profile = chainProfile(cfg.chainId);
+      const oneBalance = profile?.nativeIsUsdc === true;
+      const readBalances = async (): Promise<{ usdc: bigint; native: bigint | undefined }> => {
+        if (oneBalance) return { usdc: weiToUsdc6Down(await nativeBalanceOf(io, cfg.rpcUrl, address)), native: undefined };
+        const usdc = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+        const native = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        return { usdc, native };
+      };
+      const shown = (b: { usdc: bigint; native: bigint | undefined }) => ({
+        address,
+        chainId: cfg.chainId,
+        usdc: formatUsdc6(b.usdc),
+        ...(b.native !== undefined ? { native: formatNativeBalance(b.native) } : {}),
+      });
 
       const waitUsdcRaw = flag("wait-for-usdc");
       const waitNativeRaw = flag("wait-for-native");
       if (waitUsdcRaw === undefined && waitNativeRaw === undefined) {
-        const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-        const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
-        io.out(
-          JSON.stringify(
-            { address, chainId: cfg.chainId, usdc: formatUsdc6(usdcBalance), native: formatNativeBalance(nativeBalance) },
-            null,
-            2,
-          ),
-        );
+        io.out(JSON.stringify(shown(await readBalances()), null, 2));
         return 0;
       }
 
@@ -876,6 +1143,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // (a malformed --wait-for-* amount, a malformed --timeout, or one outside [1, 3600]) is deliberately a
       // plain Error, not this CLI's usual UsageError (exit 2): an agent that sees exit 2 here must read it as
       // "timed out, not malfunctioned", never as "bad flags", so no input mistake may share that code.
+      // Plan 6: a one-balance chain has no separate native gas to wait for (exit 1, like every input problem here).
+      if (oneBalance && waitNativeRaw !== undefined) {
+        throw new Error(
+          `--wait-for-native does not apply on ${profile?.name ?? `chain ${cfg.chainId}`}: its gas is paid in USDC, from the same balance -- use --wait-for-usdc`,
+        );
+      }
       let usdcThreshold: bigint | undefined;
       if (waitUsdcRaw !== undefined) {
         if (!/^[0-9]+(\.[0-9]{1,6})?$/.test(waitUsdcRaw)) {
@@ -903,28 +1176,34 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const pollMsRaw = io.env.ARENA_WAIT_POLL_MS;
       const pollMs = pollMsRaw !== undefined && /^[0-9]+$/.test(pollMsRaw) ? Math.max(WAIT_POLL_FLOOR_MS, Number(pollMsRaw)) : 5000;
 
+      // Live run #2 (f)2: `fund`'s ask, when this waits for exactly the `usdc.need` it asked for -- never another wait's
+      // (a session-gas top-up waits for "current + amount"), whose numbers it would get wrong.
+      let ask: string | undefined;
+      try {
+        const saved = readJson<FundAsk>(arenaPaths(home).fundAsk);
+        if (saved !== null && usdcThreshold !== undefined && saved.usdcNeed === usdcThreshold) ask = saved.ask;
+      } catch {
+        // an unreadable file: no reminder
+      }
       const startedAt = Date.now();
-      for (;;) {
-        const usdcBalance = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-        const nativeBalance = await nativeBalanceOf(io, cfg.rpcUrl, address);
+      for (let poll = 0; ; poll++) {
+        const balances = await readBalances();
         const reached =
-          (usdcThreshold === undefined || usdcBalance >= usdcThreshold) &&
-          (nativeThreshold === undefined || nativeBalance >= nativeThreshold);
+          (usdcThreshold === undefined || balances.usdc >= usdcThreshold) &&
+          (nativeThreshold === undefined || (balances.native !== undefined && balances.native >= nativeThreshold));
         const elapsedMs = Date.now() - startedAt;
-        const body = {
-          address,
-          chainId: cfg.chainId,
-          usdc: formatUsdc6(usdcBalance),
-          native: formatNativeBalance(nativeBalance),
-          reached,
-          waitedSeconds: Math.floor(elapsedMs / 1000),
-        };
+        const body = { ...shown(balances), reached, waitedSeconds: Math.floor(elapsedMs / 1000) };
         if (reached) {
+          // The ask is met: it is never repeated again (repeating it now would have the human pay twice).
+          if (ask !== undefined) rmSync(arenaPaths(home).fundAsk, { force: true });
           io.out(JSON.stringify(body, null, 2));
           return 0;
         }
+        // Before the first wait, only once nothing has arrived yet: the first thing this command says.
+        if (poll === 0 && ask !== undefined) io.err(waitReminder(ask));
         if (elapsedMs >= timeoutMs) {
-          io.out(JSON.stringify(body, null, 2));
+          // A timed-out chunk leads with it too, as `fund`'s output does, before the next chunk.
+          io.out(JSON.stringify(ask !== undefined ? { tellYourHuman: waitReminder(ask), ...body } : body, null, 2));
           return 2;
         }
         await new Promise((r) => setTimeout(r, Math.min(pollMs, timeoutMs - elapsedMs)));
@@ -1041,6 +1320,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       }
       const cap = BigInt(limits.maxDepositPerPlayer);
       const faucetUrl = typeof chess.faucet === "string" ? chess.faucet : undefined;
+      // H4: quoted in `disclosure` as the host's own words; an older host may publish none.
+      const audit = typeof chess.audit === "string" ? chess.audit : undefined;
 
       // Final fix wave (K1): the chosen offer, from the server's public lobby (the same list the daemon's `offers`
       // shows, in the server's own {"$bigint": ...} wire format). Only its deposit and stake are used, to size the
@@ -1093,23 +1374,41 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           : depositRaw !== undefined
             ? " (--deposit takes whole USDC)"
             : "";
-      const computeNeed = (usdcHave: bigint, nativeHave: bigint): FundingNeed => {
+      // Plan 6 (spec §2.1, Review Focus 1): on a chain whose gas is USDC (`nativeIsUsdc`), one balance -- the native
+      // one, read alone -- and one ask: the gas is folded into `usdc.need`, and there is no `native`. Every other
+      // chain reads both balances and asks for both, exactly as before.
+      const oneBalance = chainProfile(cfg.chainId)?.nativeIsUsdc === true;
+      // Fix round 1 (spec §2.1 as amended, audit-daemon I-5): on such a chain, this home's channels that are not
+      // finalized each keep one sessionGasWei of the same balance for their refills, so the ask includes it
+      // (`usdc.reserved`) -- the daemon's opening gates refuse a new channel that would spend it. No daemon needed: the
+      // records on disk. A record that cannot be read is not counted (the daemon cannot open it either). Final fix wave B
+      // (m-11): a degraded one is (unlike the daemon's own reserve count), so this asks for more, never less.
+      const unsettledChannels = oneBalance ? new RecordStore(home).channels().filter((r) => !r.finalized).length : 0;
+      const sized = <T>(compute: () => T): T => {
         try {
-          return computeFundingNeed({
-            games: fundGames,
-            stake: fundStake,
-            deposit: explicitDeposit,
-            cap,
-            feePerPlayer,
-            sessionGasWei: cfg.sessionGasWei,
-            feeCeilingWei,
-            usdcHave,
-            nativeHave,
-          });
+          return compute();
         } catch (err) {
           if (err instanceof RangeError) throw new Error(`${err.message}${rangeHint}`);
           throw err;
         }
+      };
+      const readNeed = async (): Promise<FundingNeed | OneBalanceFundingNeed> => {
+        const common = {
+          games: fundGames,
+          stake: fundStake,
+          deposit: explicitDeposit,
+          cap,
+          feePerPlayer,
+          sessionGasWei: cfg.sessionGasWei,
+          feeCeilingWei,
+        };
+        if (oneBalance) {
+          const balanceWei = await nativeBalanceOf(io, cfg.rpcUrl, address);
+          return sized(() => computeOneBalanceFundingNeed({ ...common, balanceWei, unsettledChannels }));
+        }
+        const usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
+        const nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
+        return sized(() => computeFundingNeed({ ...common, usdcHave, nativeHave }));
       };
 
       const feePerPlayerRaw = await rpcCall(io, cfg.rpcUrl, "eth_call", [
@@ -1128,22 +1427,22 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         );
       }
       const feePerPlayer = hexToBigIntOrThrow(feePerPlayerRaw, `RPC ${cfg.rpcUrl} eth_call (feePerPlayer)`);
-      const feeCeilingWei = cfg.feeCeilingWei ?? DEFAULT_FEE_CEILING_WEI;
+      // Plan 6 (spec §2.4): the daemon's own wallet ceiling -- the profile's on Arc -- so this ask matches its gates.
+      const feeCeilingWei = feeCeilingOf(cfg);
 
-      let usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-      let nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
-      let funding: FundingNeed = computeNeed(usdcHave, nativeHave);
+      let funding = await readNeed();
 
       // spec §4.1: call the faucet (as init does) only when something is actually short and the template
       // advertises one; never fails fund -- a failed top-up just leaves the shortfall for the human to cover.
-      let faucetReported: { usdc: string; native: string } | string | undefined;
-      if ((funding.usdc.shortfall > 0n || funding.native.shortfall > 0n) && faucetUrl !== undefined) {
+      let faucetReported: { usdc: string; native?: string } | string | undefined;
+      if ((funding.usdc.shortfall > 0n || ("native" in funding && funding.native.shortfall > 0n)) && faucetUrl !== undefined) {
         try {
           const funded = await callFaucet(io, faucetUrl, cfg.serverUrl, address);
-          faucetReported = { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
-          usdcHave = await usdcBalanceOf(io, cfg.rpcUrl, cfg.usdc, address);
-          nativeHave = await nativeBalanceOf(io, cfg.rpcUrl, address);
-          funding = computeNeed(usdcHave, nativeHave);
+          // Fix round 1 (m-6): on a one-balance chain, USDC only, like the rest of this output.
+          faucetReported = oneBalance
+            ? { usdc: formatUsdc6(funded.usdc) }
+            : { usdc: formatUsdc6(funded.usdc), native: formatNativeBalance(funded.native) };
+          funding = await readNeed();
         } catch (err) {
           faucetReported = `skipped: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`;
         }
@@ -1152,24 +1451,49 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // Plan 5.6 Task 3: the owner recorded in config.json (`arena owner set` / `init --owner`), or null.
       const owner = cfg.owner ?? null;
       const message = fundMessage(funding, { address, chainId: cfg.chainId, ownerSet: owner !== null, games: fundGames, stake: fundStake });
+      // Plan 6 hardening H4 (live run frictions 1, 2): the output leads with what the agent must say to its human, in
+      // its own reply -- what they are funding, then the ask. Every field after these two is unchanged for scripts.
+      const disclosure = fundDisclosure({ chainId: cfg.chainId, hub: cfg.hub, audit, cap, feePerPlayer, owner });
+      const short = funding.usdc.shortfall > 0n || ("native" in funding && funding.native.shortfall > 0n);
 
       const body: Record<string, unknown> = {
+        tellYourHuman: tellYourHuman(disclosure, message, short),
+        disclosure,
         address,
         chainId: cfg.chainId,
         // Final fix wave (K1): only with --offer -- the offer sized for, and its stake in whole USDC.
         ...(offerId !== undefined ? { offerId, stakePerGame: formatUsdc6(fundStake) } : {}),
         deposit: formatUsdc6(funding.deposit),
         feePerPlayer: formatUsdc6(funding.feePerPlayer),
-        usdc: { have: formatUsdc6(funding.usdc.have), need: formatUsdc6(funding.usdc.need), shortfall: formatUsdc6(funding.usdc.shortfall) },
-        native: {
-          have: formatNativeBalance(funding.native.have),
-          need: formatNativeBalance(funding.native.need),
-          shortfall: formatNativeBalance(funding.native.shortfall),
+        usdc: {
+          have: formatUsdc6(funding.usdc.have),
+          need: formatUsdc6(funding.usdc.need),
+          shortfall: formatUsdc6(funding.usdc.shortfall),
+          // Fix round 1 (I-5): one-balance chains only -- the part of `need` kept for the other unsettled channels.
+          ...("reserved" in funding.usdc ? { reserved: formatUsdc6(funding.usdc.reserved) } : {}),
         },
+        // Plan 6: absent on a one-balance chain, whose gas is in `usdc` above.
+        ...("native" in funding
+          ? {
+              native: {
+                have: formatNativeBalance(funding.native.have),
+                need: formatNativeBalance(funding.native.need),
+                shortfall: formatNativeBalance(funding.native.shortfall),
+              },
+            }
+          : {}),
         owner,
       };
       if (faucetReported !== undefined) body.faucet = faucetReported;
       body.message = message;
+      // Live run #2 (f)2: kept for the wait to repeat (best effort: a failed write only loses the reminder).
+      try {
+        const askPath = arenaPaths(home).fundAsk;
+        if (short) writeJsonAtomic(askPath, { ask: `${disclosure} ${message}`, usdcNeed: funding.usdc.need, at: Date.now() } satisfies FundAsk);
+        else rmSync(askPath, { force: true });
+      } catch {
+        // the output above is what counts
+      }
       io.out(JSON.stringify(body, null, 2));
       return 0;
     }
@@ -1185,6 +1509,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       if (addr === undefined) throw new UsageError("owner set needs an address");
       await setOwner(home, addr, io, CLI_COMMAND, flag("signature"));
       io.out(JSON.stringify({ owner: readRecordedOwner(home) }));
+      // Plan 6 hardening H2 (audit-journey C-2): on Arc, the confirmation says the owner must be an address the human
+      // controls on Arc. On stderr, so stdout stays the same `{owner}` JSON on every chain.
+      const ownerChainId = loadConfig(home).chainId;
+      const ownerProfile = chainProfile(ownerChainId);
+      if (ownerProfile !== undefined) io.err(ownerNetworkNote(ownerProfile.name, ownerChainId));
       return 0;
     }
 
@@ -1269,7 +1598,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         if (readRecordedOwner(home) === null) throw new Error(noOwnerMessage(CLI_COMMAND));
         // Exactly as `arena bot` does: the in-process daemon takes the home lock, so nothing else can send from
         // this wallet meanwhile; it is stopped (and the lock released) whether or not the withdraw succeeds.
-        const proc = await startDaemonProcess(home, { log: () => {} });
+        const proc = await startDaemonProcess(home, { log: () => {}, role: "withdraw" });
         try {
           result = await proc.daemon.withdraw(req);
         } finally {
@@ -1334,7 +1663,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const deposit = amountOrDefault("deposit", "10");
       const stake = amountOrDefault("stake", "1");
 
-      const proc = await startDaemonProcess(home, { log: io.err });
+      const proc = await startDaemonProcess(home, { log: io.err, role: "bot" });
       // Fix round (minor 5): an explicit --timeout this daemon would never actually be able to use (below the
       // hub's own minimum or this daemon's minChallengeTimeout, or above the hub's maximum) is caught here,
       // clearly, at startup -- rather than only surfacing later as a repeating, generic createOffer failure on
@@ -1406,6 +1735,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         // npm *and* the loader both succeed -- a failed install (npm exits non-zero, or the installed SDK fails
         // to load) then never leaves a half-populated <home>/xmtp/sdk behind; a concurrent `status`, or a retried
         // `enable`, still sees only the last good install (or none at all), never a corrupt partial one.
+        // Plan 6 hardening H2 (audit-journey I-5): a run killed part-way never reached the `catch` below, so its
+        // throwaway dir is cleared here, on the next run.
+        for (const name of removeStaleSdkTmpDirs(xmtpDir)) io.err(`xmtp enable: removed ${name}, left by an earlier run that was stopped part-way`);
         const tmpDir = join(xmtpDir, `.sdk-tmp-${process.pid}-${Date.now()}`);
         mkdirSync(tmpDir, { recursive: true });
         try {
@@ -1480,6 +1812,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             deposit: usdcAmount("deposit"),
             stakePerGame: usdcAmount("stake"),
             ...(flag("timeout") !== undefined ? { challengeTimeout: flag("timeout") } : {}),
+            // H1: omitted unless --ttl is given -- the daemon keeps its default lifetime and checks the range.
+            ...(flag("ttl") !== undefined ? { ttl: flag("ttl") } : {}),
           },
         };
         break;
@@ -1539,8 +1873,10 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // own wording (skill.md's recipe step 2 starts the daemon -- the final fix wave moved it back ahead of
       // picking an offer and `fund --offer`).
       throw new Error(
-        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon" (skill.md's recipe step 2), ` +
-          `then retry: ${err instanceof Error ? err.message : String(err)}`,
+        `cannot reach the daemon on 127.0.0.1:${cfg.port}: start it with "${CLI_COMMAND} daemon --detach" (skill.md's recipe step 2), ` +
+          // H4 fix round 1 (M2): a daemon that keeps dying says why in its log.
+          `then retry (if it keeps stopping, read the end of ${join(home, "daemon.log")} and tell your human): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
       );
     }
     const payload = (await res.json()) as unknown;
@@ -1548,7 +1884,27 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       io.err(`error: ${(payload as { error?: string }).error ?? res.statusText}`);
       return 1;
     }
+    if (cmd === "offers" && Array.isArray(payload)) {
+      io.out(JSON.stringify(shuffled(payload), null, 2));
+      io.err(OFFERS_SHUFFLED_NOTE);
+      return 0;
+    }
     io.out(JSON.stringify(payload, null, 2));
+    // H3 (Arc testnet rehearsal §8.2): the action took effect; only the chain read after it failed. Final fix wave B
+    // (m-7): except a challenge or reclaim mined with its receipt unreadable -- the chain was read, the outcome is not
+    // known.
+    const stale = payload as { chainStale?: unknown; chainStaleReason?: unknown; unconfirmed?: unknown };
+    if (typeof stale.unconfirmed === "string") {
+      io.err(
+        `note: ${cmd} was mined, but whether it succeeded is not known yet (${String(stale.chainStaleReason)}): run ` +
+          `"${CLI_COMMAND} status" to check`,
+      );
+    } else if (stale.chainStale === true) {
+      io.err(
+        `note: ${cmd} took effect, but the chain could not be read afterwards (${String(stale.chainStaleReason)}): ` +
+          `the chain fields above may be stale; run "${CLI_COMMAND} status" for a fresh view`,
+      );
+    }
     // Plan 5 fix round (I5): a daemon-wide sweep may not finish everything within its own time budget.
     if (cmd === "sweep" && typeof (payload as { remaining?: unknown }).remaining === "number") {
       const remaining = (payload as { remaining: number }).remaining;

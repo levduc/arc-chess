@@ -38,7 +38,7 @@ export type DisputeEvent = {
   deadline?: bigint;
 };
 
-/** One hub event, for any channel, decoded from `getContractEvents` with `eventName` omitted (hubEvents). */
+/** One hub event, for any channel, decoded by `hubEvents`. */
 export type HubEvent = {
   blockNumber: bigint;
   logIndex: number;
@@ -55,6 +55,20 @@ export type HubEvent = {
   | { kind: "Responded"; turnNum: bigint; signed: SignedState }
   | { kind: "Finalized"; balanceA: bigint; balanceB: bigint; fee: bigint }
   | { kind: "Reclaimed" }
+);
+
+/** The kinds of `HubEvent`: the hub events that carry a `channelId`. */
+export const HUB_EVENT_KINDS = ["ChannelCreated", "Deposited", "Opened", "Challenged", "Responded", "Finalized", "Reclaimed"] as const;
+
+/**
+ * Plan 6 Task 5 (the Arc testnet rehearsal): the ABI items of `HUB_EVENT_KINDS`, the only events `hubEvents` reads.
+ * Arc's RPC, testnet and mainnet, refuses an `eth_getLogs` whose topic-0 list has more than 10 entries, even for a
+ * single block (-32012 "requested range too large"). The hub's ABI has 15 events, so a read of all of them was refused
+ * on every range, and the host's indexer never got past the deploy block.
+ */
+export const HUB_EVENT_ABI = channelHubAbi.filter(
+  (item): item is Extract<(typeof channelHubAbi)[number], { type: "event"; name: (typeof HUB_EVENT_KINDS)[number] }> =>
+    item.type === "event" && (HUB_EVENT_KINDS as readonly string[]).includes(item.name),
 );
 
 /** Splits [fromBlock, toBlock] (inclusive) into consecutive chunks of at most `size` blocks each. */
@@ -128,6 +142,9 @@ export type WriteOptions = {
   receiptTimeoutMs?: number;
   /** Wall-clock ms past which the receipt wait neither replaces nor waits (a dispute deadline; see waitOrReplace). */
   giveUpAt?: number;
+  /** H3 fix round 2 (re-review M-g): wall-clock ms at or after which the transaction itself is not sent
+   *  (`TxRequest.notAfter`, `TxPastGiveUpError`): a respond that could only land past its deadline would revert. */
+  notAfter?: number;
   /** Aborts the receipt wait (TxWaitAbortedError). */
   signal?: AbortSignal;
 };
@@ -182,8 +199,9 @@ export class HubClient {
     return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "reclaim", args: [id] }), opts);
   }
 
-  claim(sender: TxSender, to: Address, opts?: WriteOptions): Promise<TransactionReceipt> {
-    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim", args: [to] }), opts);
+  /** Withdraws `owed[sender]` to the sender's own address: the hub pays the caller only (audit M1). */
+  claim(sender: TxSender, opts?: WriteOptions): Promise<TransactionReceipt> {
+    return this.call(sender, encodeFunctionData({ abi: channelHubAbi, functionName: "claim" }), opts);
   }
 
   async channelInfo(id: Hex): Promise<ChannelInfo> {
@@ -304,11 +322,24 @@ export class HubClient {
   /**
    * Every hub event for every channel in `[fromBlock, toBlock]`, chain order -- for a watchtower scanning the
    * whole hub rather than one channel at a time, since it may not know every channel to poll for ahead of time.
-   * Events with no `channelId` arg (PayoutDeferred, Claimed, FeeUpdated, LimitsUpdated, PausedSet,
-   * EIP712DomainChanged, OZ Ownership*) are skipped.
+   * Only the events that carry a `channelId` (`HUB_EVENT_KINDS`) are read: PayoutDeferred, Claimed, FeeUpdated,
+   * LimitsUpdated, PausedSet, EIP712DomainChanged and OZ Ownership* are not asked for (Plan 6 Task 5: one query for
+   * all 15 is refused by Arc's RPC, see `HUB_EVENT_ABI`).
+   *
+   * Plan 6 hardening H1 (review m-11): `kinds` reads only those events (one query per kind). An indexer whose RPC
+   * refuses a range because of a griefer's oversized `Challenged`/`Responded` can still read the range's other events.
    */
-  async hubEvents(fromBlock: bigint, toBlock: bigint): Promise<HubEvent[]> {
-    const logs = await this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, fromBlock, toBlock });
+  async hubEvents(fromBlock: bigint, toBlock: bigint, opts: { kinds?: readonly HubEvent["kind"][] } = {}): Promise<HubEvent[]> {
+    const logs =
+      opts.kinds === undefined
+        ? await this.client.getLogs({ address: this.hub, events: HUB_EVENT_ABI, fromBlock, toBlock })
+        : (
+            await Promise.all(
+              opts.kinds.map((eventName) =>
+                this.client.getContractEvents({ address: this.hub, abi: channelHubAbi, eventName, fromBlock, toBlock }),
+              ),
+            )
+          ).flat();
     const events: HubEvent[] = [];
     for (const log of logs) {
       const args = log.args as Record<string, unknown>;
@@ -393,7 +424,7 @@ export class HubClient {
     let hash: Hex;
     try {
       // No nonce: a tracking sender (SerialTxSender) picks it, and replaces its own released transaction if any.
-      hash = await sender.send({ to, data });
+      hash = await sender.send({ to, data, ...(opts.notAfter === undefined ? {} : { notAfter: opts.notAfter }) });
     } catch (err) {
       if (isSendRevert(err)) throw new HubRevertError(decodeRevert(err), err);
       // not a revert (RPC down, a used nonce (TxNonceUsedError), the fee cap or the balance (TxFeeCapError,

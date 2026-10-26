@@ -1,12 +1,15 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
 import {
   KNOWN_DEPLOYMENTS,
+  RPC_CALL_RETRY_DELAYS_MS,
   RPC_TIMEOUT_MS,
+  UNPINNED_INIT_ALLOWED_FOR_TESTS,
   arenaPaths,
+  feeCeilingOf,
   livePidHoldingLock,
   loadConfig,
   runCli,
@@ -110,7 +113,11 @@ describe("arena init --server", () => {
     });
     expect(code).toBe(1);
     expect(err.join("\n")).toContain(`pid ${process.pid}`);
-    expect(err.join("\n")).toContain(`kill ${process.pid}`);
+    // H4 fix round 1 (I3, M4): how to stop it is "arena daemon stop" (a bare kill is denied under a narrow tool
+    // allowlist), and a home that is already set up needs no init at all.
+    expect(err.join("\n")).toContain('stop it first with "arena daemon stop"');
+    expect(err.join("\n")).toContain("If this home is already set up for this server, skip init");
+    expect(err.join("\n")).not.toMatch(/\bkill\b/);
     expect(calls).toHaveLength(0); // refused before ever reaching the network
   });
 
@@ -183,6 +190,83 @@ describe("arena init --server", () => {
     expect(code).toBe(1);
     expect(err.join("\n")).toContain("serves chain 0x1, not chain 31337");
     expect(existsSync(failed)).toBe(false);
+  });
+
+  describe("H3 (Arc testnet rehearsal §8.3): init's RPC calls ride out a rate limit", () => {
+    /** `stubFetch`'s chain, with the RPC calls `limit` picks answered `answer` instead. */
+    function limited(limit: (method: string, call: number) => Response | null) {
+      const base = stubFetch();
+      const seen: string[] = [];
+      const fetchStub = (async (url: string, init?: RequestInit) => {
+        if (!url.endsWith("/templates")) {
+          const method = (JSON.parse(String(init?.body)) as { method: string }).method;
+          const r = limit(method, seen.filter((m) => m === method).length);
+          seen.push(method);
+          if (r) return r;
+        }
+        return base.fetchStub(url, init);
+      }) as typeof fetch;
+      return { fetchStub, seen };
+    }
+    const tooMany = (headers?: Record<string, string>) => new Response("Too Many Requests", { status: 429, headers });
+    const rateLimit = () => new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32005, message: "rate limit exceeded" } }));
+
+    async function init(fetchStub: typeof fetch) {
+      const home = mkdtempSync(join(tmpdir(), "arena-init-"));
+      const err: string[] = [];
+      const waits: number[] = [];
+      const code = await runCli(["init", "--server", "http://host.test"], {
+        env: { ARENA_HOME: home },
+        fetch: fetchStub,
+        out: () => undefined,
+        err: (s) => err.push(s),
+        sleep: async (ms) => void waits.push(ms),
+      });
+      return { home, code, err, waits };
+    }
+
+    it("a 429 on eth_getCode (Bob's first init in the rehearsal) is retried after 1 s, and init succeeds", async () => {
+      const { fetchStub, seen } = limited((m, call) => (m === "eth_getCode" && call === 0 ? tooMany() : null));
+      const { home, code, waits } = await init(fetchStub);
+      expect(code).toBe(0);
+      expect(waits).toEqual([1_000]);
+      expect(seen.filter((m) => m === "eth_getCode")).toHaveLength(4); // three contracts, one retried
+      expect(existsSync(arenaPaths(home).config)).toBe(true);
+    });
+
+    it("a JSON-RPC -32005 and a 503 are retried too; a Retry-After is honoured up to 4 s", async () => {
+      const { fetchStub } = limited((m, call) =>
+        m === "eth_chainId" && call === 0 ? rateLimit() : m === "eth_chainId" && call === 1 ? tooMany({ "retry-after": "3600" }) : m === "eth_chainId" && call === 2 ? new Response("", { status: 503 }) : null,
+      );
+      const { code, waits } = await init(fetchStub);
+      expect(code).toBe(0);
+      expect(waits).toEqual([1_000, 4_000, 4_000]);
+    });
+
+    it("a rate limit that persists fails with 'the RPC is rate-limiting' and what to do, after 15 s of retries", async () => {
+      const { fetchStub, seen } = limited(() => tooMany());
+      const { home, code, err, waits } = await init(fetchStub);
+      expect(code).toBe(1);
+      expect(waits).toEqual([...RPC_CALL_RETRY_DELAYS_MS]);
+      expect(waits.reduce((a, b) => a + b, 0)).toBe(15_000);
+      expect(seen).toEqual(Array(5).fill("eth_chainId"));
+      expect(err.join("\n")).toContain(
+        "the RPC is rate-limiting: http://rpc.test answered eth_chainId with status 429 (5 tries); wait a minute, then retry the command",
+      );
+      expect(livePidHoldingLock(home)).toBeNull();
+      expect(existsSync(arenaPaths(home).config)).toBe(false);
+    });
+
+    it("a refusal is not retried", async () => {
+      const { fetchStub, seen } = limited((m) =>
+        m === "eth_chainId" ? new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "method not found" } })) : null,
+      );
+      const { code, err, waits } = await init(fetchStub);
+      expect(code).toBe(1);
+      expect(waits).toEqual([]);
+      expect(seen).toEqual(["eth_chainId"]);
+      expect(err.join("\n")).toContain("RPC http://rpc.test refused eth_chainId: method not found");
+    });
   });
 
   it("Task 3 fix round 4 (N2): every RPC call carries a timeout, and an RPC that never answers fails init with a clear error", async () => {
@@ -271,6 +355,291 @@ describe("arena init --server", () => {
     }
     // An unknown chain id (the table is empty until Plan 6 fills in Arc mainnet): nothing to compare, no warning.
     expect((await run()).err).not.toMatch(/WARNING/);
+  });
+
+  describe("Plan 6 (spec §2.5, Review Focus 3): on a chain with a profile, init refuses a non-pinned USDC, hub or rules", () => {
+    const ARC_USDC = "0x3600000000000000000000000000000000000000";
+    const HUB = `0x${"11".repeat(20)}` as const;
+    const RULES = `0x${"33".repeat(20)}` as const;
+    const OTHER = `0x${"44".repeat(20)}` as const;
+    const arcChain = (chainId: number, withCode = [HUB, RULES, OTHER, ARC_USDC, `0x${"22".repeat(20)}`]) => ({ chainId, withCode });
+    const explicit = (o: { chainId?: number; hub?: string; usdc?: string; rules?: string } = {}) => [
+      "init", "--server", "https://host.test", "--rpc", "http://rpc.test", "--chain-id", String(o.chainId ?? 5042002),
+      "--hub", o.hub ?? HUB, "--usdc", o.usdc ?? ARC_USDC, "--rules", o.rules ?? RULES, "--session-gas-wei", "10000000000000000",
+    ];
+    const fromServer = ["init", "--server", "https://host.test", "--session-gas-wei", "10000000000000000"];
+    const run = async (home: string, args: string[], stub: ReturnType<typeof stubFetch>) => {
+      const err: string[] = [];
+      const code = await runCli(args, { env: { ARENA_HOME: home }, fetch: stub.fetchStub, out: () => undefined, err: (s) => err.push(s) });
+      return { code, err: err.join("\n"), calls: stub.calls };
+    };
+    const freshHome = () => join(mkdtempSync(join(tmpdir(), "arena-init-arc-")), "home");
+    /** Runs `body` with `entry` pinned for `chainId`, then puts back whatever was there (Plan 6 Task 5: a real pin, or
+     *  none) -- a plain `delete` would drop a real pin for every later test in the process. */
+    const pin = async <T>(chainId: number, entry: { name: string; hub: `0x${string}`; rules: `0x${string}` }, body: () => Promise<T>): Promise<T> => {
+      const saved = Object.hasOwn(KNOWN_DEPLOYMENTS, chainId) ? KNOWN_DEPLOYMENTS[chainId] : undefined;
+      KNOWN_DEPLOYMENTS[chainId] = entry;
+      try {
+        return await body();
+      } finally {
+        if (saved !== undefined) KNOWN_DEPLOYMENTS[chainId] = saved;
+        else delete KNOWN_DEPLOYMENTS[chainId];
+      }
+    };
+    // Plan 6 Task 5: these cases use synthetic addresses, so they run with Arc's real pins (5042002 since Task 5, 5042
+    // once Task 6 pins it) taken out of the table, and put back after each one. The real pin is tested below. Final
+    // fix wave B (m-10): with no pin, init refuses an Arc chain outright, so these cases also set the test-only
+    // override (refused without it: tested in "no pin at all" below).
+    const realPins = new Map<number, (typeof KNOWN_DEPLOYMENTS)[number]>();
+    beforeEach(() => {
+      for (const chainId of [5042, 5042002]) {
+        UNPINNED_INIT_ALLOWED_FOR_TESTS.add(chainId);
+        if (!Object.hasOwn(KNOWN_DEPLOYMENTS, chainId)) continue;
+        realPins.set(chainId, KNOWN_DEPLOYMENTS[chainId]);
+        delete KNOWN_DEPLOYMENTS[chainId];
+      }
+    });
+    afterEach(() => {
+      for (const [chainId, entry] of realPins) KNOWN_DEPLOYMENTS[chainId] = entry;
+      realPins.clear();
+      UNPINNED_INIT_ALLOWED_FOR_TESTS.clear();
+    });
+
+    it("final fix wave B (m-10): no pin at all -- without the test-only override, init refuses the chain whatever the addresses, before any RPC call", async () => {
+      UNPINNED_INIT_ALLOWED_FOR_TESTS.clear();
+      for (const [chainId, name] of [[5042, "Arc"], [5042002, "Arc Testnet"]] as const) {
+        for (const [how, args, stub] of [
+          ["templates", fromServer, stubFetch({ templates: templatesResponse({ chainId, usdc: ARC_USDC }), ...arcChain(chainId) })],
+          ["flags", explicit({ chainId }), stubFetch(arcChain(chainId))],
+        ] as const) {
+          const home = freshHome();
+          const r = await run(home, [...args], stub);
+          expect(r.code, `${name} ${how}`).toBe(1);
+          expect(r.err).toContain(
+            `refusing to init on ${name} (chain ${chainId}): this CLI pins no arena deployment on ${name} yet, so it cannot ` +
+              "tell its hub from any other: a CLI release that pins it is needed",
+          );
+          expect(r.calls.filter((c) => c.method !== undefined), `${name} ${how}`).toEqual([]); // no RPC call at all
+          expect(existsSync(home), `${name} ${how}`).toBe(false);
+        }
+      }
+    });
+
+    it("a USDC other than the profile's is refused -- from /templates or from --usdc, on 5042 and 5042002 -- before any RPC call, writing nothing", async () => {
+      for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
+        // The host publishes its own "USDC" for the chain.
+        const home1 = freshHome();
+        const viaTemplates = await run(home1, fromServer, stubFetch({ templates: templatesResponse({ chainId }), ...arcChain(chainId) }));
+        expect(viaTemplates.code, name).toBe(1);
+        expect(viaTemplates.err).toContain(`refusing to init on ${name} (chain ${chainId}): usdc 0x${"22".repeat(20)} is not ${name}'s USDC ${ARC_USDC}`);
+        expect(viaTemplates.calls.map((c) => c.method ?? "templates"), name).toEqual(["templates"]); // no RPC call at all
+        expect(existsSync(home1), name).toBe(false); // a failed first init leaves no home behind
+
+        // The same address as an explicit flag.
+        const home2 = freshHome();
+        const viaFlag = await run(home2, explicit({ chainId, usdc: `0x${"22".repeat(20)}` }), stubFetch(arcChain(chainId)));
+        expect(viaFlag.code, name).toBe(1);
+        expect(viaFlag.err).toContain(`usdc 0x${"22".repeat(20)} is not ${name}'s USDC ${ARC_USDC}`);
+        expect(viaFlag.calls, name).toEqual([]);
+        expect(existsSync(home2), name).toBe(false);
+      }
+    });
+
+    it("with no pinned deployment and the test-only override, the profile's USDC (any case) is accepted with any hub and rules that hold code", async () => {
+      const home = freshHome();
+      const r = await run(home, fromServer, stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC.toUpperCase().replace("0X", "0x") }), ...arcChain(5042002) }));
+      expect(r.code, r.err).toBe(0);
+      expect(loadConfig(home)).toMatchObject({ chainId: 5042002, hub: HUB, rules: RULES });
+      expect(r.err).not.toMatch(/WARNING|refusing/);
+    });
+
+    it("once the chain's deployment is pinned, another hub or rules is refused -- from /templates or from flags", async () => {
+      await pin(5042002, { name: "Arc Testnet", hub: OTHER, rules: RULES }, async () => {
+        const viaTemplates = await run(freshHome(), fromServer, stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC }), ...arcChain(5042002) }));
+        expect(viaTemplates.code).toBe(1);
+        expect(viaTemplates.err).toContain(`refusing to init on Arc Testnet (chain 5042002): hub ${HUB} is not the pinned Arc Testnet hub ${OTHER}`);
+        expect(viaTemplates.calls.map((c) => c.method ?? "templates")).toEqual(["templates"]);
+
+        const viaFlag = await run(freshHome(), explicit({ hub: HUB }), stubFetch(arcChain(5042002)));
+        expect(viaFlag.code).toBe(1);
+        expect(viaFlag.err).toContain(`hub ${HUB} is not the pinned Arc Testnet hub ${OTHER}`);
+        expect(viaFlag.calls).toEqual([]);
+
+        const badRules = await run(freshHome(), explicit({ hub: OTHER, rules: HUB }), stubFetch(arcChain(5042002)));
+        expect(badRules.code).toBe(1);
+        expect(badRules.err).toContain(`rules ${HUB} is not the pinned Arc Testnet rules ${RULES}`);
+        expect(badRules.err).not.toMatch(/hub .* is not the pinned/);
+
+        // The pinned deployment itself, any case: accepted.
+        const home = freshHome();
+        const ok = await run(home, explicit({ hub: OTHER.toUpperCase().replace("0X", "0x") }), stubFetch(arcChain(5042002)));
+        expect(ok.code, ok.err).toBe(0);
+        expect(ok.err).not.toMatch(/WARNING|refusing/);
+
+        // A pin on 5042002 says nothing about Arc mainnet (5042): its own profile USDC check still applies there.
+        const mainnet = await run(freshHome(), explicit({ chainId: 5042, hub: HUB }), stubFetch(arcChain(5042)));
+        expect(mainnet.code, mainnet.err).toBe(0);
+      });
+    });
+
+    it("re-running init on an existing home is checked too: a home whose hub is no longer the pinned one is refused, config.json unchanged", async () => {
+      const home = freshHome();
+      expect((await run(home, explicit(), stubFetch(arcChain(5042002)))).code).toBe(0);
+      const before = readFileSync(join(home, "config.json"), "utf8");
+      await pin(5042002, { name: "Arc Testnet", hub: OTHER, rules: RULES }, async () => {
+        const r = await run(home, explicit(), stubFetch(arcChain(5042002)));
+        expect(r.code).toBe(1);
+        expect(r.err).toContain(`hub ${HUB} is not the pinned Arc Testnet hub ${OTHER}`);
+        expect(r.calls).toEqual([]);
+      });
+      expect(readFileSync(join(home, "config.json"), "utf8")).toBe(before);
+    });
+
+    describe("Plan 6 Task 2 (spec §2.3, §2.4): the fee ceiling and the session gas on a chain with a profile", () => {
+      const ARC_SESSION_GAS = 336_000_000_000_000_000n; // 4 x 2.1M gas x 40 gwei = 0.336 USDC
+      /** `explicit(...)` without its `--session-gas-wei`, so init derives the default. */
+      const derived = (o: Parameters<typeof explicit>[0] = {}, extra: string[] = []) => {
+        const a = explicit(o);
+        const i = a.indexOf("--session-gas-wei");
+        return [...a.slice(0, i), ...a.slice(i + 2), ...extra];
+      };
+
+      it("the ceiling defaults to the profile's 40 gwei, and sessionGasWei to 4 x 2.1M gas x that, with no eth_gasPrice call", async () => {
+        for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
+          const home = freshHome();
+          const r = await run(home, derived({ chainId }), stubFetch({ ...arcChain(chainId), gasPrice: 25_000_000_000n }));
+          expect(r.code, r.err).toBe(0);
+          const cfg = loadConfig(home);
+          expect(cfg.sessionGasWei, name).toBe(ARC_SESSION_GAS); // before: 4 x 2.1M x 4 x 25 gwei = 0.84
+          expect(cfg.feeCeilingWei, name).toBeUndefined(); // nothing written: the profile's value applies
+          expect(feeCeilingOf(cfg), name).toBe(40_000_000_000n);
+          expect(r.calls.some((c) => c.method === "eth_gasPrice"), name).toBe(false);
+        }
+      });
+
+      it("an explicit ceiling at or over the floor is kept, and sessionGasWei stays the profile's (the ruling); --session-gas-wei still overrides", async () => {
+        const home = freshHome();
+        const r = await run(home, derived({}, ["--fee-ceiling-wei", "60000000000"]), stubFetch(arcChain(5042002)));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home)).toMatchObject({ feeCeilingWei: 60_000_000_000n, sessionGasWei: ARC_SESSION_GAS });
+        const atFloor = freshHome();
+        expect((await run(atFloor, derived({}, ["--fee-ceiling-wei", "20000000000"]), stubFetch(arcChain(5042002)))).code).toBe(0);
+        expect(loadConfig(atFloor).feeCeilingWei).toBe(20_000_000_000n);
+        const explicitGas = freshHome();
+        expect((await run(explicitGas, explicit(), stubFetch(arcChain(5042002)))).code).toBe(0);
+        expect(loadConfig(explicitGas).sessionGasWei).toBe(10n ** 16n);
+      });
+
+      it("--fee-ceiling-wei under the floor is refused -- from flags or with /templates -- before any RPC call, writing nothing", async () => {
+        for (const [chainId, name] of [[5042002, "Arc Testnet"], [5042, "Arc"]] as const) {
+          const home = freshHome();
+          const r = await run(home, [...explicit({ chainId }), "--fee-ceiling-wei", "19999999999"], stubFetch(arcChain(chainId)));
+          expect(r.code, name).toBe(2);
+          expect(r.err).toContain(`--fee-ceiling-wei 19999999999 is under ${name}'s fee floor of 20000000000 wei per gas`);
+          expect(r.calls, name).toEqual([]);
+          expect(existsSync(home), name).toBe(false);
+        }
+        const viaTemplates = freshHome();
+        const t = await run(
+          viaTemplates,
+          [...fromServer, "--fee-ceiling-wei", "1"],
+          stubFetch({ templates: templatesResponse({ chainId: 5042002, usdc: ARC_USDC }), ...arcChain(5042002) }),
+        );
+        expect(t.code).toBe(2);
+        expect(t.calls.map((c) => c.method ?? "templates")).toEqual(["templates"]); // no RPC call at all
+        expect(existsSync(viaTemplates)).toBe(false);
+      });
+
+      it("a chain without a profile is unchanged: any ceiling is accepted, and sessionGasWei follows max(ceiling, 4 x the gas price)", async () => {
+        const home = freshHome();
+        const r = await run(home, ["init", "--server", "https://host.test", "--fee-ceiling-wei", "1"], stubFetch({ gasPrice: 1_000_000_000n }));
+        expect(r.code, r.err).toBe(0);
+        expect(loadConfig(home)).toMatchObject({ chainId: 31337, feeCeilingWei: 1n, sessionGasWei: 4n * 2_100_000n * 4_000_000_000n });
+        expect(r.calls.some((c) => c.method === "eth_gasPrice")).toBe(true);
+      });
+    });
+
+    it("a chain without a profile keeps today's warning-only behaviour, even with a table entry (31337)", async () => {
+      await pin(31337, { name: "test chain", hub: OTHER, rules: OTHER }, async () => {
+        const r = await run(freshHome(), explicit({ chainId: 31337, usdc: `0x${"22".repeat(20)}` }), stubFetch({ withCode: [HUB, RULES, `0x${"22".repeat(20)}`] }));
+        expect(r.code, r.err).toBe(0);
+        expect(r.err).toMatch(/WARNING: hub 0x1{40} is not the canonical test chain hub 0x4{40}/);
+        expect(r.err).toMatch(/WARNING: rules 0x3{40} is not the canonical test chain rules 0x4{40}/);
+        expect(r.err).not.toMatch(/refusing/);
+      });
+    });
+  });
+
+  describe("Plan 6 Task 5: the real Arc Testnet pin (contracts/deployments/5042002.json)", () => {
+    const ARC_USDC = "0x3600000000000000000000000000000000000000";
+    const PINNED_HUB = "0x3D8434455E4258a877a327De3B1201f94A558d38";
+    const PINNED_RULES = "0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba";
+    /** The pre-hardening testnet deploy (superseded 2026-10-24): refused like any other hub. */
+    const SUPERSEDED_HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893";
+    const SUPERSEDED_RULES = "0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5";
+    /** The hardened deploy with the ERC-1271 fallback (superseded 2026-10-25, final review A I-1): refused too. */
+    const SUPERSEDED_1271_HUB = "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41";
+    const SUPERSEDED_1271_RULES = "0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01";
+    const OTHER = `0x${"44".repeat(20)}` as const;
+    const testnet = () => ({
+      chainId: 5042002,
+      withCode: [PINNED_HUB, PINNED_RULES, SUPERSEDED_HUB, SUPERSEDED_RULES, SUPERSEDED_1271_HUB, SUPERSEDED_1271_RULES, OTHER, ARC_USDC],
+    });
+    const explicit = (hub: string, rules = PINNED_RULES) => [
+      "init", "--server", "https://host.test", "--rpc", "http://rpc.test", "--chain-id", "5042002",
+      "--hub", hub, "--usdc", ARC_USDC, "--rules", rules, "--session-gas-wei", "10000000000000000",
+    ];
+    const run = async (home: string, args: string[], stub: ReturnType<typeof stubFetch>) => {
+      const err: string[] = [];
+      const code = await runCli(args, { env: { ARENA_HOME: home }, fetch: stub.fetchStub, out: () => undefined, err: (s) => err.push(s) });
+      return { code, err: err.join("\n"), calls: stub.calls };
+    };
+    const freshHome = () => join(mkdtempSync(join(tmpdir(), "arena-init-testnet-")), "home");
+
+    it("init on 5042002 refuses a hub other than the pinned one -- from /templates or from --hub -- before any RPC call, writing nothing", async () => {
+      expect(KNOWN_DEPLOYMENTS[5042002]).toEqual({ name: "Arc Testnet", hub: PINNED_HUB, rules: PINNED_RULES, usdc: ARC_USDC });
+      const home1 = freshHome();
+      const viaTemplates = await run(
+        home1,
+        ["init", "--server", "https://host.test", "--session-gas-wei", "10000000000000000"],
+        stubFetch({ templates: templatesResponse({ chainId: 5042002, hub: OTHER, usdc: ARC_USDC, rules: PINNED_RULES }), ...testnet() }),
+      );
+      expect(viaTemplates.code).toBe(1);
+      expect(viaTemplates.err).toContain(`refusing to init on Arc Testnet (chain 5042002): hub ${OTHER} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(viaTemplates.calls.map((c) => c.method ?? "templates")).toEqual(["templates"]);
+      expect(existsSync(home1)).toBe(false);
+
+      const home2 = freshHome();
+      const viaFlag = await run(home2, explicit(OTHER), stubFetch(testnet()));
+      expect(viaFlag.code).toBe(1);
+      expect(viaFlag.err).toContain(`hub ${OTHER} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(viaFlag.calls).toEqual([]);
+      expect(existsSync(home2)).toBe(false);
+
+      const badRules = await run(freshHome(), explicit(PINNED_HUB, OTHER), stubFetch(testnet()));
+      expect(badRules.code).toBe(1);
+      expect(badRules.err).toContain(`rules ${OTHER} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
+
+      // The superseded pre-hardening deploy is refused too: a host still publishing it gets no new home.
+      const superseded = await run(freshHome(), explicit(SUPERSEDED_HUB, SUPERSEDED_RULES), stubFetch(testnet()));
+      expect(superseded.code).toBe(1);
+      expect(superseded.err).toContain(`hub ${SUPERSEDED_HUB} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(superseded.err).toContain(`rules ${SUPERSEDED_RULES} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
+
+      // So is the hardened deploy that still had the ERC-1271 fallback.
+      const superseded1271 = await run(freshHome(), explicit(SUPERSEDED_1271_HUB, SUPERSEDED_1271_RULES), stubFetch(testnet()));
+      expect(superseded1271.code).toBe(1);
+      expect(superseded1271.err).toContain(`hub ${SUPERSEDED_1271_HUB} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(superseded1271.err).toContain(`rules ${SUPERSEDED_1271_RULES} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
+    });
+
+    it("init on 5042002 accepts the pinned hub, rules and USDC (any case)", async () => {
+      const home = freshHome();
+      const r = await run(home, explicit(PINNED_HUB.toLowerCase(), PINNED_RULES.toUpperCase().replace("0X", "0x")), stubFetch(testnet()));
+      expect(r.code, r.err).toBe(0);
+      expect(r.err).not.toMatch(/WARNING|refusing/);
+      expect(loadConfig(home)).toMatchObject({ chainId: 5042002, usdc: ARC_USDC });
+    });
   });
 
   it("final review C1: the default sessionGasWei is 4 x 2.1M gas x max(fee ceiling, 4 x the RPC's gas price); the floor defaults to half", async () => {

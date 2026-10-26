@@ -1,5 +1,5 @@
 import { Chess } from "chess.js";
-import type { Hex } from "viem";
+import { formatUnits, type Hex } from "viem";
 import {
   KIND,
   PROMO_LETTER,
@@ -15,7 +15,9 @@ import {
   type PlayerIndex,
   type SessionSnapshot,
 } from "@arena/sdk";
+import { chainProfile, weiToUsdc6Up } from "./chains.js";
 import type { ChainView } from "./daemon.js";
+import { FUND_TX_GAS_UNITS, formatUsdc6 } from "./funding.js";
 import type { ChannelRecord, Controller } from "./records.js";
 
 export type ChannelStatus = {
@@ -62,6 +64,9 @@ export type ChannelStatus = {
   };
   attention:
     | null
+    /** H1 fix round 1 (review I-1): Challenged on a registered state newer than this daemon holds, whose event could
+     *  not be read -- unanswered, the current game is forfeited at the deadline. Whoever holds the seat. */
+    | "challenge-unseen"
     | "session-gas-low"
     | "human-must-move"
     | "your-turn"
@@ -103,6 +108,17 @@ export type ChannelStatus = {
    *  stranger's, an oversized or malformed one, one over the rate limit, or one the session rejected after its sender
    *  could not be determined. 0 when the XMTP fallback is off (or not armed for this channel). */
   xmtpDropped: number;
+  /** H1 fix round 1 (review m-2): blocks whose dispute events for this channel the RPC refused to serve, even alone,
+   *  and the scan skipped (`ChannelRecord.skippedEventBlocks`), as decimal strings; empty when none. */
+  skippedEventBlocks: string[];
+  /** H3 (Arc testnet rehearsal §8.2): set only on an action route's answer (`POST /move`, `/close`, ...) whose action
+   *  took effect but whose chain refresh afterwards failed (a rate-limited RPC): the chain fields are the last ones
+   *  read, and `chainStaleReason` says why they could not be read again. A `GET /status` never sets it. */
+  chainStale?: true;
+  chainStaleReason?: string;
+  /** Final fix wave B (m-7): set with `chainStale` when the action's own transaction (a challenge, a reclaim) was mined
+   *  but its receipt could not be read -- whether it succeeded is not known yet. The text says so, with the hash. */
+  unconfirmed?: string;
 };
 
 export type StatusInput = {
@@ -120,6 +136,12 @@ export type StatusInput = {
   lobbyError?: string | null;
   /** Final review C1: why the session key's dispute gas is low and the wallet could not refill it, or null. */
   sessionGasLow?: string | null;
+  /** H1 (Task 2 review Minor-2, audit-daemon M-5): what kind of failure `sessionGasLow` is, so its action names a
+   *  remedy that works. Absent: `"funds"`, the action as before. */
+  sessionGasLowCause?: SessionGasLowCause | null;
+  /** H1 fix round 1 (review I-1): set by the daemon once a registered state newer than its latest has stayed unread
+   *  past its debounce (`challenge-unseen`). */
+  unseenChallenge?: { registeredTurn: bigint; deadline: bigint } | null;
   /** Final review m4: the channel settled while the daemon watched it and no `wait()` has woken for it yet. */
   settled?: boolean;
   /** Final fix wave (I1): seconds before the deadline at which the daemon returns a human-held seat that must move
@@ -131,9 +153,98 @@ export type StatusInput = {
   transport?: ChannelStatus["transport"];
   /** Plan 5.7 (K3): see ChannelStatus.xmtpDropped. Default 0. */
   xmtpDropped?: number;
+  /** Plan 6 hardening H2 (audit-journey I-2): the chain and gas numbers `session-gas-low` is worded from -- the
+   *  daemon's `config.chainId` and `config.sessionGasWei`, and its wallet's fee ceiling. On a chain whose gas is USDC
+   *  (Arc), the reason is then shown in USDC, not wei, and the action says how much USDC to send. Absent, or on any
+   *  other chain: the chain-neutral wording, unchanged. See `sessionGasLowAction`. */
+  gasFunding?: { chainId: number; sessionGasWei: bigint; feeCeilingWei: bigint };
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
+
+/**
+ * Plan 6 hardening H2 (audit-journey I-2): a `session-gas-low` reason (the daemon's own text, in wei) as an agent on a
+ * chain whose gas is USDC should read it: on Arc, 10^18 wei is 1 USDC. The daemon's reason is "the session key holds
+ * N wei, below the floor of M, and the wallet could not refill it: <the first line of the error>". So:
+ * - a fee per gas -- `TxFeeCapError`'s "the cap of N wei per gas (needs M)" -- becomes gwei, its `needs` included;
+ * - every other native amount (`N wei`) becomes USDC at 18 decimals, as does the key's floor (printed without a unit).
+ * Anything else in the text is kept as it is. H2 fix round 1 (review m-1): the rules are pinned against the reasons
+ * the daemon actually emits; the amount to ask the human for never comes from here (see `sessionGasLowAction`).
+ */
+export function gasReasonInUsdc(reason: string): string {
+  const gwei = (n: string) => `${formatUnits(BigInt(n), 9)} gwei per gas`;
+  return reason
+    .replace(/\b(\d+) wei per gas( \(needs (\d+)\))?/g, (_m, n: string, needs?: string, m?: string) =>
+      needs !== undefined && m !== undefined ? `${gwei(n)} (needs ${gwei(m)})` : gwei(n),
+    )
+    .replace(/\b(\d+) wei\b/g, (_m, n: string) => `${formatUnits(BigInt(n), 18)} USDC`)
+    .replace(/\b(below the floor of )(\d+)\b(?! (?:g?wei|USDC))/g, (_m, pre: string, n: string) => `${pre}${formatUnits(BigInt(n), 18)} USDC`);
+}
+
+/**
+ * H1 (Task 2 review Minor-2, audit-daemon M-5): why a refill failed, as the daemon classified it.
+ * - `funds`: the wallet cannot pay the refill (`TxInsufficientFundsError`) -- funding the wallet fixes it.
+ * - `fee-cap`: a refill needs a fee over the wallet's fee ceiling (`TxFeeCapError`).
+ * - `estimate`: the refill's fee or gas estimate failed.
+ * - `reverted`: the top-up was mined and reverted (`txHash`); nothing reached the key.
+ * - `failing`: `failures` refills in a row failed in transit (dropped, stuck, no receipt, a nonce race).
+ * Only `funds` is fixed by sending the wallet money, so only its action asks for any.
+ */
+export type SessionGasLowCause =
+  | { kind: "funds" }
+  | { kind: "fee-cap" }
+  | { kind: "estimate" }
+  | { kind: "reverted"; txHash: Hex }
+  | { kind: "failing"; failures: number };
+
+/**
+ * The `session-gas-low` action, first in `suggestedActions` (final review C1). Chain-neutral by default, unchanged:
+ * fund the wallet and the daemon refills the key on its next pass. Plan 6 hardening H2 (audit-journey I-2): on a
+ * chain whose gas is USDC (Arc), the reason is shown in USDC (`gasReasonInUsdc`), and the action names the asset,
+ * the network and the amount -- one channel's gas budget, as `arena fund` counts it: its `sessionGasWei` (the most
+ * one refill can send) plus `FUND_TX_GAS_UNITS` x the wallet's fee ceiling for the refill's own gas, rounded up.
+ * H1 (Task 2 review Minor-2): that holds only when the wallet's balance is the cause (`cause` absent or `funds`).
+ * Any other cause gets its own remedy, says that funding the wallet will not fix it, and asks for no amount.
+ */
+export function sessionGasLowAction(
+  channelId: Hex,
+  reason: string,
+  gasFunding?: StatusInput["gasFunding"],
+  cause?: SessionGasLowCause | null,
+): string {
+  const profile = gasFunding !== undefined ? chainProfile(gasFunding.chainId) : undefined;
+  if (cause && cause.kind !== "funds") {
+    const why = profile?.nativeIsUsdc === true ? gasReasonInUsdc(reason) : reason;
+    const low = `dispute gas for channel ${channelId} is low (${why})`;
+    const notFunds = "funding the wallet will not fix it; the daemon retries with back-off";
+    switch (cause.kind) {
+      case "reverted":
+        return (
+          `check the refill: a top-up of channel ${channelId}'s session key reverted on-chain (tx ${cause.txHash}), so ` +
+          `nothing reached the key and ${low}; ${notFunds}. A top-up reverts when the wallet or the session key ` +
+          "cannot send or receive (on Arc: a blocklisted address)"
+        );
+      case "fee-cap":
+        return `wait: ${low}; a refill needs a fee over the wallet's fee ceiling right now, and ${notFunds} as fees fall`;
+      case "estimate":
+        return `check the RPC: ${low}; the refill's fee or gas estimate failed, so nothing was sent, and ${notFunds}`;
+      case "failing":
+        return (
+          `check the RPC: ${low}; the last ${cause.failures} refills failed before they could be confirmed (dropped, ` +
+          `stuck or without a receipt), and ${notFunds}. On Arc, a transfer from or to a blocklisted address gets no receipt`
+        );
+    }
+  }
+  if (gasFunding === undefined || profile?.nativeIsUsdc !== true) {
+    return `fund your wallet: dispute gas for channel ${channelId} is low (${reason}); the daemon refills it on its next pass`;
+  }
+  const ask = formatUsdc6(weiToUsdc6Up(gasFunding.sessionGasWei + FUND_TX_GAS_UNITS * gasFunding.feeCeilingWei));
+  return (
+    `fund your wallet: dispute gas for channel ${channelId} is low (${gasReasonInUsdc(reason)}); on ${profile.name}, ` +
+    `gas is paid in USDC: ask your human to send at least ${ask} USDC to this wallet on ${profile.name} ` +
+    `(chain id ${gasFunding.chainId}), and the daemon refills it on its next pass once that arrives`
+  );
+}
 
 export function usdc(amount: bigint): string {
   const whole = amount / 1_000_000n;
@@ -218,7 +329,10 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   // Final review C1: first, and whoever controls the channel -- a session key that cannot pay cannot answer a
   // challenge, and an unanswered one can roll the channel back.
   const gasLow = live && input.sessionGasLow ? input.sessionGasLow : null;
-  if (gasLow) attention = "session-gas-low";
+  const unseen = phase === "Challenged" && input.unseenChallenge ? input.unseenChallenge : null;
+  const skippedBlocks = (record.skippedEventBlocks ?? []).map((b) => b.toString());
+  if (unseen) attention = "challenge-unseen";
+  else if (gasLow) attention = "session-gas-low";
   else if (live && record.controller === "agent") {
     if (myTurn) attention = "your-turn";
     else if (newGame === "proposed_by_opponent" && !closing) attention = "new-game-proposed";
@@ -294,12 +408,35 @@ export function buildStatus(input: StatusInput): ChannelStatus {
           : "; if they cannot, take the seat back (arena handoff agent) and move"),
     );
   }
-  if (input.lobbyError) {
-    suggestedActions.unshift(`restart this daemon: the host refused a subscribe (${input.lobbyError}) -- new offers/accepts are refused until then`);
-  }
-  if (gasLow) {
+  // Final fix wave B (m-3): never on a finalized record (a retired channel is still in `live` for a while): its first
+  // action stays `done:`. m-5: `daemon stop` refuses while any channel is live, so the restart waits for that.
+  if (input.lobbyError && !record.finalized) {
     suggestedActions.unshift(
-      `fund your wallet: dispute gas for channel ${record.channelId} is low (${gasLow}); the daemon refills it on its next pass`,
+      `restart this daemon once no channel is live ("arena daemon stop", then "arena daemon --detach"; until then keep ` +
+        `playing, and tell your human if it persists): the host refused a subscribe (${input.lobbyError}) -- new ` +
+        "offers/accepts are refused until then",
+    );
+  }
+  if (gasLow) suggestedActions.unshift(sessionGasLowAction(record.channelId, gasLow, input.gasFunding, input.sessionGasLowCause));
+  // H1 fix round 1 (review m-2): a skipped block is shown from the record, whatever `lastError` says.
+  const skippedNote =
+    skippedBlocks.length > 0
+      ? `block(s) ${skippedBlocks.join(", ")} hold dispute events for this channel that the RPC refuses to serve, even alone`
+      : null;
+  if (unseen) {
+    const left = chain ? Math.max(0, Number(unseen.deadline - chain.now)) : null;
+    suggestedActions.unshift(
+      `switch RPC: channel ${record.channelId} is challenged on turn ${unseen.registeredTurn}, newer than this daemon holds ` +
+        `(turn ${s.turnNum}), and the challenge's event could not be read${skippedNote ? ` (${skippedNote})` : ""}; unanswered, ` +
+        `the current game is forfeited at the deadline (${unseen.deadline}${left !== null ? `, in ${left}s` : ""}). Tell ` +
+        "your human now: they (never you) set rpcUrl in config.json to an RPC that serves larger getLogs responses, " +
+        "then restart the daemon",
+    );
+  } else if (skippedNote && live) {
+    suggestedActions.push(
+      `check the RPC: ${skippedNote}; the daemon skipped them so later events stay readable, and retries them every ` +
+        "few minutes. If a challenge's state is in one of them, tell your human: they (never you) set rpcUrl in " +
+        "config.json to an RPC that serves larger getLogs responses, then restart the daemon",
     );
   }
 
@@ -343,5 +480,6 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     sweeps: (record.sweeps ?? []).map((s) => ({ amount: s.amount.toString(), tx: s.tx, at: s.at })),
     transport: input.transport ?? "none",
     xmtpDropped: input.xmtpDropped ?? 0,
+    skippedEventBlocks: skippedBlocks,
   };
 }

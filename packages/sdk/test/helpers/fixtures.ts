@@ -66,3 +66,16 @@ export const sampleSignedState: SignedState = {
   sigA: await signState(sampleSignerKeys[0], sampleOpeningState, SAMPLE_DOMAIN),
   sigB: "0x",
 };
+
+/** The high-`s` twin of a signature: the same signer to `ecrecover`, refused by OpenZeppelin's `ECDSA`. */
+export function highSTwin(sig: Hex): Hex {
+  const n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  const s = BigInt(`0x${sig.slice(66, 130)}`);
+  const v = Number.parseInt(sig.slice(130), 16);
+  return `0x${sig.slice(2, 66)}${(n - s).toString(16).padStart(64, "0")}${(v === 27 ? 28 : 27).toString(16)}`;
+}
+
+/** The same signature with `v` as the parity bit 0/1, which viem accepts and `ecrecover` does not. */
+export function vAsParity(sig: Hex): Hex {
+  return `${sig.slice(0, 130)}${(Number.parseInt(sig.slice(130), 16) - 27).toString(16).padStart(2, "0")}` as Hex;
+}

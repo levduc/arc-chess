@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-import { createTestClient, http, TransactionReceiptNotFoundError, type Hex } from "viem";
+import { createTestClient, http, LimitExceededRpcError, TransactionReceiptNotFoundError, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
   ChannelSession,
@@ -25,9 +25,23 @@ import {
   type SignedAcceptance,
 } from "@arena/sdk";
 import { SCHOLARS_MATE } from "../../sdk/test/helpers/fixtures.js";
-import { CHAIN, RPC, increaseTime, now, setBaseFeePerGas, setEthBalance, setLimits, setPaused } from "../../sdk/test/helpers/chain.js";
+import {
+  ARC_FLOOR_WEI,
+  CHAIN,
+  ON_ARC_ANVIL,
+  RPC,
+  increaseTime,
+  now,
+  publicClient,
+  setBaseFeePerGas,
+  setEthBalance,
+  setLimits,
+  setPaused,
+} from "../../sdk/test/helpers/chain.js";
 import {
   ArenaDaemon,
+  CLOSE_RELAY_DEFER_MS,
+  CLOSE_RELAY_JITTER_MS,
   DaemonError,
   FileSessionStore,
   RecordStore,
@@ -812,7 +826,10 @@ describe("minor fixes", () => {
     // A getLogs failure must not stop the rest of the watchtower pass.
     const hub = bob.daemon.hub;
     const real = hub.disputeEvents.bind(hub);
-    let failures = 1;
+    // H1 ("oversized events"): two failures -- the read and the scan's own probe of the RPC (the same range, for no
+    // channel). An RPC that refuses both is down, so the pass stops reading and reports it; one that served the
+    // probe would have had the refused range split and read in the same pass instead (h1-disputes.test.ts).
+    let failures = 2;
     hub.disputeEvents = (...a: Parameters<typeof real>) => (failures-- > 0 ? Promise.reject(new Error("range too large")) : real(...a));
     await bob.daemon.idle();
     await bob.daemon.tick();
@@ -957,11 +974,49 @@ describe("Plan 4.5 Task 10: the watchtower retries a failed cooperative close", 
     }
     await alice.daemon.close(id, "agent"); // alice alone: nothing to submit yet
     await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
-    await expect(bob.daemon.close(id, "agent")).rejects.toThrow(/HTTP request failed/);
-    await waitFor(() => failures.length === 2, 5_000, "alice's relay-path submission to fail too");
+    // H3 fix round 1 (review M4): Bob's Close is signed and relayed, so close() resolves; only its on-chain submission
+    // failed, which the watchtower retries (shown as a `close:` lastError meanwhile).
+    await bob.daemon.close(id, "agent");
+    expect(failures).toEqual(["bob"]);
     // Before the fix nothing retried: the channel stayed Open with a fully co-signed close.
     await waitFor(async () => (await alice.daemon.hub.channelInfo(id)).phase === "Finalized", 10_000, "the watchtower's retry");
     await waitFor(() => alice.daemon.handle(id).lastError === null && bob.daemon.handle(id).lastError === null, 5_000, "close: cleared");
+    // H1 (audit-daemon M-11): Alice, who got Bob's signature over the relay, no longer submits at once beside Bob's
+    // own close; her watchtower would have, after CLOSE_RELAY_DEFER_MS, had Bob's retry not settled it first.
+    expect(failures).toEqual(["bob"]);
+  });
+
+  it("H1 (audit-daemon M-11): the side the relay completes a close on waits; one closeCooperative is sent, and none reverts", async () => {
+    const { alice, bob, id } = await matched();
+    for (const m of SCHOLARS_MATE) {
+      const [mover, other] = alice.daemon.handle(id).session.isMyTurn() ? [alice, bob] : [bob, alice];
+      await mover.daemon.move(id, m, { actor: "agent" });
+      const turn = mover.daemon.handle(id).session.latest.state.turnNum;
+      await waitFor(() => other.daemon.handle(id).session.latest.state.turnNum >= turn, 5_000, `relay ${m}`);
+    }
+    await waitFor(() => alice.daemon.handle(id).session.latest.state.turnNum === 8n, 5_000, "bob's auto-resign");
+    const sent = { alice: 0, bob: 0 };
+    for (const [name, p] of [["alice", alice], ["bob", bob]] as const) {
+      const hub = p.daemon.hub;
+      const real = hub.closeCooperative.bind(hub);
+      hub.closeCooperative = async (sender, tx) => {
+        sent[name]++;
+        // Bob's send is slow (an RPC round trip on a real chain): before H1, Alice's relay path read the phase as
+        // Open in that window and sent her own.
+        if (name === "bob") await new Promise((r) => setTimeout(r, 500));
+        return real(sender, tx);
+      };
+    }
+    await alice.daemon.close(id, "agent");
+    await waitFor(() => bob.daemon.handle(id).session.snapshot().closeSigs[0] !== "0x", 5_000, "alice's Close reaches bob");
+    await bob.daemon.close(id, "agent"); // the second signer submits at once
+    expect((await bob.daemon.hub.channelInfo(id)).phase).toBe("Finalized");
+    await waitFor(() => alice.daemon.handle(id).record.finalized, 10_000, "alice sees it settled");
+    // Past Alice's deferral: her watchtower read the phase and sent nothing. Before H1 she raced Bob's close, and the
+    // loser's transaction reverted on-chain.
+    await new Promise((r) => setTimeout(r, CLOSE_RELAY_DEFER_MS + CLOSE_RELAY_JITTER_MS + 500));
+    expect(sent).toEqual({ alice: 0, bob: 1 });
+    expect(alice.daemon.handle(id).lastError).toBeNull();
   });
 });
 
@@ -1010,6 +1065,18 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     await bob.daemon.close(id, "agent");
     await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "settled");
     return original;
+  }
+
+  /** Plan 6 Task 4: the fee per gas F that the dust-boundary tests stub `currentFeePerGas` to. On stock anvil it is
+   *  1.5 gwei, as before. arc-anvil holds its base fee at Arc's 20 gwei floor, so its market estimate is about 25 gwei
+   *  (1.2 x the base fee plus a 1 gwei tip). A sweep that reserves ceil(1.3 x 1.5 gwei) per gas there can never pay its
+   *  own send: the session sender refuses it (`TxInsufficientFundsError`) on every attempt, which is how scenario E2
+   *  failed on `pnpm test:arc`. On arc-anvil, F is therefore the chain's own market estimate, read once. The base fee
+   *  cannot move off the floor there (asserted), and the reserve ceil(1.3F) covers the send's own fee at that market. */
+  async function pinnedFee(): Promise<bigint> {
+    if (!ON_ARC_ANVIL) return 1_500_000_000n;
+    expect((await publicClient().getBlock()).baseFeePerGas).toBe(ARC_FLOOR_WEI);
+    return ((await publicClient().estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
   }
 
   /** Stops the daemon's periodic passes (the `285c4c1` pattern) so a test drives every pass itself: a test that
@@ -1678,7 +1745,12 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // key after this sweep already ran and reported "true" -- comfortably above dust, not the sweep's own
     // untouched fee reserve (see minor 4's "already" path for that case, covered by the pre-existing
     // "an already-swept channel ... reports already" test just above).
-    const topUp = 1_000_000_000_000_000n;
+    // Plan 6 Task 4: at least 20 x a 21,000-gas transfer at the market fee, so it is never dust. Stock anvil's market
+    // (about 1-2 gwei) leaves this at 1e15 wei, as before. arc-anvil's, at about 25 gwei, makes 1e15 wei dust: the sweep
+    // would reserve 21,000 x ceil(1.3 x 25 gwei) and keep less than one transfer's own gas, so the re-check correctly
+    // declined it as dust and reported "already". That was a fee-level assumption in this test, not a daemon bug.
+    const market = ((await d.client.estimateFeesPerGas()) as { maxFeePerGas: bigint }).maxFeePerGas;
+    const topUp = 20n * 21_000n * market > 1_000_000_000_000_000n ? 20n * 21_000n * market : 1_000_000_000_000_000n;
     await setEthBalance(session, topUp);
     const walletBefore = await d.client.getBalance({ address: alice.address });
 
@@ -1705,8 +1777,9 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     // A fixed F, not a live read: the real market fee can (and, in practice, does) drift by the time the periodic
     // pass gets around to reading it itself -- enough to tip a balance chosen to land exactly on the boundary
     // computed from an earlier read. currentFeePerGas is stubbed to this fixed value below so the boundary this
-    // test computes and the one performSweep actually applies are guaranteed to be the same number.
-    const F = 1_500_000_000n;
+    // test computes and the one performSweep actually applies are guaranteed to be the same number. Plan 6 Task 4:
+    // 1.5 gwei on stock anvil; on arc-anvil the market estimate, read once (see `pinnedFee`).
+    const F = await pinnedFee();
     const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN; // ceil(1.3F)
     // `value = balance - gas*reserve` is dust once `value <= gas*F` -- i.e. `balance <= gas*(reserve+F)` exactly.
     const boundary = gas * (reserve + F);
@@ -1741,7 +1814,14 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       // decision. If the real network fee happened to be above F, the value sent (reserved against F) could come
       // up short and the send itself could fail on TxInsufficientFundsError, flaking this test independently of
       // the boundary math it is actually about. Pinned well below F here so that can never happen.
-      await setBaseFeePerGas(F / 10n);
+      if (ON_ARC_ANVIL) {
+        // Plan 6 Task 4: arc-anvil refuses this cheat ("the next block base fee cannot be overridden on Arc", -32602:
+        // the one Arc-caused test:arc failure). It needs none: its base fee holds at the 20 gwei floor, and F is the
+        // market estimate there (`pinnedFee`), so the send's own fee is about F, well under the ceil(1.3F) it may pay.
+        expect((await publicClient().getBlock()).baseFeePerGas).toBe(ARC_FLOOR_WEI);
+      } else {
+        await setBaseFeePerGas(F / 10n);
+      }
       d.sweepChannel = original;
       await waitFor(() => l.record.swept !== undefined, 20_000, "swept one wei above the boundary");
       expect(l.record.swept).toBe(true);
@@ -1867,7 +1947,7 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
     const d = alice.daemon as unknown as SweepableDaemon & { currentFeePerGas(): Promise<bigint> };
     const l = alice.daemon.handle(id);
     const sender = l.sessionSender;
-    const F = 1_500_000_000n;
+    const F = await pinnedFee(); // Plan 6 Task 4: 1.5 gwei on stock anvil; arc-anvil's market there (see pinnedFee)
     d.currentFeePerGas = () => Promise.resolve(F);
     const gas = 21_000n;
     const reserve = (F * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
@@ -2294,6 +2374,170 @@ describe("Plan 5 Task 1: session-gas sweep", () => {
       expect(c.budgetMs!).toBeLessThanOrEqual(SWEEP_PER_RECORD_TIMEOUT_MS);
       expect(c.budgetMs!).toBeGreaterThan(SWEEP_PER_RECORD_TIMEOUT_MS - 5_000);
     }
+  });
+
+  it("H1 (audit-daemon M-4): a sweep transaction mined with no readable receipt is charged after SWEEP_PENDING_PROBES probes, not probed forever", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    await stopPeriodicPasses(d);
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    const l = d.handle(id);
+    const hash = ("0x" + "6b".repeat(32)) as Hex;
+    l.sweep.pendingTx = [hash];
+    const internals = d as unknown as {
+      recoverPendingSweepTx(hashes: Hex[]): Promise<unknown>;
+      performSweep(sender: unknown, giveUpAt?: number): Promise<unknown>;
+      sweepChannel(l: unknown): Promise<void>;
+    };
+    let probes = 0;
+    let sends = 0;
+    // Arc's included revert of a blocklisted transfer: mined, and no receipt is ever served for it.
+    internals.recoverPendingSweepTx = async () => {
+      probes++;
+      return "receiptless";
+    };
+    internals.performSweep = async () => {
+      sends++;
+      throw new Error("simulated: the fresh attempt fails too");
+    };
+    // Before H1 this was "unknown": skipped on every pass (an RPC probe every pollMs), never charged, never abandoned.
+    for (let i = 0; i < 10; i++) await internals.sweepChannel(l);
+    expect(probes).toBe(1); // later probes wait out the back-off the first one started
+    expect(l.sweep.attempts).toBe(0);
+    for (let p = 2; p <= SWEEP_PENDING_PROBES; p++) {
+      l.sweep.blockedUntil = 0;
+      await internals.sweepChannel(l);
+      expect(probes).toBe(p);
+    }
+    // The last probe gave the hash up: one attempt charged for it, and the attempt went ahead (and failed: charged too).
+    expect(l.sweep.pendingTx).toBeUndefined();
+    expect(sends).toBe(1);
+    expect(l.sweep.attempts).toBe(2);
+    expect(l.record.swept).toBeUndefined();
+  });
+
+  it("H1 (audit-daemon M-4): recoverPendingSweepTx tells a mined transaction with no receipt ('receiptless') from a read failure ('unknown')", async () => {
+    const { alice } = await matched();
+    const d = alice.daemon;
+    const recover = (d as unknown as { recoverPendingSweepTx(h: Hex[]): Promise<unknown> }).recoverPendingSweepTx.bind(d);
+    const hash = ("0x" + "7c".repeat(32)) as Hex;
+    const realReceipt = d.client.getTransactionReceipt.bind(d.client);
+    const realTx = d.client.getTransaction.bind(d.client);
+    try {
+      d.client.getTransactionReceipt = (async () => {
+        throw new TransactionReceiptNotFoundError({ hash });
+      }) as typeof d.client.getTransactionReceipt;
+      d.client.getTransaction = (async () => ({ hash, blockNumber: 5n })) as unknown as typeof d.client.getTransaction;
+      expect(await recover([hash])).toBe("receiptless");
+      d.client.getTransaction = (async () => {
+        throw new Error("socket hang up");
+      }) as typeof d.client.getTransaction;
+      expect(await recover([hash])).toBe("unknown");
+    } finally {
+      d.client.getTransactionReceipt = realReceipt;
+      d.client.getTransaction = realTx;
+    }
+  });
+
+  it("H1 (audit-daemon M-12): a sweep reported dropped keeps its hash; one that landed after all is recorded as the sweep, not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    // A real sweep-shaped transaction that lands -- one a load-balanced RPC reported dropped before another of its
+    // nodes mined it.
+    const balance = await d.client.getBalance({ address: sender.address });
+    const gas = 21_000n;
+    const { maxFeePerGas } = await d.client.estimateFeesPerGas();
+    const value = balance - gas * ((maxFeePerGas * 13n + 9n) / 10n);
+    const req = { to: alice.address, data: "0x" as Hex, value, gas };
+    const hash = await sender.send(req);
+    await d.client.waitForTransactionReceipt({ hash });
+    sender.tracker?.settle(hash);
+    const internals = d as unknown as { performSweep(sender: unknown): Promise<unknown> };
+    const realPerformSweep = internals.performSweep.bind(d);
+    internals.performSweep = () => Promise.reject(new TxDroppedError(hash, 0));
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx?.[0] === hash, 10_000, "the dropped hash is remembered");
+    expect(l.sweep.attempts).toBe(0); // not charged: the next attempt checks the hash first
+    internals.performSweep = realPerformSweep;
+    l.sweep.blockedUntil = 0;
+    // Before H1: the hash was forgotten, and the next attempt read the near-empty key as "dust".
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptTx).toBe(hash);
+    expect(l.record.sweptAmount).toBe(value);
+  });
+
+  it("H3 (rehearsal §8.4): a sweep whose receipt read is rate-limited keeps its hash; it is recorded as the sweep, not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const sender = l.sessionSender;
+    // The real sweep runs; the first read of its receipt is refused as Arc's RPC refused it in the rehearsal.
+    let sweepHash: Hex | undefined;
+    const realSend = sender.send.bind(sender);
+    sender.send = async (tx) => {
+      const h = await realSend(tx);
+      sweepHash ??= h;
+      return h;
+    };
+    const realReceipt = d.client.getTransactionReceipt.bind(d.client);
+    let refused = 0;
+    d.client.getTransactionReceipt = (async (args: { hash: Hex }) => {
+      if (args.hash === sweepHash && refused === 0) {
+        refused++;
+        throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+      }
+      return realReceipt(args);
+    }) as typeof d.client.getTransactionReceipt;
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx !== undefined, 10_000, "the hash is remembered for the next attempt");
+    expect(refused).toBe(1);
+    expect(l.sweep.pendingTx).toEqual([sweepHash]);
+    expect(l.record.sweepPending).toEqual([sweepHash]); // on disk too: a restart checks it as well
+    expect(l.sweep.attempts).toBe(0); // not charged
+    expect(l.record.swept).toBeUndefined();
+    // Before H3: "sweep failed (retried with back-off)", the hash forgotten, and the next attempt read the leftover
+    // (0.0002667 USDC in the rehearsal) as "dust".
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptTx).toBe(sweepHash);
+    expect(l.record.sweeps).toHaveLength(1);
+    expect(l.record.sweeps?.[0].tx).toBe(sweepHash);
+    expect(l.record.sweepPending).toBeUndefined();
+  });
+
+  it("H3 fix round 1 (review M2): a sweep whose send's response is lost, and unverifiable, keeps its hash; not dust", async () => {
+    const { alice, bob, id } = await matched();
+    const original = await settleWithSweepDisabled(alice, bob, id);
+    const d = alice.daemon;
+    const l = d.handle(id);
+    const inner = (l.sessionSender as unknown as { inner: { sendRawTransaction(raw: Hex): Promise<Hex> } }).inner;
+    const realRaw = inner.sendRawTransaction.bind(inner);
+    const realGet = d.client.getTransaction.bind(d.client);
+    let sweepHash: Hex | undefined;
+    inner.sendRawTransaction = async (raw: Hex) => {
+      inner.sendRawTransaction = realRaw;
+      sweepHash = await realRaw(raw); // the node takes it (and Anvil mines it)...
+      d.client.getTransaction = (async () => {
+        d.client.getTransaction = realGet as typeof d.client.getTransaction;
+        throw new LimitExceededRpcError(new Error("rate limit exceeded")); // ...the sender cannot check its hash...
+      }) as typeof d.client.getTransaction;
+      throw new Error("fetch failed: socket hang up"); // ...and the response is lost
+    };
+    (d as unknown as SweepableDaemon).sweepChannel = original;
+    await waitFor(() => l.sweep.pendingTx !== undefined, 10_000, "the hash is remembered for the next attempt");
+    // Before: "sweep failed", charged, the hash forgotten -- and the next attempt read the leftover as "dust".
+    expect(l.sweep.pendingTx).toEqual([sweepHash]);
+    expect(l.sweep.attempts).toBe(0);
+    await waitFor(() => l.record.swept !== undefined, 20_000, "recovered on the next attempt");
+    expect(l.record.swept).toBe(true);
+    expect(l.record.sweptTx).toBe(sweepHash);
+    expect(l.record.sweeps).toHaveLength(1);
   });
 });
 

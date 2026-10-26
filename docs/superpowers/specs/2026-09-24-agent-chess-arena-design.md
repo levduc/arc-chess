@@ -214,9 +214,12 @@ Draw offers ride on a move (`NORMAL_OFFER_DRAW` → status `DRAW_OFFERED`); the
 opponent either plays `ACCEPT_DRAW` (board unchanged, status `DRAW`) or a
 `NORMAL` move, which implicitly declines (status back to `PLAYING`).
 
-Signatures are verified ECDSA-first (OpenZeppelin `ECDSA.tryRecover`); only if that fails is ERC-1271
-consulted (`SignatureChecker.isValidERC1271SignatureNow`), so a contract signer is accepted, and a session
-key that later gains code cannot revoke its earlier ECDSA signatures.
+Signatures are verified with ECDSA only (OpenZeppelin `ECDSA.tryRecover`: 65 bytes, v 27 or 28, low s), with no
+ERC-1271 fallback (owner decision 2026-10-25, final review A I-1). A signer whose code accepts any bytes, such as a
+contract or an EIP-7702-delegated session key, could otherwise put unverifiable signatures in a proof. A delegated
+key's own ECDSA signatures still verify against its address, and gaining code cannot revoke them. The SDK's
+`recoverStateSigner`/`recoverCloseSigner` accept only the same form, because viem alone also recovers a high-s twin
+and v 0/1, so a session never stores a signature the hub refuses (§12 item 70).
 
 ### 4.4 `IGameRules`
 
@@ -512,7 +515,8 @@ The stream closes on client disconnect, daemon stop, or server close.
    challenge/respond/timeout, challenge by participant vs session key,
    cooldown, `CLAIM_STALEMATE` via challenge/respond, stale-state and
    wrong-signer rejection, fee snapshot vs later `setFee`, reclaim refunds
-   including fee, ERC-1271 signer path.
+   including fee, a contract signer refused and an ECDSA signature that survives its signer gaining code
+   (ECDSA only: §4.3).
 2. **Foundry — invariant/fuzz tests:** hub USDC balance equals the sum of
    un-finalized channel escrow (game balances + fee escrow); every finalize
    path succeeds for any reachable balances; `balanceA + balanceB` conserved; registered
@@ -685,6 +689,26 @@ The stream closes on client disconnect, daemon stop, or server close.
     `ingestOnChain` ignores states it already holds, so the overlap is harmless. The server indexer uses the same
     pattern over all hub events: chunked cursor plus a trailing 32-block rescan, with `apply` idempotent through
     each row's `lastEvent`. A rescanned chunk never moves the indexer's cursor back.
+    *Plan 6 hardening H1:* when the RPC refuses a chunk, the scan splits it (only a refusal of the query itself, never
+    a rate limit or a transient failure: item 67). A single block it refuses even on its own, while the RPC is
+    otherwise up, is skipped, so later events stay readable. The skip is recorded per channel
+    (`skippedEventBlocks`), shown in `status`, and the skipped blocks are retried in turn every few minutes; a block
+    that reads again resets its count. The dispute pass reads the phase and the registered state from the hub's
+    storage, not from events, so a skip cannot hide a challenge.
+    - If the unreadable event is a `Challenged` that registered a move this daemon never received, the daemon adopts
+      the registered move from storage when the hub's endorsement makes that safe, and answers it. The worst case is
+      a lock: a later challenge needs the opponent's signature, which a later readable event repairs. It is not a
+      forfeit.
+    - When adoption is impossible, the daemon raises the attention `challenge-unseen`. It names the turn and the
+      deadline. The fix is the human's: switch `rpcUrl` and restart the daemon.
+    - The server indexer applies the same split-and-skip, skipping only a refused block's `Challenged`/`Responded`
+      events. It reports the count as `arena_indexer_skipped_blocks` on `/metrics`: the blocks skipped since that
+      process started. A skip is permanent in practice. The count starts at 0 on a restart, and a later read of the
+      block can drop it from the count without applying its dispute events (`apply` ignores an event older than a
+      row's `lastEvent`), so the affected rows may stay stale (final review C m-1).
+    - The hardened hub (audit I1; `proposal/hub-hardening`, merged in `750e280` and deployed on Arc testnet) verifies
+      every signature slot it re-emits, and since `aa5ddfc` with ECDSA only (item 70). So an oversized event cannot
+      arise from a daemon-signed state; it needs an RPC that refuses, or lies about, an ordinary one.
 19. **Host connection lifecycle (CLI).**
     - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
       or the local API. A failed join is recorded as the channel's `lastError`.
@@ -727,8 +751,11 @@ The stream closes on client disconnect, daemon stop, or server close.
        replaces N with raised fees instead of queueing behind it. A fresh sender that finds pending nonces it does
        not track (a restart, or a lost response) adopts the lowest one as released and replaces it.
     4. **Bounded fees.** The wallet never pays more per gas than max(4 × the node's estimate, `feeCeilingWei`,
-       default 100 gwei), nor more than its balance can cover. Session keys have no fee ceiling (a dispute must
-       never be refused by one); only their balance bounds them, which is why item 29 exists.
+       default 100 gwei; 40 gwei on Arc, item 60), nor more than its balance can cover. Session keys have no fee
+       ceiling (a dispute must never be refused by one); only their balance bounds them, which is why item 29
+       exists. *Plan 6 (item 62):* on a chain with a fee floor (Arc, 20 gwei), the floor is applied last, after the
+       balance clamp. It can beat the ceiling, but never the balance: a send the balance cannot pay at the floor is
+       refused (`TxInsufficientFundsError`), never sent under it.
     5. **Every wait is bounded** by its give-up time, its replacement count or the daemon's stop signal.
 
     It assumes instant finality (Arc): after a reorg that un-mines one of our transactions, that nonce is not
@@ -771,14 +798,19 @@ The stream closes on client disconnect, daemon stop, or server close.
       $$\text{sessionGasWei} = k \cdot G_{\text{respond}} \cdot F_{\text{cap}}$$
       with $k = 4$, $G_{\text{respond}} = 2{,}100{,}000$ (the heaviest measured respond, about 1.86M, plus a
       margin) and $F_{\text{cap}} = \max(\text{fee ceiling}, 4 \times \text{the RPC's gas price})$.
-      `--session-gas-wei` overrides it. Arc's real fee level decides the final values (Plan 6).
+      `--session-gas-wei` overrides it. *Plan 6 (item 61):* on a chain with a built-in profile,
+      $F_{\text{cap}}$ is the profile's own fee ceiling, with no gas-price read and whatever `--fee-ceiling-wei`
+      says: $4 \times 2{,}100{,}000 \times 40\,\text{gwei} = 0.336$ USDC per channel on Arc. On Arc,
+      $4 \times$ `eth_gasPrice` is at least 80 gwei (20 gwei floor), so the old term would always lock at least
+      0.672 USDC (0.84 at a 25 gwei gas price); refills cover a fee spike instead.
 30. **Minimum challenge timeout (final review I4).** Daemons refuse a `challengeTimeout` under `minChallengeTimeout`
     (default 900 s): `createOffer` and `acceptOffer` answer 400, and a match under it is ignored. The offer defaults
     (`arena offer`, the API, the server's `defaults.challengeTimeout`) are 900 s. The hub's own minimum stays 60 s.
 31. **Bounded approval (final review I2).** The daemon approves exactly `deposit + feePerPlayer` before a deposit,
     and only when the current allowance is short; never an unlimited allowance. `arena init` warns loudly when the
-    hub, rules or USDC address differs from the canonical deployment for a known chain id (`KNOWN_DEPLOYMENTS`,
-    empty until Plan 6 adds Arc mainnet).
+    hub, rules or USDC address differs from the canonical deployment for a known chain id (`KNOWN_DEPLOYMENTS`).
+    *Plan 6 (item 64):* on a chain with a built-in profile it refuses instead; Arc's entries are added after each
+    deploy.
 32. **Flat daemon memory (final review I3).** A settled channel (Finalized, Reclaimed, or retired without our
     deposit) is dropped from the daemon's live set 10 minutes of chain time after the main pass first sees it
     settled. `status` still serves it from its cached final status (the latest 1,000) or from disk, and `channels`
@@ -807,7 +839,12 @@ The stream closes on client disconnect, daemon stop, or server close.
 37. **`session-gas-low` precision.** Raised only when the wallet itself cannot pay for a refill --
     `TxInsufficientFundsError`, `TxFeeCapError`, or a failed fee/gas estimate for it -- never for a transient refill
     error (a nonce race, a dropped/stuck send, a missing receipt), which is logged and re-evaluated on the next
-    pass without alarming the agent.
+    pass without alarming the agent. *Plan 6 (item 63):* a top-up that was mined and reverted raises it too, and
+    is never counted as a refill. *Plan 6 hardening H1 (commit 50f71c9):* the action is cause-specific. Only a
+    wallet shortfall says "fund your wallet", and only it names an amount (0.356 USDC on Arc). A reverted top-up
+    ("check the refill:"), a fee over the ceiling ("wait:"), a failed estimate, or 3 refills in a row lost in
+    transit (cause "failing"; "check the RPC:") each say that funding will not fix it. Transient failures now raise
+    the attention after 3 in a row. A revert's back-off is not ended by a rise in the wallet's balance.
 38. **Offer default timeout** (supersedes item 30 for the daemon's own defaults). When `POST /offers` omits
     `challengeTimeout`, the daemon now defaults it to its own `minChallengeTimeoutOf(config)` rather than a fixed
     900 s; `arena offer` omits the field unless `--timeout` is given. The server's `/templates`
@@ -1084,6 +1121,283 @@ with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch 
     file with every image pinned by `@sha256:` digest and host ports parameterized
     (`${XMTP_GRPC_PORT:-5555}`/`${XMTP_API_PORT:-5556}`/`${XMTP_HISTORY_PORT:-5558}`), brought up under a unique
     compose project name per run and always torn down with `down -v`, even on failure.
+
+### Plan 6 refinements (Arc launch, 2026-10-24)
+
+See `docs/superpowers/specs/2026-10-23-arc-launch-design.md` for the design and `docs/superpowers/arc-facts.md` for
+the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2; item 67,
+hardening wave H3; item 68, hardening wave H4; item 69, the final fix wave's CLI part (B); item 70, the ECDSA-only
+hub.
+
+60. **Chain profiles.** `CHAIN_PROFILES` (`packages/cli/src/chains.ts`) is built into the CLI and keyed by chain id;
+    nothing in it is ever taken from the host. Arc (5042) and Arc Testnet (5042002) each have `usdc`
+    `0x3600…0000`, `nativeIsUsdc: true`, `minFeePerGas` 20 gwei and `feeCeilingWei` 40 gwei. The profile's ceiling
+    is the wallet's default fee ceiling there (`feeCeilingOf`). A chain without a profile (anvil, 31337) behaves
+    exactly as before.
+61. **One balance and reserve gating.** On a `nativeIsUsdc` chain, USDC and gas are one balance:
+    - `wallet` prints one `usdc`, the native balance (18 decimals) shown with 6, rounded down, and no `native`;
+      `--wait-for-native` exits 1.
+    - `fund` folds the gas into `usdc.need`, rounded up, and prints no `native` object. `usdc.need` also keeps one
+      `sessionGasWei` for each of the home's channels that is not finalized, shown as `usdc.reserved`; `usdc.have`
+      stays the whole balance.
+    - `withdrawReserve()` = unsettled channels × `sessionGasWei` + 500,000 × the fee ceiling, rounded up.
+      `withdraw --all` keeps it, so `usdcAfter` is not 0, and `withdraw --amount` never dips into it.
+    - The other unsettled channels' reserve also gates every opening path (`createOffer`, `acceptOffer`, `fund()`'s
+      top-up and deposit; `oneBalanceOpenNeed`), so a new channel never spends a live channel's refill money.
+    - The default `sessionGasWei` is $4 \times 2{,}100{,}000 \times$ the profile's ceiling = 0.336 USDC (item 29).
+62. **Fee floor.** `SerialTxSender` takes `minFeePerGas` from the profile, for the wallet and every session key.
+    Every send and replacement has `maxFeePerGas` ≥ the floor and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. The
+    floor is applied after the balance clamp: a fee is raised to it, or the send is refused when the balance cannot
+    pay it, never sent below it (Arc's mempool drops such a transaction silently). `init` refuses a
+    `--fee-ceiling-wei` below the floor (item 22.4).
+63. **Top-up gas and receipts.** A session-key top-up's gas limit is its `estimateGas` plus 20 % and 5,000 (a
+    plain transfer costs 21,000 on Arc). A failed estimate sends nothing and raises `session-gas-low`. Every
+    top-up checks its receipt: a reverted one never counts as a refill, raises `session-gas-low`, and backs off
+    (item 37). Arc may give no receipt for a gas-consuming blocklist revert, so every receipt wait stays bounded
+    (item 25), and a wait that times out must never be reported as success on the deposit, close, dispute, sweep
+    or withdraw path (to be confirmed path by path: Arc launch spec §2.6).
+64. **Pinned deployments.** On a chain with a profile, `init` always refuses a USDC other than the profile's and,
+    once `KNOWN_DEPLOYMENTS` pins that chain, any other hub or rules, whether from `/templates` or from flags. The
+    daemon re-checks the pin when it starts. Other chains keep item 31's warning. The entries for 5042 and 5042002
+    are added after each deploy.
+65. **Arc test subset.** `pnpm test:arc` (`scripts/test-arc.sh`) runs the contract suite, the SDK and CLI
+    money-moving tests (deposit, close, dispute, sweep, top-up, withdraw) and the system dispute e2e against
+    Arc Foundry's `arc-anvil --network arc`, pinned at `v0.8.0-2` with verified checksums (`tools/arc-foundry.md`).
+    Each step uses its own port, but the subset must run alone: its SDK, CLI and system steps build into the same
+    `contracts/out` as the standard suites (which stay on standard anvil), and two builds at once can fail (the race
+    was reproduced in the Task 4 review; the ledger's ruling is to serialize it).
+    `arc-anvil` answers a below-floor send with an error (`-32003`, at chain ids 31337 and 5042) instead of
+    dropping it silently, so the silent drop itself is asserted at sender level.
+66. **The agent journey on Arc (hardening wave H2, audit-journey).**
+    - `fund`'s message on a profile chain names the network and its chain id, says the USDC must be sent on that
+      network only, warns that USDC sent on Ethereum, Base or any other network will not arrive, and says how to
+      get USDC there: Circle's CCTP bridge from another chain, or an exchange or wallet that supports Arc; Circle's
+      faucet on Arc Testnet.
+    - The owner must be an address the human controls on Arc: not an exchange deposit address unless that
+      exchange supports USDC deposits on Arc, and not a smart wallet deployed only on another chain. `fund`'s
+      owner question, `owner set`'s stderr note and `/skill.md` all say so.
+    - `/skill.md` on 5042 and 5042002 uses only `usdc.*` and `--wait-for-usdc`; reads the profit and loss only
+      once `status.swept` is set, or after a bounded wait and `arena sweep`, and counts the USDC spent on gas;
+      confirms the amount, owner and network before `withdraw --all`; after about 30 minutes unmatched, tells its
+      human but keeps waiting, and plays any late match, until the offer's `expiresAt` (30 minutes: the recipe
+      posts `--ttl 1800`; there is no cancel) has passed; offers back, with `withdraw --all`, whatever arrived when a funding wait times out; and leaves
+      funding to the human, on Arc only.
+    - `buildStatus` takes optional `gasFunding` `{chainId, sessionGasWei, feeCeilingWei}`, which the daemon's
+      `statusOf` passes (`cb142ea`). With it, on Arc,
+      `session-gas-low`'s reason is shown in USDC and gwei, and its action asks for one channel's gas budget in
+      USDC ($\text{sessionGasWei} + 500{,}000 \times \text{ceiling}$, 0.356 USDC by default).
+    - `arena xmtp enable` removes the `.sdk-tmp-*` directory a killed earlier run left behind. `/skill.md` tells
+      the agent to run it in the background and poll `arena xmtp status`.
+67. **Rate-limit resilience (hardening wave H3, and its fix round 1).** Arc's public RPC answers a modest mix of
+    reads with `-32005` "rate limit exceeded" (viem's `LimitExceededRpcError`, "Request exceeds defined limit.") or an
+    HTTP 429. It refuses a query it will never serve with `-32012` "requested range too large" (Arc testnet rehearsal
+    §8.1, §8.2).
+    - **Error classes** (`packages/sdk/src/rpc.ts`). `isRateLimited` is checked first, so its words always win: the
+      words "rate limit", "too many requests", "request limit", "max requests", "requests per", "per second", "rps",
+      "throttl…", "quota", "compute units" or "capacity" anywhere in the cause chain; an HTTP 429; a JSON-RPC code
+      429 or `-32007`; or `-32005`, unless its words are a refusal. `isRangeRefusal` is never true while
+      `isRateLimited` is. Otherwise it is `-32012`, viem's `ResponseBodyTooLargeError`, or the RPC's words for a
+      block range, result count or response size over its limit (a bare "exceeds max" is not one: "exceeds max
+      requests per second" is a rate limit). Only a refusal splits a range or counts toward a skip, in the indexer
+      and in the daemon's dispute scan (item 18). Any other failure ends that poll or pass, uncounted and unprobed,
+      and the next one reads the same range. Why: under load the RPC refuses at random, and a skip on that would hide
+      a dispute event. H1's probes stay the second gate: a probe that is refused too stops the poll or pass, uncounted.
+    - **Transport.** Every RPC client (`LocalKeyTxSender`, the daemon's, the server's `RpcChainReader`) uses
+      `rpcTransport`: viem's `http` retry classes, retried after 0.5, 1, 2, 4 and 8 s, with a `Retry-After` honoured
+      up to 4 s per retry. Under a rate limit (fast answers) a read waits at most 15.5 s in all, 20 s with
+      `Retry-After`. On an RPC that does not answer, the timeout is retried too:
+      - The daemon's client caps each request's **total** time at 20 s (`DAEMON_RPC_TOTAL_TIMEOUT_MS`, the transport's
+        `totalTimeoutMs`), attempts at 5 s (`DAEMON_RPC_TIMEOUT_MS`). An attempt in flight at the deadline is
+        abandoned, no retry starts whose wait would end past it, and the last error is thrown, so a rate limit stays a
+        rate limit. A respond makes 11 requests one after another before its send (counted on the real path by
+        `h3-ratelimit.test.ts`), and the send is one attempt of at most 10 s: 11 × 20 s + 10 s = 230 s, inside
+        `autoReturnSecondsOf` (300 s at the 900 s default window). The session key's tracker adds reads to that count:
+        up to two per hash it still tracks (each replacement adds a hash), a receipt read and, for a released entry
+        with fees, a transaction read (`prune`, `knowsAny`). Arc's tracker is normally empty at a respond.
+      - The server's and `LocalKeyTxSender`'s own clients keep viem's retries and its 10 s: about 75 s per read.
+      A send is never retried: viem issues `eth_sendRawTransaction` with `retryCount: 0`, and the capped transport
+      excludes the send methods by name. A `SerialTxSender` send answered "nonce too low" whose own hash cannot be read
+      (a rate-limited check) is kept at its nonce with that hash, released, on every path (a fresh send, a replacement
+      of a released entry, the wait's own replacement), and never re-sent at the next nonce. Every path checks a
+      request's `notAfter` right before it transmits: `waitOrReplace` sets it to its `giveUpAt` on a replacement, and a
+      respond sets it to its give-up time plus 15 s (`RESPOND_SEND_MARGIN_MS`; 3 s before final fix wave B, m-6), so a
+      respond whose reads end well past its deadline is not broadcast (it could only revert). The give-up time is never
+      earlier than the last moment a block could still take the respond (it is computed from the latest block's
+      timestamp, which is not ahead of the chain's clock). The margin is wide because the costs are lopsided: a respond
+      held back that would have landed forfeits the game, one sent too late costs about 0.008 USDC of gas. It covers
+      Arc's 1 s timestamps, a proposer clock running ahead, and this machine's wall clock stepping forward by up to
+      15 s between the read and the send (both times are `Date.now()`).
+    - **CLI one-shot calls** (`rpcCall`: `init`, `wallet`, `fund`). An HTTP 429 or 5xx, or a JSON-RPC rate limit, is
+      retried after 1, 2, 4 and 8 s. One that persists fails with "the RPC is rate-limiting: … wait a minute, then
+      retry the command".
+    - **Action routes** (`/move`, `/resign`, `/accept-draw`, `/next-game`, `/close`, `/challenge`, `/reclaim`,
+      `/handoff`). An action that took effect answers 200 even when the chain read for the status it returns fails:
+      the last known status, with `chainStale: true` and `chainStaleReason` (e.g. "the RPC is rate-limiting (HTTP
+      429)"). The CLI prints a note. Took effect includes a Close that is signed and relayed whose on-chain submission
+      failed on anything but the hub's refusal (the watchtower retries it), and a challenge or reclaim mined with no
+      readable receipt (`chainStaleReason` says so, and that whether it succeeded is not known yet). A failed action
+      still errors. A rate limit that outlasts the retries is a 503: "the RPC is rate-limiting (<the RPC's answer>):
+      wait a few seconds, then retry", or "rate-limited (RPC or host) (…)" when no RPC error is in the chain (the
+      host's own 429).
+    - **Sweep attribution.** A sweep whose receipt wait fails other than with a typed `Tx*Error` (a rate-limited
+      receipt read), or whose send fails ambiguously (a lost response), throws `SweepWaitError` with the sweep's own
+      hashes. They are kept in `pendingTx` and `sweepPending`, and the attempt is not charged. The next attempt
+      records the landed sweep (`swept: true` and a `sweeps` entry), never `"dust"`.
+    - **Session-gas check.** After a failed read of a session key's balance, the check waits 5 s, doubling to 60 s,
+      before it reads again. A read that succeeds ends the back-off. A refill is at most 60 s late because of it.
+    - Tips are unchanged: a key tips `eth_maxPriorityFeePerGas` (5 gwei on Arc Testnet in the rehearsal), within the
+      profile's floor and ceiling.
+68. **The agent journey after the first live run (hardening wave H4).** Three unprimed Claude agents onboarded from
+    `/skill.md` on Arc testnet, had their human pay them, played 11 games and cashed out
+    (`.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`). Five frictions are fixed:
+    - **`fund` leads with what to tell the human.** No agent put the ask in its own reply: each ran `fund`, then went
+      straight to `wallet --wait-for-usdc`, and a human sees only the agent's replies. `fund`'s JSON now starts with
+      `tellYourHuman`: "Tell your human now, in your own reply, word for word, before you run wallet
+      --wait-for-usdc (they cannot see this command's output): " (the wait clause only when something is short),
+      then `disclosure`, then `message`. `disclosure` comes second. Every earlier field is unchanged, and `message`
+      is still the sentence the live-run human watcher parses.
+    - **The human hears what they fund before paying.** `disclosure` is a few sentences: the network (on Arc, whether
+      it is mainnet or a test network), the hub address, the host's `/templates` `audit` text (quoted as the host's
+      words, folded onto one line, Unicode format characters such as bidi overrides removed (fix round 1, M6), at
+      most 300 characters, or "Its host publishes no audit statement."), the per-player deposit cap as the host's
+      own figure ("The host says each player may deposit at most …", M6), the hub's fee per player per channel, and
+      that withdrawals go only to the owner
+      (named once recorded). `/skill.md` step 4 tells the agent to write `tellYourHuman` into its reply before any
+      wait, and to remind the human of the missing amount after each wait that returns `reached: false`. The
+      report after about 30 minutes, and the offer of `withdraw --all` for what did arrive, are unchanged.
+    - **`arena daemon --detach`.** The daemon died with the agent's tool session, once mid-game with a channel open.
+      `--detach` refuses, spawning nothing, when the home has no `config.json`. It re-runs the same CLI directly
+      (`<node> <node flags> <entry script> daemon`, never a wrapper or `npx`) as a detached child in its own session
+      and process group, stdin closed, stdout and stderr appended to `ARENA_HOME/daemon.log`. It waits up to
+      `--timeout` (default 60 s, 1–600) for the child's own start line, its pid in `daemon.lock` and its `/health`,
+      then prints `{detached: true, healthy: true, pid, api, log}` (exit 0). Fix round 1:
+      - **A lock-holding child is never stopped (I1).** `ArenaDaemon.start()` arms its dispute timer before the chain
+        reads that make a start slow, so at the deadline a child that holds the lock is reported `{detached: true,
+        healthy: false, …, hint}` (exit 0) and left running. Only a child that exits (an error with the log's last
+        lines) or never takes the lock (stopped by its own pid: SIGTERM, SIGKILL after 10 s) fails.
+      - **A live lock holder is named, never looped on (I2, M1; fix round 2, N3).** Before spawning, and when the
+        child loses the lock to another daemon (two `--detach` at once), the holder is asked who it is through its own
+        API, until the deadline (see the next bullet). This home's `arena daemon` prints `{alreadyRunning: true,
+        healthy: true, pid, api, log}` (exit 0). A lock pid that never answers -- starting, stuck, or a reused pid --
+        exits 1 "not answering" (check `channels` in a minute, then tell the human, with the pid and the log); a bot,
+        a withdraw, or an answer that is not the lock's writer exit 1 with what to do. No lock is called stale while
+        its pid lives.
+      - **Its limit (M8).** A new session and process group survive a process-group kill and a terminal hangup, not
+        the teardown of a systemd scope (logind `KillUserProcesses=yes`), a per-command PID namespace or cgroup, or a
+        container stop. The next live run checks survival under its own sandbox.
+      `/skill.md` step 2 starts the daemon this way, says not to use the tool's background-task feature or
+      `nohup … &`, and says what to do on each outcome. Setup keeps the restart loop for a human. Every "cannot reach
+      the daemon" hint says `start it with "<cli> daemon --detach"` and, if it keeps stopping, to read the end of
+      `daemon.log` (M2). `init` on a home a daemon holds says to skip init if the home is set up, and names
+      `daemon stop` for a re-init (I3, M4).
+    - **Lock identity, with no clock (fix round 2, N1, N3).** `acquireHomeLock` writes `{pid, nonce}` with a fresh
+      random nonce per acquisition. Asked `GET /health` with the home's bearer token, the daemon's API answers
+      `{ok, pid, lock: <nonce>, role: daemon|bot|withdraw}`; without the token, `{ok}` as before. A holder is "this
+      home's daemon" only when that pid and nonce are the lock's (never for an older CLI's nonce-less lock: item 69).
+      This replaces fix round 1's start-time-versus-lock-mtime check, which broke on the `ps` path (a start time
+      derived from `Date.now()` compared for equality, so `stop` never worked off Linux) and under wall-clock steps
+      (a live daemon called a reused pid). `/proc` or `ps` now only shows a stopped process go. A home with port 0
+      (tests only) cannot be asked.
+    - **`arena daemon stop [--timeout S] [--yes-i-understand]`.** `stop` SIGTERMs the pid that `daemon.lock` names
+      only after the daemon's API confirmed it is that pid with that nonce and role `daemon`, in the same call, and
+      again right before the signal. A lock pid that does not answer is never signalled: wait, retry, then tell the
+      human (pid, log). `stop` refuses while any channel record is not `finalized`, whatever its phase (N2): `None`
+      may have our deposit in flight, `Funding` opens by itself on the opponent's deposit, and a deposit past its
+      funding deadline needs this daemon to reclaim it; a retired record is finalized, so it never blocks. The
+      refusal does not print the override (m2). `--yes-i-understand`, documented in the README for a human only,
+      overrides that check alone. `stop` waits up to 60 s by default for the process to exit, then prints
+      `{stopped: true, pid}`. `/skill.md`: a restart is `daemon stop`, then
+      `daemon --detach`; if `stop` refuses, keep the running daemon and tell the human (m3). Step 8 ends the recipe
+      with `daemon stop` once every channel is settled -- `Finalized`, `Reclaimed`, or a suggested action starting
+      with `done:`, which includes a retired channel (m4; "a", not "the first": a host refusal can be listed before
+      it, final review C m-15) -- and swept, any offer the agent posted has expired (M5), and
+      the withdraw is done, and says overriding a refusal is the human's decision. skill.md never names the flag.
+    - **Offers are picked at random among equals.** Two concurrent agents took the same first-listed offer; the
+      loser got `offer … not found` after its money arrived. `/skill.md` step 3 says to pick at random among the
+      offers that fit equally well. Step 5 and Troubleshooting say a lost race needs no new money: re-list, pick
+      another, and ask for more only if that `fund --offer` shows a shortfall. The CLI has no auto-pick path.
+    - **The took-effect note.** `/skill.md` Troubleshooting quotes H3's CLI note (`note: <action> took effect, but
+      the chain could not be read afterwards`) and says the action did take effect and is never sent again. H3's
+      code is unchanged.
+69. **Final fix wave, the CLI (B; `.superpowers/sdd/2026-10-23-arc-launch/final-review-b.md`).**
+    - **An unconfirmed withdraw is never answered "retry" (I-1).** `withdraw()` diffs the wallet sender's tracked
+      hashes around `hub.transfer`, as the sweep does. A failure after the send that is none of the four typed wait
+      errors (a rate-limited or timed-out receipt read, a 5xx) is a 502 naming what was sent, never H3's 503 "wait a
+      few seconds, then retry". Every 502 or 503 of an unconfirmed withdraw carries its hashes, as the API body's
+      `hashes` and in the message ("check the owner's balance, an explorer or `<cli> wallet` before retrying: a retry
+      can pay the owner twice"). It is recorded in `<home>/withdraw-pending.json`, and the next withdraw, through the
+      same daemon or a fresh in-process one, resolves it from the chain before it reads the balance:
+      - one of its transactions mined with the `Transfer` to the owner: it landed. That withdraw is refused (409,
+        "the owner has been paid, so nothing was sent now"), the record cleared, and the next one goes ahead;
+      - each mined without that `Transfer`, or never mined while another transaction took its nonce: none can pay.
+        Cleared, and the withdraw goes ahead. "Another took its nonce" is concluded only after the receipt is read once
+        more, after the nonce count: it may be this very transfer, mined during the reads (re-review n-1);
+      - mined with its receipt unreadable: refused (409) whatever its age (re-review n-2), since its nonce is used and a
+        send would be a second transfer. The message has the agent tell its human, who checks it on an explorer and,
+        if it did not pay, removes the record;
+      - otherwise (pending, or unknown with its nonce free): refused (409) until `WITHDRAW_UNCONFIRMED_HOLD_MS`
+        (10 minutes) after it was sent, then cleared and sent. The send replaces a transfer still pending at its
+        nonce wherever the RPC's pending count shows it; on one that does not, a fresh in-process daemon past the
+        hold sends at the next nonce (the residual).
+      A check whose read fails is a 503: nothing is sent.
+    - **No message tells the agent to edit `config.json` (I-2).** `start()`'s refusal of a config naming contracts this
+      CLI does not pin is addressed to the human: "Tell your human: this daemon's config names contracts the CLI does
+      not pin for chain N … they decide what happens next". It says the agent never edits `config.json` and starts no
+      new home while a channel is unsettled, and that the release that set the home up can still settle and withdraw;
+      restoring the pinned addresses would read the channels on the wrong hub and retire them. `init`'s and `owner`'s
+      "fix or remove it first" on an unreadable `config.json`, and `owner set`'s hand-edit lines, are the human's step.
+    - **`init` refuses an Arc chain no release pins yet (m-10).** With `requirePin` (`init` only, never `start()`, so
+      no home is stranded), `pinnedDeploymentRefusals` refuses a `nativeIsUsdc` profile chain with no
+      `KNOWN_DEPLOYMENTS` entry: a CLI published before Task 6 never takes the mainnet hub a hostile `/templates`
+      names. The test-only override is `UNPINNED_INIT_ALLOWED_FOR_TESTS`, a module-level set that no flag, environment
+      variable or file writes.
+    - **The respond margin is 15 s (m-6):** item 67.
+    - **Lock identity (m-1, m-2).** A lock with no nonce is never confirmed (any listener can echo a pid), and a
+      confirmed answer must name a role. An answer that waiting does not change -- a 200 without identity, a
+      nonce-less lock -- is a `definite` silence: `--detach` and `stop` exit 1 at once, telling the agent to tell its
+      human, where `--detach` used to wait out its timeout. The README says how a human stops such a daemon by hand.
+    - **`stop` and the channels no daemon watches (m-4, m-11).** A record that cannot be read counts as live for
+      `stop`, as for `init`'s RPC check. The authenticated `/health` lists the channels the daemon does not watch
+      (`degraded`), and `stop`'s refusal names degraded and unreadable records apart: not watched by any daemon,
+      `close` cannot settle them, tell your human. Three counts of "not settled" remain, each erring safe: `fund`
+      counts degraded records (it asks for more), the daemon's reserve does not, and `stop` counts degraded and
+      unreadable ones (it refuses more often).
+    - **Status and notes (m-3, m-5, m-7).** The lobby refusal's "restart this daemon" is not shown for a finalized
+      record, so a retired channel's first action stays `done:`. It, the 503 on offer and accept, and the withdraw 409
+      restart the daemon only once no channel is live, and otherwise say to tell the human (`stop` refuses while one
+      is). A challenge or reclaim mined with its receipt unreadable carries `unconfirmed` in its status; the CLI then
+      prints `note: <cmd> was mined, but whether it succeeded is not known yet (…): run "<cli> status" to check`, not
+      the took-effect note.
+    - **Smaller (m-8, m-9, m-12).** A close the wallet cannot pay for, or whose fee is over its ceiling, says so in
+      `lastError` (`close()` still answers 200). `handleUnseenRegistered` re-reads the session's latest turn after its
+      awaits, so a turn a relay delivered meanwhile is not raised as `challenge-unseen`. The daemon's 20 s request cap
+      leaves a `Retry-After` 5 attempts and 16 s of waiting. A respond still pending at its give-up time
+      (`TxStuckError`), which a send inside the 15 s margin can be on Arc before the next block, gets the same phase
+      re-check as a revert or a drop, so one that landed is not reported "stuck".
+    - **Live run #2's frictions (its (f)1-3).**
+      - A funding pass resumed after its approve and session-key top-up (a rate limit stopped the deposit) needs only
+        what is still to be spent. `fund()` records the gas those two paid, from their receipts
+        (`ChannelRecord.fundingGasPaid`, on disk), and `oneBalanceOpenNeed` credits it, rounded up and capped at the
+        wallet-gas term it came out of. So `fund`'s ask always covers a resumed pass, and the human is never asked
+        again for gas already spent (0.002189 USDC in the run). An approve or top-up whose receipt could not be read,
+        or that reverted, is not credited.
+      - `fund` keeps its ask (`<home>/fund-ask.json`) when something is short. A `wallet --wait-for-usdc` for exactly
+        that `usdc.need` says first, on stderr and while nothing has arrived, "Your human must see this -- if you
+        have not written it in your reply, stop and do that now, word for word (they cannot see this command's
+        output): <disclosure> <message>". A timed-out result leads with it as `tellYourHuman`. It is never repeated
+        once the wait is met, nor for another amount.
+      - `offers` prints the open offers in a fresh `node:crypto` random order on every call, and says so on stderr:
+        "take the first one that fits". The daemon's `GET /offers` is unchanged.
+70. **ECDSA-only signatures (final review A I-1, owner decision 2026-10-25; `aa5ddfc`, `aeed9dc`).** Signatures are
+    verified with ECDSA only (OpenZeppelin `ECDSA.tryRecover`: 65 bytes, v 27 or 28, low s), with no ERC-1271
+    fallback. A signer whose code accepts any bytes, such as a contract or an EIP-7702-delegated session key, could
+    otherwise put unverifiable signatures in a proof. A delegated key's own ECDSA signatures still verify against its
+    address, and gaining code cannot revoke them. The SDK's `recoverStateSigner`/`recoverCloseSigner` accept only the
+    same form, because viem alone also recovers a high-s twin and v 0/1, so a session never stores a signature the
+    hub refuses. §4.3 says the same. Arc testnet runs this hub since redeploy #2 (`ed5862a`: ChannelHub
+    `0x3D8434455E4258a877a327De3B1201f94A558d38`, ChessRules `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba`, pinned in
+    `KNOWN_DEPLOYMENTS[5042002]`); `init` refuses the superseded hub with the ERC-1271 fallback (`0x9b8B…bA41`), as it
+    refuses the pre-hardening one.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

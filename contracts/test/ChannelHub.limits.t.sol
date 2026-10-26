@@ -278,9 +278,9 @@ contract ChannelHubLimitsTest is HubFixture {
         assertGt(hub.owed(bob), 0);
 
         _pause();
-        address bobNew = makeAddr("bobNew");
+        usdc.setBlocked(bob, false); // claim pays the caller only (audit M1)
         vm.prank(bob);
-        hub.claim(bobNew);
+        hub.claim();
         assertEq(hub.owed(bob), 0);
     }
 

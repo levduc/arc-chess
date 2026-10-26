@@ -228,4 +228,26 @@ contract GasTest is HubFixture {
         assertEq(uint8(hub.channelInfo(id).phase), uint8(ChannelHub.Phase.Open));
         assertEq(hub.registeredState(id).turnNum, claimState.turnNum);
     }
+
+    /// I1: the heaviest honest move proof now also carries the non-mover's co-signature in `latest`, which the
+    /// hub verifies (one more signature check) because it re-emits that slot.
+    function test_gas_respond_heaviestFoundClaimStalemate_coSignedLatest() public {
+        State memory s0 = rules.initialState(id, p);
+        State memory s1 = _play(s0, p, uci("e2e4"));
+        bytes memory openingProof = _moveProof(s0, "", "", s1, _sign(aliceKey, s1), "");
+        vm.prank(alice);
+        hub.challenge(openingProof);
+
+        (State memory st, State memory claimState) = _heaviestFoundStalemate();
+        bytes memory coSig = _sign(aliceKey, claimState);
+        bytes memory proof =
+            _moveProof(st, _sign(aliceKey, st), _sign(bobKey, st), claimState, coSig, _sign(bobKey, claimState));
+
+        uint256 before = gasleft();
+        hub.respond(proof);
+        uint256 used = before - gasleft();
+        console2.log("respond(CLAIM_STALEMATE, heaviest found, co-signed latest) gas:", used);
+        assertLt(used, GAS_BUDGET, "respond must stay well under 30% of the block gas limit");
+        assertEq(hub.registeredState(id).turnNum, claimState.turnNum);
+    }
 }

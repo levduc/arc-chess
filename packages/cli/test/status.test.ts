@@ -298,4 +298,79 @@ describe("buildStatus", () => {
     expect(view(a, rec(0), none).suggestedActions).toEqual(["wait: the channel is being funded"]);
     expect(view(a, { ...rec(0), finalized: true }, none).suggestedActions[0]).toMatch(/^done: the funding window closed/);
   });
+
+  it("final fix wave B (m-3, m-5): a lobby refusal never leads a finalized record; on a live one, the restart waits for no live channel", async () => {
+    const { a, rec } = await sessions();
+    const lobbyError = "too many watched offers";
+    const at = (record: ChannelRecord, chain: ChainView) =>
+      buildStatus({ record, snapshot: a.snapshot(), myTurn: a.isMyTurn(), chain, lastError: null, lobbyError });
+    // Retired (None/Funding, finalized) or settled: the first suggested action is still `done:` (skill.md's rule).
+    for (const phase of ["None", "Funding", "Finalized", "Reclaimed"]) {
+      const s = at({ ...rec(0), finalized: true }, { ...OPEN, phase, funded: [false, false] });
+      expect(s.suggestedActions[0], phase).toMatch(/^done: /);
+      expect(s.suggestedActions.join("\n"), phase).not.toMatch(/restart/);
+      expect(s.lobbyError).toBe(lobbyError); // still reported
+    }
+    // A live channel: named first, and only once no channel is live.
+    expect(at(rec(0), OPEN).suggestedActions[0]).toBe(
+      'restart this daemon once no channel is live ("arena daemon stop", then "arena daemon --detach"; until then keep ' +
+        `playing, and tell your human if it persists): the host refused a subscribe (${lobbyError}) -- new offers/accepts ` +
+        "are refused until then",
+    );
+  });
+});
+
+// Plan 6 hardening H2 (audit-journey I-2): on Arc, session-gas-low is worded in USDC, with the amount to send.
+// Fix round 1 (review m-1): every reason here is one the daemon actually emits -- `ensureSessionGas`'s prefix plus the
+// first line of the error (`errorText`), from the SDK's own messages (tx.ts) and the daemon's (daemon.ts).
+describe("session-gas-low wording", () => {
+  const KEY = "0x00000000000000000000000000000000000000Aa";
+  const PREFIX = "the session key holds 12000000000000000 wei, below the floor of 168000000000000000, and the wallet could not refill it: ";
+  const PREFIX_USDC = "the session key holds 0.012 USDC, below the floor of 0.168 USDC, and the wallet could not refill it: ";
+  const REASONS = {
+    // TxInsufficientFundsError (tx.ts): the wallet cannot pay the value plus gas.
+    insufficient: `${KEY} cannot pay for the transaction (value plus gas at the fee it needs): not sent`,
+    // TxFeeCapError (tx.ts): a replacement over the wallet's fee ceiling.
+    feeCap: "replacing the transaction at nonce 7 needs a fee over the cap of 40000000000 wei per gas (needs 52000000000): not sent",
+    // SessionGasEstimateError (daemon.ts): the top-up's own estimate failed.
+    estimate: "gas estimate failed: RPC unreachable",
+    // TopUpRevertedError (daemon.ts).
+    reverted: `the session-key top-up 0x${"ab".repeat(32)} was mined but reverted: nothing reached the key`,
+  };
+  const ARC_GAS = { sessionGasWei: 336_000_000_000_000_000n, feeCeilingWei: 40_000_000_000n };
+
+  it("gasReasonInUsdc shows the key's balance and floor in USDC and a fee per gas in gwei, and keeps every other word", async () => {
+    const { gasReasonInUsdc } = await import("../src/status.js");
+    expect(gasReasonInUsdc(PREFIX + REASONS.insufficient)).toBe(PREFIX_USDC + REASONS.insufficient);
+    expect(gasReasonInUsdc(PREFIX + REASONS.feeCap)).toBe(
+      `${PREFIX_USDC}replacing the transaction at nonce 7 needs a fee over the cap of 40 gwei per gas (needs 52 gwei per gas): not sent`,
+    );
+    expect(gasReasonInUsdc(PREFIX + REASONS.estimate)).toBe(PREFIX_USDC + REASONS.estimate);
+    expect(gasReasonInUsdc(PREFIX + REASONS.reverted)).toBe(PREFIX_USDC + REASONS.reverted);
+    // No bare wei amount is left in any of them.
+    for (const r of Object.values(REASONS)) expect(gasReasonInUsdc(PREFIX + r)).not.toMatch(/\b\d+ wei\b|\(needs \d+\)/);
+    // A TxFeeCapError with no `needs` part.
+    expect(gasReasonInUsdc("over the cap of 40000000000 wei per gas: not sent")).toBe("over the cap of 40 gwei per gas: not sent");
+  });
+
+  it("on Arc: fund USDC, on Arc, with the amount; elsewhere, or with no gas numbers, the chain-neutral text, unchanged", async () => {
+    const { a, rec } = await sessions();
+    const reason = PREFIX + REASONS.insufficient;
+    const at = (gasFunding?: StatusInput["gasFunding"]) =>
+      buildStatus({ record: rec(0), snapshot: a.snapshot(), myTurn: a.isMyTurn(), chain: OPEN, lastError: null, sessionGasLow: reason, gasFunding });
+    const id = rec(0).channelId;
+    for (const [chainId, name] of [[5042, "Arc"], [5042002, "Arc Testnet"]] as const) {
+      const s = at({ chainId, ...ARC_GAS });
+      expect(s.attention).toBe("session-gas-low");
+      // 0.336 of session gas + 500,000 x 40 gwei for the refill's own gas = 0.356 USDC.
+      expect(s.suggestedActions[0]).toBe(
+        `fund your wallet: dispute gas for channel ${id} is low (${PREFIX_USDC}${REASONS.insufficient}); on ${name}, gas is ` +
+          `paid in USDC: ask your human to send at least 0.356000 USDC to this wallet on ${name} (chain id ${chainId}), and ` +
+          "the daemon refills it on its next pass once that arrives",
+      );
+    }
+    const neutral = `fund your wallet: dispute gas for channel ${id} is low (${reason}); the daemon refills it on its next pass`;
+    expect(at().suggestedActions[0]).toBe(neutral);
+    expect(at({ chainId: 31337, ...ARC_GAS }).suggestedActions[0]).toBe(neutral);
+  });
 });

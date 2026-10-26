@@ -6,8 +6,9 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **Session-gas sweep** (spec §3.1) — **done in Plan 5** (spec §12 item 35). The main pass sweeps a
   Finalized/Reclaimed channel's session key back to the wallet, with per-record back-off and an `"abandoned"`
   outcome after `SWEEP_ABANDON_ATTEMPTS`; `arena sweep` / `POST /sweep` sweep settled-but-unswept records too,
-  including legacy ones from before this feature. Still open: pin Arc's real fee ceiling and re-derive
-  `sessionGasWei` with k = 2..4 once Arc's fee data is known (Plan 6).
+  including legacy ones from before this feature. Arc's fee ceiling and `sessionGasWei` — **done in Plan 6**
+  (Task 2, `dc0d0ed`; spec §12 items 60–61): a 40 gwei profile ceiling, and on profile chains `sessionGasWei` =
+  4 × 2.1M × 40 gwei = 0.336 USDC (k stays 4; refills cover a fee spike).
 - **Refill retries** — **done in Plan 5** (spec §12 item 36). Empty-wallet refill retries back off per channel
   (`refillBlockedUntil`: 30 s doubling to 5 min), with one log line per episode.
 - **`session-gas-low`** — **done in Plan 5** (spec §12 item 37). Raised only on insufficient funds, the fee cap, or
@@ -77,7 +78,7 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   records from a previous chain are never acted on (ghost channels after a dev-up restart).
 
 ### Plan 5.6
-- Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC and set feeCeilingWei for Arc in Plan 6.
+- Arc: a lying RPC can inflate priority fees up to 4x its own estimate (tx.ts room()); pin a trusted RPC. (`feeCeilingWei` for Arc: done in Plan 6, 40 gwei by default, with the 20 gwei floor applied last; spec §12 items 60, 62.)
 - **Before the first real publish** (owner's own steps, not automated — spec §6):
   - choose the npm package name/scope and set `ARENA_CLI_PACKAGE`;
   - choose a license, add a `LICENSE` file, and set `ARENA_CLI_LICENSE`; make `scripts/build-cli.ts` copy that
@@ -89,11 +90,10 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
 - **Host `cli` config set to a provenance-published version.** Only after a real `cli-v*` tag has gone through
   `.github/workflows/release-cli.yml` (build → the clean-room test → `npm publish --provenance`) should the
   host's `cli: {package, version, minVersion?}` point at that version — never at a version only built locally.
-- **Plan 6: Arc's USDC-as-gas reserve.** `fund`'s native line (`native.need = sessionGasWei + 500_000n ×
-  feeCeilingWei`) assumes native gas; on Arc, gas is paid in USDC, so this line needs its own Arc-specific
-  accounting. `withdraw --all`'s `withdrawReserve()` currently returns `0n` (correct on every chain this daemon
-  runs on today, whose gas is native) — Plan 6 must give it Arc's real reserve so `--all` never drains the USDC
-  a live channel's session key needs to keep paying its own gas.
+- **Plan 6: Arc's USDC-as-gas reserve** — **done in Plan 6** (Task 1, `4b822e3`, `4bc5e13`; spec §12 item 61).
+  On Arc, `fund` folds the gas into `usdc.need` (plus one `sessionGasWei` per unsettled channel, `usdc.reserved`),
+  and `withdrawReserve()` keeps unsettled channels × `sessionGasWei` + 500,000 × the fee ceiling, which also gates
+  every opening path.
 - **The host can pin only a version of the CLI's own package.** `init` validates `/templates.cli` locally and,
   in the published bundle, refuses a different package name (final review C1: a host-supplied package used to
   reach an install command the recipe told the agent to run). Re-check this whenever the gate or the install
@@ -124,6 +124,12 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
   (Docker); nothing in this repo exercises XMTP's real `dev` or production network. Before mainnet, run the
   manual smoke script (spec §7) against XMTP's public `dev` network, and confirm the fallback actually works
   against production XMTP, not just the local-node fixture.
+  - **`dev`: done in Plan 6 Task 5** (`docs/superpowers/arc-testnet-rehearsal.md` §7). On Arc testnet, the host was
+    SIGKILLed mid-game, twice (once per hub). Both daemons were seen on XMTP `dev` 4.4 s after the kill in the first
+    run, and 45.5 s after it in the rerun. Both figures are as observed through the script's own `/status` polling,
+    which was rate-limited in the rerun; the daemons do not timestamp the switch itself. Both times they finished the
+    game and closed over XMTP, the payouts were exact, and nothing reached the chain's dispute path. **Production
+    XMTP is still open.**
 - **Supply-chain note for the pinned native SDK.** `@xmtp/node-sdk@6.1.0` is installed at runtime (`arena xmtp
   enable`), never bundled into the published CLI, and pinned by exact version (`--save-exact`). It is a native
   module (not pure JS) fetched from npm outside the workspace's own lockfile/audit surface — confirm its
@@ -135,6 +141,53 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 - **XMTP resource bound.** A daemon runs at most 64 XMTP clients (`XMTP_MAX_CLIENTS`), each one opened only once its
   channel is Open on-chain and closed (`Client.close()`, node-sdk 6.1.0) when the channel settles. Before launch,
   measure fds, threads and RSS on a long-running house bot across many channels and confirm they stay flat.
+
+### Plan 6 live agent run and H3/H4 (2026-10-24)
+
+- **H3 (rate-limit resilience).** A rate limit never counts as a refused range in the indexer or the dispute scan;
+  every viem transport retries rate limits with bounded back-off; the sender treats an ambiguous "nonce too low" as
+  possibly ours, never re-sending at the next nonce; actions that took effect answer 200 with `chainStale`. The
+  dedicated-RPC item under Task 5 below still stands: retries soften a shared public RPC, they do not make it safe for
+  a watchtower.
+- **H4 (agent journey, from the live run's frictions).** `arena fund` leads with `tellYourHuman` and a `disclosure`;
+  `arena daemon --detach` keeps the daemon alive past the agent's tool session; skill.md picks a random matching
+  offer and explains `chainStale`. A detached daemon keeps running after the agent finishes (by design);
+  `arena daemon stop` (`8e7eb93`) lets an agent under a narrow tool allowlist stop or restart it.
+- [ ] **Re-run the live agent test after H4** and check: each agent writes the funding ask in its own reply before
+  `wallet --wait-for-usdc`; it states the audit text and caps before funding; `daemon --detach` survives the session;
+  concurrent agents pick different offers.
+
+### Plan 6 Task 5 (the Arc testnet rehearsal, 2026-10-24)
+
+See `docs/superpowers/arc-testnet-rehearsal.md` §2–§12. The scripted rehearsal used real faucet USDC on Arc testnet:
+3 games then a close, a challenge → respond → timeout dispute, and a host kill finished over XMTP `dev`. It ran
+three times: on the pre-hardening hub (§2–§9), on the hardened-hub redeploy (§10), and on the ECDSA-only redeploy
+(§12, 2026-10-25). Every time, payouts and balances reconciled exactly; gas was 0.0827, 0.0844 and 0.0831 USDC. On
+both hardened hubs, `claim()` and `renounceOwnership()` behave as M1/M2 require (`eth_call`).
+
+- **Fixed: Arc's RPC refuses an `eth_getLogs` with more than 10 topics** (testnet and mainnet, -32012). The host's
+  indexer read all 15 hub events in one query and could never index a channel, so the relay could serve no game. The
+  SDK's `hubEvents` now asks for the 7 channel events only (report 8.1).
+- **Pre-mainnet: a dedicated, rate-limit-free RPC for the host and every daemon.** The public testnet RPC rate-limited
+  the run constantly (report 8.2):
+  - 264 indexer errors and over 200 daemon read failures were logged;
+  - a `respond` landed 53 s after the move that answered the challenge;
+  - a `timeout` landed 55 s after the deadline;
+  - the session-gas check, which triggers refills, failed 208 times.
+
+  Measure the mainnet RPC's limits under the expected load; do not run the watchtower on a shared public endpoint.
+  (This makes item 5's "`publicRpcUrl` is an RPC you run or trust" concrete.)
+- **Fixed (H3, `7d151b8`): an action route must not report failure for an action that happened.** `POST /move` (and every route
+  that returns `status()`: `/close`, `/challenge`, `/next-game`, `/accept-draw`, `/resign`) answered 500 when only
+  the status read after the action was rate-limited. The move had been signed and relayed. An agent that trusts the
+  500 may retry, or give up on a move it already made (report 8.2).
+- **Fixed (H3, `c0e07d7`): `arena init` had no retry on a 429.** One rate-limited `eth_getCode` failed the command (report 8.3). The CLI's one-shot RPC calls now retry 429/-32005/5xx for up to about 15 s.
+- **Fixed (H3, `abde97a`): a sweep whose receipt wait hits a plain RPC error was recorded as `"dust"`.** The swept amount is then missing from
+  `sweeps`; the funds are safe in the wallet. This is a new path into the parked "Other" item above (report 8.4).
+- **Each sweep leaves about 0.00027 USDC on its session key:** the fee reserve it did not spend (report 8.5).
+- **Closing over XMTP `dev`.** The rerun timed every sub-step and measured 5.8 s, against 2.8 s over the relay. About
+  3 s of it was the Close signature's XMTP delivery (report §10). The first run's 48.9 s was not broken down. Its cause
+  is unproven; rate-limited status polling is likely. Measure it again under load before relying on it.
 
 ## Mainnet-readiness checklist (must be true before any real-USDC deploy)
 
@@ -148,41 +201,91 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
    - `sessionGasWei` is derived from item 1.
    - There is a re-top-up while Open/Challenged, and a low-gas attention.
    - The new system test passes.
-   - The wallet's `--fee-ceiling-wei` default is set for Arc.
+   - The wallet's `--fee-ceiling-wei` default is set for Arc. (Done in Plan 6 Task 2, `dc0d0ed`: 40 gwei, and `init` refuses a value under the 20 gwei floor.)
 3. **Daemon safety policy.**
    - A `minChallengeTimeout` floor (I4).
    - Bounded USDC approval (I2).
-   - Pinned canonical mainnet addresses in the CLI.
+   - Pinned canonical mainnet addresses in the CLI. (Arc testnet 5042002 pinned in Plan 6 Task 5, with tests: `init`
+     refuses another hub or rules there, and the pin is checked against `contracts/deployments/5042002.json`. The
+     mainnet 5042 pin is Task 6's, after the mainnet deploy.)
    - Offer signature verified on accept (m6).
    - A supervisor or auto-restart is documented, and memory stays flat over 60 min (I3).
-4. **Deployment and ownership.**
-   - `ARENA_TOKEN` is set explicitly to Arc USDC (the script reverts on non-local chains without it; confirm the value).
-   - `ARENA_OWNER` is a multisig. `ARENA_FEE_RECIPIENT` is set.
+4. **Deployment and ownership.** The steps are in `docs/superpowers/arc-mainnet-runbook.md`, which is self-contained.
+   - [x] **The ECDSA-only hub is redeployed on Arc testnet and the rehearsal rerun on it.** On 2026-10-25 the owner
+     decided that the hub verifies ECDSA only (final review A I-1, `aa5ddfc`). The bytecode changed, so the testnet
+     hub `0x9b8B…bA41` still had the ERC-1271 fallback.
+     **Done 2026-10-25** (rehearsal report §1, "Redeploy #2 (ECDSA-only hub)", and §12):
+     - Redeployed on HEAD `90d5ed6`, with the testnet deployer as the only sender: `ChannelHub`
+       `0x3D8434455E4258a877a327De3B1201f94A558d38` and `ChessRules` `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba`,
+       block 69,112,538, 0.103048386 USDC.
+     - Both are fully verified.
+     - `contracts/deployments/5042002.json` and `KNOWN_DEPLOYMENTS[5042002]` were updated in `ed5862a`, and the
+       ERC-1271 pair is refused.
+     - The rehearsal rerun on `ed5862a` passed, with every check exact: hub 30/30, wallet reconciliation and the
+       whole run exact to the wei, M1/M2 4/4, nonces 9/9.
+   - `ARENA_TOKEN` is set explicitly to Arc USDC. The script reverts without it on any chain but 31337, and on 5042 and
+     5042002 it reverts for any token but `0x3600…0000` (`21bd2da`, final review A m-1).
+   - The owner ends as a multisig that exists on Arc (last bullet). `ARENA_FEE_RECIPIENT` is set, to an address that
+     can transact on Arc, since only it can `claim()` a payout deferred to it.
    - The fee and max fee, and the launch limits (10 USDC / 1,000 USDC suggested), are signed off.
-   - Source is verified on the explorer, and `deployments/<chainId>.json` is committed.
-   - Ownership acceptance (`Ownable2Step`) is completed and tested.
+   - Source is verified on the explorer, and `deployments/<chainId>.json` is committed. (Testnet done in Plan 6 Task
+     5: both contracts are verified on `explorer.testnet.arc.io`, and `contracts/deployments/5042002.json` is committed
+     (rehearsal report §1). That includes the hardened-hub redeploy (`0x9b8B…bA41`, I1/M1/M2), whose `ChannelHub`
+     verified cold through `scripts/verify-arc.sh`'s Sourcify import, and the ECDSA-only redeploy (`0x3D84…8d38`,
+     2026-10-25), fully verified the same way. The script now requires a full match
+     (`is_fully_verified`). It is ready for mainnet pending a check of `explorer.arc.io`'s API: in the T5 review, its
+     `/api/v2/smart-contracts/verification/config` answered 403 to a plain request; Sourcify lists 5042. Re-checked
+     2026-10-25: still 403, a Cloudflare "Just a moment…" challenge page, and Sourcify lists 5042 as supported. Since
+     `bb7acb0` the script warns on an explorer that does not answer, skips its explorer steps and still verifies on
+     Sourcify (runbook §7). Mainnet is still to do.)
+   - [ ] **The mainnet deploy key never touches argv or the environment.** Use a Foundry encrypted keystore
+     (`cast wallet import <name> --interactive`, then `forge script … --account <name> --sender <address>`, with a
+     password prompt or a 0600 `--password-file`), or a hardware wallet. Never `--private-key` on the command line,
+     never an exported variable. The testnet deploys used `--private-key` (rehearsal report §1, "For mainnet
+     (Task 6)"); mainnet follows the runbook's §2.
+   - [ ] **Ownership is handed to the multisig on Arc** (runbook §8).
+     - Deploy with `ARENA_OWNER` set to the deployer. The deployer then calls `transferOwnership(multisig)`, and the
+       multisig itself calls `acceptOwnership()` on Arc. That is the multisig's own transaction there, which proves
+       it can transact on Arc before it holds the pause key.
+     - Afterwards `owner()` reads the multisig and `pendingOwner()` reads zero. Record both transaction hashes.
+     - Deploying with `ARENA_OWNER` set to the multisig would skip that proof, because the constructor sets the
+       owner directly and there is nothing to accept. A Safe that exists only on another chain, or a typo, could
+       then be fixed only by a redeploy. Renouncing is disabled (audit M2).
 5. **Host production config.**
    - WS and HTTP limits come from load data (m8).
    - `fundingWindow` ≤ 7200.
    - `trustProxy` is set correctly behind the proxy.
    - A fresh `dbPath` records the identity on first start.
    - `audit` is truthful (m21). `publicRpcUrl` is an RPC you run or trust.
+   - The server enforces three checks on Arc mainnet, and refuses to start if one fails (final wave C, `4184a16`):
+     - `indexer.startBlock` must be set to the hub's deploy block (runbook §9); from 0 the indexer would need days to
+       catch up;
+     - `xmtp.env` must be `"production"` when XMTP is configured;
+     - the RPC's `eth_chainId` must equal the config's `chainId`, which the server checks at every startup.
+   - The `eth_getLogs` timing is repeated on the mainnet RPC the host will use, at deploy (h3-rereview M-f). The
+     reference is 0.087 s for 1,000 blocks (565 USDC logs) on `rpc.mainnet.arc.io`, measured 2026-10-25
+     (`arc-facts.md`), against the SDK's 5 s per-attempt timeout.
 6. **Monitoring and alerting.**
    - `committedEscrow` against the cap and against game activity (m13 squatting).
    - Every `Challenged`, `PayoutDeferred`/`owed`, `Paused`/`LimitsUpdated` event, and ownership events.
    - Indexer lag and the cursor-ahead-of-head warning.
    - Server RSS and DB size (m7).
 7. **Runbook.**
-   - The multisig pause procedure and who can sign within minutes.
+   - The multisig pause procedure and who can sign within minutes. Confirm a pause on-chain (`paused()`), not from
+     the host's `/templates`. That endpoint serves its last good limits read when reads fail, with no age cap, so it
+     can show `paused: false` during an RPC outage (final review C re-review N-5). The daemon and the lobby read the
+     hub live.
    - The cap-raise policy.
    - Incident response for a suspected hub defect: pause, let channels settle, redeploy.
-   - Key custody. Never renounce ownership (m15).
+   - Key custody. Never renounce ownership (m15); the hub enforces this on-chain (audit M2).
 8. **Docs.**
    - The spec's Plan 4.5 refinement block and the `TxSender` contract (I1).
-   - skill.md's Arc gas wording (m11) and the settle/`wait` guidance (m4).
+   - skill.md's Arc gas wording (m11) and the settle/`wait` guidance (m4). (Arc wording: done in hardening wave H2, `2bbdf58`; spec §12 item 66. Still to do: read it back from the deployed mainnet host before launch.)
+   - The spec's Plan 6 refinement block (spec §12 items 60–68). (Done in H2.)
    - The admin-surface caveats (m13, m14).
 9. **A final test gate on the release commit.**
-   - `test:contracts`, plus the deep profile, mutants 18/18, Slither 0 High/Medium, and Echidna.
+   - `test:contracts`, plus the deep profile, mutants 28/28 (`scripts/tools/mutants.sh`: the original 18, I1a–I1e,
+     M2a–M2b, M1a–M1b and E1), Slither 0 High/Medium, and Echidna.
    - `test:sdk`, `test:cli` and `test:server`, each run on its own.
    - `test:system` twice.
    - A 60-minute soak.

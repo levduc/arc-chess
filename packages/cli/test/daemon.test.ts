@@ -153,9 +153,11 @@ describe("ArenaDaemon core", () => {
     const status = await pair.alice.daemon.status(id);
     expect(status.lobbyError).toBe("too many watched offers");
     expect(status.suggestedActions[0]).toMatch(/restart this daemon.*too many watched offers/);
+    // Final fix wave B (m-5): `daemon stop` refuses while a channel is live, so the restart says it waits for that.
+    expect(status.suggestedActions[0]).toMatch(/^restart this daemon once no channel is live \("arena daemon stop", then "arena daemon --detach"; until then keep playing, and tell your human if it persists\)/);
     await expect(
       pair.alice.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n }),
-    ).rejects.toThrow(/too many watched offers/);
+    ).rejects.toThrow(/too many watched offers\); restart this daemon to recover, once no channel is live \(otherwise tell your human\)$/);
     const { offerId: secondOfferId } = await pair.bob.daemon.createOffer({ deposit: 1_000_000n, stakePerGame: 100_000n, challengeTimeout: 600n });
     await expect(pair.alice.daemon.acceptOffer(secondOfferId)).rejects.toThrow(/too many watched offers/);
   });
@@ -170,6 +172,9 @@ describe("ArenaDaemon core", () => {
     await waitFor(async () => (await bob.daemon.status(id)).attention === "close-requested", 5_000, "close requested");
     await bob.daemon.close(id, "agent");
     await waitFor(() => alice.daemon.handle(id).record.finalized, 20_000, "finalized");
+    // H1 (flake fix): `record.finalized` is set inside settleCheck, which then awaits its own last refreshChain --
+    // a new `chain` object. Let that pass finish before taking the reference this test compares against.
+    await alice.daemon.idle();
 
     const find = async () => {
       const c = (await alice.daemon.channels()).find((c) => c.channelId === id);
@@ -708,6 +713,9 @@ describe("watchtower", () => {
     // failure while behind), so Bob's local `latest` stays stuck at turn 0 no matter how many ticks run.
     const session = bob.daemon.handle(id).session;
     session.ingestOnChain = () => Promise.reject(new Error("simulated ingest failure"));
+    // H1 fix round 1: and nor can it adopt the registered state from storage (the fallback for an event it cannot
+    // read) -- this test is about the on-move invariant of a session that stays behind.
+    session.adoptRegistered = () => Promise.resolve(false);
     bob.client.disconnect(); // Bob also never receives Alice's move over the relay
     await alice.daemon.move(undefined, "e4", { actor: "agent" }); // turn 1; Bob (black) is on move there
     await alice.daemon.challenge(undefined, "agent"); // registers turn 1 on-chain
@@ -732,6 +740,8 @@ describe("watchtower", () => {
     // R9/4: the always-failing event was never marked processed, so it is retried (and never skipped).
     expect(bob.daemon.handle(id).processedEvents).toBe(0);
     expect(bob.daemon.handle(id).lastError).toMatch(/^ingest:/);
+    // H1 fix round 1 (review I-1): and Bob is told -- before, nothing said he was about to lose the game.
+    await waitFor(async () => (await bob.daemon.status(id)).attention === "challenge-unseen", 10_000, "challenge-unseen");
   });
 
   it("calls timeout in its favour once a stale challenge can no longer be answered past the deadline (I2)", async () => {

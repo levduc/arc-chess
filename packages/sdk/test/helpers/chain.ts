@@ -14,9 +14,12 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { foundry } from "viem/chains";
 import { channelHubAbi, mockUsdcAbi, type ArenaDomain } from "../../src/index.js";
-import { ANVIL_PORT } from "../global-setup.js";
+import { ANVIL_PORT, ON_ARC_ANVIL } from "../global-setup.js";
 
+export { ON_ARC_ANVIL };
 export const RPC = `http://127.0.0.1:${ANVIL_PORT}`;
+/** Plan 6 Task 4: Arc's base-fee floor, which arc-anvil holds at chain id 31337 (tools/arc-foundry.md point 3). */
+export const ARC_FLOOR_WEI = 20_000_000_000n;
 export const CHAIN = foundry;
 
 /** Anvil default accounts 0 (deployer), 1 (alice), 2 (bob), 3 (host). */
@@ -92,6 +95,8 @@ export async function setEthBalance(who: Address, wei: bigint): Promise<void> {
  *  mines a block right after, so the *next* read of the latest block (what `estimateFeesPerGas` projects
  *  forward from) actually reflects it. Without this, a test computing a boundary from one fee read and a daemon
  *  pass computing the same boundary from a later read can disagree if the real market fee moves in between. */
+/** Plan 6 Task 4: arc-anvil refuses this cheat outright ("the next block base fee cannot be overridden on Arc",
+ *  -32602): a test that calls it needs an Arc variant (`ON_ARC_ANVIL`), where the base fee sits at `ARC_FLOOR_WEI`. */
 export async function setBaseFeePerGas(wei: bigint): Promise<void> {
   await testClient.setNextBlockBaseFeePerGas({ baseFeePerGas: wei });
   await testClient.mine({ blocks: 1 });

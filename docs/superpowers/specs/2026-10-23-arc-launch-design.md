@@ -48,15 +48,23 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
    - `fund` folds the gas need into `usdc.need`, converting 18 decimals to 6 and rounding up. The message asks
      for USDC only.
    - `withdrawReserve()` = (live channels × `sessionGasWei`) + 500,000 × `feeCeilingWei`, converted and rounded
-     up. `withdraw --all` keeps that much, and `withdraw --amount` refuses to dip into it.
-2. **Gas for session-key top-ups.** Today the daemon hard-codes `gas: 21_000n` for these value transfers. They are
-   now estimated with `estimateGas`, plus a margin of +20 % and +5,000. A native transfer costs 21,225 gas on Arc.
+     up. `withdraw --all` keeps that much, and `withdraw --amount` refuses to dip into it. *Amended 2026-10-24
+     (audit-daemon I-5):* the reserve of the other unsettled channels also gates the opening paths
+     (`createOffer`, `acceptOffer`, `fund()`'s top-up and deposit), and `arena fund` counts it, so a new channel can
+     never spend a live channel's refill money.
+2. **Gas for session-key top-ups.** Before Plan 6, the daemon hard-coded `gas: 21_000n` for these value transfers. They are
+   now estimated with `estimateGas`, plus a margin of +20 % and +5,000. This is hardening: a native transfer costs 21,000 gas on Arc, as the 2026-10-24 correction to `arc-facts.md` shows. Every top-up must check its receipt status (audit-daemon I-1).
 3. **Fee floor.** `SerialTxSender` gains a `minFeePerGas` option, set from the profile. Every send and replacement
-   uses `maxFeePerGas` ≥ `minFeePerGas`, and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. A `--fee-ceiling-wei` below
+   uses `maxFeePerGas` ≥ `minFeePerGas`, and `maxPriorityFeePerGas` ≤ `maxFeePerGas`. The floor is applied after
+   the balance clamp. A fee is clamped up, or the send is refused when the balance cannot pay the floor; it is
+   never clamped down below it (audit-daemon I-6). A `--fee-ceiling-wei` below
    the floor is refused at `init`.
-4. **Session gas.** The profile's `feeCeilingWei` (40 gwei) is the default fee ceiling on Arc. `sessionGasWei`
-   comes from the existing formula, 4 × 2.1M × max(ceiling, 4 × gasPrice). That is about 0.34 USDC locked per
-   channel; it is returned by the sweep.
+4. **Session gas.** The profile's `feeCeilingWei` (40 gwei) is the default fee ceiling on Arc. On profile chains,
+   `sessionGasWei` defaults to `SESSION_GAS_RESPONDS × RESPOND_GAS_BUDGET × profile.feeCeilingWei`
+   = 4 × 2.1M × 40 gwei = **0.336 USDC** per channel, returned by the sweep. This replaces the
+   `max(ceiling, 4 × gasPrice)` term there, which gives at least 0.672 USDC on Arc (4 × the 20 gwei floor) and 0.84 at
+   the 25 gwei `eth_gasPrice` seen on 2026-10-23. Refills cover any fee spike, and
+   `--session-gas-wei` still overrides the default. Profile-less chains keep today's formula.
 5. **Pinned deployments.** `KNOWN_DEPLOYMENTS[5042]` and `[5042002]` hold the deployed hub, rules and USDC
    addresses, filled in after each deploy. On a chain listed there, `init` **refuses** a mismatch. Today it only
    warns, through `knownDeploymentWarnings`.
@@ -77,7 +85,8 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   - the SDK and daemon tests that move money: deposit, close, dispute, sweep, top-up, withdraw;
   - the system dispute e2e.
 
-  Assert the Arc-specific behaviours: one balance; a top-up gas estimate above 21,000; a transaction below the
+  Assert the Arc-specific behaviours: one balance; a top-up gas limit of at least its own estimate (a plain transfer
+  costs 21,000 on Arc, so the estimate is not above it; audit-daemon I-2); a transaction below the
   20 gwei floor dropped; a blocklisted payout lands in `owed`, if arc-anvil can model the blocklist; otherwise say
   so explicitly.
 - The existing suites stay on standard anvil, unchanged.
@@ -105,16 +114,20 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
 ## 5. Mainnet deploy (gated)
 
 - **Owner inputs, at that step:**
-  - the owner address (multisig if available) and the fee recipient;
+  - the multisig address, which must exist on Arc mainnet, and the fee recipient;
   - the limits and fee;
   - a funded deployer: the owner's own wallet or a fresh key, holding a few USDC on Arc;
   - an explicit "go".
-- **Then:**
-  - deploy with the same script;
-  - verify the source;
-  - commit `contracts/deployments/5042.json`;
-  - pin `KNOWN_DEPLOYMENTS[5042]`;
-  - if the owner is a multisig, complete the `Ownable2Step` acceptance.
+- **Then, following `docs/superpowers/arc-mainnet-runbook.md`:**
+  - deploy with the same script, with `ARENA_OWNER` set to the **deployer**, and with the key in a Foundry encrypted
+    keystore (`--account`) or a hardware wallet: never `--private-key` on argv, never an exported variable
+    (mainnet-gates item 4). The chain id (5042) is asserted before the dry run and again before the broadcast;
+  - reconcile the dry run's `deployments/5042.json` with the broadcast, then verify the source;
+  - hand ownership to the multisig: the deployer calls `transferOwnership(multisig)`, and the multisig itself calls
+    `acceptOwnership()` on Arc. The constructor sets `ARENA_OWNER` as owner directly, so this two-step hand-over is
+    what proves the multisig can transact on Arc before it holds the pause key. Renouncing is disabled;
+  - confirm `owner()` is the multisig, then commit `contracts/deployments/5042.json` and pin
+    `KNOWN_DEPLOYMENTS[5042]`.
 - **Production server config template:** `docs/deploy/arc-mainnet.server.json.example` with Arc mainnet values,
   the launch limits, and `cli` and `xmtp` left for the owner to fill in once those exist.
 
@@ -126,6 +139,6 @@ mainnet (a policy decision; off by default); auditing.
 ## 7. Spec and gate updates
 
 - Parent spec §12: add a "Plan 6 refinements" block for the chain profiles, one-balance accounting, the fee floor,
-  top-up gas, pinned deployments, and the Arc test subset.
+  top-up gas, pinned deployments, and the Arc test subset. *Done 2026-10-24 (hardening wave H2): items 60–66, with items 22.4, 29, 31 and 37 amended.*
 - `mainnet-gates.md`: tick items 1, 2, 3 and 4 as they are completed, with evidence (transaction hashes, explorer
   links).

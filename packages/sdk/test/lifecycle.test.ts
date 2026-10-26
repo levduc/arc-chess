@@ -484,6 +484,15 @@ describe("hub scans", () => {
     const block = await x.hub.client.getBlock({ blockNumber: created!.blockNumber });
     expect(created!.blockHash).toBe(block.hash);
 
+    // H1 (review m-11): `kinds` reads only those events, in chain order -- the indexer reads a refused range's
+    // events other than Challenged/Responded this way.
+    const head = await x.hub.blockNumber();
+    const others = (await x.hub.hubEvents(0n, head, { kinds: ["ChannelCreated", "Deposited", "Opened", "Finalized", "Reclaimed"] }))
+      .filter((e) => e.channelId === id);
+    expect(others.map((e) => e.kind)).toEqual(kinds.filter((k) => k !== "Challenged" && k !== "Responded"));
+    expect(others).toEqual(events.filter((e) => e.channelId === id && e.kind !== "Challenged" && e.kind !== "Responded"));
+    expect((await x.hub.hubEvents(0n, head, { kinds: ["Challenged"] })).filter((e) => e.channelId === id).map((e) => e.kind)).toEqual(["Challenged"]);
+
     const all = await x.hub.disputeEvents(id, 0n);
     expect(all.map((e) => e.kind)).toEqual(["Challenged"]); // Bob never responded
     const first = all[0];

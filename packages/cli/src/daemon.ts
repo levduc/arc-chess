@@ -1,17 +1,19 @@
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
+import { rmSync } from "node:fs";
 import {
   createPublicClient,
   defineChain,
   erc20Abi,
-  http,
   parseEventLogs,
   TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
   type Address,
   type Chain,
   type Hex,
   type Log,
   type PublicClient,
+  type TransactionReceipt,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import {
@@ -37,9 +39,14 @@ import {
   checkMatchParams,
   hashState,
   isGameOver,
+  isInsufficientFundsError,
+  isRangeRefusal,
+  isRateLimited,
   mover,
   offerId as computeOfferId,
   outcome,
+  rpcErrorSummary,
+  rpcTransport,
   signAcceptance,
   signOffer,
   verifyOffer,
@@ -58,15 +65,19 @@ import {
   autoReturnSecondsOf,
   isCanonicalId,
   minChallengeTimeoutOf,
+  feeCeilingOf,
+  pinnedDeploymentRefusals,
   sessionGasFloorOf,
   DEFAULT_LOG_CHUNK_BLOCKS,
   type ArenaConfig,
 } from "./config.js";
+import { chainProfile, weiToUsdc6Up, type ChainProfile } from "./chains.js";
 import { FileSessionStore } from "./fileStore.js";
-import { formatUsdc6 } from "./funding.js";
+import { readJson, writeJsonAtomic } from "./jsonfile.js";
+import { FUND_TX_GAS_UNITS, formatUsdc6, oneBalanceOpenNeed } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
-import { buildStatus, type ChannelStatus } from "./status.js";
+import { buildStatus, type ChannelStatus, type SessionGasLowCause } from "./status.js";
 import { selfCommand } from "./version.js";
 
 export type Actor = "agent" | "human";
@@ -75,6 +86,8 @@ export class DaemonError extends Error {
   constructor(
     readonly code: number,
     message: string,
+    /** Final fix wave B (I-1): the transactions a failed withdraw may have sent, answered as the body's `hashes`. */
+    readonly hashes?: Hex[],
   ) {
     super(message);
     this.name = "DaemonError";
@@ -86,10 +99,41 @@ export class DaemonError extends Error {
  *  refill's failed fee estimate surfacing as some other, harder-to-classify error shape from deep inside the
  *  sender's own send path. */
 export class SessionGasEstimateError extends Error {
-  constructor(cause?: unknown) {
-    super(`fee estimate failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  /** Plan 6 Task 2: `what` is `"gas"` when the top-up's own `estimateGas` failed -- the top-up is then not sent at
+   *  all, never with a guessed gas limit. */
+  constructor(cause?: unknown, what: "fee" | "gas" = "fee") {
+    super(`${what} estimate failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     this.name = "SessionGasEstimateError";
   }
+}
+
+/** Plan 6 Task 2 (audit-daemon I-1): a session-key top-up was mined but reverted -- nothing reached the key. It is
+ *  never counted as a refill: the refill raises `session-gas-low` and backs off, and `fund()` backs off funding,
+ *  so a top-up that keeps reverting is not re-sent (and paid for) on every pass. */
+export class TopUpRevertedError extends Error {
+  constructor(readonly hash: Hex) {
+    super(`the session-key top-up ${hash} was mined but reverted: nothing reached the key`);
+    this.name = "TopUpRevertedError";
+  }
+}
+
+/** Plan 6 Task 2 (spec §2.2): a session-key top-up's gas limit is the node's estimate plus 20 % (rounded up) plus
+ *  5,000. A value transfer costs 21,000 on Arc today (arc-facts.md, corrected 2026-10-24) -- this is hardening, and
+ *  the gas a transaction does not use is refunded. */
+export const TOP_UP_GAS_MARGIN_PERCENT = 20n;
+export const TOP_UP_GAS_MARGIN_FIXED = 5_000n;
+export function topUpGasLimit(estimate: bigint): bigint {
+  return estimate + (estimate * TOP_UP_GAS_MARGIN_PERCENT + 99n) / 100n + TOP_UP_GAS_MARGIN_FIXED;
+}
+
+/** H1 (Task 2 review Minor-2): the `session-gas-low` cause of a refill error that raises it at once (see
+ *  `SessionGasLowCause`), or null for a transient one (logged, counted toward `REFILL_TRANSIENT_FAILURES_ALERT`). */
+export function refillFailureCause(err: unknown): SessionGasLowCause | null {
+  if (err instanceof TxInsufficientFundsError) return { kind: "funds" };
+  if (err instanceof TxFeeCapError) return { kind: "fee-cap" };
+  if (err instanceof SessionGasEstimateError) return { kind: "estimate" };
+  if (err instanceof TopUpRevertedError) return { kind: "reverted", txHash: err.hash };
+  return null;
 }
 
 /** Final fix wave (M4): a chain read a sweep attempt makes before it sends anything (the on-chain settled check,
@@ -100,6 +144,37 @@ export class SweepReadError extends Error {
     super(`a read failed before anything was sent: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
     this.name = "SweepReadError";
   }
+}
+
+/** H3 (Arc testnet rehearsal §8.4): a sweep may have gone out, and then could not be confirmed in a way that says
+ *  nothing about the transaction itself -- a rate-limited receipt read, a failed replacement send, or (fix round 1,
+ *  review M2) a send whose response was lost. `hashes`, the sweep's own transaction and every replacement of it, may
+ *  still land (or have landed): the next attempt checks them before it reads the key's balance, so a landed sweep is
+ *  never recorded as `"dust"`. */
+export class SweepWaitError extends Error {
+  constructor(
+    readonly hashes: Hex[],
+    cause: unknown,
+  ) {
+    super(`sweep ${hashes.at(-1)} may have gone out, but could not be confirmed: ${cause instanceof Error ? cause.message.split("\n")[0] : String(cause)}`, { cause });
+    this.name = "SweepWaitError";
+  }
+}
+
+/** H3 fix round 1 (review M4): what an action adds to the status its route answers with -- `unconfirmed` when its
+ *  transaction was mined but its receipt could not be read (the status then carries `chainStale`). */
+export type ActionOutcome = { unconfirmed?: string };
+
+/** H3 fix round 1 (review M4): a `TxReceiptMissingError` -- the node reports the transaction mined, its receipt
+ *  unreadable -- is an action that went through, unconfirmed; any other error is rethrown. */
+function minedUnconfirmed(what: string, err: unknown): ActionOutcome {
+  if (!(err instanceof TxReceiptMissingError)) throw err;
+  // Fix round 2 (re-review M-e): mined is not succeeded -- a race the simulate did not see can revert it.
+  return {
+    unconfirmed:
+      `the ${what} transaction ${err.hash} was mined (block ${err.blockNumber}), but its receipt could not be read: ` +
+      "whether it succeeded is not known yet; check status",
+  };
 }
 
 export type ChainView = {
@@ -167,6 +242,23 @@ export type ChannelHandle = {
   /** Final review C1: `wait()` has already woken for the current `sessionGasLow` episode (so it does not return at
    *  once on every call while the wallet stays empty). */
   sessionGasLowWoken: boolean;
+  /** H1 (Task 2 review Minor-2, audit-daemon M-5): what kind of failure `sessionGasLow` reports -- the status action
+   *  names its remedy from it. Null with `sessionGasLow`. */
+  sessionGasLowCause: SessionGasLowCause | null;
+  /** H1 (audit-daemon M-5): refills in a row that failed in transit (dropped, stuck, no receipt, a nonce race). At
+   *  `REFILL_TRANSIENT_FAILURES_ALERT` the channel raises `session-gas-low` (cause `failing`). 0 after any refill
+   *  that goes through, or a key already at its floor. */
+  refillTransientFailures: number;
+  /** H1 (audit-daemon M-8, Task 2 review Minor-2): set while the refill back-off episode was caused by the wallet's
+   *  own balance (`TxInsufficientFundsError`): the wallet balance that covers the refill (its value plus its gas at
+   *  the wallet's fee ceiling). Only then does a rise in the wallet's balance end the back-off early, and only a rise
+   *  to at least this. Null for every other cause -- a reverted top-up, a fee cap, a failed estimate, a send lost in
+   *  transit -- which funding the wallet does not fix. */
+  refillNeedWei: bigint | null;
+  /** H3 (Arc testnet rehearsal §8.2): wall-clock ms before which `ensureSessionGas` does not read the session key's
+   *  balance again after that read failed (0 = now), and the back-off it waited last (0 = no episode). */
+  gasCheckRetryAt: number;
+  gasCheckBackoffMs: number;
   /** Final review m4: this channel settled (Finalized or Reclaimed) while this daemon watched it, and no `wait()` has
    *  woken for it yet: drives the one-shot `settled` attention. */
   settledWake: boolean;
@@ -184,6 +276,19 @@ export type ChannelHandle = {
   /** Plan 5.7 (K3): the highest XMTP drop count seen for this channel, so its status keeps it once the relay has
    *  forgotten the channel (at finalization). */
   xmtpDropped?: number;
+  /** H1 ("oversized events"): the one block whose dispute events the RPC refused on consecutive scans while it was up,
+   *  and how many scans in a row -- skipped at `UNREADABLE_BLOCK_PASSES` (see `skipUnreadableBlock`). In memory. */
+  unreadableBlock: { block: bigint; tries: number } | null;
+  /** H1: wall-clock ms before which `retrySkippedEventBlock` does not re-read a skipped block. 0 = now. */
+  skippedRetryAt: number;
+  /** H1 fix round 1 (review m-1): which skipped block `retrySkippedEventBlock` tries next (rotating). */
+  skippedRetryIndex: number;
+  /** H1 fix round 1 (review I-1): set while the channel is Challenged on a registered state newer than this session's
+   *  latest -- its event not (yet) ingested. `passes` counts dispute passes that found it; `raised` once the
+   *  `challenge-unseen` attention is up. Keyed by the challenge (its deadline and registered turn). */
+  unseenRegistered: { key: string; turn: bigint; deadline: bigint; passes: number; raised: boolean } | null;
+  /** H1 fix round 1: `wait()` has already woken for this `challenge-unseen` (keyed like `unseenRegistered`). */
+  challengeUnseenWoken: string | null;
 };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
@@ -219,6 +324,8 @@ type SweepBackoff = {
   pendingTx?: Hex[];
   /** Final fix wave (M3): how many probes of `pendingTx` in a row found it still pending. */
   pendingProbes?: number;
+  /** H1 (audit-daemon M-4): how many probes of `pendingTx` in a row found it mined with no receipt to read. */
+  receiptlessProbes?: number;
 };
 
 /** Plan 5 fix round: what one sweep attempt on a session key resolved to. `"skipped"` covers every reason the
@@ -236,6 +343,26 @@ type SweepAttemptResult =
  *  narrowed by TypeScript against the first check -- `l.record`/`queued.record` really can change in between. */
 function isSweptDone(swept: ChannelRecord["swept"]): boolean {
   return swept === true || swept === "dust";
+}
+
+/** H1 ("oversized events"): `ranges` with every block in `skip` left out, each range split around it; in order. */
+export function withoutBlocks(
+  ranges: Array<{ fromBlock: bigint; toBlock: bigint }>,
+  skip: readonly bigint[],
+): Array<{ fromBlock: bigint; toBlock: bigint }> {
+  if (skip.length === 0) return ranges;
+  const sorted = [...new Set(skip)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const out: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+  for (const r of ranges) {
+    let from = r.fromBlock;
+    for (const b of sorted) {
+      if (b < from || b > r.toBlock) continue;
+      if (b > from) out.push({ fromBlock: from, toBlock: b - 1n });
+      from = b + 1n;
+    }
+    if (from <= r.toBlock) out.push({ fromBlock: from, toBlock: r.toBlock });
+  }
+  return out;
 }
 
 /** Fix round 3, M-4: a fresh `ChannelRecord` with `swept: true`, `sweptAmount`/`sweptTx` set to this sweep (kept
@@ -315,10 +442,29 @@ const errorText = (err: unknown) => (err instanceof Error ? err.message.split("\
  */
 export const DISPUTE_RESCAN_BLOCKS = 32n;
 
+/** H1 (audit-contracts I1, "oversized events"): the most `getLogs` reads one dispute scan of one channel makes -- its
+ *  chunks plus the halves of any range the RPC refused (each split adds one read). */
+export const DISPUTE_SCAN_READS_PER_PASS = 64;
+
+/** H1 fix round 1 (review I-1): a registered state newer than this session's latest is left to the scan for this
+ *  many dispute passes -- after any opponent move by challenge it is, for a pass or two, until the event is ingested
+ *  -- before the daemon adopts it from storage or raises `challenge-unseen`. At once when a block was skipped. */
+export const UNSEEN_REGISTERED_PASSES = 3;
+
+/** H1: a single block whose dispute events for a channel the RPC refuses on this many passes in a row, while it
+ *  serves the same query for no channel, is skipped (see `skipUnreadableBlock`). */
+export const UNREADABLE_BLOCK_PASSES = 3;
+
 /** The furthest out a funding deadline may be set from match time (`checkMatchParams`' `maxFundingWindow`): an
  *  offer this long past its expiry can no longer produce a fundable match. Distinct from, and must stay well
  *  under, the SDK's `MAX_FUNDING_WINDOW` (86400n): the hub's own hard cap on `fundingDeadline`. */
 export const MAX_FUNDING_WINDOW = 7200n;
+
+/** How long an offer stays matchable by default: its signed `expiresAt` is chain time at posting plus this. The most
+ *  `offer --ttl` may ask for, too. */
+export const OFFER_TTL_SECONDS = 3600n;
+/** H1 (`offer --ttl`): the shortest offer lifetime `createOffer` accepts. */
+export const MIN_OFFER_TTL_SECONDS = 60n;
 
 /** Task 2 (spec §13): once `fund()` reverts for one of these reasons, `watch()` backs off funding this channel
  *  for at least this many seconds of chain time, instead of retrying the same revert on every tick. */
@@ -327,6 +473,12 @@ export const FUND_BACKOFF_SECONDS = 30n;
 /** Plan 4.5 Task 10 review: after a cooperative-close submission reverts, the watchtower waits this long before
  *  retrying it (the close API and the relay path still submit at once). */
 export const CLOSE_RETRY_BACKOFF_MS = 30_000;
+
+/** H1 (audit-daemon M-11): when the opponent's Close signature completes a close on this side (the relay path), the
+ *  watchtower submits it no sooner than this, plus up to `CLOSE_RELAY_JITTER_MS` -- the opponent, who signed second,
+ *  submits it at once, and two submissions race (the loser's transaction reverts on-chain). */
+export const CLOSE_RELAY_DEFER_MS = 2_000;
+export const CLOSE_RELAY_JITTER_MS = 3_000;
 
 /** Plan 4.5 Task 10 round 4: how long the reclaim API waits for the main pass to release a channel before it
  *  answers 409 (the main pass may be in a bounded receipt wait on that channel). */
@@ -342,11 +494,47 @@ export const SETTLED_GRACE_SECONDS = 600n;
  *  from disk (`status`), and no longer listed by `channels()`. */
 export const SETTLED_CACHE_MAX = 1000;
 
+/** H1 (audit-daemon M-5): after this many refills in a row fail in transit -- each one logged and retried as
+ *  transient -- the channel raises `session-gas-low` (cause `failing`), so the agent is told. On Arc, a top-up from
+ *  or to a blocklisted address is included without a receipt, so it never fails any other way. */
+export const REFILL_TRANSIENT_FAILURES_ALERT = 3;
+
 /** Plan 5 Task 1 (mainnet gates: refill and sweep back-off): the first back-off, in wall-clock ms, after a failed
  *  refill or sweep -- doubled on each further failure, up to `BACKOFF_MAX_MS`. */
 export const BACKOFF_START_MS = 30_000;
 /** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
 export const BACKOFF_MAX_MS = 300_000;
+
+/** H3 fix round 1 (review M8): the daemon's per-attempt RPC timeout (viem's default is 10 s). */
+export const DAEMON_RPC_TIMEOUT_MS = 5_000;
+
+/** H3 fix round 2 (re-review I-a): the most one request on the daemon's client takes, every attempt and back-off
+ *  included (`rpcTransport`'s `totalTimeoutMs`). A respond makes about 11 requests one after another before its send
+ *  (`h3-ratelimit.test.ts` counts them), and the send is one attempt of at most 10 s: 11 x 20 s + 10 s = 230 s, inside
+ *  `autoReturnSecondsOf` (300 s at the 900 s default window). Before, a request could take 6 x 5 s + 15.5 s = 45.5 s,
+ *  about 510 s for the respond. A plain rate limit still gets its full 15.5 s back-off (6 attempts). With a
+ *  `Retry-After` (honoured up to 4 s a retry), the cap leaves 5 attempts and 16 s of waiting (final fix wave B, m-12). */
+export const DAEMON_RPC_TOTAL_TIMEOUT_MS = 20_000;
+
+/** H3 fix round 2 (re-review M-g): a respond is not sent at or after its give-up time plus this. Why it never holds back
+ *  a respond that can still land: the give-up time is the read time plus (deadline - the latest block's timestamp),
+ *  and that block is no newer than the chain's clock at the read, so the give-up time is no earlier than the last
+ *  moment a block could still take the respond (the hub needs `block.timestamp < deadline`). A send past it could
+ *  only revert, paying gas. Final fix wave B (m-6, h3 M-h): 15 s, not 3 s -- the costs are lopsided: a respond held
+ *  back that would have landed forfeits the game, and one sent too late costs about 200k gas x 40 gwei = 0.008 USDC.
+ *  The margin covers Arc's 1 s timestamps, a proposer clock running ahead, and this machine's wall clock (`giveUpAt`
+ *  and the sender's `notAfter` are both `Date.now()`) stepping forward by up to 15 s between the read and the send; a
+ *  larger step is out of the model. Measuring both on a monotonic clock is the follow-up (both at once, or they
+ *  disagree). */
+export const RESPOND_SEND_MARGIN_MS = 15_000;
+
+/** H3 (Arc testnet rehearsal §8.2): after a failed read of a session key's balance, the session-gas check waits this
+ *  long (wall-clock ms) before it reads again -- doubled on each further failure, up to `GAS_CHECK_BACKOFF_MAX_MS`.
+ *  Before, it re-read on every pass, from three call sites per pass: 208 failures in 24 minutes from two daemons on
+ *  a rate-limited RPC, every one of them adding to the load that limited it. */
+export const GAS_CHECK_BACKOFF_START_MS = 5_000;
+/** H3: the session-gas check's back-off never grows past this. A refill is at most this late. */
+export const GAS_CHECK_BACKOFF_MAX_MS = 60_000;
 
 /** Plan 5 fix round (I8): after this many failed sweep attempts (the back-off has long since reached its cap by
  *  then), the channel's session gas is written off -- `swept: "abandoned"` -- so eviction can proceed instead of
@@ -398,14 +586,33 @@ export const MAX_MATCH_RETRIES = 20;
  *  as opposed to a bug or an unrelated chain error. */
 const LIMIT_REVERTS = new Set(["Paused", "DepositTooLarge", "EscrowCapReached"]);
 
+/** Plan 6: what `withdrawReserve` is computed from. */
+export type WithdrawReserveInput = {
+  /** The chain's built-in profile (`chainProfile(config.chainId)`); undefined for a chain without one. */
+  profile: ChainProfile | undefined;
+  /** This daemon's channels that are not finalized: each one's session key may still need a refill. */
+  unsettledChannels: number;
+  sessionGasWei: bigint;
+  /** The wallet sender's fee ceiling per gas (`SerialTxSender.feeCeiling`). */
+  feeCeilingWei: bigint;
+};
+
 /**
- * Plan 5.6 Task 3 (spec §4.4): the USDC `withdraw()` always leaves in the wallet. 0 on every chain this daemon runs
- * on today, whose gas is native, so `withdraw --all` empties the wallet's USDC.
- * Plan 6: Arc USDC-gas reserve -- on Arc, gas is paid in USDC, and live channels' session keys are refilled from
- * this wallet (`ensureSessionGas`), so a reserve for those refills belongs here.
+ * Plan 5.6 Task 3 (spec §4.4): the USDC (6 decimals) `withdraw()` always leaves in the wallet.
+ * - **0** with no input, or on a chain whose gas is native (no profile, or one without `nativeIsUsdc`):
+ *   `withdraw --all` empties the wallet's USDC, as before.
+ * - Plan 6 (spec §2.1, Review Focus 1): on a `nativeIsUsdc` chain (Arc), gas is paid from the same USDC balance,
+ *   and every unsettled channel's session key is refilled from this wallet (`ensureSessionGas`). So the reserve is
+ *   `unsettledChannels x sessionGasWei + FUND_TX_GAS_UNITS x feeCeilingWei` (wei), converted to 6 decimals rounded
+ *   UP: a full refill per channel, so `withdraw --all` never strands a channel's dispute gas, plus the wallet's own
+ *   transactions, the withdraw itself included.
  */
-export function withdrawReserve(): bigint {
-  return 0n;
+export function withdrawReserve(input?: WithdrawReserveInput): bigint {
+  if (input === undefined || input.profile?.nativeIsUsdc !== true) return 0n;
+  if (input.unsettledChannels < 0 || !Number.isInteger(input.unsettledChannels)) {
+    throw new RangeError("unsettledChannels must be a non-negative integer");
+  }
+  return weiToUsdc6Up(BigInt(input.unsettledChannels) * input.sessionGasWei + FUND_TX_GAS_UNITS * input.feeCeilingWei);
 }
 
 /**
@@ -421,6 +628,59 @@ export function confirmsTransfer(logs: Log[], t: { token: Address; from: Address
     (l) => same(l.address, t.token) && same(l.args.from, t.from) && same(l.args.to, t.to) && l.args.value === t.amount,
   );
 }
+
+/**
+ * H1 (audit-daemon M-6): what `withdraw()` reports when its transfer's receipt wait ended without a receipt. Each
+ * of these leaves the transfer possibly landed, so it is a 502 naming every hash sent, with the same "check it
+ * before retrying" as an unconfirmed transfer -- never a bare 500, which reads as "nothing happened" and invites a
+ * second `--amount X` that pays the owner twice if the first one landed:
+ * - `TxReceiptMissingError`: the node reports it mined; its nonce is used, so a retry is a fresh, second transfer.
+ * - `TxStuckError` / `TxDroppedError`: still pending, or no longer known to this node; a retry replaces it at the
+ *   same nonce (at most one of the two lands), but it may land first.
+ * - `TxWaitAbortedError`: the daemon is stopping (503); the transaction may still land.
+ * Final fix wave B (I-1): any other error, when `sent` -- the transactions this wallet's sender started tracking
+ * during the withdraw -- is not empty: the transfer went out (or may have) and its wait failed for a reason that
+ * says nothing about it (a rate-limited or timed-out receipt read, a 5xx). A 502 naming them, never H3's 503 "retry".
+ * An error with nothing sent happened before the send, and is returned unchanged. Every 502 and 503 here carries its
+ * hashes (`DaemonError.hashes`), and `withdraw()` holds the next withdraw back until they are resolved.
+ */
+export function withdrawWaitError(err: unknown, amount: bigint, owner: Address, sent: Hex[] = []): unknown {
+  const what = `the transfer of ${formatUsdc6(amount)} USDC to ${owner}`;
+  const check = `check the owner's balance, an explorer or "${selfCommand()} wallet" before retrying: a retry can pay the owner twice`;
+  const all = (hashes: Hex[]) => [...new Set([...hashes, ...sent])];
+  if (err instanceof TxReceiptMissingError) {
+    const hashes = all([err.hash]);
+    return new DaemonError(502, `${what} was mined (tx ${err.hash}, block ${err.blockNumber}) but its receipt could not be read; ${check}`, hashes);
+  }
+  if (err instanceof TxStuckError) {
+    const hashes = all(err.hashes);
+    return new DaemonError(502, `${what} is still pending (tx ${hashes.join(", ")}); it may still land: ${check}`, hashes);
+  }
+  if (err instanceof TxDroppedError) {
+    const hashes = all([err.hash]);
+    return new DaemonError(502, `${what} (tx ${hashes.join(", ")}) is no longer known to the RPC and was not seen mined; it may still land: ${check}`, hashes);
+  }
+  if (err instanceof TxWaitAbortedError) {
+    const hashes = all(err.hashes);
+    return new DaemonError(503, `the daemon is stopping: ${what} (tx ${hashes.join(", ")}) was sent and may still land; ${check}`, hashes);
+  }
+  if (sent.length > 0) {
+    const why = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
+    return new DaemonError(502, `${what} may have been sent (tx ${sent.join(", ")}), but could not be confirmed (${why}); ${check}`, sent);
+  }
+  return err;
+}
+
+/** Final fix wave B (I-1): how long, in wall-clock ms after it was sent, a withdraw that may have gone out unconfirmed
+ *  (`PendingWithdraw`) holds back the next one -- unless that one is resolved first. Persisted, so a fresh in-process
+ *  daemon (`arena withdraw` with no daemon running) holds back too. After it, the next send from this wallet replaces
+ *  a transfer still pending at its nonce (the sender adopts a pending nonce it did not send, on an RPC whose pending
+ *  count shows it), so at most one of the two lands. */
+export const WITHDRAW_UNCONFIRMED_HOLD_MS = 10 * 60_000;
+
+/** Final fix wave B (I-1): `<home>/withdraw-pending.json` -- a withdraw answered 502/503 with its `hashes`. Each tx's
+ *  `nonce` is the wallet nonce it was sent at, when known. */
+export type PendingWithdraw = { to: Address; amount: bigint; at: number; txs: Array<{ hash: Hex; nonce?: number }> };
 
 /** Plan 5 Task 2 fix round, minor 4: the longest handoff note `handoff()` accepts. A note is untrusted text the
  *  board renders for a human (Global Constraints); an unbounded one is a denial-of-service/UI surface, not just
@@ -524,17 +784,36 @@ export class ArenaDaemon {
       nativeCurrency: { name: "Native", symbol: "NATIVE", decimals: 18 },
       rpcUrls: { default: { http: [c.rpcUrl] } },
     });
-    this.client = createPublicClient({ chain: this.chain, transport: http(c.rpcUrl) });
+    // H3: a rate-limited read is retried with back-off (`rpcTransport`; Arc testnet rehearsal §8.2). Sends never are.
+    // Fix round 1 (review M8): a per-attempt timeout of DAEMON_RPC_TIMEOUT_MS; fix round 2 (re-review I-a): and at most
+    // DAEMON_RPC_TOTAL_TIMEOUT_MS per request, retries included.
+    this.client = createPublicClient({
+      chain: this.chain,
+      transport: rpcTransport(c.rpcUrl, { timeout: DAEMON_RPC_TIMEOUT_MS, totalTimeoutMs: DAEMON_RPC_TOTAL_TIMEOUT_MS }),
+    });
     // Plan 4.5 Task 10 re-review 2: stop() aborts every receipt wait in flight (rather than waiting out a 30 s round).
     this.hub = new HubClient(c.hub, this.client, { signal: this.aborter.signal });
     // Tracking senders (Plan 4.5 Task 10 round 4): each manages its key's nonces, read via this.client.
     // Round 4: every fee the wallet pays is capped at max(4 x the node's estimate, feeCeilingWei) and what it can pay.
+    // Plan 6 (spec §2.3, §2.4): on a chain with a profile, the ceiling defaults to the profile's (`feeCeilingOf`), and
+    // every fee is at least the chain's floor -- under it, Arc drops the transaction without a word.
     this.wallet = new SerialTxSender(new LocalKeyTxSender(opts.walletKey, c.rpcUrl, this.chain), this.client, {
-      feeCeiling: c.feeCeilingWei,
+      feeCeiling: feeCeilingOf(c),
+      minFeePerGas: chainProfile(c.chainId)?.minFeePerGas,
     });
     this.domain = { chainId: c.chainId, hub: c.hub };
     this.records = new RecordStore(opts.home);
     this.changes.setMaxListeners(0);
+  }
+
+  /** A tracking sender for one channel's session key. Round 5: dispute transactions are never refused by a fee
+   *  ceiling -- only what the key can pay (its balance) bounds them; the wallet keeps the configured ceiling. Plan 6
+   *  (spec §2.3): but never under the chain profile's fee floor, which a key that cannot pay it is refused at. */
+  private sessionSenderFor(sessionKey: Hex): SerialTxSender {
+    return new SerialTxSender(new LocalKeyTxSender(sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
+      feeCeiling: NO_FEE_CEILING,
+      minFeePerGas: chainProfile(this.opts.config.chainId)?.minFeePerGas,
+    });
   }
 
   /** Plan 5.7 (spec §2): whether this daemon's relay falls back to XMTP -- the start line's `fallback`. */
@@ -555,6 +834,25 @@ export class ArenaDaemon {
    *  its receipt waits for good -- so a restart creates a new ArenaDaemon on the same home. */
   async start(): Promise<void> {
     if (this.stopped) throw new Error("a stopped ArenaDaemon cannot be restarted: create a new one on the same home");
+    // Plan 6 fix round 1 (m-1, spec §2.5): `init` refuses a non-pinned USDC, hub or rules on a chain with a profile,
+    // but config.json can be edited by hand, or written before the chain's deployment was pinned. Re-checked here,
+    // before anything subscribes or reads the chain: on such a chain this daemon deposits only to the pinned hub.
+    // Final fix wave B (I-2): `--detach`, `withdraw` and `bot` show this to the agent, so it is the human's to act on.
+    // The likely cause is a CLI release that pinned a newer hub, not a hand edit: restoring the pinned addresses would
+    // read this home's channels on the wrong hub (and retire them), and a fresh home would leave this wallet's funds
+    // behind. The release that set the home up can still settle and withdraw.
+    const c = this.opts.config;
+    const pinned = pinnedDeploymentRefusals(c.chainId, { hub: c.hub, rules: c.rules, usdc: c.usdc });
+    if (pinned.length > 0) {
+      const name = chainProfile(c.chainId)?.name ?? `chain ${c.chainId}`;
+      throw new Error(
+        `refusing to start on ${name} (chain ${c.chainId}): ${arenaPaths(this.opts.home).config} names contracts this CLI does ` +
+          `not accept there: ${pinned.join("; ")}. Tell your human: this daemon's config names contracts the CLI does not ` +
+          `pin for chain ${c.chainId} (most likely this home was set up by another CLI release); they decide what happens ` +
+          "next. Do not edit config.json yourself, and do not start a new ARENA_HOME while a channel of this one is " +
+          "unsettled: the CLI release that set it up can still settle its channels and withdraw (withdraw needs this daemon too)",
+      );
+    }
     this.unsubscribers.push(this.opts.lobby.onMatch((m) => this.fireAndForget("onMatch", this.onMatch(m))));
     this.unsubscribers.push(this.opts.relay.onMessage((m) => this.fireAndForget("onRelay", this.onRelay(m))));
     this.unsubscribers.push(this.opts.relay.onJoined((id) => this.fireAndForget("onJoined", this.onJoined(id))));
@@ -627,9 +925,7 @@ export class ArenaDaemon {
       if (record.swept !== undefined) continue;
       this.sweepQueue.set(record.channelId, {
         record,
-        sender: new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
-          feeCeiling: NO_FEE_CEILING,
-        }),
+        sender: this.sessionSenderFor(record.sessionKey),
         // Final fix wave (M5): a sweep transaction the last run gave up on is checked first.
         sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
         busy: false,
@@ -735,31 +1031,66 @@ export class ArenaDaemon {
           `${awaiting.reasons.join("; ")} -- a withdraw now could leave it without the USDC to deposit. Retry once it is ` +
             "funded, or once its funding window has closed" +
             // Fix round 4 (N3): a retried match that keeps failing holds withdraws up until MAX_MATCH_RETRIES drops it.
-            (awaiting.retriedMatches > 0 ? ". If this persists, restart the daemon." : ""),
+            // Final fix wave B (m-5): `daemon stop` refuses while a channel is live, so the restart waits for that.
+            (awaiting.retriedMatches > 0 ? ". If this persists, restart the daemon once no channel is live (otherwise tell your human)." : ""),
         );
       }
 
       const usdc = this.opts.config.usdc;
+      await this.resolvePendingWithdraw(usdc);
       const balance = await this.usdcBalance(usdc);
-      const reserve = withdrawReserve();
+      // Plan 6 (spec §2.1, Review Focus 1): 0 on a native-gas chain; on Arc, the USDC gas every unsettled channel and
+      // this wallet's own transactions may still need.
+      const profile = chainProfile(this.opts.config.chainId);
+      const unsettledChannels = profile?.nativeIsUsdc === true ? this.unsettledChannelCount() : 0;
+      const reserve = withdrawReserve({
+        profile,
+        unsettledChannels,
+        sessionGasWei: this.opts.config.sessionGasWei,
+        feeCeilingWei: this.wallet.feeCeiling,
+      });
       const withdrawable = balance > reserve ? balance - reserve : 0n;
       const amount = "all" in req ? withdrawable : req.amount;
       const closeFirst =
         `funds escrowed in channels are not in the wallet: close open channels first (${selfCommand()} close), then withdraw`;
-      if (amount <= 0n) throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC; ${closeFirst}`);
+      // Only when there is a reserve: on every other chain, these messages are exactly as before.
+      const reserveNote =
+        reserve > 0n
+          ? ` -- ${formatUsdc6(reserve)} USDC of it is the gas reserve, which always stays in the wallet: gas on ` +
+            `${profile?.name ?? `chain ${this.opts.config.chainId}`} is paid in USDC, for the session gas of ${unsettledChannels} ` +
+            "unsettled channel(s) and this wallet's own transactions"
+          : "";
+      if (amount <= 0n) {
+        throw new DaemonError(400, `nothing to withdraw: this wallet holds ${formatUsdc6(balance)} USDC${reserveNote}; ${closeFirst}`);
+      }
       if (amount > withdrawable) {
         throw new DaemonError(
           400,
-          `${formatUsdc6(amount)} USDC is more than this wallet can withdraw (${formatUsdc6(withdrawable)} USDC); ${closeFirst}`,
+          `${formatUsdc6(amount)} USDC is more than this wallet can withdraw (${formatUsdc6(withdrawable)} USDC)${reserveNote}; ${closeFirst}`,
         );
       }
       if (this.stopped) throw new DaemonError(503, "the daemon is stopping");
+      // Final fix wave B (I-1), as the sweep does: every hash the wallet's sender already tracks, so a failed wait
+      // below names only what was sent during this withdraw. A raw failure of the wait (a rate-limited receipt read)
+      // releases the transfer's entry, hash kept; a refill or deposit sent meanwhile is named too, which errs safe.
+      const earlier = new Set(this.wallet.tracked().flatMap((t) => t.hashes));
       let receipt: Awaited<ReturnType<HubClient["transfer"]>>;
       try {
         receipt = await this.hub.transfer(this.wallet, usdc, owner, amount);
       } catch (err) {
         if (err instanceof HubRevertError) throw new DaemonError(409, `the USDC transfer to ${owner} was refused: ${err.message}`);
-        throw err;
+        const nonces = new Map<Hex, number>();
+        for (const t of this.wallet.tracked()) for (const h of t.hashes) if (!earlier.has(h)) nonces.set(h, t.nonce);
+        const mapped = withdrawWaitError(err, amount, owner, [...nonces.keys()]);
+        if (mapped instanceof DaemonError && mapped.hashes !== undefined) {
+          const typedNonce = (err as { nonce?: unknown }).nonce;
+          const txs = mapped.hashes.map((hash) => {
+            const nonce = nonces.get(hash) ?? (typeof typedNonce === "number" ? typedNonce : undefined);
+            return nonce !== undefined ? { hash, nonce } : { hash };
+          });
+          this.savePendingWithdraw({ to: owner, amount, at: Date.now(), txs });
+        }
+        throw mapped;
       }
       const txHash = receipt.transactionHash;
       // Task 3 fix round 4 (N4, N5; spec §4.4): a mined, successful transfer is not proof the money moved -- a token
@@ -767,7 +1098,7 @@ export class ArenaDaemon {
       // Transfer(wallet -> owner, amount) log from the configured USDC, never a balance delta: a same-block inflow (a
       // settlement payout, a top-up) or, on Arc, USDC gas skews those both ways (fix round 1's M3 check, replaced).
       if (!confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: owner, amount })) {
-        throw new DaemonError(502, `could not confirm the transfer in tx ${txHash}; check it before retrying`);
+        throw new DaemonError(502, `could not confirm the transfer in tx ${txHash}; check it before retrying`, [txHash]);
       }
       this.log(`withdrew ${formatUsdc6(amount)} USDC to the owner ${owner} (tx ${txHash})`);
       // For display only: the transfer is confirmed, so a read that fails now (an RPC blip) must not turn it into an
@@ -795,9 +1126,147 @@ export class ArenaDaemon {
     }
   }
 
+  /**
+   * Plan 6 (spec §2.1): the channels whose session keys this wallet may still have to refill -- every channel record
+   * that is not finalized, whether live or recorded on disk and not yet opened (degraded ones excluded: they are
+   * never watched). The same candidates `channelsAwaitingOwnDeposit` reads. Fix round 1 (I-5): `exclude` leaves out
+   * the channel being funded. Final fix wave B (m-11): one of three counts of "not settled", each erring safe -- `fund`
+   * (cli.ts) also counts degraded records (it asks for one more session gas each), and `daemon stop`
+   * (`liveChannelIds`) also counts degraded and unreadable ones (it refuses more often).
+   */
+  private unsettledChannelCount(exclude?: Hex): number {
+    const ids = new Set<Hex>();
+    for (const l of this.live.values()) if (!l.record.finalized) ids.add(l.record.channelId);
+    for (const r of this.records.channels()) {
+      if (!r.finalized && !this.degraded.has(r.channelId) && !this.live.has(r.channelId)) ids.add(r.channelId);
+    }
+    if (exclude !== undefined) ids.delete(exclude);
+    return ids.size;
+  }
+
   /** The wallet's USDC balance at the latest block. */
   private usdcBalance(usdc: Address): Promise<bigint> {
     return this.client.readContract({ address: usdc, abi: erc20Abi, functionName: "balanceOf", args: [this.wallet.address] });
+  }
+
+  /** Final fix wave B (I-1): records a withdraw that may have gone out unconfirmed. A failed write is logged: the
+   *  502 still names the hashes. */
+  private savePendingWithdraw(p: PendingWithdraw): void {
+    try {
+      writeJsonAtomic(arenaPaths(this.opts.home).withdrawPending, p);
+    } catch (err) {
+      this.log(`withdraw: could not record the unconfirmed transfer (tx ${p.txs.map((t) => t.hash).join(", ")}): ${errorText(err)}`);
+    }
+  }
+
+  /**
+   * Final fix wave B (I-1): before a withdraw sends anything, an earlier one that may have gone out unconfirmed
+   * (`PendingWithdraw`) is resolved from the chain:
+   * - one of its transactions mined with the Transfer to the owner: it landed. Cleared, and this withdraw is refused
+   *   (409), so a retry of it is never a second payment; the next withdraw goes ahead;
+   * - every one of them mined without that Transfer, or never mined while its nonce has been used by another one:
+   *   none can pay. Cleared, and this withdraw goes ahead;
+   * - mined with its receipt unreadable: refused (409), kept, whatever its age (re-review n-2): its nonce is used, so
+   *   a send would be a second transfer, and only a readable receipt (or the human) can say whether it paid;
+   * - otherwise (still pending, or unknown with its nonce free): refused (409), kept -- until the hold is over: then
+   *   cleared, and this withdraw goes ahead (its send replaces a transfer still pending at its nonce). A landed one is
+   *   reported whatever its age. Re-review n-1: "its nonce has been used" is concluded only after its receipt is read
+   *   once more, after the count -- it may be this very transfer, mined during the reads.
+   * A read that fails is a 503: retry shortly. An unreadable file is ignored (logged).
+   */
+  private async resolvePendingWithdraw(usdc: Address): Promise<void> {
+    const path = arenaPaths(this.opts.home).withdrawPending;
+    let p: PendingWithdraw | null;
+    try {
+      p = readJson<PendingWithdraw>(path);
+    } catch (err) {
+      this.log(`withdraw: ignoring an unreadable ${path}: ${errorText(err)}`);
+      return;
+    }
+    if (p === null) return;
+    const clear = () => rmSync(path, { force: true });
+    const ageMs = Date.now() - p.at;
+    const hashes = p.txs.map((t) => t.hash);
+    const what = `an earlier withdraw of ${formatUsdc6(p.amount)} USDC to ${p.to}`;
+    /** What the chain says of one recorded transaction now. */
+    const classify = async (hash: Hex): Promise<"paid-nothing" | "pending-or-unknown" | { mined: bigint }> => {
+      const receipt = await this.client.getTransactionReceipt({ hash }).catch((err: unknown) => {
+        if (err instanceof TransactionReceiptNotFoundError) return null;
+        throw err;
+      });
+      if (receipt !== null) {
+        const paid =
+          receipt.status === "success" && confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: p.to, amount: p.amount });
+        if (paid) {
+          clear();
+          throw new DaemonError(
+            409,
+            `${what} landed (tx ${hash}, block ${receipt.blockNumber}): the owner has been paid, so nothing was sent ` +
+              "now. Run withdraw again only to send more",
+            [hash],
+          );
+        }
+        return "paid-nothing"; // mined, and paid nothing: its nonce is used
+      }
+      const tx = await this.client.getTransaction({ hash }).catch((err: unknown) => {
+        if (err instanceof TransactionNotFoundError) return null;
+        throw err;
+      });
+      return tx !== null && tx.blockNumber !== null ? { mined: tx.blockNumber } : "pending-or-unknown";
+    };
+    /** Mined with its receipt unreadable: whether it paid is not known. Never released by the hold (re-review n-2). */
+    const mined: Array<{ hash: Hex; block: bigint }> = [];
+    /** Pending, or unknown with its nonce free: may still land. Released once the hold is over. */
+    const pending: Hex[] = [];
+    try {
+      let latest: number | undefined;
+      for (const t of p.txs) {
+        let c = await classify(t.hash);
+        if (c === "paid-nothing") continue;
+        if (c === "pending-or-unknown") {
+          latest ??= await this.client.getTransactionCount({ address: this.wallet.address, blockTag: "latest" });
+          if (t.nonce === undefined || latest <= t.nonce) {
+            pending.push(t.hash);
+            continue;
+          }
+          // Its nonce is used. Re-review n-1: by this very transfer, if it was mined after the reads above -- so it is
+          // read once more, after the count, before "it can never land" (as waitOrReplace re-checks before a drop).
+          c = await classify(t.hash);
+          if (c === "paid-nothing" || c === "pending-or-unknown") continue; // another transaction took its nonce
+        }
+        mined.push({ hash: t.hash, block: c.mined });
+      }
+    } catch (err) {
+      if (err instanceof DaemonError) throw err;
+      throw new DaemonError(
+        503,
+        `${what} (tx ${hashes.join(", ")}) may have been sent, and it could not be checked (${rpcErrorSummary(err)}): nothing ` +
+          "was sent now; retry in a few seconds",
+        hashes,
+      );
+    }
+    if (mined.length > 0) {
+      const which = mined.map((m) => `tx ${m.hash}, block ${m.block}`).join("; ");
+      throw new DaemonError(
+        409,
+        `${what} was mined (${which}), but its receipt cannot be read, so whether it paid the owner is not known: nothing ` +
+          `was sent now, and nothing is until its receipt can be read. Tell your human: check it on an explorer; if it ` +
+          `did not pay, they (never you) remove ${path} to withdraw again`,
+        mined.map((m) => m.hash),
+      );
+    }
+    if (pending.length === 0) return clear();
+    if (!(ageMs < WITHDRAW_UNCONFIRMED_HOLD_MS)) {
+      this.log(`withdraw: ${what} (tx ${pending.join(", ")}) is still not confirmed, past its hold: sending`);
+      return clear();
+    }
+    throw new DaemonError(
+      409,
+      `${what} was sent ${Math.round(ageMs / 1000)} s ago (tx ${pending.join(", ")}) and is not confirmed: it may still land, ` +
+        `so nothing was sent now. Check the owner's balance, an explorer or "${selfCommand()} wallet". The next withdraw says ` +
+        `so if it landed, and sends once it can no longer land, or ${WITHDRAW_UNCONFIRMED_HOLD_MS / 60_000} minutes after it was sent`,
+      pending,
+    );
   }
 
   /** The owner `withdraw()` pays, read from config.json now (never from `opts.config`, which is the config at
@@ -919,6 +1388,51 @@ export class ArenaDaemon {
     }
   }
 
+  /**
+   * Plan 6 fix round 1 (spec §2.1 as amended, audit-daemon I-5): on a `nativeIsUsdc` chain, deposits, top-ups and
+   * refills all draw on one USDC balance, so opening or funding a channel must leave the other unsettled channels'
+   * `withdrawReserve` in the wallet. Returns why this wallet cannot pay `deposit` + fee + `ownGasWei` of session gas on
+   * top of that reserve (`oneBalanceOpenNeed`), or null when it can -- and always null, with no chain read at all, on
+   * a chain whose gas is native. `exclude` is the channel being funded, which is not one of the "others". The balance
+   * is the ERC-20 `balanceOf`, the figure `withdraw()` uses (on Arc, the native balance rounded down).
+   */
+  private async openingShortfall(o: {
+    deposit: bigint;
+    feePerPlayer?: bigint;
+    ownGasWei: bigint;
+    exclude?: Hex;
+    /** Live run #2 (f)1: the gas this channel's own funding transactions already paid (`fund()` only). */
+    paidWei?: bigint;
+  }): Promise<string | null> {
+    const profile = chainProfile(this.opts.config.chainId);
+    if (profile?.nativeIsUsdc !== true) return null;
+    const feePerPlayer = o.feePerPlayer ?? (await this.hub.feeConfig()).feePerPlayer;
+    const others = this.unsettledChannelCount(o.exclude);
+    const gas = { sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling };
+    const need = oneBalanceOpenNeed({ deposit: o.deposit, feePerPlayer, ownGasWei: o.ownGasWei, otherChannels: others, ...gas, paidWei: o.paidWei });
+    const balance = await this.usdcBalance(this.opts.config.usdc);
+    if (balance >= need) return null;
+    const reserve = withdrawReserve({ profile, unsettledChannels: others, ...gas });
+    return (
+      `this wallet holds ${formatUsdc6(balance)} USDC, ${formatUsdc6(need - balance)} USDC short of the ${formatUsdc6(need)} USDC ` +
+      `this channel needs: its deposit of ${formatUsdc6(o.deposit)} USDC and fee of ${formatUsdc6(feePerPlayer)} USDC, its ` +
+      `session gas, and the ${formatUsdc6(reserve)} USDC gas reserve that always stays in the wallet (gas on ${profile.name} ` +
+      `is paid in USDC, for the session gas of ${others} other unsettled channel(s) and this wallet's own transactions)`
+    );
+  }
+
+  /** Plan 6 fix round 1 (I-5): `createOffer` and `acceptOffer` refuse (409) a channel this wallet could not fund
+   *  without spending the other channels' reserve -- so a matched channel never sits unfundable until its deadline. */
+  private async checkOpeningAffordable(deposit: bigint, what: "offer" | "accept"): Promise<void> {
+    const why = await this.openingShortfall({ deposit, ownGasWei: this.opts.config.sessionGasWei });
+    if (why !== null) {
+      throw new DaemonError(
+        409,
+        `cannot ${what === "offer" ? "post this offer" : "accept this offer"}: ${why}. Run "${selfCommand()} fund" for what to ask your human for`,
+      );
+    }
+  }
+
   /** Final review I4: refuses a `challengeTimeout` under this daemon's `minChallengeTimeout`. Missing a challenge
    *  deadline can cost more than one stake (the challenger may time out on an old state), and a daemon restart, an
    *  RPC outage or an agent that must move under a challenge can all take longer than the hub's 60 s minimum. */
@@ -932,7 +1446,12 @@ export class ArenaDaemon {
     }
   }
 
-  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout?: bigint }): Promise<{ offerId: Hex }> {
+  /**
+   * Posts an offer. H1 (ledger ruling, `offer --ttl`): `ttlSeconds` sets its signed `expiresAt` to chain time now plus
+   * it, between `MIN_OFFER_TTL_SECONDS` and `OFFER_TTL_SECONDS` (the default, unchanged) -- so an agent that waits a
+   * bounded time for a match can post an offer that cannot be matched after it has stopped waiting.
+   */
+  async createOffer(o: { deposit: bigint; stakePerGame: bigint; challengeTimeout?: bigint; ttlSeconds?: bigint }): Promise<{ offerId: Hex }> {
     // Plan 4.5 Task 11 fix round (C2): once the host has refused a subscribe, this connection's match delivery is
     // broken until restart -- a new offer would post fine (200) and then silently never learn of its match if it
     // is the offerer. Refuse up front instead of returning a false 200.
@@ -941,6 +1460,10 @@ export class ArenaDaemon {
     // matched channel can never sit unfundable while its deposit reverts on every tick.
     if (o.stakePerGame <= 0n) throw new DaemonError(400, "stakePerGame must be greater than 0");
     if (o.deposit < o.stakePerGame) throw new DaemonError(400, "deposit must be at least stakePerGame");
+    const ttl = o.ttlSeconds ?? OFFER_TTL_SECONDS;
+    if (ttl < MIN_OFFER_TTL_SECONDS || ttl > OFFER_TTL_SECONDS) {
+      throw new DaemonError(400, `ttl must be between ${MIN_OFFER_TTL_SECONDS} and ${OFFER_TTL_SECONDS} seconds (got ${ttl})`);
+    }
     // Plan 5 Task 1 (mainnet gates: offer default timeout): an omitted challengeTimeout takes this daemon's own
     // minChallengeTimeout -- always at or above the floor `checkChallengeTimeout` enforces just below, so this
     // daemon's own default offer is always accepted by itself and by any peer at the same floor.
@@ -951,6 +1474,8 @@ export class ArenaDaemon {
     }
     this.checkChallengeTimeout(challengeTimeout);
     await this.checkDepositAllowed(o.deposit, { escrow: true });
+    // Plan 6 fix round 1 (I-5): on a one-balance chain, never an offer whose channel would spend the others' reserve.
+    await this.checkOpeningAffordable(o.deposit, "offer");
     const sessionKey = generatePrivateKey();
     // R1 deviation (Task 7 review): expiresAt must be measured on the same clock `onMatch` checks it against
     // (the chain's block timestamp), not wall-clock Date.now() — a test (or a real deployment) that has moved
@@ -964,7 +1489,7 @@ export class ArenaDaemon {
       deposit: o.deposit,
       stakePerGame: o.stakePerGame,
       challengeTimeout,
-      expiresAt: chainNow + 3600n,
+      expiresAt: chainNow + ttl,
       nonce: `0x${randomBytes(32).toString("hex")}`,
     };
     const id = computeOfferId(offer);
@@ -1032,6 +1557,8 @@ export class ArenaDaemon {
       this.checkChallengeTimeout(so.offer.challengeTimeout);
       // Task 2 (spec §13): before generating a session key or signing anything.
       await this.checkDepositAllowed(so.offer.deposit, { escrow: true });
+      // Plan 6 fix round 1 (I-5): see createOffer.
+      await this.checkOpeningAffordable(so.offer.deposit, "accept");
       const sessionKey = generatePrivateKey();
       const acceptance = {
         offerId,
@@ -1248,7 +1775,8 @@ export class ArenaDaemon {
     if (this.lobbyError) {
       throw new DaemonError(
         503,
-        `the host refused this connection's last subscribe (${this.lobbyError}); restart this daemon to recover`,
+        `the host refused this connection's last subscribe (${this.lobbyError}); restart this daemon to recover, once no ` +
+          "channel is live (otherwise tell your human)",
       );
     }
   }
@@ -1273,13 +1801,7 @@ export class ArenaDaemon {
     // I3/M1: re-check immediately before mutating `live` — the await above is a window another call (or a
     // stop()) could have used to already open this same channel, or to stop the daemon.
     if (this.stopped || this.live.has(record.channelId)) return;
-    const sessionSender = new SerialTxSender(
-      new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain),
-      this.client,
-      // Round 5: dispute transactions are never refused by a fee ceiling -- only what the session key can pay
-      // (its balance) bounds them. The wallet keeps the configured ceiling.
-      { feeCeiling: NO_FEE_CEILING },
-    );
+    const sessionSender = this.sessionSenderFor(record.sessionKey);
     const signer = privateKeyToAccount(record.sessionKey);
     const l: ChannelHandle = {
       record,
@@ -1305,10 +1827,20 @@ export class ArenaDaemon {
       refillBackoffMs: 0,
       refillLastWalletBalance: null,
       sessionGasLowWoken: false,
+      sessionGasLowCause: null,
+      refillTransientFailures: 0,
+      refillNeedWei: null,
+      gasCheckRetryAt: 0,
+      gasCheckBackoffMs: 0,
       settledWake: false,
       humanMustMoveWoken: null,
       settledAt: null,
       sweep: { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: record.sweepPending },
+      unreadableBlock: null,
+      skippedRetryAt: 0,
+      skippedRetryIndex: 0,
+      unseenRegistered: null,
+      challengeUnseenWoken: null,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -1365,6 +1897,26 @@ export class ArenaDaemon {
   protected async fund(l: ChannelHandle): Promise<void> {
     if (this.stopped) return;
     const p = l.record.params;
+    // Plan 6 fix round 1 (spec §2.1 as amended, audit-daemon I-5): on a one-balance chain, neither the approve, the
+    // top-up nor the deposit goes out while the wallet cannot pay them on top of the other channels' reserve. The
+    // channel backs off like a launch-limit revert below, and is retired at its deadline if it never can: an
+    // unfunded side costs nothing to leave. A no-op (no read) on a chain whose gas is native.
+    if (chainProfile(this.opts.config.chainId)?.nativeIsUsdc === true) {
+      const target = this.opts.config.sessionGasWei;
+      const keyBalance = target > 0n ? await this.client.getBalance({ address: l.sessionSender.address }) : 0n;
+      // Live run #2 (f)1: a pass resumed after this channel's approve and top-up (the deposit stopped by a rate limit)
+      // needs only what is still to be spent: the top-up is out of `ownGasWei` once the key holds it, and the gas those
+      // two paid is credited. Before, it needed the whole wallet-gas term again, and the human was asked to top up the
+      // gas the pass had already spent (0.002189 USDC in the run).
+      const why = await this.openingShortfall({
+        deposit: p.deposit,
+        feePerPlayer: p.feePerPlayer,
+        ownGasWei: keyBalance < target ? target - keyBalance : 0n,
+        exclude: l.record.channelId,
+        paidWei: l.record.fundingGasPaid,
+      });
+      if (why !== null) return this.backOffFunding(l, `funding: ${why}`, { log: true });
+    }
     // Plan 4.5 Task 10: read the allowance every time instead of remembering "approved" in memory -- a reorg can
     // drop the approve transaction (and a wallet owner can revoke it), after which a remembered flag would make
     // every later deposit revert on the allowance until the daemon restarts. fund() only runs while this player
@@ -1380,13 +1932,24 @@ export class ArenaDaemon {
       // Final review I2: exactly what this deposit pulls, never an unlimited allowance. The hub address may come from
       // the host's /templates; a wrong or hostile "hub" given maxUint256 could take the whole wallet, not one deposit.
       // Costs one approve per channel.
-      await this.hub.approve(this.wallet, this.opts.config.usdc, p.deposit + p.feePerPlayer);
+      this.recordFundingGas(l, await this.hub.approve(this.wallet, this.opts.config.usdc, p.deposit + p.feePerPlayer));
     }
     if (this.stopped) return;
     // I1: top up only the shortfall, and only while the session key is actually below the target -- otherwise a
     // deposit that keeps reverting (e.g. insufficient USDC) tops up the session key on every tick forever. Shared
     // with the refill (final review C1), so the two never both send one.
-    await this.sharedTopUp(l, () => this.topUpSession(l));
+    try {
+      await this.sharedTopUp(l, async () => {
+        const receipt = await this.topUpSession(l);
+        if (receipt !== null) this.recordFundingGas(l, receipt);
+      });
+    } catch (err) {
+      // Plan 6 Task 2 (audit-daemon I-1): a top-up mined and reverted reached nothing, and the next pass would send
+      // (and pay for) the same revert: funding backs off like a launch-limit revert below, and no deposit goes in
+      // for a channel whose key holds no dispute gas.
+      if (err instanceof TopUpRevertedError) return this.backOffFunding(l, `funding: ${err.message}`, { log: true });
+      throw err;
+    }
     if (this.stopped) return;
     try {
       await this.hub.deposit(this.wallet, p);
@@ -1395,15 +1958,36 @@ export class ArenaDaemon {
       // raises a cap or unpauses) or never resolve (reclaim after the deadline). Either way, retrying it on every
       // tick is a hot loop against the RPC/chain for no benefit, so back off instead of rethrowing.
       if (err instanceof HubRevertError && err.errorName && LIMIT_REVERTS.has(err.errorName)) {
-        l.lastError = `funding: ${err.errorName}`;
-        const chainNow = (await this.client.getBlock()).timestamp;
-        l.fundBlockedUntil = chainNow + FUND_BACKOFF_SECONDS;
-        return;
+        return this.backOffFunding(l, `funding: ${err.errorName}`, { log: false });
       }
       throw err;
     }
     l.fundBlockedUntil = null;
     if (l.lastError?.startsWith("funding:")) l.lastError = null;
+  }
+
+  /** Live run #2 (f)1: adds what one of this channel's funding transactions paid in gas to its record, on disk, so a
+   *  resumed (or restarted) pass credits it. A failed write is logged: the credit is then only missing. */
+  private recordFundingGas(l: ChannelHandle, receipt: { gasUsed: bigint; effectiveGasPrice: bigint }): void {
+    l.record.fundingGasPaid = (l.record.fundingGasPaid ?? 0n) + receipt.gasUsed * receipt.effectiveGasPrice;
+    try {
+      this.records.saveChannel(l.record);
+    } catch (err) {
+      this.log(`channel ${l.record.channelId}: could not record the funding gas paid: ${errorText(err)}`);
+    }
+  }
+
+  /** Backs `fund()` off for `FUND_BACKOFF_SECONDS` of chain time, with `message` as the channel's `lastError`. H1
+   *  (Task 4 report, concern on `fund()`): the block is read first, so `lastError` and `fundBlockedUntil` are set
+   *  together -- a status read in between never shows the reason without the back-off -- and a failed read sets
+   *  neither (the error reaches the watch pass, which records it; the next pass retries). */
+  private async backOffFunding(l: ChannelHandle, message: string, opts: { log: boolean }): Promise<void> {
+    const until = (await this.client.getBlock()).timestamp + FUND_BACKOFF_SECONDS;
+    if (opts.log && l.lastError !== message) {
+      this.log(`channel ${l.record.channelId}: ${message} (retried in ${FUND_BACKOFF_SECONDS}s of chain time)`);
+    }
+    l.lastError = message;
+    l.fundBlockedUntil = until;
   }
 
   /** Runs `work` as this channel's one session-key top-up at a time (final review C1): a caller that finds one in
@@ -1422,13 +2006,14 @@ export class ArenaDaemon {
   /**
    * Sends the session key the shortfall up to `sessionGasWei` from the wallet, if it is below it. The balance is read
    * afresh right before the send (a resend after a reported drop included), so a top-up that landed after all is
-   * never paid twice, and a resend replaces the dropped attempt at its nonce. Resolves true if it sent one.
+   * never paid twice, and a resend replaces the dropped attempt at its nonce. Resolves with the top-up's receipt if it
+   * sent one (live run #2: `fund()` records its gas), else null.
    */
-  private async topUpSession(l: ChannelHandle): Promise<boolean> {
+  private async topUpSession(l: ChannelHandle): Promise<TransactionReceipt | null> {
     const target = this.opts.config.sessionGasWei;
-    if (target <= 0n || this.stopped) return false;
+    if (target <= 0n || this.stopped) return null;
     const balance = await this.client.getBalance({ address: l.sessionSender.address });
-    if (balance >= target || this.stopped) return false;
+    if (balance >= target || this.stopped) return null;
     // Fix round (minor, "a failed fee estimate also raises session-gas-low"): checked as its own step, so a
     // failure here is unambiguously a `SessionGasEstimateError` -- rather than some other, harder-to-classify
     // error shape surfacing from deep inside the sender's own send path (`SerialTxSender.sendFresh`'s internal
@@ -1438,16 +2023,30 @@ export class ArenaDaemon {
     } catch (err) {
       throw new SessionGasEstimateError(err);
     }
-    // The session key is always an EOA (a generated private key, never a contract): the gas is always 21000, so
-    // it never needs estimating either (and never fails alongside the fee estimate above).
-    const req = { to: l.sessionSender.address, data: "0x" as Hex, value: target - balance, gas: 21_000n };
+    const value = target - balance;
+    // Plan 6 Task 2 (spec §2.2): the gas limit is the node's estimate plus a margin (`topUpGasLimit`), not a fixed
+    // 21000. A plain value transfer costs 21000 on Arc too, so this is hardening against a chain whose transfer costs
+    // more. A failed estimate sends nothing -- never a guessed limit -- and raises `session-gas-low` like a failed
+    // fee estimate. One whose cause is the wallet's balance is reported as exactly that.
+    let estimated: bigint;
+    try {
+      estimated = await this.valueTransferGas(this.wallet.address, l.sessionSender.address, value);
+    } catch (err) {
+      if (isInsufficientFundsError(err)) throw new TxInsufficientFundsError(this.wallet.address, err);
+      throw new SessionGasEstimateError(err, "gas");
+    }
+    if (this.stopped) return null;
+    const req = { to: l.sessionSender.address, data: "0x" as Hex, value, gas: topUpGasLimit(estimated) };
     // The wallet's sender tracks its nonces (Plan 4.5 Task 10 round 4): a top-up re-sent after an earlier wait gave
     // up (dropped or stuck) replaces it at its nonce, and one whose nonce turns out used is not re-sent, so it is
     // paid at most once.
     const hash = await this.wallet.send(req);
     // Plan 4.5 Task 10 review: bounded, with drop detection and same-nonce replacement, like every hub write.
-    await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
-    return true;
+    const receipt = await waitOrReplace(this.client, this.wallet, req, hash, { signal: this.aborter.signal });
+    // Plan 6 Task 2 (audit-daemon I-1): a mined revert moved nothing. Before, it was counted as a refill, cleared the
+    // back-off and was sent again on the next pass. The receipt may be a replacement's: it is named by its own hash.
+    if (receipt.status !== "success") throw new TopUpRevertedError(receipt.transactionHash);
+    return receipt;
   }
 
   /**
@@ -1462,6 +2061,8 @@ export class ArenaDaemon {
     // Plan 5 Task 1 (mainnet gates: refill back-off): back off retrying a channel whose refills keep failing,
     // unless the wallet's own balance has just risen (it may have just been funded) -- checked before the shared
     // top-up below so a blocked channel costs nothing beyond one balance read per pass.
+    // H3: a balance read that failed is not retried before its back-off is over.
+    if (Date.now() < l.gasCheckRetryAt) return;
     if (!(await this.refillBackoffGate(l))) return;
     // (A funding top-up in flight that fails is fund()'s to report, not this caller's.)
     await this.sharedTopUp(l, async () => {
@@ -1470,19 +2071,31 @@ export class ArenaDaemon {
       try {
         balance = await this.client.getBalance({ address: l.sessionSender.address });
       } catch (err) {
-        this.log(`channel ${l.record.channelId}: session gas check failed (retried on the next pass): ${errorText(err)}`);
+        const starting = l.gasCheckBackoffMs === 0;
+        l.gasCheckBackoffMs = starting ? GAS_CHECK_BACKOFF_START_MS : Math.min(l.gasCheckBackoffMs * 2, GAS_CHECK_BACKOFF_MAX_MS);
+        l.gasCheckRetryAt = Date.now() + l.gasCheckBackoffMs;
+        if (starting || l.gasCheckBackoffMs === GAS_CHECK_BACKOFF_MAX_MS) {
+          this.log(
+            `channel ${l.record.channelId}: session gas check failed (retried in ${l.gasCheckBackoffMs / 1000}s): ${errorText(err)}`,
+          );
+        }
         return;
       }
+      if (l.gasCheckBackoffMs !== 0) this.log(`channel ${l.record.channelId}: session gas check read the balance again`);
+      l.gasCheckBackoffMs = 0;
+      l.gasCheckRetryAt = 0;
       if (balance >= floor) {
+        l.refillTransientFailures = 0;
         this.clearSessionGasLow(l);
         this.endRefillBackoff(l);
         return;
       }
       try {
-        if (await this.topUpSession(l)) {
+        if ((await this.topUpSession(l)) !== null) {
           l.refills++;
           this.log(`channel ${l.record.channelId}: refilled the session key's dispute gas (it was at ${balance} wei, floor ${floor})`);
         }
+        l.refillTransientFailures = 0;
         this.clearSessionGasLow(l);
         this.endRefillBackoff(l);
       } catch (err) {
@@ -1491,19 +2104,35 @@ export class ArenaDaemon {
         // (insufficient funds, over its fee cap) or a gas/fee estimate for the refill failed outright -- every
         // other refill error (a nonce race, a dropped/stuck/aborted send, a missing receipt) is transient and
         // re-evaluated on the next pass without alarming the agent over something the daemon may resolve on its own.
-        if (
-          err instanceof TxInsufficientFundsError ||
-          err instanceof TxFeeCapError ||
-          err instanceof SessionGasEstimateError
-        ) {
-          const first = l.sessionGasLow === null;
-          l.sessionGasLow = `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
-          this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
-          if (first) this.notify();
-        } else {
+        // Plan 6 Task 2 (audit-daemon I-1): so is a top-up that was mined and reverted -- it is not a refill (the
+        // count and the back-off are left alone), and sending it again on the next pass would only pay for another
+        // revert, so the back-off below holds it off.
+        // H1 (audit-daemon M-5): transient failures are counted, and REFILL_TRANSIENT_FAILURES_ALERT of them in a row
+        // raise it too. H1 (Task 2 review Minor-2): every raise carries its cause, which picks the status action.
+        const cause = refillFailureCause(err);
+        if (cause === null) {
+          l.refillTransientFailures++;
           const name = err instanceof Error ? err.name : "Error";
           this.log(`channel ${l.record.channelId}: refill failed, ${name}: ${errorText(err)} (re-evaluated on the next pass)`);
+        } else {
+          l.refillTransientFailures = 0;
         }
+        const raised: SessionGasLowCause | null =
+          cause ?? (l.refillTransientFailures >= REFILL_TRANSIENT_FAILURES_ALERT ? { kind: "failing", failures: l.refillTransientFailures } : null);
+        if (raised !== null) {
+          const first = l.sessionGasLow === null;
+          l.sessionGasLow =
+            raised.kind === "failing"
+              ? `the session key holds ${balance} wei, below the floor of ${floor}, and the last ${raised.failures} refills failed in transit: ${errorText(err)}`
+              : `the session key holds ${balance} wei, below the floor of ${floor}, and the wallet could not refill it: ${errorText(err)}`;
+          l.sessionGasLowCause = raised;
+          this.log(`channel ${l.record.channelId}: ${l.sessionGasLow}`);
+          if (first) this.notify();
+        }
+        // H1 (audit-daemon M-8): only a shortfall of the wallet's own may end the back-off on a balance rise, and only
+        // on one that covers the refill: its value, plus its gas at the wallet's fee ceiling.
+        l.refillNeedWei =
+          cause?.kind === "funds" ? this.opts.config.sessionGasWei - balance + topUpGasLimit(21_000n) * this.wallet.feeCeiling : null;
         this.startOrBumpRefillBackoff(l);
       }
     }).catch(() => undefined);
@@ -1517,10 +2146,17 @@ export class ArenaDaemon {
    *  to reset otherwise, so the common (not backed off) case costs no RPC call at all. */
   private async refillBackoffGate(l: ChannelHandle): Promise<boolean> {
     if (!(l.refillBlockedUntil > 0)) return true;
-    const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
-    if (balance !== null) {
-      if (l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance) this.endRefillBackoff(l);
-      l.refillLastWalletBalance = balance;
+    // H1 (audit-daemon M-8, Task 2 review Minor-2): on Arc every USDC inflow -- a payout, a sweep of another channel
+    // -- raises the wallet's balance. Only a back-off the wallet's own shortfall caused ends on a rise, and only on a
+    // rise that covers the refill (`refillNeedWei`); a reverted top-up, a fee cap, a failed estimate or a send lost
+    // in transit waits its back-off out, and its balance is not even read.
+    if (l.refillNeedWei !== null) {
+      const balance = await this.client.getBalance({ address: this.wallet.address }).catch(() => null);
+      if (balance !== null) {
+        const rose = l.refillLastWalletBalance !== null && balance > l.refillLastWalletBalance;
+        if (rose && balance >= l.refillNeedWei) this.endRefillBackoff(l);
+        l.refillLastWalletBalance = balance;
+      }
     }
     return !(l.refillBlockedUntil > 0 && Date.now() < l.refillBlockedUntil);
   }
@@ -1546,28 +2182,34 @@ export class ArenaDaemon {
   }
 
   private clearSessionGasLow(l: ChannelHandle): void {
+    l.refillNeedWei = null;
     if (l.sessionGasLow === null) return;
     l.sessionGasLow = null;
+    l.sessionGasLowCause = null;
     l.sessionGasLowWoken = false;
     this.notify();
   }
 
   // ------------------------------------------------------------------ sweep (Plan 5 Task 1)
 
-  /** Cached once (round 4, m7): whether `this.wallet.address` holds contract code, so `performSweep` doesn't read
-   *  it again for every channel it sweeps. `undefined` = not yet read. */
-  private walletHasCode: boolean | undefined;
+  /**
+   * The gas limit of a sweep: the node's estimate of this very value transfer (the session key to the wallet). H1
+   * (audit-daemon M-3): never a fixed 21,000. A plain transfer costs 21,000 on Arc today (arc-facts.md), but a chain
+   * whose value transfers cost more would have made every sweep fail until it was abandoned, stranding the key's gas.
+   * With the top-up (`valueTransferGas`), one helper for both value transfers. Unlike the top-up's limit, no margin:
+   * a value transfer to an EOA costs exactly its estimate, and the sweep reserves `gas x fee` out of what it sends, so
+   * a margin would only leave `margin x fee` in a retired key for good. (A contract wallet, which may run logic on
+   * receipt, was always estimated.) The estimate is the sweep's own dry run, so its failure -- e.g. a wallet that
+   * rejects the transfer, or a blocklisted address on Arc -- is charged like a failed send, not a read (M4).
+   */
+  private gasForSweep(sender: SerialTxSender): Promise<bigint> {
+    return this.valueTransferGas(sender.address, this.wallet.address, 1n);
+  }
 
-  private async gasForSweep(sender: SerialTxSender): Promise<bigint> {
-    if (this.walletHasCode === undefined) {
-      const code = await this.sweepRead(() => this.client.getCode({ address: this.wallet.address }));
-      this.walletHasCode = code !== undefined && code !== "0x";
-    }
-    // A plain transfer to an EOA always costs exactly 21000 gas; a contract wallet may run more logic (a proxy, a
-    // multisig's fallback), so its cost is estimated instead of assumed. That estimate is the sweep's own dry run,
-    // so its failure (e.g. a wallet that rejects the transfer) is charged like a failed send, not a read (M4).
-    if (!this.walletHasCode) return 21_000n;
-    return this.client.estimateGas({ account: sender.address, to: this.wallet.address, value: 1n });
+  /** H1 (audit-daemon M-3): the node's gas estimate for a plain value transfer of `value` from `from` to `to` --
+   *  shared by the top-up (which adds `topUpGasLimit`'s margin) and the sweep (which uses it as is). */
+  private valueTransferGas(from: Address, to: Address, value: bigint): Promise<bigint> {
+    return this.client.estimateGas({ account: from, to, data: "0x", value });
   }
 
   private async currentFeePerGas(): Promise<bigint> {
@@ -1650,9 +2292,14 @@ export class ArenaDaemon {
       // live dead transaction that needs answering for.
       await this.sweepRead(() => sender.refresh());
       const balance = await this.sweepRead(() => this.client.getBalance({ address: sender.address }));
+      // H1 (M-3): an empty key is dust before anything is estimated (the estimate sends 1 wei, which it cannot).
+      if (balance === 0n) return { status: "dust" };
       const gasLimit = await this.gasForSweep(sender);
-      const feePerGas = await this.sweepRead(() => this.currentFeePerGas());
-      if (feePerGas === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
+      // Plan 6 Task 2: never under the session sender's fee floor -- the send below is floored, so a reserve sized on
+      // a lower estimate could not pay its own transaction, and every attempt would be refused until abandoned.
+      const market = await this.sweepRead(() => this.currentFeePerGas());
+      if (market === 0n) throw new Error("the fee estimate is 0: refusing to sweep without a reliable fee to reserve a bump against");
+      const feePerGas = market > sender.minFeePerGas ? market : sender.minFeePerGas;
       const baseReserve = (feePerGas * SWEEP_HEADROOM_NUM + (SWEEP_HEADROOM_DEN - 1n)) / SWEEP_HEADROOM_DEN;
       // Fix round 3, I-1(b): dust is decided against the plain reserve first, regardless of any tracked entry --
       // a balance this low has nothing worth sending whether or not there is a dead transaction to answer for
@@ -1678,14 +2325,43 @@ export class ArenaDaemon {
         );
       }
       const req = { to: this.wallet.address, data: "0x" as Hex, value, gas: gasLimit };
+      // H3: every hash this key's sender already holds -- an earlier intent's -- so a failed wait below names only this
+      // sweep's own transactions (the next attempt records whichever of them landed as the sweep).
+      const earlier = new Set(sender.tracked().flatMap((t) => t.hashes));
       let hash: Hex;
       try {
         hash = await sender.send(req);
       } catch (err) {
         if (err instanceof TxInsufficientFundsError && attempt === 0) continue; // I7: one immediate retry
+        // H3 fix round 1 (review M2): a send that failed ambiguously -- a lost response, a "nonce too low" whose hash
+        // could not be read -- leaves its transaction's hash in the sender's entry (a send the node refused outright
+        // leaves none). It may land: the next attempt checks it first, as after a failed receipt wait.
+        const fresh = sender
+          .tracked()
+          .flatMap((t) => t.hashes)
+          .filter((h) => !earlier.has(h));
+        if (fresh.length > 0) throw new SweepWaitError(fresh, err);
         throw err;
       }
-      const receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal, giveUpAt });
+      let receipt: Awaited<ReturnType<typeof waitOrReplace>>;
+      try {
+        receipt = await waitOrReplace(this.client, sender, req, hash, { signal: this.aborter.signal, giveUpAt });
+      } catch (err) {
+        // These carry their own verdict on the transaction (and the hashes to check, where it may still land).
+        if (
+          err instanceof TxReceiptMissingError ||
+          err instanceof TxDroppedError ||
+          err instanceof TxStuckError ||
+          err instanceof TxWaitAbortedError ||
+          err instanceof TxNonceUsedError
+        ) {
+          throw err;
+        }
+        // H3 (rehearsal §8.4): anything else -- a rate-limited receipt read, most likely -- left the sweep sent and
+        // unconfirmed. Before, its hash was dropped here, and the next attempt read the landed sweep's leftover as dust.
+        const own = (sender.tracker?.entryOf(hash)?.hashes ?? []).filter((h) => h !== hash && !earlier.has(h));
+        throw new SweepWaitError([hash, ...own], err);
+      }
       if (receipt.status !== "success") throw new Error(`sweep transaction ${receipt.transactionHash} reverted`);
       return { status: "swept", amount: value, hash: receipt.transactionHash };
     }
@@ -1740,14 +2416,37 @@ export class ArenaDaemon {
         // Final fix wave (M3): the first probe is immediate, but once one has found the transaction still
         // pending, the next waits out the back-off like any other attempt instead of re-probing every pass.
         const probed = backoff.pendingProbes ?? 0;
-        if (probed > 0 && !opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) {
+        const receiptless = backoff.receiptlessProbes ?? 0;
+        if ((probed > 0 || receiptless > 0) && !opts.force && backoff.blockedUntil > 0 && Date.now() < backoff.blockedUntil) {
           return { kind: "skipped", record };
         }
         const recovered = await this.recoverPendingSweepTx(backoff.pendingTx);
-        // An RPC failure (or a mined transaction whose receipt could not be read) is retried on the next pass,
-        // not counted as a pending probe.
+        // An RPC failure is retried on the next pass, not counted as a pending probe.
         if (recovered === "unknown") return { kind: "skipped", record };
-        if (recovered === "pending") {
+        let giveUp = false;
+        if (recovered === "receiptless") {
+          // H1 (audit-daemon M-4): mined, but no receipt can be read. Arc documents exactly that for an included
+          // revert (a blocklisted address), so it may never change: probed with the back-off, and after
+          // SWEEP_PENDING_PROBES in a row it is charged as a failed attempt and the sweep goes on -- before, every
+          // pass found "unknown" again, and the record was never re-sent, abandoned or evicted.
+          backoff.receiptlessProbes = receiptless + 1;
+          if (backoff.receiptlessProbes < SWEEP_PENDING_PROBES) {
+            this.bumpSweepBackoff(record.channelId, backoff);
+            return { kind: "skipped", record };
+          }
+          this.log(
+            `channel ${record.channelId}: sweep transaction(s) ${backoff.pendingTx.join(", ")} mined with no readable receipt ` +
+              `${backoff.receiptlessProbes} times in a row: counted as a failed attempt`,
+          );
+          giveUp = true;
+        }
+        if (giveUp) {
+          backoff.pendingTx = undefined;
+          backoff.pendingProbes = 0;
+          backoff.receiptlessProbes = 0;
+          persistPending();
+          backoff.attempts++;
+        } else if (recovered === "pending") {
           backoff.pendingProbes = probed + 1;
           // Not a failure (no attempt charged), but backed off. After SWEEP_PENDING_PROBES probes, fall through
           // to a normal attempt: its send replaces the released entry at the same nonce with raised fees (at
@@ -1756,9 +2455,10 @@ export class ArenaDaemon {
             this.bumpSweepBackoff(record.channelId, backoff);
             return { kind: "skipped", record };
           }
-        } else {
+        } else if (recovered !== "receiptless") {
           backoff.pendingTx = undefined;
           backoff.pendingProbes = 0;
+          backoff.receiptlessProbes = 0;
           if (recovered !== "failed") {
             const updated = appendSweep(record, recovered.amount, recovered.hash);
             save(updated);
@@ -1811,10 +2511,14 @@ export class ArenaDaemon {
       const remember = (hashes: Hex[]) => {
         backoff.pendingTx = [...new Set([...(backoff.pendingTx ?? []), ...hashes])];
       };
-      if (err instanceof TxReceiptMissingError) {
+      if (err instanceof TxReceiptMissingError || err instanceof TxDroppedError) {
         // Minor 2: remember this hash so the very next attempt (see the top of this method) checks it before
         // trying anything else -- the transaction is most likely already mined; only the receipt went missing.
+        // H1 (audit-daemon M-12): a reported drop too. A load-balanced RPC can report a transaction dropped that
+        // another of its nodes mines later; the next attempt's check records that as the sweep, not as "dust".
         remember([err.hash]);
+      } else if (err instanceof SweepWaitError) {
+        remember(err.hashes); // H3: sent, then its receipt wait failed -- it may have landed
       } else if (err instanceof TxStuckError || err instanceof TxWaitAbortedError) {
         // Fix round 3, I-1(c): probe E3 -- a sweep this wait gave up on (a tight giveUpAt, or stop()) can still
         // land later: any one of the original send or its fee-bumped replacements might mine after this daemon
@@ -1832,6 +2536,20 @@ export class ArenaDaemon {
         // next pass re-reads the chain and, if still unswept, tries again fresh. No back-off, no attempt charged.
         this.log(`channel ${record.channelId}: sweep: a foreign transaction landed at that nonce; re-evaluated on the next pass`);
         return { kind: "skipped", record };
+      }
+      if (err instanceof TxDroppedError) {
+        // H1 (M-12): not charged here -- the next attempt checks the hash first, and charges the attempt if the
+        // transaction is really gone (a "failed" recovery), or records the sweep if it landed after all.
+        this.log(`channel ${record.channelId}: sweep transaction ${err.hash} was reported dropped; checked first on the next attempt`);
+        this.bumpSweepBackoff(record.channelId, backoff);
+        return { kind: "error", record, error: err };
+      }
+      if (err instanceof SweepWaitError) {
+        // H3 (rehearsal §8.4): not charged, like a reported drop -- the next attempt checks the hashes first, and
+        // charges the attempt if they are really gone, or records the sweep if one landed.
+        this.log(`channel ${record.channelId}: ${errorText(err)}; its transaction(s) are checked first on the next attempt`);
+        this.bumpSweepBackoff(record.channelId, backoff);
+        return { kind: "error", record, error: err };
       }
       if (err instanceof SweepReadError) {
         // Final fix wave (M4): an RPC blip before anything was sent -- backed off, never charged, so an RPC outage
@@ -1872,6 +2590,7 @@ export class ArenaDaemon {
     backoff.attempts = 0;
     backoff.pendingTx = undefined;
     backoff.pendingProbes = 0;
+    backoff.receiptlessProbes = 0;
     if (wasBackedOff) this.log(`channel ${channelId}: sweep back-off ended`);
   }
 
@@ -1896,7 +2615,11 @@ export class ArenaDaemon {
    *  for the one intent this backoff gave up on -- at most one of them can ever mine (they share a nonce), but
    *  it is never necessarily the last one this daemon happened to be watching when it gave up, so every one of
    *  them is checked. */
-  private async recoverPendingSweepTx(hashes: Hex[]): Promise<"pending" | "unknown" | "failed" | { amount: bigint; hash: Hex }> {
+  /** H1 (audit-daemon M-4): `"receiptless"` (it was `"unknown"`) when a hash is reported mined but no receipt can be
+   *  read for it; `"unknown"` is left to read failures. */
+  private async recoverPendingSweepTx(
+    hashes: Hex[],
+  ): Promise<"pending" | "unknown" | "receiptless" | "failed" | { amount: bigint; hash: Hex }> {
     try {
       let anyPending = false;
       let anyMined = false;
@@ -1927,7 +2650,7 @@ export class ArenaDaemon {
           else anyMined = true; // mined, but its receipt could not be read just now
         }
       }
-      if (anyMined) return "unknown";
+      if (anyMined) return "receiptless";
       return anyPending ? "pending" : "failed";
     } catch (err) {
       this.log(`sweep recovery: ${errorText(err)} looking up ${hashes.length} pending hash(es) (retried next attempt)`);
@@ -2115,7 +2838,7 @@ export class ArenaDaemon {
     return (
       this.live.get(id)?.sessionSender ??
       this.sweepQueue.get(id)?.sender ??
-      new SerialTxSender(new LocalKeyTxSender(record.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, { feeCeiling: NO_FEE_CEILING })
+      this.sessionSenderFor(record.sessionKey)
     );
   }
 
@@ -2193,9 +2916,7 @@ export class ArenaDaemon {
     const fresh = this.records.channel(id) ?? record;
     if (isSweptDone(fresh.swept) && !recheck) return { channelId: id, swept: "already" };
     const wasAbandoned = fresh.swept === "abandoned";
-    const sender = new SerialTxSender(new LocalKeyTxSender(fresh.sessionKey, this.opts.config.rpcUrl, this.chain), this.client, {
-      feeCeiling: NO_FEE_CEILING,
-    });
+    const sender = this.sessionSenderFor(fresh.sessionKey);
     const backoff: SweepBackoff = { blockedUntil: 0, backoffMs: 0, attempts: 0, pendingTx: fresh.sweepPending };
     const result = await this.runSweepAttempt(fresh, sender, backoff, (r) => this.records.saveChannel(r), { force: true, giveUpAt, recheck });
     // Fix round 3, M-1: this record may already be in the settled-index cache (evicted from `live` some time
@@ -2276,9 +2997,16 @@ export class ArenaDaemon {
       this.log(`channel ${msg.channelId}: ${l.lastError}`);
     }
     if (this.stopped) return;
-    // A failed submission is recorded as `close:` by trySubmitClose and retried by the watchtower.
-    if (closeReceived) await this.trySubmitClose(l).catch(() => undefined);
-    if (this.stopped) return;
+    // H1 (audit-daemon M-11): the opponent's Close signature completed the close here. The opponent signed second,
+    // so their own `close()` is submitting it right now; submitting it here as well raced theirs, and the loser's
+    // transaction reverted on-chain (about 37k gas, paid for nothing). So this side leaves it to its watchtower after
+    // a short, jittered delay (two sides that both completed it here are spread apart), and the watchtower's
+    // `submitClose` reads the phase first: a close that went through meanwhile is never sent again. If theirs never
+    // lands, this one does. The close API and every later retry are unchanged.
+    if (closeReceived && l.session.closeTransaction()) {
+      const defer = CLOSE_RELAY_DEFER_MS + Math.floor(Math.random() * CLOSE_RELAY_JITTER_MS);
+      l.closeRetryAt = Math.max(l.closeRetryAt, Date.now() + defer);
+    }
     this.notify();
   }
 
@@ -2338,6 +3066,8 @@ export class ArenaDaemon {
       await this.hub.respond(l.sessionSender, l.session.challengeProof(), {
         receiptTimeoutMs: this.disputeReceiptTimeoutMs(info.deadline, now),
         giveUpAt,
+        // H3 fix round 2 (re-review M-g): nor is it sent past then -- after its pre-send reads -- since it would revert.
+        notAfter: giveUpAt + RESPOND_SEND_MARGIN_MS,
       });
     } catch (err) {
       // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
@@ -2349,12 +3079,15 @@ export class ArenaDaemon {
       // show up here. A failure that is not a hub revert (transport, our own gas) is always this daemon's problem.
       // A respond reported dropped, whose nonce turned out used (an earlier transaction of this session key landed
       // there), or mined with its receipt unreadable, may have answered the challenge after all -- the same check
-      // applies (Plan 4.5 Task 10 round 4).
+      // applies (Plan 4.5 Task 10 round 4). Final fix wave B (m-6 follow-up): so may one still pending at its give-up
+      // time (`TxStuckError`), which, sent inside RESPOND_SEND_MARGIN_MS past it, can then still land: on Arc the wait
+      // finds no receipt before the next block.
       const after =
         err instanceof HubRevertError ||
         err instanceof TxDroppedError ||
         err instanceof TxNonceUsedError ||
-        err instanceof TxReceiptMissingError
+        err instanceof TxReceiptMissingError ||
+        err instanceof TxStuckError
           ? await this.hub.channelInfo(id).catch(() => null)
           : null;
       if (after?.phase !== "Open") {
@@ -2366,7 +3099,8 @@ export class ArenaDaemon {
         () => "unknown",
       );
       this.log(
-        `channel ${id}: respond reverted but the challenge was already answered (registered turn ${reg}, ours ${l.session.latest.state.turnNum}): ${errorText(err)}`,
+        `channel ${id}: respond ${err instanceof HubRevertError ? "reverted" : "was not confirmed"}, but the challenge was already ` +
+          `answered (registered turn ${reg}, ours ${l.session.latest.state.turnNum}): ${errorText(err)}`,
       );
     }
     if (l.lastError?.startsWith("respond:")) l.lastError = null;
@@ -2388,8 +3122,17 @@ export class ArenaDaemon {
       if (l.lastError?.startsWith("close:")) l.lastError = null;
     } catch (err) {
       if (err instanceof HubRevertError) l.closeRetryAt = Date.now() + CLOSE_RETRY_BACKOFF_MS;
+      // Final fix wave B (m-8, h3 M-d): a wallet that cannot pay for the close is named as such -- `close()` answers 200
+      // either way (the Close is signed and relayed, and the opponent can submit it too).
+      const retried = "the watchtower retries every pass, and the opponent can submit the close too";
+      const why =
+        err instanceof TxInsufficientFundsError
+          ? `this wallet cannot pay the close transaction's gas (${errorText(err)}); ${retried}. If it persists, tell your human the wallet needs gas`
+          : err instanceof TxFeeCapError
+            ? `the close transaction's fee is over this wallet's fee ceiling (${errorText(err)}); ${retried}`
+            : errorText(err);
       // Once settled (the watchtower may have marked it meanwhile), nothing would ever clear the error again.
-      if (!l.record.finalized) l.lastError = `close: ${errorText(err)}`;
+      if (!l.record.finalized) l.lastError = `close: ${why}`;
       this.log(`channel ${l.record.channelId}: submitting the cooperative close failed (the watchtower retries): ${errorText(err)}`);
       throw err;
     } finally {
@@ -2466,18 +3209,27 @@ export class ArenaDaemon {
     await this.opts.relay.send({ type: "close", channelId: l.record.channelId, close: cs }).catch((err) => {
       l.lastError = `relay: ${errorText(err)}`;
     });
-    await this.guard(() => this.trySubmitClose(l));
+    // H3 fix round 1 (review M4): the Close is signed and relayed -- the action took effect. A submission that fails
+    // on anything but the hub's own refusal (a rate-limited read, a lost receipt) is the watchtower's to retry, on
+    // every pass, and is shown as the channel's `close:` lastError (trySubmitClose): not answered as a failure.
+    await this.guard(() => this.trySubmitClose(l)).catch((err: unknown) => {
+      if (err instanceof DaemonError) throw err;
+    });
     this.notify();
   }
 
-  async challenge(ref: string | undefined, actor: Actor): Promise<void> {
+  async challenge(ref: string | undefined, actor: Actor): Promise<ActionOutcome> {
     const l = this.pick(ref);
     this.requireController(l, actor);
-    await this.guard(() => this.hub.challenge(l.sessionSender, l.session.challengeProof()));
+    const outcome = await this.guard(() => this.hub.challenge(l.sessionSender, l.session.challengeProof())).then(
+      () => ({}),
+      (err: unknown) => minedUnconfirmed("challenge", err),
+    );
     this.notify();
+    return outcome;
   }
 
-  async reclaim(ref: string | undefined): Promise<void> {
+  async reclaim(ref: string | undefined): Promise<ActionOutcome> {
     const l = this.pick(ref);
     // Plan 4.5 Task 10 round 4: never beside the main pass (which reclaims after the funding deadline itself). A main
     // pass visits every channel briefly, so the API waits for it a little before refusing.
@@ -2485,14 +3237,19 @@ export class ArenaDaemon {
     while (l.mainBusy && Date.now() < until && !this.stopped) await new Promise((r) => setTimeout(r, 20));
     if (l.mainBusy) throw new DaemonError(409, "the watchtower is working on this channel: retry shortly");
     l.mainBusy = true;
+    let outcome: ActionOutcome;
     try {
       // R9/I1: dispute operations go through the session key (spec §3.1), so they keep working after the
       // Circle session backing the wallet key has expired.
-      await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId));
+      outcome = await this.guard(() => this.hub.reclaim(l.sessionSender, l.record.channelId)).then(
+        () => ({}),
+        (err: unknown) => minedUnconfirmed("reclaim", err),
+      );
     } finally {
       l.mainBusy = false;
     }
     this.notify();
+    return outcome;
   }
 
   async handoff(ref: string | undefined, to: Controller, note: string): Promise<void> {
@@ -2875,6 +3632,10 @@ export class ArenaDaemon {
     await this.scanDisputes(l);
     if (this.stopped) return true;
     const registered = await this.hub.registeredState(id);
+    // H1 fix round 1 (review I-1): a registered state newer than anything this session holds, whose event the scan
+    // could not read. Adopted from storage when it can be (then the branches below see it), else surfaced.
+    await this.handleUnseenRegistered(l, info, registered);
+    if (this.stopped) return true;
     const latest = l.session.latest.state;
     if (now < info.deadline && latest.turnNum > registered.turnNum) {
       // Stale challenge, and there is still time to answer it: we hold a newer supported state.
@@ -2910,6 +3671,71 @@ export class ArenaDaemon {
   }
 
   /**
+   * H1 fix round 1 (review I-1): the dispute pass found the channel Challenged on a registered state newer than this
+   * session's latest. Normally that is the opponent's move by challenge whose event the scan ingests within a pass;
+   * but if its event cannot be read (a griefer's oversized proof that the RPC refuses), this player cannot answer, and
+   * the challenger's `timeout` forfeits the current game at the deadline -- silently, before this.
+   *
+   * After `UNSEEN_REGISTERED_PASSES` passes (at once if a block was skipped):
+   * - (b) when the registered state is the very next turn, it is adopted from storage, unsigned
+   *   (`ChannelSession.adoptRegistered`), checked against the hub's `registeredHash` on a fresh read. The player can
+   *   then move, and the move answers the challenge: a lock at worst (a later challenge needs the opponent's
+   *   signature, which a readable event repairs), never a forfeit.
+   * - (c) otherwise, the `challenge-unseen` attention (status: switch RPC, and the deadline), once per challenge.
+   * Never throws.
+   */
+  private async handleUnseenRegistered(
+    l: ChannelHandle,
+    info: Awaited<ReturnType<HubClient["channelInfo"]>>,
+    registered: Awaited<ReturnType<HubClient["registeredState"]>>,
+  ): Promise<void> {
+    const latest = l.session.latest.state;
+    if (registered.turnNum <= latest.turnNum) {
+      if (l.unseenRegistered?.raised) this.notify();
+      l.unseenRegistered = null;
+      return;
+    }
+    const key = `${info.deadline}:${registered.turnNum}`;
+    const u = l.unseenRegistered?.key === key ? l.unseenRegistered : { key, turn: registered.turnNum, deadline: info.deadline, passes: 0, raised: false };
+    u.passes++;
+    l.unseenRegistered = u;
+    const skipped = (l.record.skippedEventBlocks?.length ?? 0) > 0;
+    if (u.passes < UNSEEN_REGISTERED_PASSES && !skipped) return;
+    const id = l.record.channelId;
+    try {
+      if (registered.turnNum === latest.turnNum + 1n) {
+        const fresh = await this.hub.channelInfo(id);
+        if (fresh.phase === "Challenged" && fresh.hasRegistered && (await l.session.adoptRegistered(registered, fresh.registeredHash))) {
+          this.log(
+            `channel ${id}: adopted the registered turn ${registered.turnNum} from the hub's storage: its event could not be ` +
+              "read, and a move on it answers the challenge",
+          );
+          l.unseenRegistered = null;
+          this.notify();
+          return;
+        }
+      }
+    } catch (err) {
+      this.log(`channel ${id}: reading the registered state to adopt it failed (retried on the next pass): ${errorText(err)}`);
+    }
+    // Final fix wave B (m-9, h1 N-7): `latest` was read before the awaits above. A relay or a move ingested meanwhile
+    // may already hold the registered turn -- the reason an adopt was refused -- and then nothing is unseen.
+    if (registered.turnNum <= l.session.latest.state.turnNum) {
+      if (u.raised) this.notify();
+      l.unseenRegistered = null;
+      return;
+    }
+    if (!u.raised) {
+      u.raised = true;
+      this.log(
+        `channel ${id}: challenged on turn ${registered.turnNum}, newer than this daemon holds (turn ${latest.turnNum}), and ` +
+          `its event could not be read: unanswered, the current game is forfeited at the deadline (${info.deadline})`,
+      );
+      this.notify();
+    }
+  }
+
+  /**
    * I3: scans dispute events forward from the persisted cursor (`record.scannedBlock`, or `createdBlock - 1n`
    * for a channel never scanned before) in chunks of at most `logChunkBlocks` blocks — real RPCs cap the range
    * a single `getLogs` call may cover. Ingests events in order and never advances the cursor past one that
@@ -2925,13 +3751,65 @@ export class ArenaDaemon {
     const scanned = l.record.scannedBlock ?? l.record.createdBlock - 1n;
     const rescanFrom = scanned + 1n - DISPUTE_RESCAN_BLOCKS;
     const start = rescanFrom > l.record.createdBlock ? rescanFrom : l.record.createdBlock;
-    let cursor = scanned; // only moves forward as chunks succeed; a scan with nothing new leaves it unchanged
+    // Only moves forward as ranges succeed (the trailing rescan reads blocks at or below it); a scan with nothing
+    // new leaves it unchanged. Ranges are read in chain order, so every block up to it has been read and ingested.
+    let cursor = scanned;
+    const advance = (to: bigint) => {
+      if (to > cursor) cursor = to;
+    };
+    let skipped: bigint | null = null;
+    /** Set once a probe this pass showed the RPC up while it refused this channel's events in some range. */
+    let contentRefused = false;
     try {
       const head = await this.hub.blockNumber();
-      // At most 50 chunks per tick, so a long-dormant channel catches up over a few ticks without starving the others.
-      for (const r of chunkRanges(start, head, size).slice(0, 50)) {
+      if (this.stopped) return;
+      await this.retrySkippedEventBlock(l);
+      // At most 50 chunks per tick, so a long-dormant channel catches up over a few ticks without starving the
+      // others. A stack, so a split range's halves are read next, in order.
+      // A block skipped earlier (`skipUnreadableBlock`) is left out of every range, not read and refused again.
+      const pending = withoutBlocks(chunkRanges(start, head, size).slice(0, 50), l.record.skippedEventBlocks ?? []).reverse();
+      for (let reads = 0; pending.length > 0 && reads < DISPUTE_SCAN_READS_PER_PASS; reads++) {
         if (this.stopped) break;
-        const events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
+        const r = pending.pop()!;
+        let events: Awaited<ReturnType<HubClient["disputeEvents"]>>;
+        try {
+          events = await this.hub.disputeEvents(id, r.fromBlock, r.toBlock);
+        } catch (err) {
+          // H3: only a refusal of the query itself (`isRangeRefusal`) may split the range or count toward a skip. A
+          // rate limit, a timeout, a 5xx -- anything else -- ends this channel's scan for the pass, uncounted and
+          // unprobed: the next pass reads the same range again. Before, a rate-limited read whose probe slipped
+          // through was split, and a block rate-limited on three passes was skipped.
+          if (!isRangeRefusal(err)) {
+            this.saveCursor(l, cursor); // what was read before it stays read
+            l.lastError = `events: ${errorText(err)}`;
+            return;
+          }
+          // H1 (audit-contracts I1, "oversized events"): the hub re-emits a proof's unchecked signature bytes, so
+          // a griefer can make a range's response larger than an RPC serves. If the RPC serves the same range for no
+          // channel (so it is up, and this channel's events are what it refuses), the range is split, down to one
+          // block: the ranges around a large event are still read, and the event itself is fetched alone. An RPC
+          // that refuses the probe too is down (or caps the range itself): nothing more is read this pass.
+          if (!contentRefused && !(await this.servesEmptyQuery(r.fromBlock, r.toBlock))) {
+            this.saveCursor(l, cursor); // what was read before it stays read
+            l.lastError = `events: ${errorText(err)}`;
+            return;
+          }
+          contentRefused = true;
+          if (r.fromBlock < r.toBlock) {
+            const mid = r.fromBlock + (r.toBlock - r.fromBlock) / 2n;
+            pending.push({ fromBlock: mid + 1n, toBlock: r.toBlock }, { fromBlock: r.fromBlock, toBlock: mid });
+            continue;
+          }
+          if (!(await this.skipUnreadableBlock(l, r.fromBlock, err))) {
+            this.saveCursor(l, cursor);
+            return;
+          }
+          skipped = r.fromBlock;
+          events = [];
+        }
+        // H1 fix round 1 (review m-3): "passes in a row" -- a block that reads is no longer counted toward a skip.
+        const u = l.unreadableBlock;
+        if (u !== null && skipped !== u.block && u.block >= r.fromBlock && u.block <= r.toBlock) l.unreadableBlock = null;
         for (const e of events) {
           try {
             await l.session.ingestOnChain(e.signed);
@@ -2942,15 +3820,95 @@ export class ArenaDaemon {
             return;
           }
         }
-        cursor = r.toBlock;
+        advance(r.toBlock);
       }
-      // Saved once for the whole pass (not per chunk): every ingest above already succeeded (or the loop
-      // returned early on the first failure), so this is the real, fully-ingested scanned head.
       this.saveCursor(l, cursor);
       if (l.lastError?.startsWith("events:") || l.lastError?.startsWith("ingest:")) l.lastError = null;
+      // H1 fix round 1 (review m-2): a skip is surfaced from `record.skippedEventBlocks` (status), not `lastError`.
+      if (skipped !== null) this.notify();
     } catch (err) {
       l.lastError = `events: ${errorText(err)}`;
     }
+  }
+
+  /** H1: whether the RPC serves the dispute-event query on `[fromBlock, toBlock]` for a channel id that has no
+   *  events (the zero hash) -- an empty response. Tells an RPC that is up but refuses one channel's (large) events
+   *  apart from one that is down, or that caps the range itself. */
+  private servesEmptyQuery(fromBlock: bigint, toBlock: bigint): Promise<boolean> {
+    return this.hub.disputeEvents(ZERO_HASH, fromBlock, toBlock).then(
+      () => true,
+      () => false,
+    );
+  }
+
+  /**
+   * H1 (audit-contracts I1, "oversized events"): decides what the scan does with block `block`, whose dispute events
+   * for this channel the RPC refused even on their own. A block it refuses while it serves the same query for no
+   * channel -- the RPC is up, and this channel's events in that block are what it will not return (a griefer's
+   * oversized proof) -- is retried for `UNREADABLE_BLOCK_PASSES` passes, then skipped: recorded in
+   * `record.skippedEventBlocks`, logged, and retried later (`retrySkippedEventBlock`), so one block can never stop
+   * every later event from being read. Spec §12 item 18's "never past an event that failed to ingest" still holds
+   * for every event that was read. An RPC that also refuses the probe is down, not refusing the block: nothing is
+   * skipped. Returns true when the block is skipped now.
+   */
+  private async skipUnreadableBlock(l: ChannelHandle, block: bigint, err: unknown): Promise<boolean> {
+    if (!(await this.servesEmptyQuery(block, block))) {
+      l.unreadableBlock = null;
+      l.lastError = `events: ${errorText(err)}`;
+      return false;
+    }
+    const tries = l.unreadableBlock?.block === block ? l.unreadableBlock.tries + 1 : 1;
+    if (tries < UNREADABLE_BLOCK_PASSES) {
+      l.unreadableBlock = { block, tries };
+      l.lastError = `events: block ${block}: the RPC refuses this channel's dispute events in it (${errorText(err)}); retried on the next pass`;
+      return false;
+    }
+    l.unreadableBlock = null;
+    const already = l.record.skippedEventBlocks ?? [];
+    if (!already.includes(block)) {
+      l.record = { ...l.record, skippedEventBlocks: [...already, block] };
+      this.records.saveChannel(l.record);
+    }
+    this.log(
+      `channel ${l.record.channelId}: skipping block ${block}: the RPC refused its dispute events for this channel ` +
+        `${tries} passes in a row (${errorText(err)}) while serving the same query for no channel; retried later`,
+    );
+    return true;
+  }
+
+  /** H1: re-reads a block the scan skipped (`skipUnreadableBlock`), at most one per pass and once per
+   *  `BACKOFF_MAX_MS`. H1 fix round 1 (review m-1): the blocks are tried in turn, so a block that never reads (a
+   *  griefer's) does not keep one refused only transiently from ever being re-read. Its events are ingested in order
+   *  (an older state is not adopted, but a signature it carries for a state this session holds is: `ingestOnChain`);
+   *  once it reads and ingests, it is no longer skipped. Never throws. */
+  private async retrySkippedEventBlock(l: ChannelHandle): Promise<void> {
+    const blocks = l.record.skippedEventBlocks ?? [];
+    if (blocks.length === 0 || Date.now() < l.skippedRetryAt) return;
+    const block = blocks[l.skippedRetryIndex % blocks.length];
+    l.skippedRetryIndex++;
+    l.skippedRetryAt = Date.now() + BACKOFF_MAX_MS;
+    let events: Awaited<ReturnType<HubClient["disputeEvents"]>>;
+    try {
+      events = await this.hub.disputeEvents(l.record.channelId, block, block);
+    } catch (err) {
+      this.log(`channel ${l.record.channelId}: skipped block ${block} still cannot be read: ${errorText(err)}`);
+      return;
+    }
+    try {
+      for (const e of events) {
+        await l.session.ingestOnChain(e.signed);
+        l.processedEvents++;
+      }
+    } catch (err) {
+      this.log(`channel ${l.record.channelId}: skipped block ${block} was read but an event in it failed to ingest: ${errorText(err)}`);
+      return;
+    }
+    const rest = (l.record.skippedEventBlocks ?? []).filter((b) => b !== block);
+    l.record = { ...l.record, skippedEventBlocks: rest.length > 0 ? rest : undefined };
+    this.records.saveChannel(l.record);
+    l.skippedRetryAt = 0;
+    this.log(`channel ${l.record.channelId}: skipped block ${block} was read and ingested`);
+    this.notify();
   }
 
   private saveCursor(l: ChannelHandle, block: bigint): void {
@@ -2977,6 +3935,40 @@ export class ArenaDaemon {
     // before it was marked finalized -- refreshing it again on every status call is a pure, avoidable RPC cost.
     if (!l.record.finalized) await this.refreshChain(l);
     return this.statusOf(l);
+  }
+
+  /**
+   * H3 (Arc testnet rehearsal §8.2): the status an action route (`POST /move`, `/close`, `/challenge`, ...) answers
+   * with, once its action has taken effect. Its chain refresh can fail on its own -- a rate-limited RPC -- and that
+   * must not turn a move that was signed and relayed into an error the agent may act on: the last known status is
+   * returned instead, with `chainStale` and the reason. A `DaemonError` (no such channel) is thrown as by `status`.
+   */
+  async statusAfterAction(ref?: string, outcome: ActionOutcome = {}): Promise<ChannelStatus> {
+    let st: ChannelStatus;
+    try {
+      st = await this.status(ref);
+    } catch (err) {
+      if (err instanceof DaemonError) throw err;
+      let l: ChannelHandle;
+      try {
+        l = this.pick(ref);
+      } catch {
+        throw err;
+      }
+      // Fix round 1 (review M6): the RPC's own answer ("HTTP 429"), not viem's first line ("HTTP request failed.").
+      const reason = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
+      st = { ...this.statusOf(l), chainStale: true, chainStaleReason: reason };
+    }
+    // Fix round 1 (review M4): a transaction mined with no readable receipt went through, but is unconfirmed.
+    if (outcome.unconfirmed !== undefined) {
+      st = {
+        ...st,
+        chainStale: true,
+        chainStaleReason: [outcome.unconfirmed, st.chainStaleReason].filter(Boolean).join("; "),
+        unconfirmed: outcome.unconfirmed,
+      };
+    }
+    return st;
   }
 
   /** Every live channel's status, followed by the channels that could not be loaded (I1). Plan 4.5 Task 11 fix
@@ -3043,6 +4035,17 @@ export class ArenaDaemon {
         if (prev === undefined) controllers.set(id, l.record.controller);
         else if (prev !== l.record.controller) return { channelId: id, reason: "control-changed" };
         let st = this.statusOf(l);
+        let ignoreChallengeUnseen = false;
+        if (st.attention === "challenge-unseen") {
+          // H1 fix round 1 (review I-1): whoever holds the seat, one wake per challenge.
+          const key = l.unseenRegistered?.key ?? "";
+          if (l.challengeUnseenWoken !== key) {
+            l.challengeUnseenWoken = key;
+            return { channelId: id, reason: st.attention };
+          }
+          ignoreChallengeUnseen = true;
+          st = this.statusOf(l, { ignoreChallengeUnseen });
+        }
         let ignoreSessionGasLow = false;
         if (st.attention === "session-gas-low") {
           // Final review C1: one wake per low-gas episode. While the wallet stays empty, later waits see the
@@ -3052,7 +4055,7 @@ export class ArenaDaemon {
             return { channelId: id, reason: st.attention };
           }
           ignoreSessionGasLow = true;
-          st = this.statusOf(l, { ignoreSessionGasLow });
+          st = this.statusOf(l, { ignoreSessionGasLow, ignoreChallengeUnseen });
         }
         if (st.attention === "human-must-move") {
           // Final fix wave (I1): whoever holds the seat, one wake per challenge (keyed by its deadline).
@@ -3061,7 +4064,7 @@ export class ArenaDaemon {
             l.humanMustMoveWoken = deadline;
             return { channelId: id, reason: st.attention };
           }
-          st = this.statusOf(l, { ignoreSessionGasLow, ignoreHumanMustMove: true });
+          st = this.statusOf(l, { ignoreSessionGasLow, ignoreHumanMustMove: true, ignoreChallengeUnseen });
         }
         // Final review m4: `settled` wakes one wait, then is gone.
         if (st.attention === "settled") l.settledWake = false;
@@ -3080,7 +4083,10 @@ export class ArenaDaemon {
     return l.xmtpDropped;
   }
 
-  private statusOf(l: ChannelHandle, opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean } = {}): ChannelStatus {
+  private statusOf(
+    l: ChannelHandle,
+    opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean; ignoreChallengeUnseen?: boolean } = {},
+  ): ChannelStatus {
     return buildStatus({
       record: l.record,
       snapshot: l.session.snapshot(),
@@ -3090,6 +4096,13 @@ export class ArenaDaemon {
       lastProgressAt: l.lastProgressAt,
       lobbyError: this.lobbyError,
       sessionGasLow: opts.ignoreSessionGasLow ? null : l.sessionGasLow,
+      sessionGasLowCause: l.sessionGasLowCause,
+      unseenChallenge:
+        l.unseenRegistered?.raised && !opts.ignoreChallengeUnseen
+          ? { registeredTurn: l.unseenRegistered.turn, deadline: l.unseenRegistered.deadline }
+          : null,
+      // H2 (controller request): on a one-balance chain, the session-gas-low action names its amount in USDC.
+      gasFunding: { chainId: this.opts.config.chainId, sessionGasWei: this.opts.config.sessionGasWei, feeCeilingWei: this.wallet.feeCeiling },
       settled: l.settledWake,
       autoReturnSeconds: autoReturnOnChallengeOf(this.opts.config) ? autoReturnSecondsOf(l.record.params.challengeTimeout) : null,
       ignoreHumanMustMove: opts.ignoreHumanMustMove,
@@ -3218,6 +4231,12 @@ export class ArenaDaemon {
   private markDegraded(channelId: string, error: string): void {
     this.degraded.set(channelId, error);
     this.log(`channel ${channelId} is degraded and not watched: ${error}`);
+  }
+
+  /** Final fix wave B (m-4): the channels this daemon could not load and does not watch (`markDegraded`), for the
+   *  authenticated `/health` -- so `daemon stop` names them, without a chain read. */
+  degradedChannelIds(): string[] {
+    return [...this.degraded.keys()];
   }
 
   protected log(line: string): void {

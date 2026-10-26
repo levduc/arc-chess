@@ -26,7 +26,7 @@ import {
   type SessionStore,
   type SignedState,
 } from "../src/index.js";
-import { SCHOLARS_MATE, makeParams } from "./helpers/fixtures.js";
+import { SCHOLARS_MATE, highSTwin, makeParams, vAsParity } from "./helpers/fixtures.js";
 
 const domain: ArenaDomain = { chainId: 31337, hub: "0x000000000000000000000000000000000000beef" };
 
@@ -959,5 +959,162 @@ describe("ChannelSession", () => {
       expect(bob.snapshot()).toEqual(before);
       expect(bobStore.snapshots.length).toBe(saves); // early return, not a re-verify + re-save
     });
+  });
+});
+
+// Plan 6 hardening H1 (audit-contracts I1): the hub checks only the mover's slot of a `hasPrev` proof and re-emits
+// the whole `proof.latest`, so an event's other slot can hold any bytes. A session stores only what it verified.
+describe("H1: ingestOnChain stores only signatures it verified (audit-contracts I1)", () => {
+  /** The audit's scenario: Alice (honest) plays e4 offering a draw and challenges on it; Bob answers on-chain with
+   *  ACCEPT_DRAW and puts `junk` in Alice's slot, which the hub never reads. */
+  async function junkResponse(junk: Hex) {
+    const { a, b, cfgA } = await setup();
+    const s1 = await a.move("e2e4", { offerDraw: true });
+    await b.receive(s1);
+    const s2 = await b.acceptDraw();
+    return { a, cfgA, s1, s2, onChain: { state: s2.state, sigA: junk, sigB: s2.sigB } };
+  }
+
+  it("drops junk in the slot the hub never checks, and builds the proof the hub accepts", async () => {
+    const { a, s1, s2, onChain } = await junkResponse("0x01");
+    expect(await a.ingestOnChain(onChain)).toBe(true);
+    expect(a.latest).toEqual({ state: s2.state, sigA: "0x", sigB: s2.sigB });
+    const proof = a.challengeProof();
+    // Before H1: `{hasPrev: false, latest: {sigA: "0x01", ...}}`, which the hub refuses (Unsupported) every time.
+    expect(proof.hasPrev).toBe(true);
+    expect(proof.prev).toEqual(s1); // Alice's own signature endorses the predecessor
+    expect(proof.latest).toEqual({ state: s2.state, sigA: "0x", sigB: s2.sigB });
+  });
+
+  it("drops large junk too, and never echoes it into a later proof's prev", async () => {
+    const big = `0x${"ab".repeat(200_000)}` as Hex;
+    const { a, b } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    expect(await a.ingestOnChain({ state: e5.state, sigA: big, sigB: e5.sigB })).toBe(true);
+    expect(a.latest.sigA).toBe("0x");
+    await a.move("g1f3");
+    expect(a.challengeProof().prev).toEqual({ state: e5.state, sigA: "0x", sigB: e5.sigB });
+  });
+
+  it("keeps a valid second signature, and still refuses junk in the mover's own slot", async () => {
+    const { a, b } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    // The mover's slot is the one the hub checks: junk there is not a supported state at all.
+    await expect(a.ingestOnChain({ state: e5.state, sigA: "0x", sigB: "0x01" })).rejects.toThrow(/unverifiable/);
+    // A both-signed state keeps both signatures (case ii): each was verified.
+    const { a: c, b: d, keys: keysCD, params: paramsCD } = await setup();
+    await finishGame(c, d);
+    await d.receive(await c.proposeNewGame());
+    const full = await d.countersignNewGame();
+    const fresh = await ChannelSession.create({ params: paramsCD, me: 0, sessionKey: keysCD[0], domain, store: new MemoryStore() });
+    expect(await fresh.ingestOnChain(full)).toBe(true);
+    expect(fresh.latest.sigA).toBe(full.sigA);
+    expect(fresh.latest.sigB).toBe(full.sigB);
+    expect(fresh.challengeProof().hasPrev).toBe(false);
+  });
+
+  it("open() drops an unverified signature a pre-H1 snapshot stored, and saves the result", async () => {
+    const { a, cfgA, s1, s2 } = await junkResponse("0x01");
+    // A snapshot as a pre-H1 session left it: the junk stored verbatim in latest.sigA.
+    const legacy = structuredClone(a.snapshot());
+    legacy.prev = structuredClone(s1);
+    legacy.latest = { state: s2.state, sigA: "0x01", sigB: s2.sigB };
+    const store = new MemoryStore();
+    await store.save(legacy);
+    const restored = await ChannelSession.open({ ...cfgA, store });
+    expect(restored.latest).toEqual({ state: s2.state, sigA: "0x", sigB: s2.sigB });
+    expect(store.snapshots.length).toBe(2); // saved once, with the junk dropped
+    expect(store.last?.latest.sigA).toBe("0x");
+    expect(restored.challengeProof()).toMatchObject({ hasPrev: true, prev: s1 });
+    // A snapshot with nothing to drop is not re-saved.
+    const again = await ChannelSession.open({ ...cfgA, store });
+    expect(store.snapshots.length).toBe(2);
+    expect(again.latest).toEqual(restored.latest);
+  });
+});
+
+// H1 fix round 1 (review I-1(b)): a registered state whose event cannot be read is adopted from the hub's storage,
+// unsigned, only as the canonical next move of the opponent with the hub's own registered hash.
+describe("H1 fix round 1: adoptRegistered and the signature an event later supplies", () => {
+  it("adopts the opponent's canonical next move with the matching hash; refuses anything else", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    await b.receive(e4);
+    const e5 = await b.move("e7e5"); // never delivered to a
+    const h = hashState(e5.state, domain);
+    // A wrong hash, a state two turns ahead, a non-successor and a malformed state change nothing.
+    expect(await a.adoptRegistered(e5.state, `0x${"00".repeat(32)}`)).toBe(false);
+    expect(await a.adoptRegistered({ ...e5.state, turnNum: 3n }, h)).toBe(false);
+    expect(await a.adoptRegistered({ ...e5.state, move: e5.state.move + 1 }, h)).toBe(false);
+    expect(await a.adoptRegistered({ ...e5.state, board: 1n }, hashState({ ...e5.state, board: 1n }, domain))).toBe(false);
+    expect(a.latest.state.turnNum).toBe(1n);
+    // Its own move is never adopted from storage: a second session on the same key signs e4 behind c's back.
+    const { a: c, cfgA: cfgC } = await setup();
+    const fork = await ChannelSession.create({ ...cfgC, store: new MemoryStore() });
+    const own = await fork.move("e2e4");
+    expect(await c.adoptRegistered(own.state, hashState(own.state, domain))).toBe(false);
+    expect(c.latest.state.turnNum).toBe(0n);
+    // The real one: adopted unsigned, a's turn, and a move on it is provable with `prev` endorsed by the hub's hash.
+    expect(await a.adoptRegistered(e5.state, h)).toBe(true);
+    expect(a.latest).toEqual({ state: e5.state, sigA: "0x", sigB: "0x" });
+    expect(a.isMyTurn()).toBe(true);
+    const nf3 = await a.move("g1f3");
+    const proof = a.challengeProof();
+    expect(proof).toMatchObject({ hasPrev: true, prev: { state: e5.state, sigA: "0x", sigB: "0x" }, latest: nf3 });
+    // Adopting again is a no-op (not the next turn any more).
+    expect(await a.adoptRegistered(e5.state, h)).toBe(false);
+  });
+
+  it("an event for a state already held repairs its missing signature -- verified only -- and saves once", async () => {
+    const { a, b, cfgA } = await setup();
+    await b.receive(await a.move("e2e4"));
+    const e5 = await b.move("e7e5");
+    expect(await a.adoptRegistered(e5.state, hashState(e5.state, domain))).toBe(true);
+    await a.move("g1f3");
+    const store = cfgA.store as MemoryStore;
+    const saves = store.snapshots.length;
+    // Junk for the slot is refused; Bob's real signature on e5 fills `prev`, which the next proof carries.
+    expect(await a.ingestOnChain({ state: e5.state, sigA: "0x01", sigB: "0x02" })).toBe(false);
+    expect(a.snapshot().prev?.sigB).toBe("0x");
+    expect(store.snapshots.length).toBe(saves);
+    expect(await a.ingestOnChain({ state: e5.state, sigA: "0x01", sigB: e5.sigB })).toBe(false);
+    expect(a.snapshot().prev).toEqual({ state: e5.state, sigA: "0x", sigB: e5.sigB });
+    expect(store.snapshots.length).toBe(saves + 1);
+    expect(a.challengeProof().prev.sigB).toBe(e5.sigB);
+  });
+});
+
+// Final review A: the hub verifies ECDSA only, with OpenZeppelin's rules. A session stores a signature only in the form
+// the hub accepts, so no signature it holds can sink a proof.
+describe("final review A: signatures only in the hub's form", () => {
+  it("refuses the opponent's move and Close signatures in a form the hub refuses", async () => {
+    const { a, b } = await setup();
+    const e4 = await a.move("e2e4");
+    for (const sigA of [highSTwin(e4.sigA), vAsParity(e4.sigA)]) {
+      await expect(b.receive({ ...e4, sigA })).rejects.toThrow(/missing or invalid opponent signature/);
+    }
+    expect(await b.receive(e4)).toBe("move");
+    await a.receive(await b.resign());
+    const ca = await a.signClose();
+    await expect(b.receiveClose({ ...ca, sig: highSTwin(ca.sig) })).rejects.toThrow(/invalid close signature/);
+    await b.receiveClose(ca);
+  });
+
+  it("m-3: challengeProof() leaves a lone opening signature out, as the hub supports the opening with none or both", async () => {
+    const { a, cfgA, keys } = await setup();
+    const opening = a.latest.state;
+    const lone = { state: opening, sigA: "0x" as Hex, sigB: await signState(keys[1], opening, domain) };
+    const store = new MemoryStore();
+    await store.save({ ...structuredClone(a.snapshot()), latest: lone });
+    const restored = await ChannelSession.open({ ...cfgA, store });
+    expect(restored.latest).toEqual(lone); // a valid signature survives the restore
+    expect(restored.challengeProof()).toMatchObject({ hasPrev: false, latest: { state: opening, sigA: "0x", sigB: "0x" } });
+    // A co-signed opening keeps both: the hub's both-signed rule supports it.
+    const both = { ...lone, sigA: await signState(keys[0], opening, domain) };
+    const store2 = new MemoryStore();
+    await store2.save({ ...structuredClone(a.snapshot()), latest: both });
+    expect((await ChannelSession.open({ ...cfgA, store: store2 })).challengeProof().latest).toEqual(both);
   });
 });

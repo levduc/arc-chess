@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Hex } from "viem";
+import { isRateLimited, isRpcError, rpcErrorSummary } from "@arena/sdk";
 import { DaemonError, type Actor, type ArenaDaemon } from "./daemon.js";
 import { selfCommand } from "./version.js";
 
@@ -162,6 +163,11 @@ function amount(v: unknown, name: string): bigint {
   if (typeof v !== "string" || !/^[0-9]+$/.test(v)) throw new DaemonError(400, `${name} must be a decimal string of base units`);
   return BigInt(v);
 }
+/** H1: a whole number of seconds, as a decimal string (like `amount`). */
+function seconds(v: unknown, name: string): bigint {
+  if (typeof v !== "string" || !/^[0-9]+$/.test(v)) throw new DaemonError(400, `${name} must be a decimal string of seconds`);
+  return BigInt(v);
+}
 
 export async function startApi(
   daemon: ArenaDaemon,
@@ -173,6 +179,9 @@ export async function startApi(
     sse?: { pingIntervalMs?: number; changeDebounceMs?: number };
     /** Test-only: the clock the board's one-time codes and their rate limit read (default `Date.now`). */
     board?: { now?: () => number };
+    /** H4 fix round 2: who this process is, for `/health` asked with the token -- the nonce its `daemon.lock` holds
+     *  and the command running it. `startDaemonProcess` always sets it. */
+    identity?: { lockNonce: string; role: string };
   },
 ): Promise<{ server: Server; url: string }> {
   const host = opts.host ?? "127.0.0.1";
@@ -348,7 +357,19 @@ export async function startApi(
         // path under /board that isn't one of them must 404, never 401.
         if (isBoardRequest(req.url ?? "/")) return serveBoard(req, res, url.pathname);
         const route = `${req.method} ${url.pathname}`;
-        if (route === "GET /health") return send(res, 200, { ok: true });
+        // H4 fix round 2 (N1, N3): asked with this home's token, /health also says which process answers -- its pid
+        // and the nonce of the daemon.lock it wrote -- so `daemon stop` and `daemon --detach` identify the lock's
+        // writer without any clock. Without the token it stays the bare liveness probe it always was. Final fix wave B
+        // (m-4): and the channels it does not watch (degraded), which `daemon stop` names as the human's to handle.
+        if (route === "GET /health") {
+          return send(
+            res,
+            200,
+            opts.identity !== undefined && authorized(req, opts.token)
+              ? { ok: true, pid: process.pid, lock: opts.identity.lockNonce, role: opts.identity.role, degraded: daemon.degradedChannelIds() }
+              : { ok: true },
+          );
+        }
         if (route === "GET /events") {
           if (!authorized(req, opts.token)) return send(res, 401, { error: "missing or invalid token" });
           if (sseClients.size >= MAX_SSE_CLIENTS) return send(res, 429, { error: `too many /events clients (max ${MAX_SSE_CLIENTS})` });
@@ -384,6 +405,8 @@ export async function startApi(
                 deposit: amount(b.deposit, "deposit"),
                 stakePerGame: amount(b.stakePerGame, "stakePerGame"),
                 ...(b.challengeTimeout === undefined ? {} : { challengeTimeout: amount(b.challengeTimeout, "challengeTimeout") }),
+                // H1 (`offer --ttl`): the offer's lifetime in seconds; omitted, the daemon's default (createOffer).
+                ...(b.ttl === undefined ? {} : { ttlSeconds: seconds(b.ttl, "ttl") }),
               }),
             );
           case "POST /offers/accept": {
@@ -396,26 +419,24 @@ export async function startApi(
             const m = str(b.move);
             if (!m) throw new DaemonError(400, "move is required");
             await daemon.move(ch, m, { offerDraw: b.offerDraw === true, actor });
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           }
           case "POST /resign":
             await daemon.resign(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /accept-draw":
             await daemon.acceptDraw(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /next-game":
             await daemon.nextGame(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /close":
             await daemon.close(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           case "POST /challenge":
-            await daemon.challenge(ch, actor);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.challenge(ch, actor)));
           case "POST /reclaim":
-            await daemon.reclaim(ch);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.reclaim(ch)));
           case "POST /sweep":
             // Plan 5 Task 1: a daemon-wide sweep (no `channel`) has no single channel's status to return.
             return send(res, 200, await daemon.sweep(ch));
@@ -426,7 +447,7 @@ export async function startApi(
             // break is not refused as a stray "\r"; a lone "\r" still is.
             const note = typeof b.note === "string" ? b.note.replace(/\r\n/g, "\n") : "";
             await daemon.handoff(ch, to, note);
-            return send(res, 200, await daemon.status(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch));
           }
           case "POST /withdraw": {
             // Plan 5.6 Task 3 (spec §4.4): either actor may ask -- the owner lock, not the actor, is the protection.
@@ -451,8 +472,18 @@ export async function startApi(
         // A throw after headers already went out (e.g. mid-SSE) must never re-writeHead -- that throws its own
         // ERR_HTTP_HEADERS_SENT and crashes this handler instead of just ending the one response.
         if (res.headersSent) return void res.end();
-        if (err instanceof DaemonError) return send(res, err.code, { error: err.message });
-        return send(res, 500, { error: err instanceof Error ? err.message.split("\n")[0] : String(err) });
+        if (err instanceof DaemonError) {
+          return send(res, err.code, err.hashes !== undefined ? { error: err.message, hashes: err.hashes } : { error: err.message });
+        }
+        const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        // H3 (Arc testnet rehearsal §8.2, §8.3): a rate limit that outlasted the daemon's own retries is named as one,
+        // so the agent knows the fix is to wait -- viem's own words ("HTTP request failed.") do not say so.
+        // Fix round 1 (review M5): the host's own 429 ("rate limited", host.ts) is no viem error: named as either.
+        if (isRateLimited(err)) {
+          const who = isRpcError(err) ? "the RPC is rate-limiting" : "rate-limited (RPC or host)";
+          return send(res, 503, { error: `${who} (${rpcErrorSummary(err)}): wait a few seconds, then retry (check status first after an action)` });
+        }
+        return send(res, 500, { error: message });
       }
     })();
   });

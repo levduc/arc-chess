@@ -8,6 +8,8 @@ import {ChessRules} from "../src/chess/ChessRules.sol";
 import {MockUSDC} from "../src/dev/MockUSDC.sol";
 
 contract Deploy is Script {
+    address internal constant ARC_USDC = 0x3600000000000000000000000000000000000000;
+
     function run() external returns (ChannelHub hub, ChessRules rules, address token) {
         address owner = vm.envAddress("ARENA_OWNER");
         address feeRecipient = vm.envAddress("ARENA_FEE_RECIPIENT");
@@ -21,6 +23,11 @@ contract Deploy is Script {
         bool deployMock = token == address(0);
         if (deployMock && block.chainid != 31337) {
             revert("Deploy: ARENA_TOKEN must be set on non-local chains (MockUSDC is deployed only on chain 31337)");
+        }
+        // Arc's USDC has the same address on mainnet and testnet (docs/superpowers/arc-facts.md). Anything else there
+        // is a typo or another chain's USDC: a hub every client refuses, and a wasted deploy (proposal M3).
+        if ((block.chainid == 5042 || block.chainid == 5042002) && token != ARC_USDC) {
+            revert("Deploy: on Arc (5042, 5042002) ARENA_TOKEN must be USDC 0x3600000000000000000000000000000000000000");
         }
 
         vm.startBroadcast();
