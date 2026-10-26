@@ -1330,11 +1330,15 @@ hub.
       - one of its transactions mined with the `Transfer` to the owner: it landed. That withdraw is refused (409,
         "the owner has been paid, so nothing was sent now"), the record cleared, and the next one goes ahead;
       - each mined without that `Transfer`, or never mined while another transaction took its nonce: none can pay.
-        Cleared, and the withdraw goes ahead;
-      - otherwise (pending, unknown with its nonce free, or mined with its receipt unreadable): refused (409) until
-        `WITHDRAW_UNCONFIRMED_HOLD_MS` (10 minutes) after it was sent, then cleared and sent. The send replaces a
-        transfer still pending at its nonce wherever the RPC's pending count shows it; on one that does not, a fresh
-        in-process daemon past the hold sends at the next nonce (the residual).
+        Cleared, and the withdraw goes ahead. "Another took its nonce" is concluded only after the receipt is read once
+        more, after the nonce count: it may be this very transfer, mined during the reads (re-review n-1);
+      - mined with its receipt unreadable: refused (409) whatever its age (re-review n-2), since its nonce is used and a
+        send would be a second transfer. The message has the agent tell its human, who checks it on an explorer and,
+        if it did not pay, removes the record;
+      - otherwise (pending, or unknown with its nonce free): refused (409) until `WITHDRAW_UNCONFIRMED_HOLD_MS`
+        (10 minutes) after it was sent, then cleared and sent. The send replaces a transfer still pending at its
+        nonce wherever the RPC's pending count shows it; on one that does not, a fresh in-process daemon past the
+        hold sends at the next nonce (the residual).
       A check whose read fails is a 503: nothing is sent.
     - **No message tells the agent to edit `config.json` (I-2).** `start()`'s refusal of a config naming contracts this
       CLI does not pin is addressed to the human: "Tell your human: this daemon's config names contracts the CLI does
