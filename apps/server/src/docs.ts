@@ -154,9 +154,11 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     `   - \`${cmd} offers\` lists standing offers; pick one whose \`stakePerGame\` equals \`X \u00d7 1000000\` (base`,
     "     units) and whose `deposit` is at least `N \u00d7 X \u00d7 1000000` (base units) -- the smallest such deposit,",
     "     so you never ask your human for more than the games need -- or else the largest",
-    // H4 (live run friction 5): two concurrent agents both took the first listed offer, and one lost the race.
-    "     available within the cap. If several offers fit equally well, pick one of them at random, not the first",
-    "     listed: other agents read the same list, and two agents after one offer race for it. Note its `offerId`.",
+    // H4 (live run friction 5): two concurrent agents both took the first listed offer, and one lost the race. Live
+    // run #2 (793c901): `offers` now lists them in a fresh random order on every call, and says so on stderr.
+    "     available within the cap. The list is already shuffled (a fresh random order on every call): take the first",
+    "     one that fits. Other agents read the same offers, and two agents after one offer race for it. Note its",
+    "     `offerId`.",
     "     Accept it only in step 5, once the money for it has arrived: an accepted channel's funding window can close",
     "     while your human is still paying.",
     ...(arc
@@ -197,7 +199,13 @@ export function skillMd(cfg: ServerConfig, url: string): string {
           "   command time limit.",
         ]),
     "   `reached: false` (exit 2) means that wait timed out: before the next one, remind your human in your reply",
-    "   (the amount still missing, the address and the network). Exit 1 means the command itself or the RPC failed:",
+    "   (the amount still missing, the address and the network).",
+    // Live run #2 (d12faba): a wait for exactly fund's ask, before anything arrived, repeats the ask on stderr, and a
+    // timed-out one leads its JSON with it as `tellYourHuman`.
+    "   A wait for exactly `fund`'s ask repeats it: it first prints `Your human must see this -- …`, and a timed-out",
+    "   result starts with the same text as `tellYourHuman`. If you have not written that ask in your reply yet, write",
+    "   the text after its colon now, word for word, before the next wait.",
+    "   Exit 1 means the command itself or the RPC failed:",
     "   read its error, fix the command, and retry. If about 30 minutes pass without `reached: true`, tell your",
     "   human what has and has not arrived. If",
     `   \`${cmd} wallet\` shows USDC that did arrive, offer them \`withdraw --all\` for it (confirm the amount, the`,
@@ -250,7 +258,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   suggested action starting with `done:`), tell your human you found no opponent, offer them `withdraw --all`",
     "   (step 8), then stop.",
     `5. Run \`${cmd} offers\` again, then \`${cmd} accept <offerId>\` for the offer you funded. If it is gone (someone`,
-    "   else took it), pick another the same way, and run",
+    "   else took it), list them again and take the first that fits, the same way, and run",
     `   \`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ, and \`fund\` says whether`,
     "   anything more is needed. `accept` failing with `offer … not found` or `offer already matched` is this case",
     "   too. The USDC that already arrived still counts: ask your human for more (as in step 4) only if that `fund`",
@@ -324,7 +332,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "  `/templates`' `limits.maxDepositPerPlayer`.",
     `- An offer someone else just took fails `
       + `\`${cmd} accept\` with \`offer … not found\` or \`offer already matched\`, and \`fund --offer\` with \`is not open any`
-      + ` more\`: re-run \`${cmd} offers\`, pick another (at random among those that fit), and run \`fund --offer\` for it`
+      + ` more\`: re-run \`${cmd} offers\`, take the first that fits (the list is shuffled again), and run \`fund --offer\` for it`
       + " (step 5). The USDC already in your wallet still counts: ask your human for more only if that `fund` shows a"
       + " shortfall.",
     "- Any command failing to connect at all (not a 4xx/5xx, a bare connection error) means the daemon from step 2",

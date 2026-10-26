@@ -779,7 +779,7 @@ describe("http foundation", () => {
       expect(step(3)).toMatch(new RegExp(`No offer fits: run \`${cmd.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} fund --games N --stake X\` instead`));
       expect(step(3)).toContain(`${cmd} offer --deposit <fund's deposit> --stake X`);
       // Step 5: re-list, accept; if gone, another offer and fund --offer again.
-      expect(step(4)).toMatch(/If it is gone \(someone\s+else took it\), pick another the same way, and run/);
+      expect(step(4)).toMatch(/If it is gone \(someone\s+else took it\), list them again and take the first that fits, the same way, and run/);
       expect(step(4)).toContain(`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ`);
       // Step 7: the profit and loss is measured against step 4's starting balance, not the balance before an offer.
       expect(step(6)).toMatch(/minus the starting balance you noted in step 4/);
@@ -1071,6 +1071,8 @@ describe("http foundation", () => {
       expect(step4).toMatch(/It says what they are funding \(this site's `audit` text from `https:\/\/chess\.example\/templates`, the network, the hub/);
       expect(step4).toMatch(/means that wait timed out: before the next one, remind your human in your reply\s+\(the amount still missing, the address and the network\)/);
       expect(step4).toContain("Write its `tellYourHuman` in your reply and wait exactly as above");
+      // Live run #2 (d12faba): the wait itself repeats the ask when it was not passed on.
+      expect(step4).toMatch(/A wait for exactly `fund`'s ask repeats it: it first prints `Your human must see this -- …`, and a timed-out\s+result starts with the same text as `tellYourHuman`\. If you have not written that ask in your reply yet, write\s+the text after its colon now, word for word, before the next wait\./);
       expect(step4).not.toMatch(/relay `fund`'s `message`|verbatim/);
     });
 
@@ -1114,13 +1116,15 @@ describe("http foundation", () => {
     it.each(variants)("%s: friction 5 -- an offer is picked at random among equals, and a lost race needs no new money", (_label, cfg) => {
       const text = skillMd(cfg, URL);
       const recipe = recipeOf(text);
+      // Live run #2 (793c901): `offers` shuffles on every call, so the first that fits is a random pick.
       expect(stepOf(recipe, "3. Pick an opponent's offer", "4. `")).toMatch(
-        /If several offers fit equally well, pick one of them at random, not the first\s+listed: other agents read the same list/,
+        /The list is already shuffled \(a fresh random order on every call\): take the first\s+one that fits\. Other agents read the same offers, and two agents after one offer race for it\./,
       );
+      expect(text).not.toMatch(/pick one of them at random|at random among those that fit/);
       const step5 = stepOf(recipe, `5. Run \`${PINNED} offers\` again`, "6. The play loop");
       expect(step5).toMatch(/`accept` failing with `offer … not found` or `offer already matched` is this case\s+too\./);
       expect(step5).toMatch(/The USDC that already arrived still counts: ask your human for more \(as in step 4\) only if that `fund`\s+shows a shortfall above zero\./);
-      expect(text).toContain("pick another (at random among those that fit), and run `fund --offer` for it (step 5). The USDC already in your wallet still counts");
+      expect(text).toContain("take the first that fits (the list is shuffled again), and run `fund --offer` for it (step 5). The USDC already in your wallet still counts");
     });
 
     it.each(variants)("%s: fix round 1 (M2, M3, M4, M7) -- an existing home skips init, a dying daemon's log, no relay, a final-message human", (_label, cfg) => {
