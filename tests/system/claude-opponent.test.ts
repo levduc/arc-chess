@@ -174,6 +174,10 @@ describe("the human watcher's decision", () => {
   it("retries only the helper's refusal before sending, never a send whose fate it could not see", () => {
     expect(isRefusalBeforeSend("testnet: refusing: the deployer has a pending transaction (nonce latest 7, pending 8)")).toBe(true);
     expect(isRefusalBeforeSend("testnet: the send failed and 0x3dc0 is not on the chain: Transaction creation failed.")).toBe(false);
+    // Final review C N-2's wording of the same case.
+    expect(
+      isRefusalBeforeSend(`testnet: the send failed (Transaction creation failed.), and 0x${"ab".repeat(32)} was not found 3 s later, but it may still land: check https://explorer.testnet.arc.io/tx/0x${"ab".repeat(32)} before paying again`),
+    ).toBe(false);
     expect(isRefusalBeforeSend("pay: no receipt within 180s; do not resend until 0xab confirms or drops")).toBe(false);
     expect(isRefusalBeforeSend("refusing: the deployer holds 2.1 USDC; sending 1 would leave it under 2 USDC")).toBe(false);
   });
@@ -186,6 +190,9 @@ describe("the human watcher's decision", () => {
     expect(payOutcome({ exit: 1, stdout: open.stdout.trim(), stderr: `pay: sent 1.35 USDC to ${WALLET}: x/tx/${HASH}\n${open.stderr}`.trim() })).toBe("maybe-paid");
     expect(payOutcome({ exit: 1, stdout: lost.stdout.trim(), stderr: lost.stderr.trim() })).toBe("maybe-paid");
     expect(payOutcome({ exit: 1, stdout: "", stderr: `testnet: the send failed and ${HASH} is not on the chain: Transaction creation failed.` })).toBe("maybe-paid");
+    expect(
+      payOutcome({ exit: 1, stdout: "", stderr: `testnet: the send failed (Transaction creation failed.), and ${HASH} was not found 3 s later, but it may still land: check https://explorer.testnet.arc.io/tx/${HASH} before paying again` }),
+    ).toBe("maybe-paid");
     expect(payOutcome({ exit: 0, stdout: '{"sent":true,"status":"success"}', stderr: "" })).toBe("paid");
     expect(payOutcome({ exit: 1, stdout: `{"sent":false,"status":"reverted","txHash":"${HASH}"}`, stderr: "" })).toBe("failed");
     expect(payOutcome({ exit: 1, stdout: "", stderr: "testnet: refusing: the deployer has a pending transaction (nonce latest 7, pending 8)" })).toBe("not-sent");
@@ -199,7 +206,7 @@ describe("the human watcher's decision", () => {
     expect(decide({ usdc: "1.35", address: WALLET }, WALLET, ledger, "3")).toMatchObject({ pay: false, why: "already paid this ask" });
     expect(decide({ usdc: "1.36", address: WALLET }, WALLET, ledger, "3")).toEqual({
       pay: false,
-      why: `an earlier payment of 1.35 USDC may have landed (tx ${HASH}): a person checks it before anything more is paid`,
+      why: `an earlier payment of 1.35 USDC may have landed (tx ${HASH}): a person checks it before anything more is paid, by hand with human/pay`,
     });
     // A ledger line from before `outcome` existed is read from its output the same way.
     const { outcome: _o, ...older } = ledger[1] as Extract<LedgerEntry, { kind: "paid" }>;

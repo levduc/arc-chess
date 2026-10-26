@@ -794,7 +794,14 @@ async function pay(argvIn: string[]): Promise<number> {
       () => "yes" as const,
       (e: unknown) => (e instanceof TransactionNotFoundError ? ("no" as const) : ("unknown" as const)),
     );
-    if (seen === "no") throw new Error(`the send failed and ${hash} is not on the chain: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+    // Final review C N-2: one lookup 3 s after a failed send is not proof -- a lagging node can miss a transaction that
+    // then mines -- so this says to check, never that nothing was sent.
+    if (seen === "no") {
+      throw new Error(
+        `the send failed (${rpcErrorSummary(err)}), and ${hash} was not found 3 s ` +
+          `later, but it may still land: check ${EXPLORER}/tx/${hash} before paying again`,
+      );
+    }
     sentKnown = seen === "yes";
   }
   const explorer = `${EXPLORER}/tx/${hash}`;
@@ -1047,13 +1054,19 @@ let payInFlight: Promise<unknown> | undefined;
  * explorer link as soon as it sends -- streamed straight to ours, and registered so teardown waits for it instead of
  * killing a transfer mid-flight. It is bounded by its own receipt wait.
  */
-function runPay(payPath: string, to: Address, usdc: string): Promise<{ code: number | null; stdout: string }> {
-  const p = new Promise<{ code: number | null; stdout: string }>((resolvePromise, reject) => {
-    const child = spawn(payPath, [to, usdc], { cwd: REPO_ROOT, env: testnetChildEnv(), detached: true, stdio: ["ignore", "pipe", "inherit"] });
+function runPay(payPath: string, to: Address, usdc: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const p = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolvePromise, reject) => {
+    const child = spawn(payPath, [to, usdc], { cwd: REPO_ROOT, env: testnetChildEnv(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
+    let stderr = "";
     child.stdout?.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
+    // Streamed straight on, as before, and kept: a failure that names a transaction is not a plain failure.
+    child.stderr?.on("data", (c: Buffer) => {
+      process.stderr.write(c);
+      stderr += c.toString("utf8");
+    });
     child.once("error", reject);
-    child.once("exit", (code) => resolvePromise({ code, stdout }));
+    child.once("exit", (code) => resolvePromise({ code, stdout, stderr }));
   });
   // Tracked through a promise that never rejects (the caller awaits `p` and sees its error): a rejection here would
   // otherwise sit unhandled until teardown.
@@ -1519,7 +1532,7 @@ async function up(args: UpArgs): Promise<void> {
       );
       const p = await runPay(payPath, address, due);
       if (p.code === 0) paidWei += parseUnits(due, 18);
-      else if (/"status":"pending"/.test(p.stdout)) {
+      else if (/"status":"pending"/.test(p.stdout) || /0x[0-9a-fA-F]{64}\b/.test(p.stderr)) {
         // Sent (or maybe sent), with no receipt yet: not a failure to retry, and not counted as paid either.
         process.stderr.write(`testnet-up: funding ${name} is not confirmed yet; see above, and check it before paying again\n`);
       } else process.stderr.write(`testnet-up: funding ${name} failed (exit ${p.code}); see above\n`);

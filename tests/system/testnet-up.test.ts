@@ -637,6 +637,58 @@ describe("the pay helper", () => {
   );
 
   it(
+    "final review C N-2: a failed send that one lookup cannot find says to check the explorer before paying again",
+    async () => {
+      // The proxy refuses the send itself and forwards everything else, so the 3 s lookup really finds nothing.
+      const proxy = createHttpServer((req, res) => {
+        let body = "";
+        req.on("data", (c: Buffer) => (body += c.toString("utf8")));
+        req.on("end", () => {
+          const msg = JSON.parse(body) as { id: number; method: string };
+          if (msg.method === "eth_sendRawTransaction") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "Transaction creation failed." } }));
+            return;
+          }
+          void fetch(anvil.url, { method: "POST", headers: { "content-type": "application/json" }, body }).then(async (r) => {
+            res.writeHead(r.status, { "content-type": "application/json" });
+            res.end(await r.text());
+          });
+        });
+      });
+      await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
+      try {
+        const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+        const to = privateKeyToAccount(generatePrivateKey()).address;
+        const r = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+          const c = spawn(payPath, [to, "0.5"], {
+            cwd: REPO_ROOT,
+            env: { ...process.env, ARENA_TESTNET_TEST_OVERRIDE: JSON.stringify({ rpcUrl: url, chainId: 31337, keyFile }) },
+          });
+          let stdout = "";
+          let stderr = "";
+          c.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+          c.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+          c.once("exit", (status) => resolve({ status, stdout, stderr }));
+        });
+        printed.push(r.stdout, r.stderr);
+        expect(r.status).toBe(1);
+        const hash = /0x[0-9a-f]{64}/.exec(r.stderr)?.[0];
+        expect(hash).toBeDefined();
+        expect(r.stderr).toContain(
+          `the send failed (-32000 "Transaction creation failed."), and ${hash} was not found 3 s later, but it may still land: ` +
+            `check https://explorer.testnet.arc.io/tx/${hash} before paying again`,
+        );
+        expect(r.stderr).not.toMatch(/is not on the chain/);
+        expect(await pub.getBalance({ address: to })).toBe(0n);
+      } finally {
+        await new Promise<void>((r) => proxy.close(() => r()));
+      }
+    },
+    90_000,
+  );
+
+  it(
     "refuses more than 3 USDC, and a bad amount or recipient, before sending anything",
     async () => {
       const to = privateKeyToAccount(generatePrivateKey()).address;

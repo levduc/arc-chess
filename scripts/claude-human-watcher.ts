@@ -16,8 +16,10 @@
  *
  * Every decision is appended to a JSON-lines ledger, with an ISO timestamp, *before* the pay helper runs, so a
  * resumed session (`--resume`) or a crash mid-payment can never pay the same ask twice. A payment whose outcome the
- * helper could not see (no receipt by its deadline, a lost send) is `maybe-paid`: it is never sent again, and nothing
- * more is paid to that wallet until a person has checked the transaction (`payOutcome`, `decide`). Node built-ins only, like
+ * helper could not see (no receipt by its deadline, a lost send) is `maybe-paid`: it is never sent again, and this
+ * watcher pays nothing more to that wallet for as long as that ledger line stands (`payOutcome`, `decide`). The way on
+ * is a person's: they check the transaction on the explorer, and pay anything still missing by hand with the stack's
+ * `<dir>/human/pay` (final review C N-3). Node built-ins only, like
  * `tests/system/claude-sandbox.ts` (and `arc-rehearsal-lib.ts`, whose allowlist is the environment of both children,
  * the CLI's `wallet` and the pay helper: never this process's whole environment, final review C m-9).
  */
@@ -178,7 +180,8 @@ export function microUsdc(usdc: string): bigint {
  *  the same address asked again (the agent repeating itself, or its final `result` restating its last message) is
  *  never paid twice. Refuses an address other than the agent's own wallet, more than 3 USDC in one payment (the pay
  *  helper's own cap), and anything that would take the total past `budget`. Final wave C add-on: once a payment to
- *  that wallet is `maybe-paid` (it may have landed), it pays nothing more there: a person checks that transaction. */
+ *  that wallet is `maybe-paid` (it may have landed), it pays nothing more there, for the rest of this ledger: a person
+ *  checks that transaction and pays anything still missing by hand with `<dir>/human/pay`. */
 export function decide(
   ask: FundingAsk,
   wallet: string,
@@ -199,7 +202,10 @@ export function decide(
   );
   if (open !== undefined) {
     const hash = TX_HASH.exec(`${open.stdout}\n${open.stderr}`)?.[0] ?? "(see the ledger)";
-    return { pay: false, why: `an earlier payment of ${open.usdc} USDC may have landed (tx ${hash}): a person checks it before anything more is paid` };
+    return {
+      pay: false,
+      why: `an earlier payment of ${open.usdc} USDC may have landed (tx ${hash}): a person checks it before anything more is paid, by hand with human/pay`,
+    };
   }
   const total = pays.reduce((sum, p) => sum + microUsdc(p.usdc), 0n);
   if (total + amount > microUsdc(budget)) return { pay: false, why: `would exceed the ${budget} USDC budget (paid so far ${Number(total) / 1e6}): stop and report` };
@@ -348,9 +354,9 @@ export class HumanWatcher {
 }
 
 /** True only for the pay helper's refusal while another transaction from the deployer is pending: it refused before
- *  signing anything, so a retry once that one confirms is safe. Not "the send failed and <hash> is not on the
- *  chain": the helper's lookup cannot tell a dropped send from a rate-limited lookup, so that one is left for a
- *  person, and so is `"status":"pending"`, which is never resent. */
+ *  signing anything, so a retry once that one confirms is safe. Not "the send failed …, and <hash> was not found 3 s
+ *  later": one lookup cannot tell a dropped send from a lagging node, so that one is left for a person, and so is
+ *  `"status":"pending"`, which is never resent. */
 export function isRefusalBeforeSend(stderr: string): boolean {
   return /refusing: the deployer has a pending transaction/.test(stderr);
 }
@@ -358,7 +364,9 @@ export function isRefusalBeforeSend(stderr: string): boolean {
 /** One pay at a time per pay helper, across every watcher process on this machine. The live run's two watchers paid
  *  from the one deployer at the same moment, both read the same nonce, and the second send failed ("Transaction
  *  creation failed"). An exclusive lock file in the tmp dir, keyed by the helper's path; a lock older than 5 minutes
- *  (a watcher killed mid-pay -- the helper itself gives up on a receipt after 3) is taken over. */
+ *  (a watcher killed mid-pay) is taken over. A pay itself ends within about 3.5 minutes: its reads before the send,
+ *  then a receipt wait of 180 s whose last read is capped at 20 s. A takeover that still overlaps a slow pay is safe:
+ *  the helper refuses while the deployer has a pending transaction (`isRefusalBeforeSend`). */
 async function payLock(pay: string): Promise<() => void> {
   const path = join(tmpdir(), `claude-human-pay-${createHash("sha256").update(pay).digest("hex").slice(0, 16)}.lock`);
   for (;;) {
