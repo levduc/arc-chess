@@ -16,7 +16,8 @@ const CHESS = "0x00000000000000000000000000000000000000c1";
 const HUB = "0x00000000000000000000000000000000000000c2";
 
 /** A `curl` that answers the explorer with a 403 (as `curl -f` reports it), or with `STUB_EXPLORER=up` plays a working
- *  Blockscout, and plays Sourcify; its state is files in `STUB_STATE`. */
+ *  Blockscout (`notindexed`: one that answers 404 for the contracts; `partial`: one that reports only a partial match),
+ *  and plays Sourcify (`STUB_SOURCIFY=partial`: a partial match only); its state is files in `STUB_STATE`. */
 const CURL_STUB = `#!/bin/bash
 method=GET; url=""; body=""
 while [ $# -gt 0 ]; do
@@ -31,7 +32,7 @@ done
 echo "$method $url" >> "$STUB_STATE/calls.log"
 case "$url" in
   "$ARENA_EXPLORER_URL"*)
-    if [ "$STUB_EXPLORER" != up ]; then echo "curl: (22) The requested URL returned error: 403" >&2; exit 22; fi
+    if [ -z "$STUB_EXPLORER" ]; then echo "curl: (22) The requested URL returned error: 403" >&2; exit 22; fi
     case "$url" in
       */verification/config) echo '{"solidity_compiler_versions":["v0.8.27+commit.40a35a09","v0.8.28+commit.7893614a"]}' ;;
       */verification/via/standard-input) echo '{"message":"Smart-contract verification started"}' ;;
@@ -40,9 +41,12 @@ case "$url" in
         touch "$STUB_STATE/imported-$addr"; echo '{"message":"Smart-contract verification started"}' ;;
       *)
         addr="\${url##*/}"
+        if [ "$STUB_EXPLORER" = notindexed ]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
+        if [ "$STUB_EXPLORER" = partial ]; then echo '{"is_verified":true,"is_fully_verified":false}'; exit 0; fi
         if [ -e "$STUB_STATE/imported-$addr" ]; then echo '{"is_verified":true,"is_fully_verified":true}'; else echo '{"is_verified":false}'; fi ;;
     esac ;;
   "$ARENA_SOURCIFY_URL/v2/verify/vid-"*)
+    if [ "$STUB_SOURCIFY" = partial ]; then echo '{"isJobCompleted":true,"contract":{"match":"match"}}'; exit 0; fi
     echo '{"isJobCompleted":true,"contract":{"match":"exact_match"}}' ;;
   "$ARENA_SOURCIFY_URL/v2/verify/"*)
     if [ "$STUB_SOURCIFY" = down ]; then echo "curl: (22) The requested URL returned error: 503" >&2; exit 22; fi
@@ -55,7 +59,7 @@ case "$url" in
     if [ ! -e "$STUB_STATE/verified-$addr" ]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
     case "$url" in
       *fields=*) echo '{"metadata":{"compiler":{"version":"0.8.28+commit.7893614a"}},"sources":{"src/A.sol":{"content":"contract A {}"}}}' ;;
-      *) echo '{"match":"exact_match"}' ;;
+      *) if [ "$STUB_SOURCIFY" = partial ]; then echo '{"match":"match"}'; else echo '{"match":"exact_match"}'; fi ;;
     esac ;;
   *) echo "unexpected URL $url" >&2; exit 99 ;;
 esac
@@ -67,7 +71,7 @@ afterAll(() => {
 });
 
 /** A fixture checkout, stubs and a fake HOME; `verified` pre-marks addresses as exact matches on Sourcify. */
-function setup(opts: { sourcify?: "down"; explorer?: "up"; verified?: string[] } = {}) {
+function setup(opts: { sourcify?: "down" | "partial"; explorer?: "up" | "notindexed" | "partial"; verified?: string[] } = {}) {
   const root = mkdtempSync(join(tmpdir(), "arena-verify-arc-"));
   roots.push(root);
   const contracts = join(root, "contracts");
@@ -172,6 +176,28 @@ describe("verify-arc.sh when the explorer's API answers HTTP 403 (explorer.arc.i
     }
     expect(r.stdout.match(/VERIFIED: Blockscout full match/g)).toHaveLength(2);
     expect(r.stdout).toContain("compiler_version=v0.8.28+commit.7893614a");
+  });
+
+  it("final review C N-4: an explorer that answers 404 for the contract is 'not indexed yet', not 'does not answer'", () => {
+    const { run, calls } = setup({ explorer: "notindexed" });
+    const r = run(["chessRules"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toContain(`WARNING: the explorer has not indexed ${CHESS} yet (HTTP 404): skipping its standard-input step; the import is still tried after Sourcify`);
+    expect(r.stderr).not.toMatch(/does not answer/);
+    // Reachable, so the import is still tried; with the page never indexed, Sourcify's exact match is the verdict.
+    expect(calls()).toContain(`POST https://explorer.stub/api/v2/smart-contracts/${CHESS}/verification/via/sourcify`);
+    expect(r.stdout).toContain(`VERIFIED: Sourcify exact_match -- https://sourcify.stub/server/v2/contract/${CHAIN}/${CHESS} (Blockscout: not-indexed)`);
+  });
+
+  it("final review C N-4: a partial match is never enough -- Sourcify's `match`, or Blockscout's is_verified alone", () => {
+    const sourcifyPartial = setup({ sourcify: "partial" }).run(["chessRules"]);
+    expect(sourcifyPartial.status).toBe(1);
+    expect(sourcifyPartial.stderr).toContain("NOT VERIFIED: no verifier confirmed a full match (Blockscout: unreachable; Sourcify: match)");
+
+    const blockscoutPartial = setup({ explorer: "partial", sourcify: "down" }).run(["chessRules"]);
+    expect(blockscoutPartial.status).toBe(1);
+    expect(blockscoutPartial.stdout).not.toMatch(/already fully verified|VERIFIED: Blockscout/);
+    expect(blockscoutPartial.stderr).toContain("NOT VERIFIED: no verifier confirmed a full match (Blockscout: false; Sourcify: none)");
   });
 
   it("with an explorer that answers no compiler version, Sourcify still gets ARENA_SOLC_LONG_VERSION", () => {

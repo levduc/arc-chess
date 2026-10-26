@@ -128,15 +128,17 @@ full_solc_version() {
 EXPLORER_ERROR=""
 
 # "true" only for a FULL match: Blockscout sets is_verified for a partial match too (metadata differs), and a partial
-# match is not proof that the published source is what was deployed (T5 review m-5). "unreachable" when the explorer's
-# API does not answer. Every decision below uses this. Run in the current shell (not `$(...)`) so EXPLORER_ERROR sticks:
-# the answer is in BLOCKSCOUT.
+# match is not proof that the published source is what was deployed (T5 review m-5). "not-indexed" when the explorer
+# answers HTTP 404 for the address (it has not indexed the contract yet: final review C N-4), "unreachable" when its
+# API does not answer at all (explorer.arc.io's Cloudflare challenge answers 403). Every decision below uses this.
+# Run in the current shell (not `$(...)`) so EXPLORER_ERROR sticks: the answer is in BLOCKSCOUT.
 BLOCKSCOUT=false
 blockscout_full_match() {
   local body
   if ! body="$(curl -fsS -m 15 "$EXPLORER_URL/api/v2/smart-contracts/$1" 2>&1)"; then
     EXPLORER_ERROR="$(echo "$body" | head -1)"
-    BLOCKSCOUT=unreachable
+    # curl -f names the HTTP status: "curl: (22) The requested URL returned error: 404".
+    if [[ "$EXPLORER_ERROR" =~ returned\ error:\ 404 ]]; then BLOCKSCOUT=not-indexed; else BLOCKSCOUT=unreachable; fi
     return 0
   fi
   BLOCKSCOUT="$(echo "$body" | jq -r '(.is_verified // false) and (.is_fully_verified // false)' 2>/dev/null)" || BLOCKSCOUT=unreachable
@@ -305,6 +307,8 @@ verify_one() {
 
   if [[ "$BLOCKSCOUT" == "unreachable" ]]; then
     warn "the explorer's API at $EXPLORER_URL does not answer (${EXPLORER_ERROR:-no answer}): skipping its steps; Sourcify still runs"
+  elif [[ "$BLOCKSCOUT" == "not-indexed" ]]; then
+    warn "the explorer has not indexed $addr yet (HTTP 404): skipping its standard-input step; the import is still tried after Sourcify"
   elif [[ "$autodetect" != "true" && -z "$ctor_args_hex" ]]; then
     warn "no constructor arguments (ARENA_OWNER or ARENA_FEE_RECIPIENT unset): skipping the explorer's standard-input step"
   else
@@ -326,7 +330,7 @@ verify_one() {
       # ChannelHub -- so poll for up to 90 s.
       local waited=0
       blockscout_full_match "$addr"
-      while [[ "$BLOCKSCOUT" == "false" && "$waited" -lt 90 ]]; do
+      while [[ ("$BLOCKSCOUT" == "false" || "$BLOCKSCOUT" == "not-indexed") && "$waited" -lt 90 ]]; do
         sleep 5
         waited=$((waited + 5))
         blockscout_full_match "$addr"
