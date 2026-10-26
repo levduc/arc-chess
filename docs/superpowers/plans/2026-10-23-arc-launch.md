@@ -173,9 +173,14 @@
 
 **Requirements:**
 - Deploy, verify the source, commit `contracts/deployments/5042.json` and pin `KNOWN_DEPLOYMENTS[5042]`.
-  - Deploy the testnet way, with the same script and env vars (`docs/superpowers/arc-testnet-rehearsal.md` §1), but
-    with the key in a Foundry encrypted keystore (`forge script … --account <name> --sender <address>`) or a
-    hardware wallet. Never `--private-key` on argv, never an exported variable (T5 review I-1; mainnet-gates item 4).
-- If the owner is a multisig, the owner completes the `Ownable2Step` acceptance; document the exact transaction for them to run.
+  - Follow `docs/superpowers/arc-mainnet-runbook.md` step by step (final review C I-1). It deploys with the
+    **deployer as owner**, the key in a Foundry encrypted keystore (`forge script … --account <name> --sender
+    <address>`) or a hardware wallet, never `--private-key` on argv and never an exported variable (T5 review I-1;
+    mainnet-gates item 4). Chain id 5042 is asserted before the dry run and before the broadcast, and the dry run's
+    deployments output is reconciled first.
+- Ownership: `Deploy.s.sol` passes `ARENA_OWNER` to the constructor, so there is no pending transfer to accept at
+  deploy time. The deployer then calls `transferOwnership(<multisig>)`, and the multisig calls `acceptOwnership()`
+  **on Arc** (`Ownable2Step`). That transaction proves the multisig can transact on Arc before it holds the pause
+  key, because `renounceOwnership` is disabled and a wrong owner means a redeploy (runbook §8).
 - Write `docs/deploy/arc-mainnet.server.json.example`.
 - Tick the mainnet gates with evidence.
