@@ -231,12 +231,13 @@ both hardened hubs, `claim()` and `renounceOwnership()` behave as M1/M2 require 
    - Source is verified on the explorer, and `deployments/<chainId>.json` is committed. (Testnet done in Plan 6 Task
      5: both contracts are verified on `explorer.testnet.arc.io`, and `contracts/deployments/5042002.json` is committed
      (rehearsal report §1). That includes the hardened-hub redeploy (`0x9b8B…bA41`, I1/M1/M2), whose `ChannelHub`
-     verified cold through `scripts/verify-arc.sh`'s Sourcify import. The script now requires a full match
+     verified cold through `scripts/verify-arc.sh`'s Sourcify import, and the ECDSA-only redeploy (`0x3D84…8d38`,
+     2026-10-25), fully verified the same way. The script now requires a full match
      (`is_fully_verified`). It is ready for mainnet pending a check of `explorer.arc.io`'s API: in the T5 review, its
      `/api/v2/smart-contracts/verification/config` answered 403 to a plain request; Sourcify lists 5042. Re-checked
-     2026-10-25: still 403, a Cloudflare "Just a moment…" challenge page, and Sourcify lists 5042 as supported. The
-     script reads that endpoint first, under `set -e`, so it stops there, before Sourcify (runbook §7). Mainnet is
-     still to do.)
+     2026-10-25: still 403, a Cloudflare "Just a moment…" challenge page, and Sourcify lists 5042 as supported. Since
+     `bb7acb0` the script warns on an explorer that does not answer, skips its explorer steps and still verifies on
+     Sourcify (runbook §7). Mainnet is still to do.)
    - [ ] **The mainnet deploy key never touches argv or the environment.** Use a Foundry encrypted keystore
      (`cast wallet import <name> --interactive`, then `forge script … --account <name> --sender <address>`, with a
      password prompt or a 0600 `--password-file`), or a hardware wallet. Never `--private-key` on the command line,
