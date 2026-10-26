@@ -18,8 +18,8 @@ ever move by this two-step hand-over.
 - **Deploy from the release commit.** In `contracts/`, `git status --porcelain -- .` prints nothing, and
   `git rev-parse HEAD` is the commit that passed item 9. Step 6 compares the deployed bytecode with this build.
 - **No `contracts/deployments/5042.json` exists yet** (it is untracked until §9). If one exists, stop and find out
-  which dry run or deploy wrote it before going on. If you abandon the run after the dry run (§4), delete the file
-  that run wrote, so that no later step trusts its predicted addresses.
+  which dry run or deploy wrote it before going on. If you abandon the run after the dry run (§4), or must redo
+  §3 and §4, clear that run's outputs as §5's "Redo" says, so that no later step trusts its predicted addresses.
 - **The deployer** is a fresh key or the owner's own wallet, in a Foundry keystore (§2). It holds at least 1 USDC
   on Arc mainnet. The testnet deploy cost 0.1035 USDC at 21 gwei (4.93M gas). The dry run quotes about 0.26 USDC at
   the 40 gwei cap, and the transfer in §8 costs about 0.001 USDC.
@@ -83,7 +83,7 @@ cast balance "$DEPLOYER" --rpc-url "$RPC" --ether                 # at least 1 (
 N=$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block latest)
 [ "$N" = "$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block pending)" ] && echo OK || echo "STOP: a tx is pending"
 cast call 0x3600000000000000000000000000000000000000 "decimals()(uint8)" --rpc-url "$RPC"    # 6
-[ ! -e deployments/5042.json ] && echo OK || echo "STOP: deployments/5042.json already exists"
+[ ! -e deployments/5042.json ] && echo OK || echo "STOP: deployments/5042.json exists (a redo? see §5)"
 cast compute-address "$DEPLOYER" --nonce "$N"                     # predicted ChessRules
 cast compute-address "$DEPLOYER" --nonce "$((N + 1))"             # predicted ChannelHub
 ```
@@ -102,13 +102,14 @@ env "${DEPLOY_ENV[@]}" forge script script/Deploy.s.sol --rpc-url "$RPC" \
 - **The dry run already writes `deployments/5042.json`** with forge's predicted addresses, because `vm.writeJson`
   runs during simulation too. It also writes `broadcast/Deploy.s.sol/5042/dry-run/run-latest.json`. Reconcile
   before going on: both addresses in `deployments/5042.json` equal the two predicted in §3. If they differ, the
-  nonce moved: stop and find out why.
+  nonce moved: follow §5's "Redo".
 - A revert reading "Deploy: on Arc (5042, 5042002) ARENA_TOKEN must be USDC 0x3600…" means `ARENA_TOKEN` is
   wrong. Fix §1. Do not work around the check.
 
 ## 5. Broadcast
 
-Re-assert the chain id and the nonce first. If the nonce moved since §3, the addresses change: redo §3 and §4.
+Re-assert the chain id and the nonce first. If the nonce moved since §3, the addresses change: follow "Redo" below
+before broadcasting.
 
 ```bash
 [ "$(cast chain-id --rpc-url "$RPC")" = 5042 ] && echo OK || echo "STOP: not Arc mainnet"
@@ -116,6 +117,26 @@ Re-assert the chain id and the nonce first. If the nonce moved since §3, the ad
 env "${DEPLOY_ENV[@]}" forge script script/Deploy.s.sol --rpc-url "$RPC" \
   --account "$ACCOUNT" --sender "$DEPLOYER" "${FORGE_GAS[@]}" --broadcast
 ```
+
+**Redo, when the nonce moved after §3.** §4's dry run wrote `deployments/5042.json`, so a plain rerun of §3 stops
+at its "already exists" check. Clear that run's outputs first:
+
+1. **Find out why the nonce moved.** This key exists only for this deploy, so a transaction you cannot account for
+   means someone else holds it. Stop the deploy and treat the key as compromised.
+2. **Check that nothing landed at the old addresses.** Run `cast code` on both addresses §3 predicted, at the old
+   `N`.
+   - Both empty: nothing was deployed. Go on.
+   - The hub has code: an earlier broadcast landed. Do not deploy again. Go to §6 with
+     `broadcast/Deploy.s.sol/5042/run-latest.json`.
+   - Only `ChessRules` has code: a broadcast landed halfway. That orphan is harmless and is never pinned. Go on.
+3. **Remove the dry run's outputs.** These files must be untracked, so confirm that first:
+   ```bash
+   git status --porcelain -- deployments/5042.json      # must print "?? contracts/deployments/5042.json"
+   rm deployments/5042.json && rm -r broadcast/Deploy.s.sol/5042/dry-run
+   ```
+   If `git status` shows the file as tracked, a deploy was already committed. Stop: this runbook does not cover
+   that case.
+4. **Redo §3 and §4 from the top,** with the new `N` and its predicted addresses, then come back here.
 
 ## 6. Reconcile and read back
 
@@ -207,6 +228,11 @@ The hub emitted `OwnershipTransferred(DEPLOYER, MULTISIG)`. Record both transact
 - **Recommended: the pause drill (gates item 7).** The multisig sends `setPaused(true)`. Check that `paused()` reads
   true, and that an `eth_call` of `deposit` reverts with `Paused()`, `0x9e87fac8`. Then the multisig sends
   `setPaused(false)`. This times the signers' real response before any user funds are in the hub.
+- **Read the pause on-chain, never from the host's `/templates`.** While the host's limits reads fail, `/templates`
+  keeps serving the last good value, with no age cap. During an RPC outage it can therefore show `paused: false`
+  for a hub that is paused (final review C re-review N-5). No funds are at risk, because the daemon re-reads the
+  hub before every deposit and the lobby checks live. Still, confirm a pause with `cast call "$HUB"
+  "paused()(bool)"`.
 
 ## 9. Commit, pin, record
 

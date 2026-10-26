@@ -271,7 +271,10 @@ both hardened hubs, `claim()` and `renounceOwnership()` behave as M1/M2 require 
    - Indexer lag and the cursor-ahead-of-head warning.
    - Server RSS and DB size (m7).
 7. **Runbook.**
-   - The multisig pause procedure and who can sign within minutes.
+   - The multisig pause procedure and who can sign within minutes. Confirm a pause on-chain (`paused()`), not from
+     the host's `/templates`. That endpoint serves its last good limits read when reads fail, with no age cap, so it
+     can show `paused: false` during an RPC outage (final review C re-review N-5). The daemon and the lobby read the
+     hub live.
    - The cap-raise policy.
    - Incident response for a suspected hub defect: pause, let channels settle, redeploy.
    - Key custody. Never renounce ownership (m15); the hub enforces this on-chain (audit M2).
