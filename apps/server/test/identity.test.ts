@@ -102,4 +102,47 @@ describe("startServer: chain/deployment identity check", () => {
       /^could not read the RPC's chain id \(eth_chainId\) to check it against chainId 31337: fetch failed/,
     );
   });
+
+  /** viem's own text for a failed request, as `RpcChainReader` throws it: it quotes the URL in full. */
+  const viemFailure = (url: string) =>
+    new Error(`HTTP request failed.\n\nURL: ${url}\nRequest body: {"method":"eth_chainId","params":[]}\n\nDetails: fetch failed\nVersion: viem@2.56.8`);
+  const KEYED = "https://rpc.example/v2/SECRETKEY123";
+  const KEYED_PUBLIC = "https://public.example/key/OTHERKEY456?x=1";
+
+  it("final review C N-6/N-7: a startup read failure never quotes rpcUrl or publicRpcUrl, and says it may be transient", async () => {
+    dbPath = join(tmpdir(), `arena-identity-${randomBytes(8).toString("hex")}.sqlite`);
+    const cfg = testConfig({ dbPath, rpcUrl: KEYED, publicRpcUrl: KEYED_PUBLIC });
+    const chain = new FakeChain();
+    chain.chainId = async () => {
+      throw viemFailure(KEYED);
+    };
+    const err = await startServer(cfg, { chain }).then(() => null, (e: unknown) => e as Error);
+    expect(err?.message).not.toContain("SECRETKEY123");
+    expect(err?.message).toContain("URL: https://rpc.example\n");
+    expect(err?.message).toMatch(/The RPC may be down or rate-limiting: retry, or check rpcUrl$/);
+
+    // The genesis read after it, the same way, with the public URL in the text too.
+    delete (chain as { chainId?: unknown }).chainId;
+    chain.genesisHash = async () => {
+      throw new Error(`${viemFailure(KEYED).message} (also tried ${KEYED_PUBLIC})`);
+    };
+    const err2 = await startServer(cfg, { chain }).then(() => null, (e: unknown) => e as Error);
+    expect(err2?.message).toMatch(/^could not read the chain's genesis block to verify database identity: /);
+    expect(err2?.message).not.toMatch(/SECRETKEY123|OTHERKEY456/);
+    expect(err2?.message).toContain("(also tried https://public.example)");
+    expect(err2?.message).toMatch(/The RPC may be down or rate-limiting: retry, or check rpcUrl$/);
+  });
+
+  it("final review C N-6: no log line quotes rpcUrl either (the indexer logs viem's errors)", async () => {
+    dbPath = join(tmpdir(), `arena-identity-${randomBytes(8).toString("hex")}.sqlite`);
+    const logs: string[] = [];
+    const chain = new FakeChain();
+    server = await startServer(testConfig({ dbPath, rpcUrl: KEYED }), { chain, log: (l) => logs.push(l) });
+    chain.head = async () => {
+      throw viemFailure(KEYED);
+    };
+    await server.indexer.poll();
+    expect(logs.some((l) => l.startsWith("indexer: HTTP request failed.") && l.includes("URL: https://rpc.example\n"))).toBe(true);
+    expect(logs.join("\n")).not.toContain("SECRETKEY123");
+  });
 });

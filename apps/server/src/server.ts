@@ -257,21 +257,54 @@ function canonicalChannelId(raw: string): Hex | null {
   return HEX32_ROUTE_RE.test(raw) ? (raw.toLowerCase() as Hex) : null;
 }
 
+/**
+ * Final review C N-6: `text` with this config's RPC URLs shown as their scheme and host only. A provider URL can carry
+ * an API key in its path or query, and viem quotes a failed request's URL in full in its error messages (it strips
+ * only a username and password). Every startup error and every log line of the server goes through this.
+ */
+export function redactRpcUrls(text: string, cfg: Pick<ServerConfig, "rpcUrl" | "publicRpcUrl">): string {
+  let out = text;
+  // Longest first, so a URL that is a prefix of the other one never leaves the rest of it behind.
+  for (const url of [cfg.rpcUrl, cfg.publicRpcUrl].filter((u) => u !== "").sort((a, b) => b.length - a.length)) {
+    let shown: string;
+    try {
+      const u = new URL(url);
+      shown = `${u.protocol}//${u.host}`;
+    } catch {
+      shown = "(the RPC URL)";
+    }
+    out = out.split(url).join(shown);
+  }
+  return out;
+}
+
+/** The text of `err`, with the RPC URLs redacted (`redactRpcUrls`). */
+function errorText(err: unknown, cfg: Pick<ServerConfig, "rpcUrl" | "publicRpcUrl">): string {
+  return redactRpcUrls(err instanceof Error ? err.message : String(err), cfg);
+}
+
+/** Final review C N-7: a failed startup read may be the RPC's passing trouble, not the config. */
+const STARTUP_READ_HINT = "The RPC may be down or rate-limiting: retry, or check rpcUrl";
+
 export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Promise<ArenaServer> {
   const repo = new SqliteRepo(cfg.dbPath, (p) => channelId(cfg.chainId, cfg.hub, p));
   // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
-  const log = deps.log ?? ((line: string) => console.log(line));
+  const rawLog = deps.log ?? ((line: string) => console.log(line));
+  const log = (line: string) => rawLog(redactRpcUrls(line, cfg));
 
   // Final review C m-5: the RPC must serve the chain this config names. Checked first: a 5042 config pointed at a
   // testnet RPC would otherwise index nothing, silently, and a new database would record the wrong genesis hash. The
-  // RPC URL itself is never quoted (a provider URL can carry an API key).
+  // RPC URL itself is never quoted (a provider URL can carry an API key): N-6, `errorText`.
   let rpcChainId: number;
   try {
     rpcChainId = await chain.chainId();
   } catch (err) {
     repo.close();
-    throw new Error(`could not read the RPC's chain id (eth_chainId) to check it against chainId ${cfg.chainId}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(
+      `could not read the RPC's chain id (eth_chainId) to check it against chainId ${cfg.chainId}: ${errorText(err, cfg)}. ` +
+        STARTUP_READ_HINT,
+    );
   }
   if (rpcChainId !== cfg.chainId) {
     repo.close();
@@ -291,7 +324,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     genesisHash = await chain.genesisHash();
   } catch (err) {
     repo.close();
-    throw new Error(`could not read the chain's genesis block to verify database identity: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`could not read the chain's genesis block to verify database identity: ${errorText(err, cfg)}. ${STARTUP_READ_HINT}`);
   }
   const recorded = repo.identity();
   if (recorded === null) {

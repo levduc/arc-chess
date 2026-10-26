@@ -779,7 +779,7 @@ describe("http foundation", () => {
       expect(step(3)).toMatch(new RegExp(`No offer fits: run \`${cmd.replace(/[.*+?^${}()|[\]\\@/]/g, "\\$&")} fund --games N --stake X\` instead`));
       expect(step(3)).toContain(`${cmd} offer --deposit <fund's deposit> --stake X`);
       // Step 5: re-list, accept; if gone, another offer and fund --offer again.
-      expect(step(4)).toMatch(/If it is gone \(someone\s+else took it\), list them again and take the first that fits, the same way, and run/);
+      expect(step(4)).toMatch(/If it is gone \(someone\s+else took it\), list them again and pick the same way \(step 3: the smallest deposit that fits, then the first\s+listed\), and run/);
       expect(step(4)).toContain(`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ`);
       // Step 7: the profit and loss is measured against step 4's starting balance, not the balance before an offer.
       expect(step(6)).toMatch(/minus the starting balance you noted in step 4/);
@@ -1117,14 +1117,18 @@ describe("http foundation", () => {
       const text = skillMd(cfg, URL);
       const recipe = recipeOf(text);
       // Live run #2 (793c901): `offers` shuffles on every call, so the first that fits is a random pick.
-      expect(stepOf(recipe, "3. Pick an opponent's offer", "4. `")).toMatch(
-        /The list is already shuffled \(a fresh random order on every call\): take the first\s+one that fits\. Other agents read the same offers, and two agents after one offer race for it\./,
+      // Final review C N-8: "first listed" is among the offers with the chosen deposit, after the smallest-deposit rule.
+      const step3 = stepOf(recipe, "3. Pick an opponent's offer", "4. `");
+      expect(step3).toMatch(
+        /Among the offers with that deposit, take the first listed: the list is shuffled\s+on every call, and other agents read the same offers, so two agents after one offer race for it\./,
       );
+      expect(step3.indexOf("the smallest such deposit")).toBeLessThan(step3.indexOf("Among the offers with that deposit"));
+      expect(step3).not.toMatch(/take the first one that fits/);
       expect(text).not.toMatch(/pick one of them at random|at random among those that fit/);
       const step5 = stepOf(recipe, `5. Run \`${PINNED} offers\` again`, "6. The play loop");
       expect(step5).toMatch(/`accept` failing with `offer … not found` or `offer already matched` is this case\s+too\./);
       expect(step5).toMatch(/The USDC that already arrived still counts: ask your human for more \(as in step 4\) only if that `fund`\s+shows a shortfall above zero\./);
-      expect(text).toContain("take the first that fits (the list is shuffled again), and run `fund --offer` for it (step 5). The USDC already in your wallet still counts");
+      expect(text).toContain("pick as in step 3 (it is shuffled again), and run `fund --offer` for it (step 5). The USDC already in your wallet still counts");
     });
 
     it.each(variants)("%s: fix round 1 (M2, M3, M4, M7) -- an existing home skips init, a dying daemon's log, no relay, a final-message human", (_label, cfg) => {

@@ -134,7 +134,11 @@ values (USDC base units) can exceed `Number.MAX_SAFE_INTEGER`.
 to 900 s, the daemons' default `minChallengeTimeout`: daemons refuse shorter offers.
 
 At startup the server reads the RPC's `eth_chainId` and refuses to start when it is not `chainId`: a config for one
-chain pointed at another chain's RPC would otherwise index nothing, silently. The message never quotes `rpcUrl`.
+chain pointed at another chain's RPC would otherwise index nothing, silently. When the read itself fails, the refusal
+says the RPC may be down or rate-limiting: retry, or check `rpcUrl`.
+
+No startup error and no log line quotes `rpcUrl` or `publicRpcUrl` in full: a provider URL can carry an API key, and
+viem's own errors quote a failed request's URL. Each shows as its scheme and host only (`https://rpc.example`).
 
 On **Arc mainnet** (chain id 5042), two more fields are checked, and startup fails naming the field:
 

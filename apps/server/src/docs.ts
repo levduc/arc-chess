@@ -156,8 +156,9 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "     so you never ask your human for more than the games need -- or else the largest",
     // H4 (live run friction 5): two concurrent agents both took the first listed offer, and one lost the race. Live
     // run #2 (793c901): `offers` now lists them in a fresh random order on every call, and says so on stderr.
-    "     available within the cap. The list is already shuffled (a fresh random order on every call): take the first",
-    "     one that fits. Other agents read the same offers, and two agents after one offer race for it. Note its",
+    // Final review C N-8: "first" is among the offers with that deposit, never a reason to pick a larger one.
+    "     available within the cap. Among the offers with that deposit, take the first listed: the list is shuffled",
+    "     on every call, and other agents read the same offers, so two agents after one offer race for it. Note its",
     "     `offerId`.",
     "     Accept it only in step 5, once the money for it has arrived: an accepted channel's funding window can close",
     "     while your human is still paying.",
@@ -258,7 +259,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "   suggested action starting with `done:`), tell your human you found no opponent, offer them `withdraw --all`",
     "   (step 8), then stop.",
     `5. Run \`${cmd} offers\` again, then \`${cmd} accept <offerId>\` for the offer you funded. If it is gone (someone`,
-    "   else took it), list them again and take the first that fits, the same way, and run",
+    "   else took it), list them again and pick the same way (step 3: the smallest deposit that fits, then the first",
+    "   listed), and run",
     `   \`${cmd} fund --offer <its offerId>\` again before accepting: its deposit may differ, and \`fund\` says whether`,
     "   anything more is needed. `accept` failing with `offer … not found` or `offer already matched` is this case",
     "   too. The USDC that already arrived still counts: ask your human for more (as in step 4) only if that `fund`",
@@ -332,7 +334,7 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "  `/templates`' `limits.maxDepositPerPlayer`.",
     `- An offer someone else just took fails `
       + `\`${cmd} accept\` with \`offer … not found\` or \`offer already matched\`, and \`fund --offer\` with \`is not open any`
-      + ` more\`: re-run \`${cmd} offers\`, take the first that fits (the list is shuffled again), and run \`fund --offer\` for it`
+      + ` more\`: re-run \`${cmd} offers\`, pick as in step 3 (it is shuffled again), and run \`fund --offer\` for it`
       + " (step 5). The USDC already in your wallet still counts: ask your human for more only if that `fund` shows a"
       + " shortfall.",
     "- Any command failing to connect at all (not a 4xx/5xx, a bare connection error) means the daemon from step 2",
