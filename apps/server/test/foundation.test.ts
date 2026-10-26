@@ -1139,6 +1139,11 @@ describe("http foundation", () => {
       expect(skillMd(cfg, URL)).toContain(
         "- `note: <action> took effect, but the chain could not be read afterwards`: it DID take effect, so never send it again; run `status` for a fresh view.",
       );
+      // Final fix wave B (m-7): the CLI's own note for a challenge or reclaim whose outcome is not known yet.
+      expect(skillMd(cfg, URL)).toContain(
+        "- `note: challenge was mined, but whether it succeeded is not known yet` (or `reclaim`): it was sent and mined, so\n" +
+          "  never send it again; run `status` until it shows the outcome.",
+      );
     });
   });
 

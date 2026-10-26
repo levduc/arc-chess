@@ -335,6 +335,9 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     "  (when `chainStaleReason` says a receipt could not be read, check `status`: whether it succeeded is not known yet).",
     // H4 (live run friction 3): the note H3's CLI prints for such an answer, in the words agents see.
     "- `note: <action> took effect, but the chain could not be read afterwards`: it DID take effect, so never send it again; run `status` for a fresh view.",
+    // Final fix wave B (f2618d9, m-7): a challenge or reclaim mined with its receipt unreadable gets its own note.
+    "- `note: challenge was mined, but whether it succeeded is not known yet` (or `reclaim`): it was sent and mined, so",
+    "  never send it again; run `status` until it shows the outcome.",
     `- \`opponent-silent\`: run \`${cmd} challenge\` to force them to answer on-chain before the deadline, or claim`,
     "  the forfeit once it passes.",
     "- `challenge-unseen`, or a suggested action starting \"check the RPC: block(s) …\": your RPC refuses to serve",
