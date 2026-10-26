@@ -1166,9 +1166,12 @@ export class ArenaDaemon {
    *   (409), so a retry of it is never a second payment; the next withdraw goes ahead;
    * - every one of them mined without that Transfer, or never mined while its nonce has been used by another one:
    *   none can pay. Cleared, and this withdraw goes ahead;
-   * - otherwise (still pending, unknown with its nonce free, or mined with its receipt unreadable): refused (409),
-   *   kept -- until the hold is over: then cleared, and this withdraw goes ahead (its send replaces a transfer still
-   *   pending at its nonce). A landed one is reported whatever its age.
+   * - mined with its receipt unreadable: refused (409), kept, whatever its age (re-review n-2): its nonce is used, so
+   *   a send would be a second transfer, and only a readable receipt (or the human) can say whether it paid;
+   * - otherwise (still pending, or unknown with its nonce free): refused (409), kept -- until the hold is over: then
+   *   cleared, and this withdraw goes ahead (its send replaces a transfer still pending at its nonce). A landed one is
+   *   reported whatever its age. Re-review n-1: "its nonce has been used" is concluded only after its receipt is read
+   *   once more, after the count -- it may be this very transfer, mined during the reads.
    * A read that fails is a 503: retry shortly. An unreadable file is ignored (logged).
    */
   private async resolvePendingWithdraw(usdc: Address): Promise<void> {
@@ -1185,40 +1188,53 @@ export class ArenaDaemon {
     const ageMs = Date.now() - p.at;
     const hashes = p.txs.map((t) => t.hash);
     const what = `an earlier withdraw of ${formatUsdc6(p.amount)} USDC to ${p.to}`;
-    const unresolved: Hex[] = [];
+    /** What the chain says of one recorded transaction now. */
+    const classify = async (hash: Hex): Promise<"paid-nothing" | "pending-or-unknown" | { mined: bigint }> => {
+      const receipt = await this.client.getTransactionReceipt({ hash }).catch((err: unknown) => {
+        if (err instanceof TransactionReceiptNotFoundError) return null;
+        throw err;
+      });
+      if (receipt !== null) {
+        const paid =
+          receipt.status === "success" && confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: p.to, amount: p.amount });
+        if (paid) {
+          clear();
+          throw new DaemonError(
+            409,
+            `${what} landed (tx ${hash}, block ${receipt.blockNumber}): the owner has been paid, so nothing was sent ` +
+              "now. Run withdraw again only to send more",
+            [hash],
+          );
+        }
+        return "paid-nothing"; // mined, and paid nothing: its nonce is used
+      }
+      const tx = await this.client.getTransaction({ hash }).catch((err: unknown) => {
+        if (err instanceof TransactionNotFoundError) return null;
+        throw err;
+      });
+      return tx !== null && tx.blockNumber !== null ? { mined: tx.blockNumber } : "pending-or-unknown";
+    };
+    /** Mined with its receipt unreadable: whether it paid is not known. Never released by the hold (re-review n-2). */
+    const mined: Array<{ hash: Hex; block: bigint }> = [];
+    /** Pending, or unknown with its nonce free: may still land. Released once the hold is over. */
+    const pending: Hex[] = [];
     try {
       let latest: number | undefined;
       for (const t of p.txs) {
-        const receipt = await this.client.getTransactionReceipt({ hash: t.hash }).catch((err: unknown) => {
-          if (err instanceof TransactionReceiptNotFoundError) return null;
-          throw err;
-        });
-        if (receipt !== null) {
-          const paid =
-            receipt.status === "success" &&
-            confirmsTransfer(receipt.logs, { token: usdc, from: this.wallet.address, to: p.to, amount: p.amount });
-          if (paid) {
-            clear();
-            throw new DaemonError(
-              409,
-              `${what} landed (tx ${t.hash}, block ${receipt.blockNumber}): the owner has been paid, so nothing was sent ` +
-                "now. Run withdraw again only to send more",
-              [t.hash],
-            );
+        let c = await classify(t.hash);
+        if (c === "paid-nothing") continue;
+        if (c === "pending-or-unknown") {
+          latest ??= await this.client.getTransactionCount({ address: this.wallet.address, blockTag: "latest" });
+          if (t.nonce === undefined || latest <= t.nonce) {
+            pending.push(t.hash);
+            continue;
           }
-          continue; // mined, and paid nothing: its nonce is used
+          // Its nonce is used. Re-review n-1: by this very transfer, if it was mined after the reads above -- so it is
+          // read once more, after the count, before "it can never land" (as waitOrReplace re-checks before a drop).
+          c = await classify(t.hash);
+          if (c === "paid-nothing" || c === "pending-or-unknown") continue; // another transaction took its nonce
         }
-        const tx = await this.client.getTransaction({ hash: t.hash }).catch((err: unknown) => {
-          if (err instanceof TransactionNotFoundError) return null;
-          throw err;
-        });
-        if (tx !== null && tx.blockNumber !== null) {
-          unresolved.push(t.hash); // mined, its receipt not readable yet
-          continue;
-        }
-        latest ??= await this.client.getTransactionCount({ address: this.wallet.address, blockTag: "latest" });
-        if (t.nonce !== undefined && latest > t.nonce) continue; // another transaction took its nonce: it can never land
-        unresolved.push(t.hash);
+        mined.push({ hash: t.hash, block: c.mined });
       }
     } catch (err) {
       if (err instanceof DaemonError) throw err;
@@ -1229,17 +1245,27 @@ export class ArenaDaemon {
         hashes,
       );
     }
-    if (unresolved.length === 0) return clear();
+    if (mined.length > 0) {
+      const which = mined.map((m) => `tx ${m.hash}, block ${m.block}`).join("; ");
+      throw new DaemonError(
+        409,
+        `${what} was mined (${which}), but its receipt cannot be read, so whether it paid the owner is not known: nothing ` +
+          `was sent now, and nothing is until its receipt can be read. Tell your human: check it on an explorer; if it ` +
+          `did not pay, they (never you) remove ${path} to withdraw again`,
+        mined.map((m) => m.hash),
+      );
+    }
+    if (pending.length === 0) return clear();
     if (!(ageMs < WITHDRAW_UNCONFIRMED_HOLD_MS)) {
-      this.log(`withdraw: ${what} (tx ${unresolved.join(", ")}) is still not confirmed, past its hold: sending`);
+      this.log(`withdraw: ${what} (tx ${pending.join(", ")}) is still not confirmed, past its hold: sending`);
       return clear();
     }
     throw new DaemonError(
       409,
-      `${what} was sent ${Math.round(ageMs / 1000)} s ago (tx ${unresolved.join(", ")}) and is not confirmed: it may still land, ` +
+      `${what} was sent ${Math.round(ageMs / 1000)} s ago (tx ${pending.join(", ")}) and is not confirmed: it may still land, ` +
         `so nothing was sent now. Check the owner's balance, an explorer or "${selfCommand()} wallet". The next withdraw says ` +
         `so if it landed, and sends once it can no longer land, or ${WITHDRAW_UNCONFIRMED_HOLD_MS / 60_000} minutes after it was sent`,
-      unresolved,
+      pending,
     );
   }
 

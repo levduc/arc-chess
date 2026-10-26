@@ -222,7 +222,11 @@ transaction hashes, in the message and as `hashes`: check them on an explorer, o
 (final fix wave B, I-1). It is recorded in `ARENA_HOME/withdraw-pending.json`, and the next withdraw, through this
 daemon or a new one, checks it first. If it landed, that withdraw sends nothing and says the owner was paid; the
 one after goes ahead. While it may still land, every withdraw is refused (`409`), until another transaction takes
-its nonce or 10 minutes have passed since it was sent.
+its nonce or 10 minutes have passed since it was sent. "Another transaction took its nonce" is concluded only after
+its receipt is read once more, after the nonce count: it may be this very transfer, mined during the check
+(re-review n-1). A transfer known to be mined whose receipt cannot be read stays held whatever its age (n-2): its
+nonce is used, so a new send would be a second transfer. The message tells the agent to tell its human, who checks
+it on an explorer and, if it did not pay, removes `ARENA_HOME/withdraw-pending.json` to withdraw again.
 
 **Honesty note.** The owner lock stops a confused or prompt-injected agent from redirecting funds through the CLI
 or the daemon API — it cannot, by itself, send to any address but the recorded owner. It is **not** a defence

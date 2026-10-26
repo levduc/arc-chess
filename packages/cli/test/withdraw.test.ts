@@ -12,6 +12,7 @@ import {
   erc20Abi,
   http,
   LimitExceededRpcError,
+  TransactionReceiptNotFoundError,
   pad,
   toHex,
   type Address,
@@ -1269,5 +1270,104 @@ describe("Final fix wave B (I-1): a withdraw that was sent and whose receipt rea
     pending({ txs: [{ hash: unknown }] });
     expect(((await proc.daemon.withdraw({ amount: 1_000_000n }).catch((e: unknown) => e)) as DaemonError).code).toBe(409);
     expect(await usdcBalance(env.usdc, owner)).toBe(2_000_000n);
+  });
+
+  /** A fake chain for one recorded transfer `hash`, on `daemon`'s client: `reads` decide each answer, in call order. */
+  function fakeReads(
+    daemon: ArenaDaemon,
+    hash: Hex,
+    reads: { receipt: (call: number) => unknown; tx: () => unknown; count: () => number },
+  ) {
+    const c = daemon.client as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    const real = { receipt: c.getTransactionReceipt, tx: c.getTransaction, count: c.getTransactionCount };
+    let receipts = 0;
+    c.getTransactionReceipt = async (...a) => {
+      if ((a[0] as { hash: Hex }).hash !== hash) return real.receipt!(...a);
+      const r = reads.receipt(receipts++);
+      if (r === null) throw new TransactionReceiptNotFoundError({ hash });
+      return r;
+    };
+    c.getTransaction = async (...a) => ((a[0] as { hash: Hex }).hash === hash ? reads.tx() : real.tx!(...a));
+    c.getTransactionCount = async () => reads.count();
+    return () => {
+      c.getTransactionReceipt = real.receipt!;
+      c.getTransaction = real.tx!;
+      c.getTransactionCount = real.count!;
+    };
+  }
+  const resolve = (d: ArenaDaemon, usdc: Address) =>
+    (d as unknown as { resolvePendingWithdraw(u: Address): Promise<void> }).resolvePendingWithdraw(usdc).then(
+      () => "sends" as const,
+      (e: unknown) => e as DaemonError,
+    );
+
+  it("re-review n-1: a transfer mined during the guard's own reads is found landed -- never judged 'can never land', which sent it twice", async () => {
+    const { env, home, wallet } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    const hash = `0x${randomBytes(32).toString("hex")}` as Hex;
+    const path = arenaPaths(home).withdrawPending;
+    writeJsonAtomic(path, { to: owner, amount: 2_000_000n, at: Date.now(), txs: [{ hash, nonce: 7 }] } satisfies PendingWithdraw);
+    // The re-review's probe: no receipt yet, the transaction pending -- then mined before the nonce count is read, so
+    // its nonce (7) reads as used, and its receipt, with the Transfer to the owner, is there on the next read.
+    const transferLog = {
+      address: env.usdc,
+      topics: encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from: wallet, to: owner } }),
+      data: encodeAbiParameters([{ type: "uint256" }], [2_000_000n]),
+      blockHash: `0x${"aa".repeat(32)}`,
+      blockNumber: 9n,
+      logIndex: 0,
+      transactionHash: hash,
+      transactionIndex: 0,
+      removed: false,
+    };
+    let minedNow = false;
+    const restore = fakeReads(proc.daemon, hash, {
+      receipt: () => (minedNow ? { status: "success", blockNumber: 9n, logs: [transferLog] } : null),
+      tx: () => ({ hash, nonce: 7, blockNumber: null }),
+      count: () => ((minedNow = true), 8),
+    });
+    const r = await resolve(proc.daemon, env.usdc);
+    restore();
+    // Before: "another transaction took its nonce: it can never land" -- cleared, and the withdraw sent a second transfer.
+    expect(r).toBeInstanceOf(DaemonError);
+    expect((r as DaemonError).code).toBe(409);
+    expect((r as DaemonError).message).toMatch(new RegExp(`landed \\(tx ${hash}, block 9\\): the owner has been paid, so nothing was sent now`));
+    expect(existsSync(path)).toBe(false);
+    // Nonce used and still no receipt after the count: another transaction took it, so it can never land.
+    writeJsonAtomic(path, { to: owner, amount: 2_000_000n, at: Date.now(), txs: [{ hash, nonce: 7 }] } satisfies PendingWithdraw);
+    const restore2 = fakeReads(proc.daemon, hash, { receipt: () => null, tx: () => null, count: () => 8 });
+    expect(await resolve(proc.daemon, env.usdc)).toBe("sends");
+    restore2();
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it("re-review n-2: a transfer known mined whose receipt cannot be read stays held past the hold, and the human is told", async () => {
+    const { env, home } = await walletHome();
+    const owner = newAddress();
+    await firstSet(home, owner);
+    const proc = await startDaemon(home);
+    const hash = `0x${randomBytes(32).toString("hex")}` as Hex;
+    const path = arenaPaths(home).withdrawPending;
+    // Sent past the hold: a still-pending transfer is let go then -- a mined one is not (its nonce is used, so a send is
+    // a second transfer, and whether the first paid is unknown).
+    writeJsonAtomic(path, { to: owner, amount: 2_000_000n, at: Date.now() - WITHDRAW_UNCONFIRMED_HOLD_MS - 1, txs: [{ hash, nonce: 0 }] } satisfies PendingWithdraw);
+    const restore = fakeReads(proc.daemon, hash, { receipt: () => null, tx: () => ({ hash, nonce: 0, blockNumber: 12n }), count: () => 1 });
+    const r = await resolve(proc.daemon, env.usdc);
+    // A full withdraw is refused the same way, and nothing moves.
+    const w = (await proc.daemon.withdraw({ amount: 1_000_000n }).catch((e: unknown) => e)) as DaemonError;
+    restore();
+    // Before: past the hold, cleared, and the withdraw sent.
+    expect(r).toBeInstanceOf(DaemonError);
+    expect([(r as DaemonError).code, (r as DaemonError).hashes]).toEqual([409, [hash]]);
+    expect((r as DaemonError).message).toBe(
+      `an earlier withdraw of 2.000000 USDC to ${owner} was mined (tx ${hash}, block 12), but its receipt cannot be read, so ` +
+        "whether it paid the owner is not known: nothing was sent now, and nothing is until its receipt can be read. Tell your " +
+        `human: check it on an explorer; if it did not pay, they (never you) remove ${path} to withdraw again`,
+    );
+    expect(w.code).toBe(409);
+    expect(existsSync(path)).toBe(true);
+    expect(await usdcBalance(env.usdc, owner)).toBe(0n);
   });
 });
