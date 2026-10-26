@@ -163,19 +163,20 @@ env "${DEPLOY_ENV[@]}" ARENA_CHAIN_ID=5042 ARENA_EXPLORER_URL=https://explorer.a
 ```
 
 - **`ARENA_OWNER` must be the constructor's value: the deployer.** The script ABI-encodes the constructor arguments
-  from these variables, and must still be given the deployer after §8 has moved ownership. `DEPLOY_ENV` already
-  holds it, so do not substitute the multisig.
-- **Pending: a check of `explorer.arc.io`'s API.** On 2026-10-25, a scripted GET of
-  `https://explorer.arc.io/api/v2/smart-contracts/verification/config` returned HTTP 403 with a Cloudflare "Just a
-  moment…" challenge page. Sourcify's `/server/chains` lists 5042 ("Arc Mainnet") as supported. The script reads
-  that endpoint in its first step (`blockscout_compiler_version`, called bare under `set -euo pipefail`), so it stops
-  there, before Sourcify, while the block lasts. I confirmed the exit (curl status 22) by running a copy of that
-  step against the live endpoint.
+  from these variables for the explorer's standard-input step, whenever the explorer answers. It must still be
+  given the deployer after §8 has moved ownership. `DEPLOY_ENV` already holds it, so do not substitute the
+  multisig.
+- **`explorer.arc.io`'s API may refuse the script.**
+  - On 2026-10-25, a scripted GET of `https://explorer.arc.io/api/v2/smart-contracts/verification/config` returned
+    HTTP 403, with a Cloudflare "Just a moment…" challenge page. Sourcify's `/server/chains` lists 5042 ("Arc
+    Mainnet") as supported.
+  - Since FW-C's `bb7acb0`, the script treats an explorer that does not answer as one WARNING naming curl's error.
+    It skips the explorer's standard-input step, its import and its poll, and still runs Sourcify.
+  - It counts a contract as VERIFIED on the explorer's `is_fully_verified` or on Sourcify's `exact_match`, and
+    exits 0 only if both contracts have one.
+  - So while the block lasts, Sourcify's `exact_match` is the proof of the source. The explorer page's import from
+    Sourcify then has to be done another way: the explorer's web UI, or Arc or Blockscout support.
   - Check the endpoint again before Task 6.
-  - If it is still blocked, Sourcify's `exact_match` for both contracts is the independent proof of the source.
-    Get it by running the script's Sourcify step on its own.
-  - The explorer page then needs its import from Sourcify done another way: the explorer's web UI, or Arc or
-    Blockscout support.
 - **Accept only a full match** (`is_fully_verified`, or Sourcify `exact_match`). A partial match does not prove the
   source.
 
