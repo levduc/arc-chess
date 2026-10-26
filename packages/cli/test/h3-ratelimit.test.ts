@@ -13,6 +13,7 @@ import {
   TxFeeCapError,
   TxInsufficientFundsError,
   TxReceiptMissingError,
+  TxStuckError,
   ZERO_HASH,
   rpcTransport,
 } from "@arena/sdk";
@@ -260,6 +261,45 @@ describe("H3 fix round 2 (re-review M-g): a respond is never broadcast past its 
     await alice.daemon.move(id, "Nf3", { actor: "agent" });
     expect(sent.at).toBeDefined();
     expect((await alice.daemon.hub.channelInfo(id)).phase).toBe("Open");
+  });
+});
+
+describe("final fix wave B (m-6 follow-up): a respond still pending at its give-up time, that then lands, is not reported stuck", () => {
+  it("no receipt by the give-up time and the transaction pending (Arc, before its next block): TxStuckError -- the channel is Open, so no lastError", async () => {
+    const { alice, id, l, sent } = await challengedAlice();
+    const d = alice.daemon;
+    const { deadline } = await d.hub.channelInfo(id);
+    // The block the respond reads is 1 s before the deadline: its give-up time is 1 s away.
+    const realBlock = d.client.getBlock.bind(d.client);
+    d.client.getBlock = (async (...args: Parameters<typeof realBlock>) => ({ ...(await realBlock(...args)), timestamp: deadline - 1n })) as typeof realBlock;
+    // The respond's own reads: no receipt, and its transaction reads as pending -- as on Arc until the next block. On
+    // Anvil it is mined at once, so the challenge is answered.
+    const fetchFn = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const req = JSON.parse(String(init?.body)) as { id: number; method: string };
+      const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+      if (req.method === "eth_getTransactionReceipt") return json({ jsonrpc: "2.0", id: req.id, result: null });
+      const upstream = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: init?.body });
+      if (req.method !== "eth_getTransactionByHash") return upstream;
+      const body = (await upstream.json()) as { result: Record<string, unknown> | null };
+      if (body.result) body.result = { ...body.result, blockHash: null, blockNumber: null, transactionIndex: null };
+      return json(body);
+    };
+    const client = createPublicClient({ transport: rpcTransport(RPC, { fetchFn, retryDelay: 1 }) }) as PublicClient;
+    const fake = new HubClient(d.hub.hub, client);
+    let failure: unknown;
+    d.hub.respond = async (...args: Parameters<HubClient["respond"]>) =>
+      fake.respond(...args).catch((err: unknown) => {
+        failure = err;
+        throw err;
+      });
+    await d.move(id, "Nf3", { actor: "agent" });
+    expect(sent.at).toBeDefined();
+    expect(failure).toBeInstanceOf(TxStuckError);
+    expect((failure as TxStuckError).atDeadline).toBe(true);
+    expect((await d.hub.channelInfo(id)).phase).toBe("Open"); // it landed and answered the challenge
+    // Before: "respond: …" (the stuck transaction) stayed as lastError on a channel that respond had answered, and the
+    // next pass, on a channel no longer Challenged, never cleared it.
+    expect(l.lastError ?? "").not.toMatch(/^respond:/);
   });
 });
 

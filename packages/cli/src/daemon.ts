@@ -3053,12 +3053,15 @@ export class ArenaDaemon {
       // show up here. A failure that is not a hub revert (transport, our own gas) is always this daemon's problem.
       // A respond reported dropped, whose nonce turned out used (an earlier transaction of this session key landed
       // there), or mined with its receipt unreadable, may have answered the challenge after all -- the same check
-      // applies (Plan 4.5 Task 10 round 4).
+      // applies (Plan 4.5 Task 10 round 4). Final fix wave B (m-6 follow-up): so may one still pending at its give-up
+      // time (`TxStuckError`), which, sent inside RESPOND_SEND_MARGIN_MS past it, can then still land: on Arc the wait
+      // finds no receipt before the next block.
       const after =
         err instanceof HubRevertError ||
         err instanceof TxDroppedError ||
         err instanceof TxNonceUsedError ||
-        err instanceof TxReceiptMissingError
+        err instanceof TxReceiptMissingError ||
+        err instanceof TxStuckError
           ? await this.hub.channelInfo(id).catch(() => null)
           : null;
       if (after?.phase !== "Open") {
@@ -3070,7 +3073,8 @@ export class ArenaDaemon {
         () => "unknown",
       );
       this.log(
-        `channel ${id}: respond reverted but the challenge was already answered (registered turn ${reg}, ours ${l.session.latest.state.turnNum}): ${errorText(err)}`,
+        `channel ${id}: respond ${err instanceof HubRevertError ? "reverted" : "was not confirmed"}, but the challenge was already ` +
+          `answered (registered turn ${reg}, ours ${l.session.latest.state.turnNum}): ${errorText(err)}`,
       );
     }
     if (l.lastError?.startsWith("respond:")) l.lastError = null;
