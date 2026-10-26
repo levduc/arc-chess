@@ -45,7 +45,7 @@ import {
   type FundingNeed,
   type OneBalanceFundingNeed,
 } from "./funding.js";
-import { readJson } from "./jsonfile.js";
+import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import {
   classifyOwner,
   forbiddenOwners,
@@ -181,6 +181,20 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
   version  (prints this CLI's version)`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/** Live run #2 (f)2: `fund`'s last ask with something short, in `<home>/fund-ask.json`: the words to relay (the
+ *  disclosure, then the message) and the `usdc.need` they ask for, in base units. `wallet --wait-for-usdc` repeats them
+ *  when it waits for exactly that need. */
+type FundAsk = { ask: string; usdcNeed: bigint; at: number };
+
+/** Live run #2 (f)2: what `wallet --wait-for-usdc` says before it waits, and puts first in a timed-out result. One agent
+ *  of two in live run #2 still ran `fund`, then the wait, with no reply in between: the human never saw the ask. */
+export function waitReminder(ask: string): string {
+  return (
+    "Your human must see this -- if you have not written it in your reply, stop and do that now, word for word " +
+    `(they cannot see this command's output): ${ask}`
+  );
+}
 
 /** Final fix wave (M8): the fastest `wallet --wait-for-*` may poll, whatever `ARENA_WAIT_POLL_MS` says. */
 export const WAIT_POLL_FLOOR_MS = 200;
@@ -1142,8 +1156,17 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       const pollMsRaw = io.env.ARENA_WAIT_POLL_MS;
       const pollMs = pollMsRaw !== undefined && /^[0-9]+$/.test(pollMsRaw) ? Math.max(WAIT_POLL_FLOOR_MS, Number(pollMsRaw)) : 5000;
 
+      // Live run #2 (f)2: `fund`'s ask, when this waits for exactly the `usdc.need` it asked for -- never another wait's
+      // (a session-gas top-up waits for "current + amount"), whose numbers it would get wrong.
+      let ask: string | undefined;
+      try {
+        const saved = readJson<FundAsk>(arenaPaths(home).fundAsk);
+        if (saved !== null && usdcThreshold !== undefined && saved.usdcNeed === usdcThreshold) ask = saved.ask;
+      } catch {
+        // an unreadable file: no reminder
+      }
       const startedAt = Date.now();
-      for (;;) {
+      for (let poll = 0; ; poll++) {
         const balances = await readBalances();
         const reached =
           (usdcThreshold === undefined || balances.usdc >= usdcThreshold) &&
@@ -1151,11 +1174,16 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         const elapsedMs = Date.now() - startedAt;
         const body = { ...shown(balances), reached, waitedSeconds: Math.floor(elapsedMs / 1000) };
         if (reached) {
+          // The ask is met: it is never repeated again (repeating it now would have the human pay twice).
+          if (ask !== undefined) rmSync(arenaPaths(home).fundAsk, { force: true });
           io.out(JSON.stringify(body, null, 2));
           return 0;
         }
+        // Before the first wait, only once nothing has arrived yet: the first thing this command says.
+        if (poll === 0 && ask !== undefined) io.err(waitReminder(ask));
         if (elapsedMs >= timeoutMs) {
-          io.out(JSON.stringify(body, null, 2));
+          // A timed-out chunk leads with it too, as `fund`'s output does, before the next chunk.
+          io.out(JSON.stringify(ask !== undefined ? { tellYourHuman: waitReminder(ask), ...body } : body, null, 2));
           return 2;
         }
         await new Promise((r) => setTimeout(r, Math.min(pollMs, timeoutMs - elapsedMs)));
@@ -1438,6 +1466,14 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       };
       if (faucetReported !== undefined) body.faucet = faucetReported;
       body.message = message;
+      // Live run #2 (f)2: kept for the wait to repeat (best effort: a failed write only loses the reminder).
+      try {
+        const askPath = arenaPaths(home).fundAsk;
+        if (short) writeJsonAtomic(askPath, { ask: `${disclosure} ${message}`, usdcNeed: funding.usdc.need, at: Date.now() } satisfies FundAsk);
+        else rmSync(askPath, { force: true });
+      } catch {
+        // the output above is what counts
+      }
       io.out(JSON.stringify(body, null, 2));
       return 0;
     }

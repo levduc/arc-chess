@@ -286,6 +286,8 @@ export function arenaPaths(home: string) {
     token: join(home, "token.json"),
     /** Final fix wave B (I-1): a withdraw that may have been sent unconfirmed (`PendingWithdraw`, daemon.ts). */
     withdrawPending: join(home, "withdraw-pending.json"),
+    /** Live run #2 (f)2: `fund`'s last ask with something short (`FundAsk`, cli.ts), repeated by the wait for it. */
+    fundAsk: join(home, "fund-ask.json"),
     channels: join(home, "channels"),
     offers: join(home, "offers"),
     channelRecord: (id: Hex) => join(home, "channels", canonical(id), "record.json"),

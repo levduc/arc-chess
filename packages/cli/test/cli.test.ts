@@ -927,6 +927,50 @@ describe("Plan 6 (spec §2.1, Review Focus 1): one balance on a nativeIsUsdc cha
     );
   });
 
+  it("live run #2 (f)2: the wait for fund's need repeats fund's ask first and leads a timed-out result with it -- never once met, nor for another amount", async () => {
+    const home = await initArcHome();
+    const env = { ARENA_WAIT_POLL_MS: "200" };
+    const short = 1_500_000_000_000_000_001n;
+    const f = arcIo(home, { balanceWei: short });
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], f.io)).toBe(0);
+    const fund = f.json() as { disclosure: string; message: string; usdc: { need: string } };
+    expect(fund.usdc.need).toBe("3.035000");
+    const reminder =
+      "Your human must see this -- if you have not written it in your reply, stop and do that now, word for word (they " +
+      `cannot see this command's output): ${fund.disclosure} ${fund.message}`;
+    // Nothing has arrived: before it waits, the reminder is the first thing it says (stderr: stdout stays one JSON
+    // object); the timed-out result leads with it, as fund's output does. Before: neither.
+    const w = arcIo(home, { balanceWei: short, env });
+    expect(await runCli(["wallet", "--wait-for-usdc", fund.usdc.need, "--timeout", "1"], w.io)).toBe(2);
+    expect(w.err).toEqual([reminder]);
+    const timedOut = w.json();
+    expect(Object.keys(timedOut)).toEqual(["tellYourHuman", "address", "chainId", "usdc", "reached", "waitedSeconds"]);
+    expect(timedOut).toMatchObject({ tellYourHuman: reminder, usdc: "1.500000", reached: false });
+    // The next chunk says it again.
+    const next = arcIo(home, { balanceWei: short, env });
+    expect(await runCli(["wallet", "--wait-for-usdc", "3.035", "--timeout", "1"], next.io)).toBe(2);
+    expect(next.err).toEqual([reminder]);
+    // Another amount (the session-gas wait is "current + amount"): not fund's ask, so no reminder, the old shape.
+    const other = arcIo(home, { balanceWei: short, env });
+    expect(await runCli(["wallet", "--wait-for-usdc", "2", "--timeout", "1"], other.io)).toBe(2);
+    expect(other.err).toEqual([]);
+    expect(Object.keys(other.json())).toEqual(["address", "chainId", "usdc", "reached", "waitedSeconds"]);
+    // It arrived: nothing is repeated (the human has paid), and never after.
+    const paid = arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n, env });
+    expect(await runCli(["wallet", "--wait-for-usdc", "3.035", "--timeout", "1"], paid.io)).toBe(0);
+    expect(paid.err).toEqual([]);
+    expect(Object.keys(paid.json())).toEqual(["address", "chainId", "usdc", "reached", "waitedSeconds"]);
+    const after = arcIo(home, { balanceWei: short, env });
+    expect(await runCli(["wallet", "--wait-for-usdc", "3.035", "--timeout", "1"], after.io)).toBe(2);
+    expect(after.err).toEqual([]);
+    // A fund with nothing short leaves nothing to repeat either.
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], arcIo(home, { balanceWei: short }).io)).toBe(0);
+    expect(await runCli(["fund", "--games", "3", "--stake", "1"], arcIo(home, { balanceWei: 3_035_000n * 10n ** 12n }).io)).toBe(0);
+    const none = arcIo(home, { balanceWei: short, env });
+    expect(await runCli(["wallet", "--wait-for-usdc", "3.035", "--timeout", "1"], none.io)).toBe(2);
+    expect(none.err).toEqual([]);
+  });
+
   it("fix round 1 (I-5): fund keeps one session gas per unfinalized channel of the home in need, as usdc.reserved; have stays the balance", async () => {
     const home = await initArcHome();
     const id = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as Hex;

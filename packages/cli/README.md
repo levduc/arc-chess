@@ -170,6 +170,14 @@ usage error, which exits 2 too; the recipe's commands always give one. After eac
 of the missing amount before the next one; once about 30 minutes have passed, tell your human what has and has not
 arrived, and stop — do not loop forever on your own.
 
+When the wait is for exactly the `usdc.need` of the last `fund` that found something short (live run #2: one agent
+of two still went from `fund` straight to the wait, and its human never saw the ask), it repeats that ask. Before
+waiting, while nothing has arrived, its first line, on stderr, is "Your human must see this -- if you have not
+written it in your reply, stop and do that now, word for word (they cannot see this command's output): <fund's
+disclosure> <fund's message>". A timed-out result leads with the same text as `tellYourHuman`. It is kept in
+`ARENA_HOME/fund-ask.json`, and cleared once the wait is met or a `fund` finds nothing short. A wait for any other
+amount (a session-gas top-up's) repeats nothing.
+
 ## Owner and cash-out
 
 `arena withdraw` only ever pays one address: the **owner**, recorded in `config.json`. Record it the first time
