@@ -1367,7 +1367,23 @@ hub.
     - **Smaller (m-8, m-9, m-12).** A close the wallet cannot pay for, or whose fee is over its ceiling, says so in
       `lastError` (`close()` still answers 200). `handleUnseenRegistered` re-reads the session's latest turn after its
       awaits, so a turn a relay delivered meanwhile is not raised as `challenge-unseen`. The daemon's 20 s request cap
-      leaves a `Retry-After` 5 attempts and 16 s of waiting.
+      leaves a `Retry-After` 5 attempts and 16 s of waiting. A respond still pending at its give-up time
+      (`TxStuckError`), which a send inside the 15 s margin can be on Arc before the next block, gets the same phase
+      re-check as a revert or a drop, so one that landed is not reported "stuck".
+    - **Live run #2's frictions (its (f)1-3).**
+      - A funding pass resumed after its approve and session-key top-up (a rate limit stopped the deposit) needs only
+        what is still to be spent. `fund()` records the gas those two paid, from their receipts
+        (`ChannelRecord.fundingGasPaid`, on disk), and `oneBalanceOpenNeed` credits it, rounded up and capped at the
+        wallet-gas term it came out of. So `fund`'s ask always covers a resumed pass, and the human is never asked
+        again for gas already spent (0.002189 USDC in the run). An approve or top-up whose receipt could not be read,
+        or that reverted, is not credited.
+      - `fund` keeps its ask (`<home>/fund-ask.json`) when something is short. A `wallet --wait-for-usdc` for exactly
+        that `usdc.need` says first, on stderr and while nothing has arrived, "Your human must see this -- if you
+        have not written it in your reply, stop and do that now, word for word (they cannot see this command's
+        output): <disclosure> <message>". A timed-out result leads with it as `tellYourHuman`. It is never repeated
+        once the wait is met, nor for another amount.
+      - `offers` prints the open offers in a fresh `node:crypto` random order on every call, and says so on stderr:
+        "take the first one that fits". The daemon's `GET /offers` is unchanged.
 70. **ECDSA-only signatures (final review A I-1, owner decision 2026-10-25; `aa5ddfc`, `aeed9dc`).** Signatures are
     verified with ECDSA only (OpenZeppelin `ECDSA.tryRecover`: 65 bytes, v 27 or 28, low s), with no ERC-1271
     fallback. A signer whose code accepts any bytes, such as a contract or an EIP-7702-delegated session key, could
