@@ -73,15 +73,21 @@ cast wallet address --account "$ACCOUNT"        # set DEPLOYER to this
 
 ## 3. Pre-flight reads (read-only)
 
-Run from `contracts/`. Each line prints `OK` or `STOP`, and any `STOP` ends the run.
+Run from `contracts/`. Each check prints `OK` or `STOP`, and any `STOP` ends the run.
+
+A failed `cast` read prints nothing to stdout, so every check first requires its value to be non-empty. A failed
+read is a `STOP`, never an `OK`. A `STOP` that comes from a failed read (an RPC flake, a rate limit) can simply be
+retried.
 
 ```bash
 cd contracts
-[ "$(cast chain-id --rpc-url "$RPC")" = 5042 ] && echo OK || echo "STOP: not Arc mainnet"
-[ "$(cast code "$MULTISIG" --rpc-url "$RPC")" != 0x ] && echo OK || echo "STOP: the multisig has no code on Arc"
+CHAIN=$(cast chain-id --rpc-url "$RPC"); [ "$CHAIN" = 5042 ] && echo OK || echo "STOP: not Arc mainnet ('$CHAIN')"
+CODE=$(cast code "$MULTISIG" --rpc-url "$RPC") && [ -n "$CODE" ] && [ "$CODE" != 0x ] && echo OK \
+  || echo "STOP: the multisig has no code on Arc, or the read failed"
 cast balance "$DEPLOYER" --rpc-url "$RPC" --ether                 # at least 1 (native USDC, 18 decimals)
 N=$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block latest)
-[ "$N" = "$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block pending)" ] && echo OK || echo "STOP: a tx is pending"
+P=$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block pending)
+[ -n "$N" ] && [ "$N" = "$P" ] && echo OK || echo "STOP: a tx is pending, or a read failed (latest '$N', pending '$P')"
 cast call 0x3600000000000000000000000000000000000000 "decimals()(uint8)" --rpc-url "$RPC"    # 6
 [ ! -e deployments/5042.json ] && echo OK || echo "STOP: deployments/5042.json exists (a redo? see §5)"
 cast compute-address "$DEPLOYER" --nonce "$N"                     # predicted ChessRules
@@ -112,11 +118,34 @@ Re-assert the chain id and the nonce first. If the nonce moved since §3, the ad
 before broadcasting.
 
 ```bash
-[ "$(cast chain-id --rpc-url "$RPC")" = 5042 ] && echo OK || echo "STOP: not Arc mainnet"
-[ "$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block pending)" = "$N" ] && echo OK || echo "STOP: nonce moved"
+CHAIN=$(cast chain-id --rpc-url "$RPC"); [ "$CHAIN" = 5042 ] && echo OK || echo "STOP: not Arc mainnet ('$CHAIN')"
+P=$(cast nonce "$DEPLOYER" --rpc-url "$RPC" --block pending)
+[ -n "$N" ] && [ "$P" = "$N" ] && echo OK || echo "STOP: nonce moved, or a read failed (pending '$P', §3's N '$N')"
 env "${DEPLOY_ENV[@]}" forge script script/Deploy.s.sol --rpc-url "$RPC" \
   --account "$ACCOUNT" --sender "$DEPLOYER" "${FORGE_GAS[@]}" --broadcast
 ```
+
+**Resume, when the broadcast stopped after `ChessRules`.** Forge may exit or time out after the first transaction.
+- *How to recognize it:*
+  - the deployer's nonce (latest and pending) is now `N + 1`;
+  - `cast code` at §3's predicted `ChessRules` address is non-empty;
+  - `cast code` at the predicted `ChannelHub` address is `0x`;
+  - an empty output is a failed read: retry it.
+- *What to do:* do not follow "Redo" below. That would deploy a second `ChessRules` at `N + 1` and leave the first one
+  orphaned. Instead, rerun the same command with `--resume` added:
+
+```bash
+env "${DEPLOY_ENV[@]}" forge script script/Deploy.s.sol --rpc-url "$RPC" \
+  --account "$ACCOUNT" --sender "$DEPLOYER" "${FORGE_GAS[@]}" --broadcast --resume
+```
+
+- `--resume` does not simulate the script again. It sends the transactions of `broadcast/Deploy.s.sol/5042/
+  run-latest.json` that have not landed, at the nonces recorded there, so the hub lands at `N + 1`, the address §3
+  predicted. The constructor arguments come from that record, so `deployments/5042.json` (written when the
+  broadcast run started) still names the right pair.
+- Then reconcile in §6 against the receipts.
+- If `--resume` refuses, for example because the record is missing, follow "Redo". The orphan `ChessRules` costs
+  about 0.04 USDC and is never pinned.
 
 **Redo, when the nonce moved after §3.** §4's dry run wrote `deployments/5042.json`, so a plain rerun of §3 stops
 at its "already exists" check. Clear that run's outputs first:
@@ -124,11 +153,11 @@ at its "already exists" check. Clear that run's outputs first:
 1. **Find out why the nonce moved.** This key exists only for this deploy, so a transaction you cannot account for
    means someone else holds it. Stop the deploy and treat the key as compromised.
 2. **Check that nothing landed at the old addresses.** Run `cast code` on both addresses §3 predicted, at the old
-   `N`.
-   - Both empty: nothing was deployed. Go on.
+   `N`. `cast code` prints `0x` for no code; an empty output is a failed read, so retry it.
+   - Both `0x`: nothing was deployed. Go on.
    - The hub has code: an earlier broadcast landed. Do not deploy again. Go to §6 with
      `broadcast/Deploy.s.sol/5042/run-latest.json`.
-   - Only `ChessRules` has code: a broadcast landed halfway. That orphan is harmless and is never pinned. Go on.
+   - Only `ChessRules` has code: the broadcast stopped halfway. Use "Resume" above, not this redo.
 3. **Remove the dry run's outputs.** These files must be untracked, so confirm that first:
    ```bash
    git status --porcelain -- deployments/5042.json      # must print "?? contracts/deployments/5042.json"
