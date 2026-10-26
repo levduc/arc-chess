@@ -254,7 +254,8 @@ Steps, in order:
 - The hardened hub uses 12,521 more deploy gas than the old one (3,025,132 against 3,012,611). `ChessRules` is
   byte-identical, at the same gas.
 
-**New addresses.** These are what `contracts/deployments/5042002.json` and `KNOWN_DEPLOYMENTS[5042002]` now hold:
+**New addresses.** These were `contracts/deployments/5042002.json` and `KNOWN_DEPLOYMENTS[5042002]` until 2026-10-25;
+superseded by "Redeploy #2 (ECDSA-only hub)" below:
 
 | Contract | Address | Explorer (source) |
 |---|---|---|
@@ -313,6 +314,80 @@ after 5 s. Mainnet runs it the same way. Pass the deploy's own `ARENA_MAX_DEPOSI
 (final review A I-1, commit `aa5ddfc`). That changes the hub's bytecode, so the deployment above is superseded once
 the new hub is redeployed here and the rehearsal is rerun on it (`mainnet-gates.md` item 4). Until then,
 `0x9b8B…bA41` still accepts ERC-1271 signatures.
+
+### Redeploy #2 (ECDSA-only hub), 2026-10-25
+
+On 2026-10-25 the owner decided that the hub verifies signatures in ECDSA form only, and dropped the ERC-1271
+fallback (`aa5ddfc`). Final review A I-1 had found that the fallback, combined with EIP-7702, allowed a griefing
+lock.
+`Deploy.s.sol` now also refuses any token but `0x3600…0000` on chains 5042 and 5042002 (`21bd2da`).
+
+The bytecode changed, so the testnet hub was replaced again before the rehearsal was rerun on it (§12):
+- The redeploy ran on HEAD `90d5ed6`, with the testnet command in "Command" above, unchanged: the same env vars,
+  `ARENA_TOKEN=0x3600…0000`, `--with-gas-price 40000000000 --priority-gas-price 1000000000`.
+- The key was passed as in the first redeploy. That is acceptable for this testnet key only; see "For mainnet
+  (Task 6)".
+- I was the only sender from the deployer key. The testnet stack was down, and the live agent runs had finished.
+
+Steps, in order:
+1. `eth_chainId` was asserted to be 5042002, and the deployer's nonce was 18 at both `latest` and `pending`, so
+   nothing was pending.
+2. A dry run without `--broadcast`: 6,379,184 gas estimated, "0.25516736 USDC" at the 40 gwei cap.
+3. The chain id and the nonce were asserted again, then the broadcast.
+
+| Contract | Tx hash | Gas used | Effective price | Cost (USDC) |
+|---|---|---|---|---|
+| `ChessRules` | [`0x158845855569059d71ad39f3bdf560a4e6efbda63087715b580c9416de5aa34c`](https://explorer.testnet.arc.io/tx/0x158845855569059d71ad39f3bdf560a4e6efbda63087715b580c9416de5aa34c) | 1,903,343 | 21 gwei | 0.039970203 |
+| `ChannelHub` (ECDSA-only) | [`0x84d3e2146ffcf2b85647ff3e42e8752f122ac4e9c581f4e2a0016d0826102720`](https://explorer.testnet.arc.io/tx/0x84d3e2146ffcf2b85647ff3e42e8752f122ac4e9c581f4e2a0016d0826102720) | 3,003,723 | 21 gwei | 0.063078183 |
+| **Total** | | **4,907,066** | | **0.103048386** |
+
+**Result.**
+- Both transactions landed with status `0x1`, in block **69,112,538**.
+- The deployer went from 19.316808991 to 19.213760605 USDC, exactly the two costs. Its nonce went from 18 to 20.
+- Dropping the ERC-1271 path shrank `ChannelHub` by 99 bytes (12,927 bytes against 13,026). Its deploy is 21,409 gas
+  cheaper than the hardened hub's (3,003,723 against 3,025,132).
+- `ChessRules` is byte-identical to both earlier deploys.
+
+**New addresses.** These are what `contracts/deployments/5042002.json` and `KNOWN_DEPLOYMENTS[5042002]` now hold:
+
+| Contract | Address | Explorer (source) |
+|---|---|---|
+| `ChessRules` | `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba` | https://explorer.testnet.arc.io/address/0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba?tab=contract |
+| `ChannelHub` | `0x3D8434455E4258a877a327De3B1201f94A558d38` | https://explorer.testnet.arc.io/address/0x3D8434455E4258a877a327De3B1201f94A558d38?tab=contract |
+| `USDC` | `0x3600000000000000000000000000000000000000` | (unchanged) |
+
+**Superseded 2026-10-25 (ERC-1271 fallback).**
+- The hardened `ChannelHub` `0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41` and its `ChessRules`
+  `0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01` (the previous subsection) are superseded.
+- `committedEscrow` on that hub is 0: the testnet stack's bots withdrew before the redeploy.
+- `init` now refuses that pair, as it refuses the pre-hardening pair `0x9fcF…6893` / `0x3fC3…E6E5`
+  (`packages/cli/test/init.test.ts`).
+
+**Reads of the new hub.**
+
+| Read | Value |
+|---|---|
+| `owner()` = `feeRecipient()` | the deployer |
+| `feePerPlayer()` | 5,000 |
+| `maxFeePerPlayer()` | 1,000,000 |
+| `maxDepositPerPlayer()` | 2,000,000 |
+| `maxCommittedEscrow()` | 50,000,000 |
+| `token()` | `0x3600…0000` |
+| `paused()` | false |
+| `committedEscrow()` | 0 |
+
+M1/M2 still hold, checked by `eth_call` from the deployer:
+- `renounceOwnership()` reverts `RenounceDisabled()` (`0x89051165`);
+- `claim()` with nothing owed reverts `NothingToClaim()` (`0x969bf728`).
+
+The ECDSA-only signature check itself is not observable by `eth_call` without crafted signatures; the contract suite
+covers it (`aa5ddfc`). The rerun in §12 exercises every signature path the daemons use against this hub.
+
+**Source verification.** `scripts/verify-arc.sh`, at `9b4ab51`, verified both contracts.
+1. Blockscout's own recompile failed, as before.
+2. Sourcify returned `exact_match`: 5 s for `ChessRules`, 15 s for `ChannelHub`.
+3. The import into Blockscout gave a full match (`is_verified` and `is_fully_verified` both true) for both, within 5 s
+   of the import.
 
 ## 2. The rehearsal, first run on the pre-hardening hub (2026-10-24, 15:18–15:42 UTC)
 
@@ -1120,3 +1195,255 @@ New frictions:
 
 Full detail, with every hash and quote, is in the "Live run #2" part of
 `.superpowers/sdd/2026-10-23-arc-launch/live-run-report.md`.
+
+## 12. Rerun on the ECDSA-only hub (2026-10-26, 00:10–00:23 UTC; 2026-10-25 in US time)
+
+The same script (`scripts/arc-rehearsal.ts`) ran in a fresh directory against the ECDSA-only hub `0x3D84…8d38`
+("Redeploy #2 (ECDSA-only hub)" in §1), with the same steps as §2. **Every step passed with no restart, and every check
+is exact:**
+
+| Check | Result |
+|---|---|
+| Hub side | 30 of 30 (they now include the channel's fee and fee recipient against the deploy's values: review m-1) |
+| Wallet reconciliation, both homes | Exact to the wei |
+| The whole run | Exact to the wei |
+| Hardened surface | 4 of 4 (`claim()` → `NothingToClaim` from the deployer and both wallets; `renounceOwnership()` → `RenounceDisabled`) |
+| Blockscout listing against each sender's nonce | 9 of 9 |
+
+Gas for the rerun was **0.08312607 USDC**, across 34 transactions. Deployer: 19.213760605 → **19.091481605** USDC.
+
+**Ids.**
+- Wallets: alice `0xb2D7c6232004951f0Fc8Df2aBf1f4d87fe33FEA9`, bob `0x6229A5c5D0AB40dd736578629fF827a65934d1b4`.
+- Channels:
+  - `normal`: `0xe8fd4841fb14620a9c65a1db765308e99bf96eb1de8e271f3ceca7e326de850e`
+  - `dispute`: `0x23e75e752dd05cd5bd60913aa546fb6c30e55610b26a3cc3124d4a344f868a87`
+  - `xmtp`: `0x1aea569a7ef8584bb21665130d787fb9375cb88858f1cac390c4447272c362ec`
+
+**Which code ran.** The server and both daemons spawned on HEAD **`ed5862a`**, with no uncommitted source (the
+script records the checkout at each spawn). That includes H3's rate-limit work, final fix waves A–C (the ECDSA-only
+SDK, `aeed9dc`), and the script's own fix round 1. Child environments were allowlisted, and processes were matched by
+pid and start time: `state.json`'s `pids` is empty at the end, as I-2 requires.
+
+**Rate limits, against §10.** The run was far quieter:
+- 4 `GET /status` retries (91 in §10);
+- 1 rate-limited `POST /challenge` (3 rate-limited POSTs in §10);
+- one `lastError` "watch: Request exceeds defined limit." on Bob's daemon after the normal close;
+- in the daemon logs, 6 "session gas check failed (retried in 5s)" lines per daemon, each followed by "read the
+  balance again". That is H3's back-off at work;
+- in the server log, 40 rate-limit lines.
+
+Alice's `POST /challenge` answered once with a rate-limit error. It had not taken effect: the script found no
+challenge on chain within 30 s and sent the request again. Exactly one challenge transaction landed (`0xb98f…7b58`),
+110 s after the first request. The dispute window was unaffected: the clock starts at the challenge.
+
+### Transactions (ECDSA-only hub)
+
+| # | Action | Channel | Sender | Tx (explorer) | Gas used | Price (gwei) | Cost (USDC) |
+|---|---|---|---|---|---|---|---|
+| 1 | fund agent (deployer → wallet, 2 USDC) | — | deployer | [`0xa2604c8030ef2631a99f407f2113024487960dfb6d3d4a2a7a22bc805f0f67ea`](https://explorer.testnet.arc.io/tx/0xa2604c8030ef2631a99f407f2113024487960dfb6d3d4a2a7a22bc805f0f67ea) | 21,000 | 21 | 0.000441 |
+| 2 | fund agent (deployer → wallet, 2 USDC) | — | deployer | [`0x58a102914e30bd2cae02a83bdb645601c6156f7a024794b3cb600a1fcde14fca`](https://explorer.testnet.arc.io/tx/0x58a102914e30bd2cae02a83bdb645601c6156f7a024794b3cb600a1fcde14fca) | 21,000 | 21 | 0.000441 |
+| 3 | approve | — | alice wallet | [`0xafb3cd432bdc2c30a809207a2b8ce64d8a05a3360d5de45b872550a5e587b507`](https://explorer.testnet.arc.io/tx/0xafb3cd432bdc2c30a809207a2b8ce64d8a05a3360d5de45b872550a5e587b507) | 55,438 | 25 | 0.00138595 |
+| 4 | session top-up (wallet → session key, 0.336) | normal | alice wallet | [`0x1efb0c33a8dee244b88b02433159de00a083990de4c97bd31bb6fbdf00112cef`](https://explorer.testnet.arc.io/tx/0x1efb0c33a8dee244b88b02433159de00a083990de4c97bd31bb6fbdf00112cef) | 21,000 | 25 | 0.000525 |
+| 5 | deposit | normal | alice wallet | [`0xcf4cebfd3435fe7c923b198618a3d7579bf40a3a3335185ea248f796c40ced5a`](https://explorer.testnet.arc.io/tx/0xcf4cebfd3435fe7c923b198618a3d7579bf40a3a3335185ea248f796c40ced5a) | 393,821 | 25 | 0.009845525 |
+| 6 | approve | — | bob wallet | [`0xc4a2e12137bb59de7d1b568cd5b6207824615c9393017d679b6ff9374a92a99b`](https://explorer.testnet.arc.io/tx/0xc4a2e12137bb59de7d1b568cd5b6207824615c9393017d679b6ff9374a92a99b) | 55,438 | 25 | 0.00138595 |
+| 7 | session top-up (wallet → session key, 0.336) | normal | bob wallet | [`0x00e42a20dcc3deef141ca87a272b111e57d40e8ac1457099ce0dd2620dcd82a1`](https://explorer.testnet.arc.io/tx/0x00e42a20dcc3deef141ca87a272b111e57d40e8ac1457099ce0dd2620dcd82a1) | 21,000 | 25 | 0.000525 |
+| 8 | deposit | normal | bob wallet | [`0x3661566e8a52daa8cdf7574ed0ab071aabda6b36a1e8bb38ea7d94ad3ee4b092`](https://explorer.testnet.arc.io/tx/0x3661566e8a52daa8cdf7574ed0ab071aabda6b36a1e8bb38ea7d94ad3ee4b092) | 76,405 | 25 | 0.001910125 |
+| 9 | closeCooperative | normal | alice wallet | [`0x8bd0508ab1ebfef70f886af6286f30f7c2602794df304629f5afbc00101aaefa`](https://explorer.testnet.arc.io/tx/0x8bd0508ab1ebfef70f886af6286f30f7c2602794df304629f5afbc00101aaefa) | 142,460 | 25 | 0.0035615 |
+| 10 | session sweep (session key → wallet) | normal | alice session (normal) | [`0x1b92178234b1fcd84230cd6452b78248ee824964f5baab94a20d4441f5ff483d`](https://explorer.testnet.arc.io/tx/0x1b92178234b1fcd84230cd6452b78248ee824964f5baab94a20d4441f5ff483d) | 21,000 | 25 | 0.000525 |
+| 11 | session sweep (session key → wallet) | normal | bob session (normal) | [`0xeb41eb707166c3897eb10aaba182535a13472182c66db2a29e4c51ff50d62e7b`](https://explorer.testnet.arc.io/tx/0xeb41eb707166c3897eb10aaba182535a13472182c66db2a29e4c51ff50d62e7b) | 21,000 | 25 | 0.000525 |
+| 12 | approve | — | alice wallet | [`0x1710c630019a9fadde63aa8db7faa028be8b4c875709a19f47c9705320d46bfc`](https://explorer.testnet.arc.io/tx/0x1710c630019a9fadde63aa8db7faa028be8b4c875709a19f47c9705320d46bfc) | 55,438 | 25 | 0.00138595 |
+| 13 | session top-up (wallet → session key, 0.336) | dispute | alice wallet | [`0x87eec79057a7623b478836c0739f14335f597d50709f1883552e0cab8eb7a488`](https://explorer.testnet.arc.io/tx/0x87eec79057a7623b478836c0739f14335f597d50709f1883552e0cab8eb7a488) | 21,000 | 25 | 0.000525 |
+| 14 | deposit | dispute | alice wallet | [`0xda91b21a77f5d2110dc7f138b7eaac0179e1551c7c1251aa86f65213d7600bf9`](https://explorer.testnet.arc.io/tx/0xda91b21a77f5d2110dc7f138b7eaac0179e1551c7c1251aa86f65213d7600bf9) | 393,833 | 25 | 0.009845825 |
+| 15 | approve | — | bob wallet | [`0x8ffa0b262fe013cd24b788295f1b55d77d2f4a252160aac825c9e1287c088068`](https://explorer.testnet.arc.io/tx/0x8ffa0b262fe013cd24b788295f1b55d77d2f4a252160aac825c9e1287c088068) | 55,438 | 25 | 0.00138595 |
+| 16 | session top-up (wallet → session key, 0.336) | dispute | bob wallet | [`0xa03bb1e03cfa6c37470e9a9f4664b98240944c3f88c5a0c4ebeca426b9591b1a`](https://explorer.testnet.arc.io/tx/0xa03bb1e03cfa6c37470e9a9f4664b98240944c3f88c5a0c4ebeca426b9591b1a) | 21,000 | 25 | 0.000525 |
+| 17 | deposit | dispute | bob wallet | [`0xa715adf86c479a1703fba1ab19f024244cef142430907006038701c3039dc445`](https://explorer.testnet.arc.io/tx/0xa715adf86c479a1703fba1ab19f024244cef142430907006038701c3039dc445) | 76,417 | 25 | 0.001910425 |
+| 18 | challenge | dispute | alice session (dispute) | [`0xb98f0c4a3007853b0f1ee9a749bb1fcc3c0e99cf9636ba19499e3b3bda907b58`](https://explorer.testnet.arc.io/tx/0xb98f0c4a3007853b0f1ee9a749bb1fcc3c0e99cf9636ba19499e3b3bda907b58) | 356,014 | 25 | 0.00890035 |
+| 19 | respond | dispute | alice session (dispute) | [`0x5b65999a1e8870b0cc1ed4b79046925e1764ad1ac9aace289136586b763e6c85`](https://explorer.testnet.arc.io/tx/0x5b65999a1e8870b0cc1ed4b79046925e1764ad1ac9aace289136586b763e6c85) | 200,158 | 25 | 0.00500395 |
+| 20 | challenge | dispute | bob session (dispute) | [`0xb32cfb5737abafb6ff233bea4b521a028c00edca213cf6ba740b7ec22e77765e`](https://explorer.testnet.arc.io/tx/0xb32cfb5737abafb6ff233bea4b521a028c00edca213cf6ba740b7ec22e77765e) | 176,491 | 25 | 0.004412275 |
+| 21 | timeout | dispute | bob session (dispute) | [`0x30e3154777b25e96e886208823e81cc9fdec23eac29eebeb8ba04362459a840d`](https://explorer.testnet.arc.io/tx/0x30e3154777b25e96e886208823e81cc9fdec23eac29eebeb8ba04362459a840d) | 149,089 | 30 | 0.00447267 |
+| 22 | session sweep (session key → wallet) | dispute | alice session (dispute) | [`0xa7ed609612a4a1f3d0339193e0afacd95694d77f68fa45269d44f83155e299d1`](https://explorer.testnet.arc.io/tx/0xa7ed609612a4a1f3d0339193e0afacd95694d77f68fa45269d44f83155e299d1) | 21,000 | 25 | 0.000525 |
+| 23 | session sweep (session key → wallet) | dispute | bob session (dispute) | [`0x3f570f573b3fc628d94301754f1c81c68afea9fc00ff4bfe147c468a7b7ac583`](https://explorer.testnet.arc.io/tx/0x3f570f573b3fc628d94301754f1c81c68afea9fc00ff4bfe147c468a7b7ac583) | 21,000 | 25 | 0.000525 |
+| 24 | approve | — | alice wallet | [`0xb6d0244f5f02436d9b640fb56c7bf1435ca0ff563bf48d9946e28c0948f06299`](https://explorer.testnet.arc.io/tx/0xb6d0244f5f02436d9b640fb56c7bf1435ca0ff563bf48d9946e28c0948f06299) | 55,438 | 25 | 0.00138595 |
+| 25 | session top-up (wallet → session key, 0.336) | xmtp | alice wallet | [`0x5c0034ae9fd076851b0990547841033b07d7f09a65c0808bf2a8ff880f81c8a1`](https://explorer.testnet.arc.io/tx/0x5c0034ae9fd076851b0990547841033b07d7f09a65c0808bf2a8ff880f81c8a1) | 21,000 | 25 | 0.000525 |
+| 26 | deposit | xmtp | alice wallet | [`0x4954d43d37e6c2b5d093a621b35900d8331e071c6fc739126b4fcaf2ad175656`](https://explorer.testnet.arc.io/tx/0x4954d43d37e6c2b5d093a621b35900d8331e071c6fc739126b4fcaf2ad175656) | 393,833 | 25 | 0.009845825 |
+| 27 | approve | — | bob wallet | [`0xa9afc78462d5f51007b1e2cfdce99b8ab312d6c01c2745c8694880be1ef5a714`](https://explorer.testnet.arc.io/tx/0xa9afc78462d5f51007b1e2cfdce99b8ab312d6c01c2745c8694880be1ef5a714) | 55,438 | 25 | 0.00138595 |
+| 28 | session top-up (wallet → session key, 0.336) | xmtp | bob wallet | [`0x713cc9fc62cb0bad38be19952cb9b08890602f6a776e0db0722aa56ebb7b6816`](https://explorer.testnet.arc.io/tx/0x713cc9fc62cb0bad38be19952cb9b08890602f6a776e0db0722aa56ebb7b6816) | 21,000 | 25 | 0.000525 |
+| 29 | deposit | xmtp | bob wallet | [`0xa65c447e19ad89e571b2bfa6513f99cfc835b922641ec05cffc71031f37e5785`](https://explorer.testnet.arc.io/tx/0xa65c447e19ad89e571b2bfa6513f99cfc835b922641ec05cffc71031f37e5785) | 76,417 | 25 | 0.001910425 |
+| 30 | closeCooperative | xmtp | bob wallet | [`0x3edd18bb765e3e83dcfd045a6353703e92fd177053c5d59081c8178959d16daa`](https://explorer.testnet.arc.io/tx/0x3edd18bb765e3e83dcfd045a6353703e92fd177053c5d59081c8178959d16daa) | 142,479 | 25 | 0.003561975 |
+| 31 | session sweep (session key → wallet) | xmtp | bob session (xmtp) | [`0x9b07ec1128e7471da71c452878f0b95ac600d302d9e3236a3dd9cd0ff0aad1ff`](https://explorer.testnet.arc.io/tx/0x9b07ec1128e7471da71c452878f0b95ac600d302d9e3236a3dd9cd0ff0aad1ff) | 21,000 | 25 | 0.000525 |
+| 32 | session sweep (session key → wallet) | xmtp | alice session (xmtp) | [`0x009e312d5c71d7306f05f603ec05b1fbfac571c63d5a876d35ffae7ab2ba37e1`](https://explorer.testnet.arc.io/tx/0x009e312d5c71d7306f05f603ec05b1fbfac571c63d5a876d35ffae7ab2ba37e1) | 21,000 | 25 | 0.000525 |
+| 33 | withdraw --all (USDC transfer to the owner) | — | alice wallet | [`0x106ab0539ca33aa5baea0b050eb63e00e0a5e9523b195332a5baca2d20319215`](https://explorer.testnet.arc.io/tx/0x106ab0539ca33aa5baea0b050eb63e00e0a5e9523b195332a5baca2d20319215) | 48,950 | 25 | 0.00122375 |
+| 34 | withdraw --all (USDC transfer to the owner) | — | bob wallet | [`0xa285e270d09ec90af47916070098fd43aa8af2378b8a1b37295014fa035e3414`](https://explorer.testnet.arc.io/tx/0xa285e270d09ec90af47916070098fd43aa8af2378b8a1b37295014fa035e3414) | 48,950 | 25 | 0.00122375 |
+
+**Prices and senders.**
+- Everything paid 25 gwei, except the `timeout` at 30 gwei.
+- Alice's wallet sent the normal channel's `closeCooperative`, Bob's the XMTP one.
+- As in §10, Alice's watchtower sent the `respond`: it raced Bob's daemon with his newer state.
+
+### Cost per action, against the hardened hub with ERC-1271
+
+Dropping the ERC-1271 fallback makes the signature-checking calls a little cheaper:
+
+| Call | Gas saved |
+|---|---|
+| `challenge` | 36 / 150 |
+| `respond` | 48 |
+| `closeCooperative` | 96 / 108 |
+| `ChannelHub` deploy | 21,409 |
+
+Everything else is unchanged, within calldata noise.
+
+| Action | Count | Gas used, ECDSA-only hub | Gas used, hardened hub with ERC-1271 (§10) | Cost per action (USDC) | Total (USDC) |
+|---|---|---|---|---|---|
+| deploy `ChessRules` | 1 | 1,903,343 | 1,903,343 | 0.039970203 (21 gwei) | 0.039970203 |
+| deploy `ChannelHub` | 1 | 3,003,723 | 3,025,132 | 0.063078183 (21 gwei) | 0.063078183 |
+| deposit | 6 | 76,405–393,833 | 76,417–393,833 | 0.001910125–0.009845825 | 0.03526815 |
+| closeCooperative | 2 | 142,460–142,479 | 142,568–142,575 | 0.0035615–0.003561975 | 0.007123475 |
+| challenge | 2 | 176,491–356,014 | 176,641–356,050 | 0.004412275–0.00890035 | 0.013312625 |
+| respond | 1 | 200,158 | 200,206 | 0.00500395 | 0.00500395 |
+| timeout | 1 | 149,089 | 149,089 | 0.00447267 | 0.00447267 |
+| session sweep (session key → wallet) | 6 | 21,000 | 21,000 | 0.000525 | 0.00315 |
+| session top-up (wallet → session key, 0.336) | 6 | 21,000 | 21,000 | 0.000525 | 0.00315 |
+| withdraw --all (USDC transfer to the owner) | 2 | 48,950 | 48,950 | 0.00122375 | 0.0024475 |
+| approve | 6 | 55,438 | 55,438 | 0.00138595 | 0.0083157 |
+| fund agent (deployer → wallet, 2 USDC) | 2 | 21,000 | 21,000 | 0.000441 | 0.000882 |
+| **rerun total (34 txs, deploy excluded)** | 34 | | | | **0.08312607** |
+
+### Balances (ECDSA-only hub)
+
+#### Hub-side checks (6-decimal base units)
+
+| Channel | Check | Expected | Got | OK |
+|---|---|---|---|---|
+| normal | channel's fee per player (the deploy's) | 5000 | 5000 | yes |
+| normal | channel's fee recipient (the deployer) | 0x840d6f90dd12a713cc5f1fb6eabbf99e0e74a7e0 | 0x840d6f90dd12a713cc5f1fb6eabbf99e0e74a7e0 | yes |
+| normal | deposits | 2 x 1005000 | 2 x 1005000 | yes |
+| normal | Finalized.balanceA (participant 0) | 1200000 | 1200000 | yes |
+| normal | Finalized.balanceB (participant 1) | 800000 | 800000 | yes |
+| normal | Finalized.fee | 10000 | 10000 | yes |
+| normal | USDC transfer hub -> participant 0 | 1200000 | 1200000 | yes |
+| normal | USDC transfer hub -> participant 1 | 800000 | 800000 | yes |
+| normal | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
+| normal | PayoutDeferred events | 0 | 0 | yes |
+| dispute | channel's fee per player (the deploy's) | 5000 | 5000 | yes |
+| dispute | channel's fee recipient (the deployer) | 0x840d6f90dd12a713cc5f1fb6eabbf99e0e74a7e0 | 0x840d6f90dd12a713cc5f1fb6eabbf99e0e74a7e0 | yes |
+| dispute | deposits | 2 x 1005000 | 2 x 1005000 | yes |
+| dispute | Finalized.balanceA (participant 0) | 900000 | 900000 | yes |
+| dispute | Finalized.balanceB (participant 1) | 1100000 | 1100000 | yes |
+| dispute | Finalized.fee | 10000 | 10000 | yes |
+| dispute | USDC transfer hub -> participant 0 | 900000 | 900000 | yes |
+| dispute | USDC transfer hub -> participant 1 | 1100000 | 1100000 | yes |
+| dispute | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
+| dispute | PayoutDeferred events | 0 | 0 | yes |
+| xmtp | channel's fee per player (the deploy's) | 5000 | 5000 | yes |
+| xmtp | channel's fee recipient (the deployer) | 0x840d6f90dd12a713cc5f1fb6eabbf99e0e74a7e0 | 0x840d6f90dd12a713cc5f1fb6eabbf99e0e74a7e0 | yes |
+| xmtp | deposits | 2 x 1005000 | 2 x 1005000 | yes |
+| xmtp | Finalized.balanceA (participant 0) | 1100000 | 1100000 | yes |
+| xmtp | Finalized.balanceB (participant 1) | 900000 | 900000 | yes |
+| xmtp | Finalized.fee | 10000 | 10000 | yes |
+| xmtp | USDC transfer hub -> participant 0 | 1100000 | 1100000 | yes |
+| xmtp | USDC transfer hub -> participant 1 | 900000 | 900000 | yes |
+| xmtp | USDC transfer hub -> fee recipient (deployer) | 10000 | 10000 | yes |
+| xmtp | PayoutDeferred events | 0 | 0 | yes |
+
+#### Hardened-hub surface (eth_call simulations, nothing sent)
+
+| Check | Got | OK |
+|---|---|---|
+| claim() from deployer | reverted NothingToClaim | yes |
+| claim() from alice wallet | reverted NothingToClaim | yes |
+| claim() from bob wallet | reverted NothingToClaim | yes |
+| renounceOwnership() from the owner (deployer) | reverted RenounceDisabled | yes |
+
+#### Wallet-side reconciliation (wei, 18 decimals)
+
+| Home | Funded | Payouts in | Deposits out | Withdrawn | Gas paid | Expected held | Held | OK |
+|---|---|---|---|---|---|---|---|---|
+| alice | 2000000000000000000 | 3200000000000000000 | 3015000000000000000 | 2109889000000000000 | 55534575000000000 | 19576425000000000 | 19576425000000000 | yes |
+| bob | 2000000000000000000 | 2800000000000000000 | 3015000000000000000 | 1738714000000000000 | 26709495000000000 | 19576505000000000 | 19576505000000000 | yes |
+
+System: deployer before 19.213760605 = deployer after 19.091481605 + held by agents 0.03915293 + gas 0.08312607 → exact.
+
+#### Balances after (native, 18 decimals)
+
+| Address | Balance (USDC) |
+|---|---|
+| deployer | 19.091481605 |
+| alice wallet | 0.018776325 |
+| alice session (xmtp) | 0.0002667 |
+| alice session (dispute) | 0.0002667 |
+| alice session (normal) | 0.0002667 |
+| bob wallet | 0.018776405 |
+| bob session (xmtp) | 0.0002667 |
+| bob session (dispute) | 0.0002667 |
+| bob session (normal) | 0.0002667 |
+
+#### Sender nonce check (Blockscout listing vs nonce)
+
+| Sender | Listed | Nonce delta | OK |
+|---|---|---|---|
+| deployer | 2 | 2 | yes |
+| alice wallet | 11 | 11 | yes |
+| alice session (xmtp) | 1 | 1 | yes |
+| alice session (dispute) | 3 | 3 | yes |
+| alice session (normal) | 1 | 1 | yes |
+| bob wallet | 11 | 11 | yes |
+| bob session (xmtp) | 1 | 1 | yes |
+| bob session (dispute) | 3 | 3 | yes |
+| bob session (normal) | 1 | 1 | yes |
+
+### Closes and the dispute, timed
+
+| Sub-step, offset from Alice's `/close` | `normal` (relay) | `xmtp` (XMTP `dev`) |
+|---|---|---|
+| Alice's `/close` answered | +0.2 s | +0.2 s |
+| Bob sees `opponentWantsToClose` | +0.3 s | +3.3 s |
+| Bob's `/close` answered | **+31.8 s** | +5.9 s |
+| `Finalized` on chain | **+47.1 s** | +6.0 s |
+| Both daemons `Finalized` | 47.2 s | **6.0 s** |
+
+This time the slow close was the **relay** one. Bob's daemon was rate-limited after it: its `lastError` read
+"watch: Request exceeds defined limit." at the moment the close finished. The XMTP close took 6.0 s, against 5.8 s in
+§10. About 3 s of that is the Close signature crossing XMTP `dev`.
+
+This supports §10's reading: the first run's 48.9 s close over XMTP was rate limiting, not XMTP. The slow step is
+whichever one the RPC throttles.
+
+**XMTP.**
+- Both session keys were registered on `dev` 6.1 s after Open.
+- After the host SIGKILL, both daemons were seen on `transport: xmtp` 40.6 s later. That is through the script's own
+  `/status` polls; the daemons do not timestamp the switch.
+- The four remaining moves took 3,205, 692, 142 and 130 ms.
+
+**Dispute.**
+- Bob's answering move came back as an on-chain `respond`, sent by Alice's watchtower, 49.9 s after the move.
+- Bob's challenge took 1.1 s.
+- The deadline was 00:20:06 UTC, and the `timeout` was mined in a block at 00:20:17: 11 s after the deadline. That
+  was 2 s in §10, and 55 s in the first run.
+
+### Rerun timings
+
+| Step | Time |
+|---|---|
+| Offer → Open on both daemons | 16.6 s (normal), 12.7 s (dispute), 46.6 s (xmtp) |
+| One move over the relay | 130–682 ms, one of 22.6 s (game 0, move 3) |
+| NEW_GAME handshake | 4.9 s, 2.6 s |
+| Draw by agreement | 2.0 s |
+| Finalized → both session keys swept | 8.0 s, 2.0 s, 4.0 s |
+| `withdraw --all` | 1.4 s, 1.8 s |
+| Whole rerun | 00:10:03–00:23:06 UTC, no restart |
+
+### What the rerun shows
+
+- **The ECDSA-only hub works end to end with the daemons as they ship.** Every signature path ran against it:
+  - deposits;
+  - two cooperative closes;
+  - two challenges and a respond, including Alice's watchtower answering with Bob's state;
+  - a timeout.
+
+  All of them reconcile to the wei.
+- **H3's rate-limit work shows.** The same public RPC gave 4 `GET /status` retries and 1 POST retry here, against 91
+  and 3 in §10. The one rate-limited action, Alice's challenge, was not answered as done when it had not happened.
+- **Open as before:**
+  - the public RPC still throttles, and the slow step moves around with it (the 47 s relay close);
+  - the wallet reserves and the sweep leftovers are kept by design (§9). This run's homes hold 0.03915293 USDC.

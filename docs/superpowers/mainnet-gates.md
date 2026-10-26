@@ -159,11 +159,11 @@ transport ships in Plan 5.7; these are the gates before it carries real money or
 
 ### Plan 6 Task 5 (the Arc testnet rehearsal, 2026-10-24)
 
-See `docs/superpowers/arc-testnet-rehearsal.md` §2–§10. The scripted rehearsal used real faucet USDC on Arc testnet:
+See `docs/superpowers/arc-testnet-rehearsal.md` §2–§12. The scripted rehearsal used real faucet USDC on Arc testnet:
 3 games then a close, a challenge → respond → timeout dispute, and a host kill finished over XMTP `dev`. It ran
-twice: first on the pre-hardening hub (§2–§9), then on the hardened-hub redeploy (§10). Both times, payouts and
-balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened hub, `claim()` and
-`renounceOwnership()` behave as M1/M2 require (`eth_call`).
+three times: on the pre-hardening hub (§2–§9), on the hardened-hub redeploy (§10), and on the ECDSA-only redeploy
+(§12, 2026-10-25). Every time, payouts and balances reconciled exactly; gas was 0.0827, 0.0844 and 0.0831 USDC. On
+both hardened hubs, `claim()` and `renounceOwnership()` behave as M1/M2 require (`eth_call`).
 
 - **Fixed: Arc's RPC refuses an `eth_getLogs` with more than 10 topics** (testnet and mainnet, -32012). The host's
   indexer read all 15 hub events in one query and could never index a channel, so the relay could serve no game. The
@@ -211,11 +211,18 @@ balances reconciled exactly, and gas was 0.0827 and 0.0844 USDC. On the hardened
    - Offer signature verified on accept (m6).
    - A supervisor or auto-restart is documented, and memory stays flat over 60 min (I3).
 4. **Deployment and ownership.** The steps are in `docs/superpowers/arc-mainnet-runbook.md`, which is self-contained.
-   - [ ] **The ECDSA-only hub is redeployed on Arc testnet and the rehearsal rerun on it.** On 2026-10-25 the owner
+   - [x] **The ECDSA-only hub is redeployed on Arc testnet and the rehearsal rerun on it.** On 2026-10-25 the owner
      decided that the hub verifies ECDSA only (final review A I-1, `aa5ddfc`). The bytecode changed, so the testnet
-     hub `0x9b8B…bA41` still has the ERC-1271 fallback. The controller redeploys after the final fix wave, with the
-     testnet deployer as the only sender. Then it reruns the rehearsal and updates `contracts/deployments/5042002.json`
-     and `KNOWN_DEPLOYMENTS[5042002]`.
+     hub `0x9b8B…bA41` still had the ERC-1271 fallback.
+     **Done 2026-10-25** (rehearsal report §1, "Redeploy #2 (ECDSA-only hub)", and §12):
+     - Redeployed on HEAD `90d5ed6`, with the testnet deployer as the only sender: `ChannelHub`
+       `0x3D8434455E4258a877a327De3B1201f94A558d38` and `ChessRules` `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba`,
+       block 69,112,538, 0.103048386 USDC.
+     - Both are fully verified.
+     - `contracts/deployments/5042002.json` and `KNOWN_DEPLOYMENTS[5042002]` were updated in `ed5862a`, and the
+       ERC-1271 pair is refused.
+     - The rehearsal rerun on `ed5862a` passed, with every check exact: hub 30/30, wallet reconciliation and the
+       whole run exact to the wei, M1/M2 4/4, nonces 9/9.
    - `ARENA_TOKEN` is set explicitly to Arc USDC. The script reverts without it on any chain but 31337, and on 5042 and
      5042002 it reverts for any token but `0x3600…0000` (`21bd2da`, final review A m-1).
    - The owner ends as a multisig that exists on Arc (last bullet). `ARENA_FEE_RECIPIENT` is set, to an address that
