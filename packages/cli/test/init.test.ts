@@ -572,13 +572,19 @@ describe("arena init --server", () => {
 
   describe("Plan 6 Task 5: the real Arc Testnet pin (contracts/deployments/5042002.json)", () => {
     const ARC_USDC = "0x3600000000000000000000000000000000000000";
-    const PINNED_HUB = "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41";
-    const PINNED_RULES = "0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01";
+    const PINNED_HUB = "0x3D8434455E4258a877a327De3B1201f94A558d38";
+    const PINNED_RULES = "0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba";
     /** The pre-hardening testnet deploy (superseded 2026-10-24): refused like any other hub. */
     const SUPERSEDED_HUB = "0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893";
     const SUPERSEDED_RULES = "0x3fC37CCC07dbCd6cF3E894BA8df4e6D3Ff16E6E5";
+    /** The hardened deploy with the ERC-1271 fallback (superseded 2026-10-25, final review A I-1): refused too. */
+    const SUPERSEDED_1271_HUB = "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41";
+    const SUPERSEDED_1271_RULES = "0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01";
     const OTHER = `0x${"44".repeat(20)}` as const;
-    const testnet = () => ({ chainId: 5042002, withCode: [PINNED_HUB, PINNED_RULES, SUPERSEDED_HUB, SUPERSEDED_RULES, OTHER, ARC_USDC] });
+    const testnet = () => ({
+      chainId: 5042002,
+      withCode: [PINNED_HUB, PINNED_RULES, SUPERSEDED_HUB, SUPERSEDED_RULES, SUPERSEDED_1271_HUB, SUPERSEDED_1271_RULES, OTHER, ARC_USDC],
+    });
     const explicit = (hub: string, rules = PINNED_RULES) => [
       "init", "--server", "https://host.test", "--rpc", "http://rpc.test", "--chain-id", "5042002",
       "--hub", hub, "--usdc", ARC_USDC, "--rules", rules, "--session-gas-wei", "10000000000000000",
@@ -619,6 +625,12 @@ describe("arena init --server", () => {
       expect(superseded.code).toBe(1);
       expect(superseded.err).toContain(`hub ${SUPERSEDED_HUB} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
       expect(superseded.err).toContain(`rules ${SUPERSEDED_RULES} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
+
+      // So is the hardened deploy that still had the ERC-1271 fallback.
+      const superseded1271 = await run(freshHome(), explicit(SUPERSEDED_1271_HUB, SUPERSEDED_1271_RULES), stubFetch(testnet()));
+      expect(superseded1271.code).toBe(1);
+      expect(superseded1271.err).toContain(`hub ${SUPERSEDED_1271_HUB} is not the pinned Arc Testnet hub ${PINNED_HUB}`);
+      expect(superseded1271.err).toContain(`rules ${SUPERSEDED_1271_RULES} is not the pinned Arc Testnet rules ${PINNED_RULES}`);
     });
 
     it("init on 5042002 accepts the pinned hub, rules and USDC (any case)", async () => {

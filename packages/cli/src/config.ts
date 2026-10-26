@@ -112,13 +112,14 @@ export type KnownDeployment = { name: string; hub: Address; rules: Address; usdc
  */
 export const KNOWN_DEPLOYMENTS: Record<number, KnownDeployment> = {
   // 5042: Arc mainnet -- pinned by Plan 6 Task 6, after the gated mainnet deploy (contracts/deployments/5042.json).
-  // Plan 6 Task 5: the hardened hub's testnet deploy (audit I1, M1, M2), source-verified on explorer.testnet.arc.io
-  // (contracts/deployments/5042002.json; docs/superpowers/arc-testnet-rehearsal.md, "Redeploy (hardened hub)"). The
-  // pre-hardening hub 0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893 is superseded and refused.
+  // Plan 6 Task 5: the ECDSA-only hub's testnet deploy (final review A I-1, on top of audit I1, M1, M2), source-verified
+  // on explorer.testnet.arc.io (contracts/deployments/5042002.json; docs/superpowers/arc-testnet-rehearsal.md, "Redeploy
+  // #2 (ECDSA-only hub)"). Superseded and refused: the pre-hardening hub 0x9fcFBAC9FE8Dd64fB4602FB30A1583114Cef6893
+  // (2026-10-24) and the hardened hub with the ERC-1271 fallback 0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41 (2026-10-25).
   5042002: {
     name: "Arc Testnet",
-    hub: "0x9b8Bc44f261D09C94cA17b7b0281DD706f76bA41",
-    rules: "0xA538cd6dd6Ca05aBAD85e913aAB0d449C0994A01",
+    hub: "0x3D8434455E4258a877a327De3B1201f94A558d38",
+    rules: "0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba",
     usdc: "0x3600000000000000000000000000000000000000",
   },
 };
