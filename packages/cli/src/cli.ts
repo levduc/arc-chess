@@ -1333,7 +1333,8 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       // Fix round 1 (spec §2.1 as amended, audit-daemon I-5): on such a chain, this home's channels that are not
       // finalized each keep one sessionGasWei of the same balance for their refills, so the ask includes it
       // (`usdc.reserved`) -- the daemon's opening gates refuse a new channel that would spend it. No daemon needed: the
-      // records on disk. A record that cannot be read is not counted (the daemon cannot open it either).
+      // records on disk. A record that cannot be read is not counted (the daemon cannot open it either). Final fix wave B
+      // (m-11): a degraded one is (unlike the daemon's own reserve count), so this asks for more, never less.
       const unsettledChannels = oneBalance ? new RecordStore(home).channels().filter((r) => !r.finalized).length : 0;
       const sized = <T>(compute: () => T): T => {
         try {

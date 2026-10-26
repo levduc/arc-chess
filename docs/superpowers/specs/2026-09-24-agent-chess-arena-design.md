@@ -1122,7 +1122,7 @@ with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch 
 
 See `docs/superpowers/specs/2026-10-23-arc-launch-design.md` for the design and `docs/superpowers/arc-facts.md` for
 the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2; item 67,
-hardening wave H3; item 68, hardening wave H4.
+hardening wave H3; item 68, hardening wave H4; item 69, the final fix wave's CLI part (B).
 
 60. **Chain profiles.** `CHAIN_PROFILES` (`packages/cli/src/chains.ts`) is built into the CLI and keyed by chain id;
     nothing in it is ever taken from the host. Arc (5042) and Arc Testnet (5042002) each have `usdc`
@@ -1288,7 +1288,7 @@ hardening wave H3; item 68, hardening wave H4.
     - **Lock identity, with no clock (fix round 2, N1, N3).** `acquireHomeLock` writes `{pid, nonce}` with a fresh
       random nonce per acquisition. Asked `GET /health` with the home's bearer token, the daemon's API answers
       `{ok, pid, lock: <nonce>, role: daemon|bot|withdraw}`; without the token, `{ok}` as before. A holder is "this
-      home's daemon" only when that pid and nonce are the lock's (the pid alone for an older CLI's nonce-less lock).
+      home's daemon" only when that pid and nonce are the lock's (never for an older CLI's nonce-less lock: item 69).
       This replaces fix round 1's start-time-versus-lock-mtime check, which broke on the `ps` path (a start time
       derived from `Date.now()` compared for equality, so `stop` never worked off Linux) and under wall-clock steps
       (a live daemon called a reused pid). `/proc` or `ps` now only shows a stopped process go. A home with port 0
@@ -1314,6 +1314,55 @@ hardening wave H3; item 68, hardening wave H4.
     - **The took-effect note.** `/skill.md` Troubleshooting quotes H3's CLI note (`note: <action> took effect, but
       the chain could not be read afterwards`) and says the action did take effect and is never sent again. H3's
       code is unchanged.
+69. **Final fix wave, the CLI (B; `.superpowers/sdd/2026-10-23-arc-launch/final-review-b.md`).**
+    - **An unconfirmed withdraw is never answered "retry" (I-1).** `withdraw()` diffs the wallet sender's tracked
+      hashes around `hub.transfer`, as the sweep does. A failure after the send that is none of the four typed wait
+      errors (a rate-limited or timed-out receipt read, a 5xx) is a 502 naming what was sent, never H3's 503 "wait a
+      few seconds, then retry". Every 502 or 503 of an unconfirmed withdraw carries its hashes, as the API body's
+      `hashes` and in the message ("check the owner's balance, an explorer or `<cli> wallet` before retrying: a retry
+      can pay the owner twice"). It is recorded in `<home>/withdraw-pending.json`, and the next withdraw, through the
+      same daemon or a fresh in-process one, resolves it from the chain before it reads the balance:
+      - one of its transactions mined with the `Transfer` to the owner: it landed. That withdraw is refused (409,
+        "the owner has been paid, so nothing was sent now"), the record cleared, and the next one goes ahead;
+      - each mined without that `Transfer`, or never mined while another transaction took its nonce: none can pay.
+        Cleared, and the withdraw goes ahead;
+      - otherwise (pending, unknown with its nonce free, or mined with its receipt unreadable): refused (409) until
+        `WITHDRAW_UNCONFIRMED_HOLD_MS` (10 minutes) after it was sent, then cleared and sent. The send replaces a
+        transfer still pending at its nonce wherever the RPC's pending count shows it; on one that does not, a fresh
+        in-process daemon past the hold sends at the next nonce (the residual).
+      A check whose read fails is a 503: nothing is sent.
+    - **No message tells the agent to edit `config.json` (I-2).** `start()`'s refusal of a config naming contracts this
+      CLI does not pin is addressed to the human: "Tell your human: this daemon's config names contracts the CLI does
+      not pin for chain N … they decide what happens next". It says the agent never edits `config.json` and starts no
+      new home while a channel is unsettled, and that the release that set the home up can still settle and withdraw;
+      restoring the pinned addresses would read the channels on the wrong hub and retire them. `init`'s and `owner`'s
+      "fix or remove it first" on an unreadable `config.json`, and `owner set`'s hand-edit lines, are the human's step.
+    - **`init` refuses an Arc chain no release pins yet (m-10).** With `requirePin` (`init` only, never `start()`, so
+      no home is stranded), `pinnedDeploymentRefusals` refuses a `nativeIsUsdc` profile chain with no
+      `KNOWN_DEPLOYMENTS` entry: a CLI published before Task 6 never takes the mainnet hub a hostile `/templates`
+      names. The test-only override is `UNPINNED_INIT_ALLOWED_FOR_TESTS`, a module-level set that no flag, environment
+      variable or file writes.
+    - **The respond margin is 15 s (m-6):** item 67.
+    - **Lock identity (m-1, m-2).** A lock with no nonce is never confirmed (any listener can echo a pid), and a
+      confirmed answer must name a role. An answer that waiting does not change -- a 200 without identity, a
+      nonce-less lock -- is a `definite` silence: `--detach` and `stop` exit 1 at once, telling the agent to tell its
+      human, where `--detach` used to wait out its timeout. The README says how a human stops such a daemon by hand.
+    - **`stop` and the channels no daemon watches (m-4, m-11).** A record that cannot be read counts as live for
+      `stop`, as for `init`'s RPC check. The authenticated `/health` lists the channels the daemon does not watch
+      (`degraded`), and `stop`'s refusal names degraded and unreadable records apart: not watched by any daemon,
+      `close` cannot settle them, tell your human. Three counts of "not settled" remain, each erring safe: `fund`
+      counts degraded records (it asks for more), the daemon's reserve does not, and `stop` counts degraded and
+      unreadable ones (it refuses more often).
+    - **Status and notes (m-3, m-5, m-7).** The lobby refusal's "restart this daemon" is not shown for a finalized
+      record, so a retired channel's first action stays `done:`. It, the 503 on offer and accept, and the withdraw 409
+      restart the daemon only once no channel is live, and otherwise say to tell the human (`stop` refuses while one
+      is). A challenge or reclaim mined with its receipt unreadable carries `unconfirmed` in its status; the CLI then
+      prints `note: <cmd> was mined, but whether it succeeded is not known yet (…): run "<cli> status" to check`, not
+      the took-effect note.
+    - **Smaller (m-8, m-9, m-12).** A close the wallet cannot pay for, or whose fee is over its ceiling, says so in
+      `lastError` (`close()` still answers 200). `handleUnseenRegistered` re-reads the session's latest turn after its
+      awaits, so a turn a relay delivered meanwhile is not raised as `challenge-unseen`. The daemon's 20 s request cap
+      leaves a `Retry-After` 5 attempts and 16 s of waiting.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

@@ -1129,7 +1129,9 @@ export class ArenaDaemon {
    * Plan 6 (spec §2.1): the channels whose session keys this wallet may still have to refill -- every channel record
    * that is not finalized, whether live or recorded on disk and not yet opened (degraded ones excluded: they are
    * never watched). The same candidates `channelsAwaitingOwnDeposit` reads. Fix round 1 (I-5): `exclude` leaves out
-   * the channel being funded.
+   * the channel being funded. Final fix wave B (m-11): one of three counts of "not settled", each erring safe -- `fund`
+   * (cli.ts) also counts degraded records (it asks for one more session gas each), and `daemon stop`
+   * (`liveChannelIds`) also counts degraded and unreadable ones (it refuses more often).
    */
   private unsettledChannelCount(exclude?: Hex): number {
     const ids = new Set<Hex>();
