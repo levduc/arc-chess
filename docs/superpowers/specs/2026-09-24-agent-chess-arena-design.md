@@ -214,9 +214,12 @@ Draw offers ride on a move (`NORMAL_OFFER_DRAW` → status `DRAW_OFFERED`); the
 opponent either plays `ACCEPT_DRAW` (board unchanged, status `DRAW`) or a
 `NORMAL` move, which implicitly declines (status back to `PLAYING`).
 
-Signatures are verified ECDSA-first (OpenZeppelin `ECDSA.tryRecover`); only if that fails is ERC-1271
-consulted (`SignatureChecker.isValidERC1271SignatureNow`), so a contract signer is accepted, and a session
-key that later gains code cannot revoke its earlier ECDSA signatures.
+Signatures are verified with ECDSA only (OpenZeppelin `ECDSA.tryRecover`: 65 bytes, v 27 or 28, low s), with no
+ERC-1271 fallback (owner decision 2026-10-25, final review A I-1). A signer whose code accepts any bytes, such as a
+contract or an EIP-7702-delegated session key, could otherwise put unverifiable signatures in a proof. A delegated
+key's own ECDSA signatures still verify against its address, and gaining code cannot revoke them. The SDK's
+`recoverStateSigner`/`recoverCloseSigner` accept only the same form, because viem alone also recovers a high-s twin
+and v 0/1, so a session never stores a signature the hub refuses (§12 item 70).
 
 ### 4.4 `IGameRules`
 
@@ -512,7 +515,8 @@ The stream closes on client disconnect, daemon stop, or server close.
    challenge/respond/timeout, challenge by participant vs session key,
    cooldown, `CLAIM_STALEMATE` via challenge/respond, stale-state and
    wrong-signer rejection, fee snapshot vs later `setFee`, reclaim refunds
-   including fee, ERC-1271 signer path.
+   including fee, a contract signer refused and an ECDSA signature that survives its signer gaining code
+   (ECDSA only: §4.3).
 2. **Foundry — invariant/fuzz tests:** hub USDC balance equals the sum of
    un-finalized channel escrow (game balances + fee escrow); every finalize
    path succeeds for any reachable balances; `balanceA + balanceB` conserved; registered
@@ -703,8 +707,8 @@ The stream closes on client disconnect, daemon stop, or server close.
       block can drop it from the count without applying its dispute events (`apply` ignores an event older than a
       row's `lastEvent`), so the affected rows may stay stale (final review C m-1).
     - The hardened hub (audit I1; `proposal/hub-hardening`, merged in `750e280` and deployed on Arc testnet) verifies
-      every signature slot it re-emits. So an oversized event cannot arise from a daemon-signed state; it needs an RPC
-      that refuses, or lies about, an ordinary one.
+      every signature slot it re-emits, and since `aa5ddfc` with ECDSA only (item 70). So an oversized event cannot
+      arise from a daemon-signed state; it needs an RPC that refuses, or lies about, an ordinary one.
 19. **Host connection lifecycle (CLI).**
     - `start()` and match handling never wait on a relay join. A slow or silent host cannot delay the watchtower
       or the local API. A failed join is recorded as the channel's `lastError`.
@@ -1122,7 +1126,8 @@ with the code in Plan 5.7's final fix wave (2026-10-14), after the whole-branch 
 
 See `docs/superpowers/specs/2026-10-23-arc-launch-design.md` for the design and `docs/superpowers/arc-facts.md` for
 the chain facts. Items 60–66 describe the code on `feat/arc-launch` after Tasks 1–3 and hardening wave H2; item 67,
-hardening wave H3; item 68, hardening wave H4; item 69, the final fix wave's CLI part (B).
+hardening wave H3; item 68, hardening wave H4; item 69, the final fix wave's CLI part (B); item 70, the ECDSA-only
+hub.
 
 60. **Chain profiles.** `CHAIN_PROFILES` (`packages/cli/src/chains.ts`) is built into the CLI and keyed by chain id;
     nothing in it is ever taken from the host. Arc (5042) and Arc Testnet (5042002) each have `usdc`
@@ -1363,6 +1368,16 @@ hardening wave H3; item 68, hardening wave H4; item 69, the final fix wave's CLI
       `lastError` (`close()` still answers 200). `handleUnseenRegistered` re-reads the session's latest turn after its
       awaits, so a turn a relay delivered meanwhile is not raised as `challenge-unseen`. The daemon's 20 s request cap
       leaves a `Retry-After` 5 attempts and 16 s of waiting.
+70. **ECDSA-only signatures (final review A I-1, owner decision 2026-10-25; `aa5ddfc`, `aeed9dc`).** Signatures are
+    verified with ECDSA only (OpenZeppelin `ECDSA.tryRecover`: 65 bytes, v 27 or 28, low s), with no ERC-1271
+    fallback. A signer whose code accepts any bytes, such as a contract or an EIP-7702-delegated session key, could
+    otherwise put unverifiable signatures in a proof. A delegated key's own ECDSA signatures still verify against its
+    address, and gaining code cannot revoke them. The SDK's `recoverStateSigner`/`recoverCloseSigner` accept only the
+    same form, because viem alone also recovers a high-s twin and v 0/1, so a session never stores a signature the
+    hub refuses. §4.3 says the same. Arc testnet runs this hub since redeploy #2 (`ed5862a`: ChannelHub
+    `0x3D8434455E4258a877a327De3B1201f94A558d38`, ChessRules `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba`, pinned in
+    `KNOWN_DEPLOYMENTS[5042002]`); `init` refuses the superseded hub with the ERC-1271 fallback (`0x9b8B…bA41`), as it
+    refuses the pre-hardening one.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 
