@@ -6,7 +6,7 @@ import { offerId as computeOfferId, signOffer, toWire, type Offer } from "@arena
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { deployArena, mintUsdc, RPC, setEthBalance, usdcBalance as readUsdcBalance } from "../../sdk/test/helpers/chain.js";
-import { KNOWN_DEPLOYMENTS, UNPINNED_INIT_ALLOWED_FOR_TESTS, arenaPaths, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
+import { KNOWN_DEPLOYMENTS, OFFERS_SHUFFLED_NOTE, UNPINNED_INIT_ALLOWED_FOR_TESTS, arenaPaths, shuffled, daemonStartLine, invalidOfferTimeoutReason, loadConfig, loadWalletKey, runCli, writeJsonAtomic } from "../src/index.js";
 import { computeFundingNeed, fundDisclosure, fundMessage } from "../src/funding.js";
 
 function io(home: string, responses: Array<{ status: number; body: unknown }> = [], opts: { chainId?: number } = {}) {
@@ -198,6 +198,37 @@ describe("arena CLI", () => {
     const mined = io(home, [{ status: 200, body: { channelId: "0xaa", chainStale: true, chainStaleReason: reason, unconfirmed: reason } }]);
     expect(await runCli(["challenge"], mined.io)).toBe(0);
     expect(mined.err).toEqual([`note: challenge was mined, but whether it succeeded is not known yet (${reason}): run "arena status" to check`]);
+  });
+
+  it("live run #2 (f)3: offers come in a fresh crypto-random order on every call -- the same offers, never a fixed first", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    // Six equal offers, in the daemon's (the host's) fixed order. Before: printed in that order every time, and both
+    // agents of live run #2 took the same one.
+    const listed = Array.from({ length: 6 }, (_, i) => ({ offerId: `0x${String(i + 1).repeat(64)}`, mine: false, offer: { stakePerGame: "100000" } }));
+    const orders = new Set<string>();
+    const firsts = new Set<string>();
+    for (let call = 0; call < 40; call++) {
+      const t = io(home, [{ status: 200, body: listed }]);
+      expect(await runCli(["offers"], t.io)).toBe(0);
+      const printed = JSON.parse(t.out.join("\n")) as typeof listed;
+      expect([...printed].sort((a, b) => a.offerId.localeCompare(b.offerId))).toEqual(listed); // the same offers, each once
+      expect(t.err).toEqual([OFFERS_SHUFFLED_NOTE]);
+      orders.add(printed.map((o) => o.offerId).join());
+      firsts.add(printed[0]!.offerId);
+    }
+    expect(orders.size).toBeGreaterThan(1);
+    expect(firsts.size).toBeGreaterThan(1);
+    expect(OFFERS_SHUFFLED_NOTE).toBe("note: offers are listed in a fresh random order on every call: take the first one that fits");
+    // shuffled(): a permutation, and every item can come first (6 x (5/6)^300 ~ 1e-23 that one never does).
+    const seen = new Map<number, number>();
+    for (let i = 0; i < 300; i++) {
+      const p = shuffled([0, 1, 2, 3, 4, 5]);
+      expect([...p].sort()).toEqual([0, 1, 2, 3, 4, 5]);
+      seen.set(p[0]!, (seen.get(p[0]!) ?? 0) + 1);
+    }
+    expect(seen.size).toBe(6);
+    expect(shuffled([])).toEqual([]);
   });
 
   it("reports API errors and usage errors", async () => {

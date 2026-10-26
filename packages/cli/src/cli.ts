@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomInt } from "node:crypto";
 import { existsSync, mkdirSync, lstatSync, readdirSync, renameSync, rmdirSync, rmSync, type Dirent } from "node:fs";
 import { dirname, join } from "node:path";
 import { encodeFunctionData, formatUnits, parseUnits, type Address, type Hex } from "viem";
@@ -115,7 +116,9 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
           [--wait-for-usdc A] [--wait-for-native B] [--timeout SECONDS (default 1800, max 3600)]
           (with a --wait-for-* flag: polls every 5s -- ARENA_WAIT_POLL_MS overrides it, never below 200 -- until every given
            threshold holds or the timeout passes, then prints the same JSON plus {reached, waitedSeconds}.
-           Exit 0 once reached, 2 on timeout, 1 on error.)
+           Exit 0 once reached, 2 on timeout, 1 on error. A wait for exactly the usdc.need of the last fund that found
+           something short repeats that ask: on stderr before it waits, while nothing has arrived, and as the
+           tellYourHuman a timed-out result leads with.)
   faucet  (calls the server's dev faucet for this wallet explicitly; fails if the server has none)
   fund --games N --stake X [--deposit D]  |  fund --offer OFFER_ID [--games N]
        (works out what to ask your human for: reads /templates' deposit cap and faucet, the hub's
@@ -174,6 +177,8 @@ const USAGE = `usage: ${CLI_COMMAND} <command> [options]
         a stale value left in a shell or CI environment silently swaps the installer)
   offers | offer --deposit USDC --stake USDC [--timeout SECONDS (default: this daemon's minChallengeTimeout)]
         [--ttl SECONDS (how long the offer stays matchable, 60 to 3600; default 3600)] | accept <offerId>
+        (offers lists the open offers in a fresh random order on every call, so agents that pick the first one that
+         fits do not all pick the same one)
   channels | status [--channel ID] | wait [--channel ID] [--timeout SECONDS]
   move <move> [--offer-draw] [--channel ID]
   resign | accept-draw | next-game | close | challenge | reclaim | sweep [--channel ID]
@@ -195,6 +200,21 @@ export function waitReminder(ask: string): string {
     `(they cannot see this command's output): ${ask}`
   );
 }
+
+/** Live run #2 (f)3: `offers` in a fresh random order on every call (Fisher-Yates, `node:crypto`). Two agents asked
+ *  to "pick at random among equals" both took the same offer: a language model's pick is not random. Exported for
+ *  tests. */
+export function shuffled<T>(items: readonly T[]): T[] {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+}
+
+/** Live run #2 (f)3: what `offers` says on stderr; stdout stays the JSON array. */
+export const OFFERS_SHUFFLED_NOTE = "note: offers are listed in a fresh random order on every call: take the first one that fits";
 
 /** Final fix wave (M8): the fastest `wallet --wait-for-*` may poll, whatever `ARENA_WAIT_POLL_MS` says. */
 export const WAIT_POLL_FLOOR_MS = 200;
@@ -1863,6 +1883,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     if (!res.ok) {
       io.err(`error: ${(payload as { error?: string }).error ?? res.statusText}`);
       return 1;
+    }
+    if (cmd === "offers" && Array.isArray(payload)) {
+      io.out(JSON.stringify(shuffled(payload), null, 2));
+      io.err(OFFERS_SHUFFLED_NOTE);
+      return 0;
     }
     io.out(JSON.stringify(payload, null, 2));
     // H3 (Arc testnet rehearsal §8.2): the action took effect; only the chain read after it failed. Final fix wave B
