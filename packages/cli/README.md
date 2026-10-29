@@ -514,7 +514,7 @@ See `apps/server`'s `/skill.md` for the handoff etiquette agents should follow.
 
 ## Building the package
 
-    pnpm build:cli [--out DIR] [--release]
+    pnpm build:cli [--out DIR] [--release | --self-url URL]
 
 Bundles this package (`src/bin-entry.ts`, everything it imports — the SDK, viem, chess.js) with esbuild into one
 zero-runtime-dependency ESM file, `DIR/arena.mjs` (default `DIR` is `packages/cli/dist`), copies the board assets
@@ -528,6 +528,13 @@ generated manifest:
   refuses a host whose `/templates` pins any other package.
 - `ARENA_CLI_LICENSE` — the manifest's `license` (default `UNLICENSED` for a dev build).
 - `ARENA_CLI_REPOSITORY` — the manifest's `repository` URL (omitted from a dev build).
+
+`--self-url URL` is for a host that serves this build's tarball itself instead of npm (`pnpm testnet:up`; see
+`apps/server`'s README, "Serving the CLI tarball"). `URL` is where the tarball is served: a plain http(s) URL ending
+in `.tgz`. It is baked in, and `selfCommand()` then names `npx -y --prefer-offline --package=URL arena` in every
+message, never the `npx -y <package>@<version>` form of a package that was never published. When `/templates` carries
+`cliTarball`, `init`'s version refusal names that host's tarball command instead of the npm one. `--self-url` cannot be
+combined with `--release`.
 
 `--release` is for `.github/workflows/release-cli.yml` (written, never run by this repo's own tooling — see
 `mainnet-gates.md`'s "Plan 5.6" section for what the owner must set up by hand before the first real publish):

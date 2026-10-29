@@ -47,7 +47,7 @@ function buildCli(out: string, extraEnv: NodeJS.ProcessEnv = {}, extraArgs: stri
 /** Final fix wave (C1): a stand-in arena host on 127.0.0.1 -- `GET /templates` publishes a chess template whose
  *  `cli` entry is `cli`, and `POST /rpc` answers as chain 31337 on which every address holds code -- so the built
  *  bundle's own `init` can be run against it end to end. */
-async function startStubHost(cli: Record<string, unknown>): Promise<{ url: string; server: Server }> {
+async function startStubHost(cli: Record<string, unknown>, extra: Record<string, unknown> = {}): Promise<{ url: string; server: Server }> {
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (c: Buffer) => (body += c.toString("utf8")));
@@ -66,6 +66,7 @@ async function startStubHost(cli: Record<string, unknown>): Promise<{ url: strin
               usdc: `0x${"22".repeat(20)}`,
               rules: `0x${"33".repeat(20)}`,
               cli,
+              ...extra,
             },
           ]),
         );
@@ -290,6 +291,74 @@ describe("build-cli", () => {
       }
     }
   }, 60_000);
+
+  describe("remote agents: --self-url, a build a host serves as its own tarball", () => {
+    const SELF = "http://100.70.62.92:8700/cli/arena-cli-0.1.0-0123456789abcdef.tgz";
+    const CMD = `npx -y --prefer-offline --package=${SELF} arena`;
+    let selfOut: string;
+
+    beforeAll(async () => {
+      selfOut = freshDir("arena-cli-selfurl-");
+      const result = await buildCli(selfOut, {}, ["--self-url", SELF]);
+      if (result.status !== 0) throw new Error(`build-cli --self-url failed (${result.status}): ${result.stderr}`);
+    }, 180_000);
+
+    it("every message names the tarball command, never the placeholder npm package", async () => {
+      const cwd = freshDir("arena-cli-run-");
+      const env = { PATH: dirname(process.execPath), HOME: freshDir("arena-cli-noconfig-") };
+      const usage = await run(process.execPath, [join(selfOut, "arena.mjs")], { cwd, env });
+      expect(usage.status).not.toBe(0);
+      expect(usage.stderr).toContain(`usage: ${CMD} <command>`);
+      const wallet = await run(process.execPath, [join(selfOut, "arena.mjs"), "wallet"], { cwd, env });
+      expect(wallet.stderr).toContain(`run "${CMD} init" first`);
+      expect(`${usage.stderr}${wallet.stderr}`).not.toContain("@arena/cli@");
+      // The manifest is unchanged: the same placeholder name the host pins in /templates.
+      expect(JSON.parse(readFileSync(join(selfOut, "package.json"), "utf8")).name).toBe("@arena/cli");
+    });
+
+    it("init accepts a host that serves this tarball at its own version; one pinning a newer version is refused with the host's tarball", async () => {
+      const tarball = { cliTarball: { url: SELF, sha256: "a".repeat(64) } };
+      const ok = await startStubHost({ package: "@arena/cli", version: "0.1.0" }, tarball);
+      try {
+        const home = freshDir("arena-cli-gate-home-");
+        const result = await run(process.execPath, [join(selfOut, "arena.mjs"), "init", "--server", ok.url, "--no-faucet", "--port", "0"], {
+          cwd: freshDir("arena-cli-gate-cwd-"),
+          env: { PATH: dirname(process.execPath), HOME: home },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(existsSync(join(home, ".arena", "config.json"))).toBe(true);
+        expect(JSON.parse(result.stdout)).not.toHaveProperty("cliUpgrade");
+      } finally {
+        await new Promise<void>((r) => ok.server.close(() => r()));
+      }
+      const newer = await startStubHost({ package: "@arena/cli", version: "0.2.0" }, { cliTarball: { url: SELF.replace("0.1.0-", "0.2.0-"), sha256: "b".repeat(64) } });
+      try {
+        const home = freshDir("arena-cli-gate-home-");
+        const result = await run(process.execPath, [join(selfOut, "arena.mjs"), "init", "--server", newer.url, "--no-faucet"], {
+          cwd: freshDir("arena-cli-gate-cwd-"),
+          env: { PATH: dirname(process.execPath), HOME: home },
+        });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(
+          `this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0): install and run it with: npx -y --prefer-offline --package=${SELF.replace("0.1.0-", "0.2.0-")} arena init --server ${newer.url}`,
+        );
+        expect(existsSync(join(home, ".arena", "config.json"))).toBe(false);
+      } finally {
+        await new Promise<void>((r) => newer.server.close(() => r()));
+      }
+    }, 60_000);
+
+    it("refuses a --self-url that is not a plain http(s) .tgz URL, and --self-url with --release", async () => {
+      for (const bad of ["http://h/cli/a.tgz;id", "http://u:p@h/a.tgz", "http://h/a.tar", "/tmp/a.tgz"]) {
+        const result = await buildCli(freshDir("arena-cli-selfurl-bad-"), {}, ["--self-url", bad]);
+        expect(result.status, bad).not.toBe(0);
+        expect(result.stderr).toContain("--self-url needs a plain http(s) URL ending in .tgz");
+      }
+      const release = await buildCli(freshDir("arena-cli-selfurl-rel-"), {}, ["--self-url", SELF, "--release"]);
+      expect(release.status).not.toBe(0);
+      expect(release.stderr).toContain("--self-url is for a host's own tarball, never a --release build");
+    }, 60_000);
+  });
 
   it("H4: the bundle's daemon --detach, run the way npx runs it (a node_modules/.bin link), starts the bundle itself, detached", async () => {
     const env = await deployArena();

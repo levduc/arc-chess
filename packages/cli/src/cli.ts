@@ -654,6 +654,11 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
       io.out(cliVersion());
       return 0;
     }
+    // Remote agents: an agent's first command is often `--help`; it used to be read as a flag missing its value.
+    if (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+      io.out(USAGE);
+      return 0;
+    }
     const { positional, flags } = parse(argv);
     const [cmd, arg] = positional;
     const home = defaultHome(io.env);
@@ -711,6 +716,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
           rules?: string;
           faucet?: string;
           cli?: Record<string, unknown>;
+          cliTarball?: Record<string, unknown>;
           xmtp?: unknown;
         } = {};
         if (!haveAllExplicit) {
@@ -737,6 +743,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             faucet: typeof chess.faucet === "string" ? chess.faucet : undefined,
             // Plan 5.6 Task 4 (spec §3): only ever set by a host that has pinned a published CLI version.
             cli: chess.cli !== null && typeof chess.cli === "object" && !Array.isArray(chess.cli) ? (chess.cli as Record<string, unknown>) : undefined,
+            // Remote agents: only ever set by a host that serves the CLI tarball itself; used only for the version
+            // gate's install hint (`hostCliVerdict` validates its URL before echoing it). Never fetched or pinned to
+            // the server's origin: house bots reach their host on 127.0.0.1, while it publishes its tailnet URL.
+            cliTarball:
+              chess.cliTarball !== null && typeof chess.cliTarball === "object" && !Array.isArray(chess.cliTarball)
+                ? (chess.cliTarball as Record<string, unknown>)
+                : undefined,
             // Plan 5.7 Task 4 (spec §5): only ever set by a host that configures the XMTP fallback -- left as raw
             // `unknown` here (not shape-checked) so a malformed value still reaches `parseXmtpConfig` below and
             // fails with that function's own, specific message, instead of being silently dropped. Fix round 1
@@ -916,7 +929,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         // that pins a package other than this build's own. Still before anything is written.
         let cliUpgrade: string | undefined;
         if (template.cli !== undefined) {
-          const verdict = hostCliVerdict(template.cli, { ownPackage: cliPackage(), current: cliVersion(), server });
+          const verdict = hostCliVerdict(template.cli, { ownPackage: cliPackage(), current: cliVersion(), server, tarball: template.cliTarball });
           if ("refusal" in verdict) throw new Error(verdict.refusal);
           cliUpgrade = verdict.upgrade;
         }
