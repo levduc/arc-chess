@@ -177,6 +177,8 @@ describe("local API", () => {
     expect((await call(bobApi.url, bobToken, "GET", "/wait?timeout=10")).body.reason).toBe("your-turn"); // it took effect
     // Board rate-limit fix: a read-only route answers the last known view the same way -- the move is in it. Before: a
     // 503 ("the RPC is rate-limiting (…): wait a few seconds, then retry"), which left the board with nothing to show.
+    // (Board fix round 1: past the read routes' 5 s cache of the watchtower's last good read, which would answer fresh.)
+    for (const cid of d.channelIds()) d.handle(cid).chainReadAt = 0;
     const st = await call(url, token, "GET", "/status");
     expect(st.status).toBe(200);
     expect(st.body.chainStale).toBe(true);
@@ -185,7 +187,11 @@ describe("local API", () => {
     // An action that fails is still an error.
     expect((await call(url, token, "POST", "/move", { move: "d4" })).status).toBe(409);
     limit.on = false;
-    const fresh = await call(url, token, "GET", "/status");
+    // Board fix round 1: the watchtower's next good read ends the read routes' rate-limit back-off.
+    const fresh = await waitFor(async () => {
+      const r = await call(url, token, "GET", "/status");
+      return r.body.chainStale === undefined ? r : null;
+    }, 15_000, "a fresh status");
     expect(fresh.status).toBe(200);
     expect(fresh.body.chainStale).toBeUndefined();
   });

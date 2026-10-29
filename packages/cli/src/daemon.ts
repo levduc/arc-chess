@@ -42,6 +42,7 @@ import {
   isInsufficientFundsError,
   isRangeRefusal,
   isRateLimited,
+  isRpcError,
   mover,
   offerId as computeOfferId,
   outcome,
@@ -52,6 +53,7 @@ import {
   verifyOffer,
   waitOrReplace,
   type ArenaDomain,
+  type SessionSnapshot,
   type LobbyClient,
   type MatchEvent,
   type Offer,
@@ -77,7 +79,7 @@ import { readJson, writeJsonAtomic } from "./jsonfile.js";
 import { FUND_TX_GAS_UNITS, formatUsdc6, oneBalanceOpenNeed } from "./funding.js";
 import { forbiddenOwners, noOwnerMessage, readRecordedOwner, validateOwner } from "./owner.js";
 import { RecordStore, type ChannelRecord, type Controller } from "./records.js";
-import { buildStatus, type ChannelStatus, type SessionGasLowCause } from "./status.js";
+import { buildStatus, type ChannelStatus, type SessionGasLowCause, type StatusInput } from "./status.js";
 import { selfCommand } from "./version.js";
 
 export type Actor = "agent" | "human";
@@ -175,6 +177,21 @@ function minedUnconfirmed(what: string, err: unknown): ActionOutcome {
       `the ${what} transaction ${err.hash} was mined (block ${err.blockNumber}), but its receipt could not be read: ` +
       "whether it succeeded is not known yet; check status",
   };
+}
+
+/** I2: the fingerprint of a channel's progress -- the phase read and the states and signatures held (`refreshChain`
+ *  records the chain time at which it changes, `lastProgressAt`). */
+function progressKeyOf(phase: string, snap: SessionSnapshot): string {
+  const sig = (x: Hex) => (x === "0x" ? "-" : "s");
+  return [
+    phase,
+    snap.latest.state.turnNum,
+    sig(snap.latest.sigA) + sig(snap.latest.sigB),
+    snap.pendingCheckpoint ? "p" : "-",
+    snap.incomingCheckpoint ? "i" : "-",
+    snap.closeState ? "c" : "-",
+    sig(snap.closeSigs[0]) + sig(snap.closeSigs[1]),
+  ].join("|");
 }
 
 /** H3 fix round 1 (review M6): why a chain read failed, in the RPC's own words ("HTTP 429", `-32005 "rate limit
@@ -295,7 +312,14 @@ export type ChannelHandle = {
   unseenRegistered: { key: string; turn: bigint; deadline: bigint; passes: number; raised: boolean } | null;
   /** H1 fix round 1: `wait()` has already woken for this `challenge-unseen` (keyed like `unseenRegistered`). */
   challengeUnseenWoken: string | null;
+  /** Board fix round 1 (I2): wall-clock ms at which `chain` was last read in full (`refreshChain`, whoever called it:
+   *  the watchtower, the start-up restore, a read route), or 0 before the first read. Only the read routes look at it
+   *  (`CHAIN_VIEW_MAX_AGE_MS`), and a stale status reports it (`chainReadAt`). */
+  chainReadAt: number;
 };
+
+/** Board fix round 1 (I2): how a read route's status may skip a chain read (`ArenaDaemon.readView`). */
+type ReadViewOptions = { bypassCache?: boolean; ignoreBackoff?: boolean };
 
 /** I1: a channel whose files could not be loaded; reported by `channels()`, ignored by `pick()` and the watchtower. */
 export type DegradedChannel = { channelId: string; degraded: true; error: string };
@@ -510,6 +534,24 @@ export const REFILL_TRANSIENT_FAILURES_ALERT = 3;
 export const BACKOFF_START_MS = 30_000;
 /** Plan 5 Task 1: the refill/sweep back-off never grows past this. */
 export const BACKOFF_MAX_MS = 300_000;
+
+/**
+ * Board fix round 1 (review I2): the read routes (`status`, `channels`: what the board and an agent poll) answer from a
+ * channel's chain view without reading the chain while it is younger than this. The watchtower refreshes that view on
+ * every pass (`settleCheck`, every `pollMs`, 2 s by default), so a healthy daemon keeps it warm and the board adds no
+ * reads; the view is never more than 5 s old. An action route's status always reads (`statusAfterAction`). Strictly
+ * above `pollMs`, and noise against a challenge window (900 s by default; the auto-return margin is 300 s).
+ */
+export const CHAIN_VIEW_MAX_AGE_MS = 5_000;
+
+/**
+ * Board fix round 1 (review I2): after a read route's chain read is rate-limited, the read routes answer stale at
+ * once, with no read, for this long -- or until any refresh succeeds, the watchtower's included. Daemon-wide: a rate
+ * limit is the endpoint's, not a channel's. Under a persistent limit a read route then answers in about 0 s, not after
+ * the 20 s retry budget, and adds at most one read burst per 10 s to the load. Dispute logic (the watchtower's passes,
+ * `respondIfChallenged`, `settleCheck`, auto-return, withdraw, `wait()`) never honours it.
+ */
+export const READ_BACKOFF_MS = 10_000;
 
 /** H3 fix round 1 (review M8): the daemon's per-attempt RPC timeout (viem's default is 10 s). */
 export const DAEMON_RPC_TIMEOUT_MS = 5_000;
@@ -781,6 +823,11 @@ export class ArenaDaemon {
    *  ChannelStatus.lobbyError, and blocks new createOffer/acceptOffer calls (checkLobbyHealthy) so a silent,
    *  permanent loss of match notifications is never mistaken for a healthy 200. */
   private lobbyError: string | null = null;
+  /** Board fix round 1 (I2): the read routes' rate-limit back-off (`READ_BACKOFF_MS`), with the error that started it;
+   *  cleared by any successful `refreshChain`. Only `readView` and `channels()` read it. */
+  private readBackoff: { until: number; err: unknown } | null = null;
+  /** Board fix round 1 (m3): the non-RPC refresh failures already logged (each distinct one once; bounded). */
+  private readonly loggedReadFailures = new Set<string>();
 
   constructor(protected readonly opts: DaemonOptions) {
     const c = opts.config;
@@ -1847,6 +1894,7 @@ export class ArenaDaemon {
       skippedRetryIndex: 0,
       unseenRegistered: null,
       challengeUnseenWoken: null,
+      chainReadAt: 0,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -3075,7 +3123,9 @@ export class ArenaDaemon {
         // H3 fix round 2 (re-review M-g): nor is it sent past then -- after its pre-send reads -- since it would revert.
         notAfter: giveUpAt + RESPOND_SEND_MARGIN_MS,
       });
+      this.chainWritten(l);
     } catch (err) {
+      this.chainWritten(l);
       // Plan 4.5 Task 8: both players' daemons can answer the same challenge (the mover right after its move, the
       // challenger's own watchtower once the relay delivers that move), and the loser's respond reverts because the
       // winner's already returned the channel to Open. The challenge is answered either way, so a hub revert on a
@@ -3153,7 +3203,9 @@ export class ArenaDaemon {
     if (info.phase !== "Open" && info.phase !== "Challenged") return;
     try {
       await this.hub.closeCooperative(this.wallet, tx);
+      this.chainWritten(l);
     } catch (err) {
+      this.chainWritten(l);
       // Both sides race to submit the same cooperative close once they hold both signatures (each one's own
       // call, and the other's relayed close message, land within the same window). The loser's simulate can
       // still see phase "Open" (the winner hasn't mined yet), so it only reverts once mined — a status revert
@@ -3227,10 +3279,15 @@ export class ArenaDaemon {
   async challenge(ref: string | undefined, actor: Actor): Promise<ActionOutcome> {
     const l = this.pick(ref);
     this.requireController(l, actor);
-    const outcome = await this.guard(() => this.hub.challenge(l.sessionSender, l.session.challengeProof())).then(
-      () => ({}),
-      (err: unknown) => minedUnconfirmed("challenge", err),
-    );
+    let outcome: ActionOutcome;
+    try {
+      outcome = await this.guard(() => this.hub.challenge(l.sessionSender, l.session.challengeProof())).then(
+        () => ({}),
+        (err: unknown) => minedUnconfirmed("challenge", err),
+      );
+    } finally {
+      this.chainWritten(l);
+    }
     this.notify();
     return outcome;
   }
@@ -3253,6 +3310,7 @@ export class ArenaDaemon {
       );
     } finally {
       l.mainBusy = false;
+      this.chainWritten(l);
     }
     this.notify();
     return outcome;
@@ -3926,6 +3984,37 @@ export class ArenaDaemon {
   // ------------------------------------------------------------------ status
 
   async status(ref?: string): Promise<ChannelStatus> {
+    return this.statusFor(ref, {});
+  }
+
+  /**
+   * H3 (Arc testnet rehearsal §8.2): the status an action route (`POST /move`, `/close`, `/challenge`, ...) answers
+   * with, once its action has taken effect. Its chain refresh can fail on its own -- a rate-limited RPC -- and that
+   * must not turn a move that was signed and relayed into an error the agent may act on: the last known status is
+   * returned instead, with `chainStale` and the reason. A `DaemonError` (no such channel) is thrown as by `status`.
+   * Board rate-limit fix: `status` itself now answers that way (`tryRefreshChain`), so this adds only `unconfirmed`.
+   *
+   * Board fix round 1 (I2): it always reads the chain (never the read routes' 5 s cache): the action may have written
+   * it. It honours the read routes' rate-limit back-off -- so a move under a persistent limit is not held up a second
+   * time -- except with `chainWrite` (the `/challenge`, `/reclaim` and `/close` routes), whose action sent, or may
+   * have sent, a transaction: those try one read whatever the back-off.
+   */
+  async statusAfterAction(ref?: string, outcome: ActionOutcome = {}, opts: { chainWrite?: boolean } = {}): Promise<ChannelStatus> {
+    let st = await this.statusFor(ref, { bypassCache: true, ignoreBackoff: opts.chainWrite === true });
+    // Fix round 1 (review M4): a transaction mined with no readable receipt went through, but is unconfirmed.
+    if (outcome.unconfirmed !== undefined) {
+      st = {
+        ...st,
+        chainStale: true,
+        chainStaleReason: [outcome.unconfirmed, st.chainStaleReason].filter(Boolean).join("; "),
+        unconfirmed: outcome.unconfirmed,
+      };
+    }
+    return st;
+  }
+
+  /** `status` and `statusAfterAction`: the channel `ref` names, or a settled one this daemon let go of. */
+  private async statusFor(ref: string | undefined, view: ReadViewOptions): Promise<ChannelStatus> {
     let l: ChannelHandle;
     try {
       l = this.pick(ref);
@@ -3940,29 +4029,45 @@ export class ArenaDaemon {
     // I1: a Finalized/Reclaimed channel's on-chain state is terminal and was already captured (see settleCheck)
     // before it was marked finalized -- refreshing it again on every status call is a pure, avoidable RPC cost.
     if (l.record.finalized) return this.statusOf(l);
+    return this.readView(l, view);
+  }
+
+  /**
+   * Board fix round 1 (I2): one live channel's status for a read route, in this order -- the cached view if it is
+   * younger than `CHAIN_VIEW_MAX_AGE_MS` (fresh, no read) unless `bypassCache`; else the last view, stale, while the
+   * rate-limit back-off runs (`READ_BACKOFF_MS`) unless `ignoreBackoff`; else a refresh (`tryRefreshChain`), stale on
+   * failure. Only the read routes come through here: dispute logic reads the chain itself and never sees this.
+   */
+  private async readView(l: ChannelHandle, view: ReadViewOptions): Promise<ChannelStatus> {
+    if (!view.bypassCache && this.chainViewFresh(l)) return this.statusOf(l);
+    const backoff = view.ignoreBackoff ? null : this.activeReadBackoff();
+    if (backoff) return this.staleStatusOf(l, backoff.err);
     const failed = await this.tryRefreshChain(l);
     return failed ? this.staleStatusOf(l, failed.err) : this.statusOf(l);
   }
 
-  /**
-   * H3 (Arc testnet rehearsal §8.2): the status an action route (`POST /move`, `/close`, `/challenge`, ...) answers
-   * with, once its action has taken effect. Its chain refresh can fail on its own -- a rate-limited RPC -- and that
-   * must not turn a move that was signed and relayed into an error the agent may act on: the last known status is
-   * returned instead, with `chainStale` and the reason. A `DaemonError` (no such channel) is thrown as by `status`.
-   * Board rate-limit fix: `status` itself now answers that way (`tryRefreshChain`), so this adds only `unconfirmed`.
-   */
-  async statusAfterAction(ref?: string, outcome: ActionOutcome = {}): Promise<ChannelStatus> {
-    let st = await this.status(ref);
-    // Fix round 1 (review M4): a transaction mined with no readable receipt went through, but is unconfirmed.
-    if (outcome.unconfirmed !== undefined) {
-      st = {
-        ...st,
-        chainStale: true,
-        chainStaleReason: [outcome.unconfirmed, st.chainStaleReason].filter(Boolean).join("; "),
-        unconfirmed: outcome.unconfirmed,
-      };
-    }
-    return st;
+  /** Board fix round 1 (I2): a transaction this daemon sent for `l` (a challenge, a reclaim, a respond, a close) may
+   *  have changed the chain, so the read routes' cached view is dropped: the next read goes to the chain. Before, a
+   *  status within 5 s of a challenge answered the view from before it (a bot re-challenged on it). The watchtower's
+   *  own transactions are followed by `settleCheck` in the same pass, which re-reads anyway. A write: never a read of
+   *  the cache, so dispute logic still never depends on it. */
+  private chainWritten(l: ChannelHandle): void {
+    l.chainReadAt = 0;
+  }
+
+  /** Board fix round 1 (I2): whether `l`'s chain view is young enough for a read route to serve unread -- and was read
+   *  since the session last progressed (a move either way, a checkpoint, a Close signature). Silence is judged on
+   *  progress observed at a read (`lastProgressAt`, on chain time): a cached view would observe it late, so a status
+   *  could call an opponent silent who has just progressed, or miss a silence that starts at that progress. */
+  private chainViewFresh(l: ChannelHandle): boolean {
+    if (l.chainReadAt <= 0 || Date.now() - l.chainReadAt >= CHAIN_VIEW_MAX_AGE_MS || !l.chain) return false;
+    return progressKeyOf(l.chain.phase, l.session.snapshot()) === l.progressKey;
+  }
+
+  /** Board fix round 1 (I2): the read routes' rate-limit back-off, while it runs. */
+  private activeReadBackoff(): { until: number; err: unknown } | null {
+    if (this.readBackoff && Date.now() >= this.readBackoff.until) this.readBackoff = null;
+    return this.readBackoff;
   }
 
   /** Every live channel's status, followed by the channels that could not be loaded (I1). Plan 4.5 Task 11 fix
@@ -3971,31 +4076,35 @@ export class ArenaDaemon {
    *  cost grow with the daemon's *lifetime* channel count, not just its currently-open ones.
    *
    *  Board rate-limit fix: a channel whose refresh fails is listed from its last read, `chainStale` (as `status`
-   *  answers it), and the others are still refreshed -- one channel's failure no longer fails the list. Once a read
-   *  is rate-limited, or the one block read fails, the channels not yet refreshed are listed from their last read
-   *  too, for the same reason, without reading the chain: a rate-limited RPC only gets worse with more reads. */
+   *  answers it) -- one channel's failure no longer fails the list.
+   *
+   *  Board fix round 1: per channel, in `readView`'s order -- the cached view (I2), then the rate-limit back-off, then
+   *  a read. The one block read is made only once a channel needs a read, so a warm list costs none. Once a read
+   *  fails, whatever the failure (m2: a timeout or a dead endpoint fails the next read as likely, and each can wait
+   *  out the 20 s retry budget), the channels not yet read are listed stale for the same reason without reading. */
   async channels(): Promise<Array<ChannelStatus | DegradedChannel>> {
     const out: Array<ChannelStatus | DegradedChannel> = [];
     let now: bigint | undefined;
-    let limited: { err: unknown } | null = null;
+    let failed: { err: unknown } | null = null;
     for (const l of this.live.values()) {
-      if (l.record.finalized) {
+      if (l.record.finalized || this.chainViewFresh(l)) {
         out.push(this.statusOf(l));
         continue;
       }
-      if (!limited && now === undefined) {
+      failed ??= this.activeReadBackoff();
+      if (!failed && now === undefined) {
         try {
           now = (await this.client.getBlock()).timestamp;
         } catch (err) {
-          limited = { err };
+          this.noteReadFailure(err);
+          failed = { err };
         }
       }
-      if (limited) {
-        out.push(this.staleStatusOf(l, limited.err));
+      if (failed) {
+        out.push(this.staleStatusOf(l, failed.err));
         continue;
       }
-      const failed = await this.tryRefreshChain(l, now);
-      if (failed && isRateLimited(failed.err)) limited = failed;
+      failed = await this.tryRefreshChain(l, now);
       out.push(failed ? this.staleStatusOf(l, failed.err) : this.statusOf(l));
     }
     // Final review I3: settled channels no longer watched, from their cached final status.
@@ -4098,7 +4207,7 @@ export class ArenaDaemon {
 
   private statusOf(
     l: ChannelHandle,
-    opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean; ignoreChallengeUnseen?: boolean } = {},
+    opts: { ignoreSessionGasLow?: boolean; ignoreHumanMustMove?: boolean; ignoreChallengeUnseen?: boolean; stale?: StatusInput["stale"] } = {},
   ): ChannelStatus {
     return buildStatus({
       record: l.record,
@@ -4121,6 +4230,7 @@ export class ArenaDaemon {
       ignoreHumanMustMove: opts.ignoreHumanMustMove,
       transport: l.record.finalized ? "none" : (this.opts.transportOf?.(l.record.channelId) ?? "relay"),
       xmtpDropped: this.xmtpDroppedOf(l),
+      stale: opts.stale ?? null,
     });
   }
 
@@ -4132,7 +4242,8 @@ export class ArenaDaemon {
    * and the caller answers `staleStatusOf`. `refreshChain` only reads, and writes `l.chain` only once every read is
    * in, so a failure leaves the last view as it was. Nothing else trusts this answer: the watchtower's main and
    * dispute passes, `respondIfChallenged`, `settleCheck` and `wait()` read the chain (or `statusOf`) themselves, and
-   * still fail -- and retry -- on their own. Never sets `lastError` nor logs: the board polls this every few seconds.
+   * still fail -- and retry -- on their own. Never sets `lastError`: the board polls this every few seconds. A failure
+   * goes through `noteReadFailure` (fix round 1: the back-off, and a log line for a non-RPC failure).
    */
   private async tryRefreshChain(l: ChannelHandle, now?: bigint): Promise<{ err: unknown } | null> {
     try {
@@ -4140,15 +4251,38 @@ export class ArenaDaemon {
       return null;
     } catch (err) {
       if (err instanceof DaemonError) throw err;
+      this.noteReadFailure(err);
       return { err };
     }
   }
 
+  /**
+   * Board fix round 1: a read route's chain read failed. A rate limit starts the read routes' back-off (I2,
+   * `READ_BACKOFF_MS`). A failure with no RPC error in it -- a bug, or a callback that threw (`armFallback`) -- is still
+   * answered stale (an action route must never turn into an error the agent may retry), but it is no "busy RPC": it
+   * is logged, once per distinct reason (m3), so it does not hide behind the board's banner.
+   */
+  private noteReadFailure(err: unknown): void {
+    if (isRateLimited(err)) {
+      this.readBackoff = { until: Date.now() + READ_BACKOFF_MS, err };
+      return;
+    }
+    if (isRpcError(err)) return;
+    const reason = errorText(err);
+    if (this.loggedReadFailures.has(reason) || this.loggedReadFailures.size >= 32) return;
+    this.loggedReadFailures.add(reason);
+    this.log(`a chain refresh for a status read failed on no RPC error (answered from the last view; logged once): ${reason}`);
+  }
+
   /** H3 / board rate-limit fix: `l`'s last known status, marked `chainStale` -- its chain fields (`phase`, `challenge`,
    *  `cooldown`, and what they drive: `attention`, `suggestedActions`) are from the last refresh that succeeded, and
-   *  `chainStaleReason` says why this one did not. Everything else is current. */
+   *  `chainStaleReason` says why this one did not. Everything else is current. Fix round 1: built by `buildStatus` with
+   *  `stale` -- no challenge or reclaim suggested, no `humanAttention`, countdowns run on by the view's age (I1, m1). */
   private staleStatusOf(l: ChannelHandle, err: unknown): ChannelStatus {
-    return { ...this.statusOf(l), chainStale: true, chainStaleReason: chainReadFailure(err) };
+    const readAt = l.chainReadAt > 0 ? l.chainReadAt : null;
+    return this.statusOf(l, {
+      stale: { reason: chainReadFailure(err), ageSeconds: readAt !== null ? Math.floor((Date.now() - readAt) / 1000) : null, readAt },
+    });
   }
 
   /** `now`, when given, is a block timestamp already read by the caller this call, so this channel's read skips
@@ -4180,23 +4314,18 @@ export class ArenaDaemon {
       cooldownUntil: info.cooldownUntil,
       now: blockNow,
     };
+    // Board fix round 1 (I2): the whole view was just read (whoever asked): the read routes may serve it for
+    // CHAIN_VIEW_MAX_AGE_MS, and their rate-limit back-off is over -- the RPC answers again.
+    l.chainReadAt = Date.now();
+    this.readBackoff = null;
     // Plan 5.7 (spec §3, I-1): the XMTP fallback is armed only once the channel is Open on chain -- both deposits in --
     // never at match time, so an accept that costs nothing never starts an XMTP client here. Idempotent.
     if (!l.record.finalized && (info.phase === "Open" || info.phase === "Challenged")) this.opts.armFallback?.(id);
     // I2: progress is any change to the states and signatures held (our move, a received move, a checkpoint
     // proposed or completed, a Close signature either way, an on-chain adoption) or to the phase (the channel
-    // opening, a challenge being answered). Observed here — every tick and every status call — on chain time.
-    const snap = l.session.snapshot();
-    const sig = (x: Hex) => (x === "0x" ? "-" : "s");
-    const key = [
-      info.phase,
-      snap.latest.state.turnNum,
-      sig(snap.latest.sigA) + sig(snap.latest.sigB),
-      snap.pendingCheckpoint ? "p" : "-",
-      snap.incomingCheckpoint ? "i" : "-",
-      snap.closeState ? "c" : "-",
-      sig(snap.closeSigs[0]) + sig(snap.closeSigs[1]),
-    ].join("|");
+    // opening, a challenge being answered). Observed here -- every tick, and every read route's read (board fix round 1:
+    // which `chainViewFresh` forces once the session has progressed since the last read) -- on chain time.
+    const key = progressKeyOf(info.phase, l.session.snapshot());
     if (key !== l.progressKey) {
       l.progressKey = key;
       l.lastProgressAt = blockNow;

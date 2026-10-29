@@ -265,8 +265,10 @@ function markReachable(route) {
 }
 
 /** The error handler for background refreshes of `route`: one toast per new message per route, not one per poll.
- *  Board rate-limit fix: a rate-limited read (the daemon's 503) raises the calm "chain RPC is busy" banner instead --
- *  it clears itself once that route answers fresh, and the next poll is already scheduled. */
+ *  Board rate-limit fix: the daemon answers GET /status and GET /channels from its last chain read (`chainStale`,
+ *  handled by applyStatus and loadChannels) rather than failing on a rate limit. A rate-limit 503 for either -- from a
+ *  daemon before that fix -- raises the same calm banner here, as defence in depth, instead of a toast; it clears
+ *  once that route answers fresh, and the next poll is already scheduled. */
 function backgroundError(route) {
   return (err) => {
     if (state.stopped || (err instanceof ApiError && err.status === 401)) return;
@@ -291,7 +293,6 @@ const loadChannels = createCoalescer(async () => {
   if (state.stopped) return;
   const list = await state.client.channels();
   markReachable("channels");
-  chainStale.answered("channels", list);
   state.channels = Array.isArray(list) ? list : [];
   state.channelsLoaded = true;
   const current = state.channels.find((c) => c.channelId === state.selectedId && !c.degraded);
@@ -306,6 +307,8 @@ const loadChannels = createCoalescer(async () => {
   } else if (!state.status) {
     applyStatus(current);
   }
+  // Fix round 1 (m6): the list's part of the banner is the selected channel's -- the game on the board.
+  chainStale.answered("channels", state.channels, state.selectedId);
   renderAll();
 }, backgroundError("channels"));
 
@@ -350,6 +353,7 @@ function selectChannel(id) {
   closePromotion();
   state.status = state.channels.find((c) => c.channelId === id && !c.degraded) ?? null;
   chainStale.answered("status", state.status); // the newly selected channel's, until its own GET /status answers
+  chainStale.answered("channels", state.channels, id); // fix round 1 (m6)
   state.deadline = syncDeadline(null, state.status?.challenge, Date.now());
   /** @type {HTMLTextAreaElement} */ ($("hand-back-note")).value = "";
   /** @type {HTMLInputElement} */ ($("offer-draw-toggle")).checked = false;

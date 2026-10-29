@@ -119,6 +119,9 @@ export type ChannelStatus = {
    *  same way, instead of failing, when their own refresh fails. */
   chainStale?: true;
   chainStaleReason?: string;
+  /** Board fix round 1 (m1): set with a read's `chainStale` -- when the chain view it shows was read (ISO 8601), or null
+   *  if this daemon has not read one yet. `challenge.secondsLeft` and `cooldown` are already counted down from then. */
+  chainReadAt?: string | null;
   /** Final fix wave B (m-7): set with `chainStale` when the action's own transaction (a challenge, a reclaim) was mined
    *  but its receipt could not be read -- whether it succeeded is not known yet. The text says so, with the hash. */
   unconfirmed?: string;
@@ -156,6 +159,18 @@ export type StatusInput = {
   transport?: ChannelStatus["transport"];
   /** Plan 5.7 (K3): see ChannelStatus.xmtpDropped. Default 0. */
   xmtpDropped?: number;
+  /**
+   * Board fix round 1 (I1, m1): set when `chain` is the last view read, because a read route's refresh just failed
+   * (`reason`, from `chainReadFailure`). Then:
+   * - `challenge.secondsLeft` and `cooldown` (and the `challenge-unseen` countdown) count down by `ageSeconds`, the
+   *   view's age, never below 0 -- the view's own clock stopped when it was read. Silence is still judged on the view's
+   *   clock and the progress it saw, never on the wall clock;
+   * - no `arena challenge` or `arena reclaim` is suggested and `humanAttention` is null: silence on a frozen clock, a
+   *   phase and a cooldown that may have moved on, are no ground for a transaction. `arena status` (re-check) is
+   *   suggested last. `attention` is kept: informational, and `wait()` never builds from a stale view;
+   * - the status carries `chainStale`, `chainStaleReason` and `chainReadAt` (`readAt`, ms).
+   */
+  stale?: { reason: string; ageSeconds: number | null; readAt: number | null } | null;
   /** Plan 6 hardening H2 (audit-journey I-2): the chain and gas numbers `session-gas-low` is worded from -- the
    *  daemon's `config.chainId` and `config.sessionGasWei`, and its wallet's fee ceiling. On a chain whose gas is USDC
    *  (Arc), the reason is then shown in USDC, not wei, and the action says how much USDC to send. Absent, or on any
@@ -164,6 +179,9 @@ export type StatusInput = {
 };
 
 const GAME_STATUS = ["playing", "draw_offered", "white_won", "black_won", "draw"] as const;
+
+/** Board fix round 1 (I1): the last suggested action of a status answered from a stale chain view. */
+export const STALE_RECHECK_ACTION = "arena status   (the chain view is stale: re-check before any challenge)";
 
 /**
  * Plan 6 hardening H2 (audit-journey I-2): a `session-gas-low` reason (the daemon's own text, in wei) as an agent on a
@@ -297,13 +315,16 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   const closing = snapshot.closeState !== null;
   const opponentWantsToClose = snapshot.closeSigs[opponent] !== "0x";
   const phase = chain?.phase ?? "Unknown";
+  const stale = input.stale ?? null;
+  // Board fix round 1 (m1): countdowns run on from the view's clock by its age; silence (below) never does.
+  const clockNow = chain ? chain.now + BigInt(Math.max(0, Math.floor(stale?.ageSeconds ?? 0))) : 0n;
   let challenge: ChannelStatus["challenge"] = null;
   if (chain && phase === "Challenged") {
     const mustMove = myTurn && chain.registeredTurn !== null && chain.registeredTurn === s.turnNum;
     const autoReturn = input.autoReturnSeconds ?? null;
     challenge = {
       deadline: chain.deadline.toString(),
-      secondsLeft: Math.max(0, Number(chain.deadline - chain.now)),
+      secondsLeft: Math.max(0, Number(chain.deadline - clockNow)),
       mustMove,
       challenger: chain.challenger === me ? "me" : "opponent",
       autoReturnAt:
@@ -312,8 +333,8 @@ export function buildStatus(input: StatusInput): ChannelStatus {
   }
   const cooldown = chain
     ? {
-        meSeconds: Math.max(0, Number(chain.cooldownUntil[me] - chain.now)),
-        opponentSeconds: Math.max(0, Number(chain.cooldownUntil[opponent] - chain.now)),
+        meSeconds: Math.max(0, Number(chain.cooldownUntil[me] - clockNow)),
+        opponentSeconds: Math.max(0, Number(chain.cooldownUntil[opponent] - clockNow)),
       }
     : { meSeconds: 0, opponentSeconds: 0 };
   const over = isGameOver(s);
@@ -353,7 +374,8 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     attention = "settled";
   }
 
-  const humanAttention: ChannelStatus["humanAttention"] = record.controller === "human" && silent ? "opponent-silent" : null;
+  // Board fix round 1 (I1): never on a stale view (see StatusInput.stale): the board offers Challenge on it.
+  const humanAttention: ChannelStatus["humanAttention"] = record.controller === "human" && silent && !stale ? "opponent-silent" : null;
 
   const suggestedActions: string[] = [];
   // I2: the on-chain escape from a stalled or withheld state (only while Open; once Challenged it is under way).
@@ -427,7 +449,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
       ? `block(s) ${skippedBlocks.join(", ")} hold dispute events for this channel that the RPC refuses to serve, even alone`
       : null;
   if (unseen) {
-    const left = chain ? Math.max(0, Number(unseen.deadline - chain.now)) : null;
+    const left = chain ? Math.max(0, Number(unseen.deadline - clockNow)) : null;
     suggestedActions.unshift(
       `switch RPC: channel ${record.channelId} is challenged on turn ${unseen.registeredTurn}, newer than this daemon holds ` +
         `(turn ${s.turnNum}), and the challenge's event could not be read${skippedNote ? ` (${skippedNote})` : ""}; unanswered, ` +
@@ -442,6 +464,14 @@ export function buildStatus(input: StatusInput): ChannelStatus {
         "config.json to an RPC that serves larger getLogs responses, then restart the daemon",
     );
   }
+
+  // Board fix round 1 (I1): a stale view suggests no on-chain dispute step, and says to re-check (StatusInput.stale).
+  const actions = stale
+    ? [
+        ...suggestedActions.filter((a) => !a.startsWith("arena challenge") && !a.startsWith("arena reclaim")),
+        STALE_RECHECK_ACTION,
+      ]
+    : suggestedActions;
 
   return {
     channelId: record.channelId,
@@ -474,7 +504,7 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     challenge,
     attention,
     humanAttention,
-    suggestedActions,
+    suggestedActions: actions,
     lastError: input.lastError,
     lobbyError: input.lobbyError ?? null,
     swept: record.swept ?? null,
@@ -484,5 +514,12 @@ export function buildStatus(input: StatusInput): ChannelStatus {
     transport: input.transport ?? "none",
     xmtpDropped: input.xmtpDropped ?? 0,
     skippedEventBlocks: skippedBlocks,
+    ...(stale
+      ? {
+          chainStale: true as const,
+          chainStaleReason: stale.reason,
+          chainReadAt: stale.readAt !== null ? new Date(stale.readAt).toISOString() : null,
+        }
+      : {}),
   };
 }

@@ -445,10 +445,15 @@ afterwards …`): the action did take effect, so it is never sent again (skill.m
 `channels` do not fail on a chain read either: each channel whose refresh failed is answered from the daemon's own
 game state and its last chain read, with `chainStale: true` and `chainStaleReason`, and the CLI prints `note: the
 chain could not be read just now (…)`. The position, the turn, the legal moves and the balances are current; the
-chain fields (`phase`, `challenge`, `cooldown`, and the attention and suggested actions they drive) are from the last
-read, so do not challenge or reclaim on such a status: run `status` again in a few seconds. A rate limit never makes
-the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large) can, and
-`status.skippedEventBlocks` shows it.
+chain fields (`phase`, `challenge`, `cooldown`, and the attention they drive) are from the last read (`chainReadAt`),
+with the challenge and cooldown countdowns run on since then. Such a status suggests no `challenge` or `reclaim` and
+ends with `arena status   (the chain view is stale: re-check before any challenge)`: do not challenge or reclaim on
+it; run `status` again in a few seconds. To spare the RPC, `status` and `channels` serve a channel's chain view
+without reading the chain while it is under 5 s old (the watchtower refreshes it every pass), and after a
+rate-limited read they answer stale at once, with no read, for 10 s or until a read succeeds. An action's own answer
+always reads the chain. Neither applies to the watchtower, which reads the chain itself on every pass. A rate limit
+never makes the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large)
+can, and `status.skippedEventBlocks` shows it.
 
 ## Web board
 
@@ -487,9 +492,10 @@ guessing the port or trying to rebind DNS to it.
 
 When the chain RPC is rate-limiting, the board keeps showing the game: the daemon answers from its own game state
 (`chainStale`, above), and the board shows one calm banner, "The chain RPC is busy — showing your game as this daemon
-knows it …", until fresh data arrives, instead of an error per refresh. Moves still go through. While signed in, the
-browser asks before a reload or a closed tab, because either ends the session: the token is kept in memory only, so
-the next visit needs a new `arena board` link.
+knows it …", until fresh data arrives, instead of an error per refresh. Moves still go through; Challenge stays off
+until the chain is read again. While signed in, and once you have used the page (browsers ask only after a click or
+a key press on it), the browser asks before a reload or a closed tab, because either ends the session: the token is
+kept in memory only, so the next visit needs a new `arena board` link.
 
 While a human holds a seat, the agent's move-type commands (`move`, `resign`, `accept-draw`, `next-game`, `close`,
 `challenge`) all get refused with 409, and a board request (`x-arena-actor: human`) gets the same while the agent

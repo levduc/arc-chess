@@ -702,10 +702,36 @@ describe("board rate-limit fix: the chain-busy banner", () => {
     expect(gate.active()).toBe(false);
   });
 
+  it("fix round 1 (m6): the list's part counts the selected channel only -- a stale channel you are not looking at raises nothing", () => {
+    const gate = createChainStaleGate();
+    const mine = status({ channelId: "0xa1" });
+    const other = stale({ channelId: "0xb2", chainStaleReason: "HTTP 502" });
+    gate.answered("channels", [mine, other], "0xa1");
+    expect(gate.active()).toBe(false); // before: up, saying "showing your game" while the game shown was fresh
+    gate.answered("channels", [mine, other], "0xb2");
+    expect(gate.reasons()).toEqual(["HTTP 502"]);
+    gate.answered("channels", [mine, other], null); // nothing selected: nothing is shown as "your game"
+    expect(gate.active()).toBe(false);
+    expect(staleReasonOf([mine, other], "0xa1")).toBeNull();
+    expect(staleReasonOf([mine, other], "0xb2")).toBe("HTTP 502");
+  });
+
   it("the banner is calm, says the game is current, that it retries, and not to reload", () => {
     expect(CHAIN_STALE_NOTICE).toMatch(/^The chain RPC is busy — showing your game as this daemon knows it/);
     expect(CHAIN_STALE_NOTICE).toMatch(/Retrying automatically\./);
     expect(CHAIN_STALE_NOTICE).toMatch(/Don't reload this page: a reload needs a new `arena board` link\.$/);
+  });
+
+  it("fix round 1 (I1): the daemon's stale answer (no challenge suggestion, no humanAttention) leaves Challenge disabled", () => {
+    const silentFresh = status({ humanAttention: "opponent-silent", suggestedActions: ["arena challenge   (no progress)", "arena wait"] });
+    expect(actionState(silentFresh).challenge).toBe(true);
+    // What buildStatus answers for the same channel from a stale view.
+    const silentStale = stale({
+      humanAttention: null,
+      suggestedActions: ["arena wait", "arena status   (the chain view is stale: re-check before any challenge)"],
+    });
+    expect(actionState(silentStale).challenge).toBe(false);
+    expect(channelBanners(silentStale).some((b) => b.kind === "opponent-silent")).toBe(false);
   });
 
   it("moves stay enabled on a stale status when it is the human's turn (POST /move works under a rate limit)", () => {

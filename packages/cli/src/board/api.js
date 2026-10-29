@@ -297,13 +297,16 @@ export function isRateLimitAnswer(err) {
 /**
  * Board rate-limit fix: why a status -- or the first such channel of a `/channels` list -- was answered from the
  * daemon's last chain read (`chainStale`, with `chainStaleReason`), or null when it is fresh. `""` when stale with no
- * reason given.
+ * reason given. Fix round 1 (m6): with `channelId` (a string, or null for none), only that channel's entry counts --
+ * the banner speaks of "your game", the one on the board.
  * @param {unknown} payload a status, a list, or null
+ * @param {string | null} [channelId]
  * @returns {string | null}
  */
-export function staleReasonOf(payload) {
+export function staleReasonOf(payload, channelId) {
   const list = Array.isArray(payload) ? payload : [payload];
   for (const s of list) {
+    if (channelId !== undefined && (!s || typeof s !== "object" || /** @type {{ channelId?: unknown }} */ (s).channelId !== channelId)) continue;
     if (s && typeof s === "object" && !("degraded" in s) && /** @type {{ chainStale?: unknown }} */ (s).chainStale === true) {
       const reason = /** @type {{ chainStaleReason?: unknown }} */ (s).chainStaleReason;
       return typeof reason === "string" ? reason : "";
@@ -323,9 +326,10 @@ export function createChainStaleGate() {
   /** @type {Map<string, string>} */
   const reasons = new Map();
   return {
-    /** A successful read of `route`. @param {string} route @param {unknown} payload */
-    answered(route, payload) {
-      const reason = staleReasonOf(payload);
+    /** A successful read of `route`; `channelId` as for `staleReasonOf`.
+     *  @param {string} route @param {unknown} payload @param {string | null} [channelId] */
+    answered(route, payload, channelId) {
+      const reason = staleReasonOf(payload, channelId);
       if (reason === null) reasons.delete(route);
       else reasons.set(route, reason);
     },
