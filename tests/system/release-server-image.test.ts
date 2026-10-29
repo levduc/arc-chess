@@ -48,35 +48,60 @@ describe("release-server-image workflow", () => {
     expect(at("${GITHUB_REF_NAME#cli-v}")).toBeLessThan(at("docker/setup-buildx-action"));
   });
 
-  it("I-3, N-4: a tag run tags <version>, sha-<commit>, and latest only for the highest cli-v* version; a manual run tags sha-<commit> only", () => {
-    const block = text.slice(at('echo "tags<<EOF"'), at('echo "EOF"'));
+  it("I-3, N-4, N-5: a tag run tags <version>, sha-<commit>, and latest only for the highest cli-v* version, re-fetched right before the push; a manual run tags sha-<commit> only", () => {
+    const step = text.slice(at("- name: The tags to push"), at("- name: Build and push"));
+    expect(step).toContain("id: tags");
+    expect(step).toContain("if: steps.once.outputs.pushed != 'true'");
+    const block = step.slice(step.indexOf('echo "tags<<EOF"'), step.indexOf('echo "EOF"'));
     expect(block).toBe(
-      'echo "tags<<EOF"\n            echo "$IMAGE:sha-$sha"\n            if [ "$GITHUB_EVENT_NAME" = "push" ]; then\n' +
+      'echo "tags<<EOF"\n            echo "$IMAGE:sha-${{ steps.version.outputs.sha }}"\n' +
+        '            if [ "$GITHUB_EVENT_NAME" = "push" ]; then\n' +
         '              echo "$IMAGE:$version"\n' +
+        "              git fetch --quiet --force origin 'refs/tags/cli-v*:refs/tags/cli-v*'\n" +
         `              highest="$(git tag -l 'cli-v*' | sed 's/^cli-v//' | grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+$' | sort -V | tail -n 1)"\n` +
-        '              if [ "$version" = "$highest" ]; then echo "$IMAGE:latest"; fi\n            fi\n            ',
+        '              if [ "$version" = "$highest" ]; then\n                echo "$IMAGE:latest"\n              else\n' +
+        '                echo "not moving :latest: cli-v$highest is higher than $version" >&2\n              fi\n' +
+        '            fi\n            ',
     );
-    // The tags the highest-version check reads.
+    // Decided after the overwrite check, right before the push, and nowhere else.
+    expect(at("- name: The tags to push")).toBeGreaterThan(at("- name: A version tag is pushed once"));
+    expect(text.split('echo "$IMAGE:latest"').length - 1).toBe(1);
+    expect(text).toContain("tags: ${{ steps.tags.outputs.tags }}");
+    // N-5: no concurrency group (it could cancel a pending run and leave its version with no image).
+    expect(text).not.toMatch(/^\s*concurrency:/m);
     expect(text).toMatch(/persist-credentials: false\n(?: {10}#.*\n)* {10}fetch-depth: 0\n/);
-    expect(text).toContain("tags: ${{ steps.version.outputs.tags }}");
     expect(text).not.toMatch(/\$\{\{ env\.IMAGE \}\}:latest/);
     expect(text).toContain("platforms: linux/amd64,linux/arm64");
   });
 
   it("I-3: a tag run refuses to overwrite an existing :<version>, and stops when it cannot tell", () => {
-    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: Build and push"));
+    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: The tags to push"));
     expect(step).toContain("id: once");
     expect(step).toContain("if: github.event_name == 'push'");
     expect(step).toContain(`if out="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>&1)"; then`);
     expect(step).toMatch(/already exists: a version tag always names the same image[\s\S]*?exit 1/);
-    expect(step).toContain('grep -qiE "not found|manifest unknown|denied|unauthorized"');
-    expect(step).toMatch(/cannot tell whether \$ref exists[\s\S]*?exit 1/);
+    expect(step).toMatch(/if echo "\$out" \| grep -qiE "not found\|manifest unknown"; then\n\s+echo "\$ref is not pushed yet"\n\s+exit 0/);
+    // Anything else -- a network error, a 5xx -- stops the run.
+    expect(step).toMatch(/\n {10}echo "cannot tell whether \$ref exists: \$out" >&2\n {10}exit 1\n/);
+    // Authenticated: after docker login.
     expect(at("- name: A version tag is pushed once")).toBeGreaterThan(at("docker/login-action@"));
   });
 
+  it("first publish: an authenticated 403/denied counts as absent only when :sha-<commit> is absent too", () => {
+    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: The tags to push"));
+    const denied = step.slice(step.indexOf('grep -qiE "403|forbidden|denied|unauthorized"'), step.indexOf('echo "cannot tell whether $ref exists: $out" >&2'));
+    expect(denied).toContain('if mine_out="$(docker buildx imagetools inspect "$mine_ref" 2>&1)"; then');
+    expect(denied).toMatch(/while \$mine_ref exists: cannot tell whether \$ref exists" >&2\n\s+exit 1/);
+    expect(denied).toMatch(/if echo "\$mine_out" \| grep -qiE "not found\|manifest unknown\|403\|forbidden\|denied\|unauthorized"; then\n\s+echo "\$ref is not pushed yet \(the package has never been pushed: \$out\)"\n\s+exit 0/);
+    expect(denied).toMatch(/cannot tell whether \$ref exists: \$out; \$mine_ref: \$mine_out" >&2\n\s+exit 1/);
+    // "not found" is tried first; 403/denied only after it.
+    expect(step.indexOf('"not found|manifest unknown"')).toBeLessThan(step.indexOf('"403|forbidden|denied|unauthorized"'));
+  });
+
   it("N-4: a re-run of a tag run whose push went through attests the pushed digest instead of refusing", () => {
-    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: Build and push"));
-    expect(step).toContain(`mine="$(docker buildx imagetools inspect "$IMAGE:sha-\${{ steps.version.outputs.sha }}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"`);
+    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: The tags to push"));
+    expect(step).toContain('mine_ref="$IMAGE:sha-${{ steps.version.outputs.sha }}"');
+    expect(step).toContain(`mine="$(docker buildx imagetools inspect "$mine_ref" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"`);
     expect(step).toContain('if [ -n "$mine" ] && [ "$mine" = "$out" ]; then');
     expect(step).toContain('echo "pushed=true" >> "$GITHUB_OUTPUT"');
     expect(step).toContain('echo "digest=$out" >> "$GITHUB_OUTPUT"');
