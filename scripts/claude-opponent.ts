@@ -26,6 +26,7 @@
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { isTarballUrl, tarballCommand } from "../packages/cli/src/version.js";
 import { buildAllowedTools, buildClaudeEnv, extractCost } from "../tests/system/claude-sandbox.js";
 import { HumanWatcher, sessionIdOf } from "./claude-human-watcher.js";
 
@@ -171,6 +172,18 @@ export function homePrefixRules(home: string, cli: string): string[] {
   return [`Bash(ARENA_HOME=$PWD/arena-home ${cli} *)`, `Bash(ARENA_HOME=${home} ${cli} *)`, "Bash(ARENA_HOME=$PWD/arena-home arena *)"];
 }
 
+/** Remote agents: allow rules for the command a server that serves its own CLI tarball names in skill.md (its
+ *  /templates `cliTarball.url`, e.g. a `pnpm testnet:up` stack), plain and with the ARENA_HOME prefixes. Without these
+ *  every command of the agent's own recipe is denied. None for a server without a tarball, or one whose URL is not
+ *  plain (it would go into a rule as is). */
+export function servedCliRules(home: string, templates: unknown): string[] {
+  const chess = Array.isArray(templates) ? (templates as Array<Record<string, unknown>>).find((t) => t?.id === "chess") : undefined;
+  const url = (chess?.cliTarball as { url?: unknown } | undefined)?.url;
+  if (!isTarballUrl(url)) return [];
+  const cmd = tarballCommand(url);
+  return [`Bash(${cmd} *)`, ...homePrefixRules(home, cmd)];
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.includes("--help") || argv.includes("-h")) {
@@ -209,6 +222,9 @@ async function main(): Promise<void> {
   writeFileSync(stampedPath, "");
 
   const prompt = buildPrompt(args);
+  const templates = await fetch(`${args.server}/templates`, { signal: AbortSignal.timeout(10_000) })
+    .then((r) => (r.ok ? (r.json() as Promise<unknown>) : undefined))
+    .catch(() => undefined);
   console.log(`[claude-opponent] home=${home} log=${logPath}${args.resume !== undefined ? ` resume=${args.resume}` : ""}`);
   console.log(`[claude-opponent] prompt: ${prompt}`);
 
@@ -221,6 +237,7 @@ async function main(): Promise<void> {
     // (cliCommand) -- without it, every command the agent's own recipe tells it to run is denied outright.
     ...buildAllowedTools(args.server, args.cli),
     ...(args.dir !== undefined ? homePrefixRules(home, args.cli) : []),
+    ...servedCliRules(home, templates),
     "--permission-mode",
     "manual",
     "--permission-prompts",

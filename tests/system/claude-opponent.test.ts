@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fundDisclosure, fundMessage, tellYourHuman } from "../../packages/cli/src/funding.js";
-import { buildPrompt, homePrefixRules, parseArgs, runPaths } from "../../scripts/claude-opponent.js";
+import { buildPrompt, homePrefixRules, parseArgs, runPaths, servedCliRules } from "../../scripts/claude-opponent.js";
 import { payUnconfirmed } from "../../scripts/testnet-up.js";
 import {
   agentTexts,
@@ -75,6 +75,18 @@ describe("claude-opponent arguments", () => {
     expect(rules).toContain("Bash(ARENA_HOME=$PWD/arena-home /x/bin/arena *)");
     expect(rules).toContain("Bash(ARENA_HOME=/h/arena-home /x/bin/arena *)");
     for (const r of rules) expect(r).toMatch(/^Bash\(ARENA_HOME=\S+ (\/x\/bin\/)?arena \*\)$/);
+  });
+
+  it("remote agents: allows the served tarball command a testnet:up stack names in skill.md, and nothing for other hosts", () => {
+    const url = "http://100.70.62.92:8090/cli/arena-cli-0.1.0-0123456789abcdef.tgz";
+    const cmd = `npx -y --prefer-offline --package=${url} arena`;
+    const rules = servedCliRules("/h/arena-home", [{ id: "chess", cliTarball: { url, sha256: "a".repeat(64) } }]);
+    expect(rules).toContain(`Bash(${cmd} *)`);
+    expect(rules).toContain(`Bash(ARENA_HOME=$PWD/arena-home ${cmd} *)`);
+    expect(rules).toContain(`Bash(ARENA_HOME=/h/arena-home ${cmd} *)`);
+    expect(servedCliRules("/h", [{ id: "chess" }])).toEqual([]);
+    expect(servedCliRules("/h", undefined)).toEqual([]);
+    expect(servedCliRules("/h", [{ id: "chess", cliTarball: { url: "http://h/a.tgz) Bash(rm *" } }])).toEqual([]);
   });
 });
 
