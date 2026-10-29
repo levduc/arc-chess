@@ -177,6 +177,12 @@ function minedUnconfirmed(what: string, err: unknown): ActionOutcome {
   };
 }
 
+/** H3 fix round 1 (review M6): why a chain read failed, in the RPC's own words ("HTTP 429", `-32005 "rate limit
+ *  exceeded"`), not viem's first line ("HTTP request failed."); a rate limit is named as one. */
+function chainReadFailure(err: unknown): string {
+  return isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
+}
+
 export type ChainView = {
   phase: string;
   funded: readonly [boolean, boolean];
@@ -665,7 +671,7 @@ export function withdrawWaitError(err: unknown, amount: bigint, owner: Address, 
     return new DaemonError(503, `the daemon is stopping: ${what} (tx ${hashes.join(", ")}) was sent and may still land; ${check}`, hashes);
   }
   if (sent.length > 0) {
-    const why = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
+    const why = chainReadFailure(err);
     return new DaemonError(502, `${what} may have been sent (tx ${sent.join(", ")}), but could not be confirmed (${why}); ${check}`, sent);
   }
   return err;
@@ -3933,8 +3939,9 @@ export class ArenaDaemon {
     }
     // I1: a Finalized/Reclaimed channel's on-chain state is terminal and was already captured (see settleCheck)
     // before it was marked finalized -- refreshing it again on every status call is a pure, avoidable RPC cost.
-    if (!l.record.finalized) await this.refreshChain(l);
-    return this.statusOf(l);
+    if (l.record.finalized) return this.statusOf(l);
+    const failed = await this.tryRefreshChain(l);
+    return failed ? this.staleStatusOf(l, failed.err) : this.statusOf(l);
   }
 
   /**
@@ -3942,23 +3949,10 @@ export class ArenaDaemon {
    * with, once its action has taken effect. Its chain refresh can fail on its own -- a rate-limited RPC -- and that
    * must not turn a move that was signed and relayed into an error the agent may act on: the last known status is
    * returned instead, with `chainStale` and the reason. A `DaemonError` (no such channel) is thrown as by `status`.
+   * Board rate-limit fix: `status` itself now answers that way (`tryRefreshChain`), so this adds only `unconfirmed`.
    */
   async statusAfterAction(ref?: string, outcome: ActionOutcome = {}): Promise<ChannelStatus> {
-    let st: ChannelStatus;
-    try {
-      st = await this.status(ref);
-    } catch (err) {
-      if (err instanceof DaemonError) throw err;
-      let l: ChannelHandle;
-      try {
-        l = this.pick(ref);
-      } catch {
-        throw err;
-      }
-      // Fix round 1 (review M6): the RPC's own answer ("HTTP 429"), not viem's first line ("HTTP request failed.").
-      const reason = isRateLimited(err) ? `the RPC is rate-limiting (${rpcErrorSummary(err)})` : rpcErrorSummary(err);
-      st = { ...this.statusOf(l), chainStale: true, chainStaleReason: reason };
-    }
+    let st = await this.status(ref);
     // Fix round 1 (review M4): a transaction mined with no readable receipt went through, but is unconfirmed.
     if (outcome.unconfirmed !== undefined) {
       st = {
@@ -3974,16 +3968,35 @@ export class ArenaDaemon {
   /** Every live channel's status, followed by the channels that could not be loaded (I1). Plan 4.5 Task 11 fix
    *  round: skips the chain refresh entirely for Finalized/Reclaimed channels (see `status`'s comment), and reads
    *  the current block once for the whole call rather than once per channel -- both used to make this call's
-   *  cost grow with the daemon's *lifetime* channel count, not just its currently-open ones. */
+   *  cost grow with the daemon's *lifetime* channel count, not just its currently-open ones.
+   *
+   *  Board rate-limit fix: a channel whose refresh fails is listed from its last read, `chainStale` (as `status`
+   *  answers it), and the others are still refreshed -- one channel's failure no longer fails the list. Once a read
+   *  is rate-limited, or the one block read fails, the channels not yet refreshed are listed from their last read
+   *  too, for the same reason, without reading the chain: a rate-limited RPC only gets worse with more reads. */
   async channels(): Promise<Array<ChannelStatus | DegradedChannel>> {
     const out: Array<ChannelStatus | DegradedChannel> = [];
     let now: bigint | undefined;
+    let limited: { err: unknown } | null = null;
     for (const l of this.live.values()) {
-      if (!l.record.finalized) {
-        now ??= (await this.client.getBlock()).timestamp;
-        await this.refreshChain(l, now);
+      if (l.record.finalized) {
+        out.push(this.statusOf(l));
+        continue;
       }
-      out.push(this.statusOf(l));
+      if (!limited && now === undefined) {
+        try {
+          now = (await this.client.getBlock()).timestamp;
+        } catch (err) {
+          limited = { err };
+        }
+      }
+      if (limited) {
+        out.push(this.staleStatusOf(l, limited.err));
+        continue;
+      }
+      const failed = await this.tryRefreshChain(l, now);
+      if (failed && isRateLimited(failed.err)) limited = failed;
+      out.push(failed ? this.staleStatusOf(l, failed.err) : this.statusOf(l));
     }
     // Final review I3: settled channels no longer watched, from their cached final status.
     for (const v of this.settled.values()) out.push(v.status);
@@ -4109,6 +4122,33 @@ export class ArenaDaemon {
       transport: l.record.finalized ? "none" : (this.opts.transportOf?.(l.record.channelId) ?? "relay"),
       xmtpDropped: this.xmtpDroppedOf(l),
     });
+  }
+
+  /**
+   * Board rate-limit fix: `refreshChain` for the read-only routes (`status`, `channels`, and so the action routes'
+   * `statusAfterAction`), which answer from this daemon's own session state -- the position, the turn, the legal
+   * moves, the signatures held -- plus the last chain view read. A refresh that fails (a rate-limited RPC, a timeout,
+   * a 5xx: every failure but a `DaemonError`, as H3's `statusAfterAction` always treated it) resolves to its error,
+   * and the caller answers `staleStatusOf`. `refreshChain` only reads, and writes `l.chain` only once every read is
+   * in, so a failure leaves the last view as it was. Nothing else trusts this answer: the watchtower's main and
+   * dispute passes, `respondIfChallenged`, `settleCheck` and `wait()` read the chain (or `statusOf`) themselves, and
+   * still fail -- and retry -- on their own. Never sets `lastError` nor logs: the board polls this every few seconds.
+   */
+  private async tryRefreshChain(l: ChannelHandle, now?: bigint): Promise<{ err: unknown } | null> {
+    try {
+      await this.refreshChain(l, now);
+      return null;
+    } catch (err) {
+      if (err instanceof DaemonError) throw err;
+      return { err };
+    }
+  }
+
+  /** H3 / board rate-limit fix: `l`'s last known status, marked `chainStale` -- its chain fields (`phase`, `challenge`,
+   *  `cooldown`, and what they drive: `attention`, `suggestedActions`) are from the last refresh that succeeded, and
+   *  `chainStaleReason` says why this one did not. Everything else is current. */
+  private staleStatusOf(l: ChannelHandle, err: unknown): ChannelStatus {
+    return { ...this.statusOf(l), chainStale: true, chainStaleReason: chainReadFailure(err) };
   }
 
   /** `now`, when given, is a block timestamp already read by the caller this call, so this channel's read skips

@@ -111,9 +111,12 @@ export type ChannelStatus = {
   /** H1 fix round 1 (review m-2): blocks whose dispute events for this channel the RPC refused to serve, even alone,
    *  and the scan skipped (`ChannelRecord.skippedEventBlocks`), as decimal strings; empty when none. */
   skippedEventBlocks: string[];
-  /** H3 (Arc testnet rehearsal §8.2): set only on an action route's answer (`POST /move`, `/close`, ...) whose action
-   *  took effect but whose chain refresh afterwards failed (a rate-limited RPC): the chain fields are the last ones
-   *  read, and `chainStaleReason` says why they could not be read again. A `GET /status` never sets it. */
+  /** H3 (Arc testnet rehearsal §8.2): set on an action route's answer (`POST /move`, `/close`, ...) whose action took
+   *  effect but whose chain refresh afterwards failed (a rate-limited RPC): the chain fields (`phase`, `challenge`,
+   *  `cooldown`, and the `attention`/`suggestedActions` they drive) are the last ones read, and `chainStaleReason` says
+   *  why they could not be read again. The game itself -- position, turn, legal moves, balances, signatures -- is this
+   *  daemon's own state, and current. Board rate-limit fix: `GET /status` and each `GET /channels` entry set it the
+   *  same way, instead of failing, when their own refresh fails. */
   chainStale?: true;
   chainStaleReason?: string;
   /** Final fix wave B (m-7): set with `chainStale` when the action's own transaction (a challenge, a reclaim) was mined

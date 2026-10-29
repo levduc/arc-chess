@@ -1914,7 +1914,25 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     // (m-7): except a challenge or reclaim mined with its receipt unreadable -- the chain was read, the outcome is not
     // known.
     const stale = payload as { chainStale?: unknown; chainStaleReason?: unknown; unconfirmed?: unknown };
-    if (typeof stale.unconfirmed === "string") {
+    // Board rate-limit fix: a read (`status`, `channels`) whose chain refresh failed answers the last known view
+    // instead of failing; nothing "took effect", so it gets a read's note.
+    const fields = "chain fields above (phase, challenge, cooldown) are the last ones read";
+    const again = "again in a few seconds for a fresh view";
+    if (cmd === "status" && stale.chainStale === true) {
+      io.err(
+        `note: the chain could not be read just now (${String(stale.chainStaleReason)}): the ${fields}; the game itself is ` +
+          `current. Run "${CLI_COMMAND} status" ${again}`,
+      );
+    } else if (cmd === "channels" && Array.isArray(payload)) {
+      const staleOnes = (payload as Array<{ chainStale?: unknown; chainStaleReason?: unknown }>).filter((c) => c?.chainStale === true);
+      if (staleOnes.length > 0) {
+        const reasons = [...new Set(staleOnes.map((c) => String(c.chainStaleReason)))].join("; ");
+        io.err(
+          `note: the chain could not be read just now for ${staleOnes.length} channel(s) (${reasons}): their ${fields}; their ` +
+            `games are current. Run "${CLI_COMMAND} channels" ${again}`,
+        );
+      }
+    } else if (typeof stale.unconfirmed === "string") {
       io.err(
         `note: ${cmd} was mined, but whether it succeeded is not known yet (${String(stale.chainStaleReason)}): run ` +
           `"${CLI_COMMAND} status" to check`,

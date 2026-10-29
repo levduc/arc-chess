@@ -366,6 +366,26 @@ export function autoReturnText(status, deadline, formatTime = (ms) => new Date(m
   return `Move before ${formatTime(returnsAtMs)} or the seat returns to your agent`;
 }
 
+/**
+ * Board rate-limit fix: the calm banner shown while the daemon answers from its last chain read (a rate-limited RPC;
+ * api.js `createChainStaleGate`). The game -- position, turn, legal moves, channel balances -- is the daemon's own
+ * session state and current; only what it reads from the chain (the phase, a challenge's deadline, cooldowns) can lag.
+ * A reload loses the session (the token is kept in memory only, final fix wave M1), so it says not to.
+ */
+export const CHAIN_STALE_NOTICE =
+  "The chain RPC is busy — showing your game as this daemon knows it; chain details (phase, deadlines, cooldowns) " +
+  "may lag. Retrying automatically. Don't reload this page: a reload needs a new `arena board` link.";
+
+/**
+ * Board rate-limit fix: whether leaving the page asks first (`beforeunload`) -- only while it holds a live session
+ * (signed in and not locked out by a 401), and never for the reload a newly pasted `#code=` link triggers.
+ * @param {{ session: boolean, stopped: boolean, reloadingForNewLink: boolean }} page
+ * @returns {boolean}
+ */
+export function confirmUnload({ session, stopped, reloadingForNewLink }) {
+  return session && !stopped && !reloadingForNewLink;
+}
+
 /** The channel to show first: a forced move, then our turn (human-controlled first), then any live channel.
  *  @param {ReadonlyArray<ChannelStatus | DegradedChannel> | null | undefined} list @returns {string | null} */
 export function pickDefaultChannel(list) {

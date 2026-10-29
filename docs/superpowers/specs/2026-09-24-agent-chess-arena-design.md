@@ -1398,6 +1398,26 @@ hub.
     `0x3D8434455E4258a877a327De3B1201f94A558d38`, ChessRules `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba`, pinned in
     `KNOWN_DEPLOYMENTS[5042002]`); `init` refuses the superseded hub with the ERC-1271 fallback (`0x9b8B…bA41`), as it
     refuses the pre-hardening one.
+71. **Reads under a rate-limited RPC, and the board (owner report 2026-10-29: "in the take over … rpc limit … run arena
+    board again and again to move").** `GET /status` and `GET /channels` refreshed the chain first and failed with
+    item 67's 503 when that read failed, so a rate-limited RPC left the board unable to show the human's own move, the
+    opponent's reply, or the game at all, although these are the daemon's own session state. A reload to recover lost
+    the in-memory token (final fix wave M1), hence a new `arena board` link each time.
+    - **Reads answer the last known view.** A chain refresh that fails with anything but a `DaemonError` (as
+      `statusAfterAction` already treated it) answers `{ ...status, chainStale: true, chainStaleReason }`: the position,
+      turn, legal moves, balances and signatures are current; `phase`, `challenge`, `cooldown` and the attention and
+      actions they drive are from the last read. `channels()` does this per channel, so one failure no longer fails the
+      list. Once a read is rate-limited, or its one block read fails, the channels not yet refreshed are served stale for
+      that reason without further reads. `statusAfterAction` is now `status` plus `unconfirmed`. A failed refresh writes
+      no `lastError` and logs nothing; `l.chain` keeps its last view.
+    - **Nothing that acts trusts it.** The watchtower's passes, `respondIfChallenged`, `settleCheck` and `wait()` read the
+      chain or `statusOf` themselves and never call `status()`/`channels()`. The bot does not challenge on a
+      `chainStale` status; it still moves and co-signs. skill.md says the same to agents: play on, never `challenge` or
+      `reclaim` on a stale status. The CLI prints a read's note for `status` and `channels`.
+    - **The board.** A `chainStale` answer, or a background read answered with the rate-limit 503, raises one calm
+      banner ("The chain RPC is busy …", `role="status"`) instead of a "Could not refresh" toast per poll. Each route's
+      own fresh answer clears its part. Moves stay enabled. While a session is live, `beforeunload` asks before a reload
+      or a closed tab, but not for the reload a newly pasted link triggers. The token stays in memory only.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

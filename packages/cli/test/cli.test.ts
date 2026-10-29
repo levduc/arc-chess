@@ -200,6 +200,34 @@ describe("arena CLI", () => {
     expect(mined.err).toEqual([`note: challenge was mined, but whether it succeeded is not known yet (${reason}): run "arena status" to check`]);
   });
 
+  it("board rate-limit fix: status and channels answered with chainStale exit 0 with a read's note, not the took-effect one", async () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
+    await runCli(INIT, io(home).io);
+    const reason = "the RPC is rate-limiting (HTTP 429)";
+    const body = { channelId: "0xaa", turnNum: "2", chainStale: true, chainStaleReason: reason };
+    const st = io(home, [{ status: 200, body }]);
+    expect(await runCli(["status"], st.io)).toBe(0);
+    expect(JSON.parse(st.out.join("\n"))).toEqual(body);
+    expect(st.err).toEqual([
+      `note: the chain could not be read just now (${reason}): the chain fields above (phase, challenge, cooldown) are the ` +
+        'last ones read; the game itself is current. Run "arena status" again in a few seconds for a fresh view',
+    ]);
+    const list = [body, { channelId: "0xbb", turnNum: "0" }, { channelId: "0xcc", degraded: true, error: "x" }];
+    const ch = io(home, [{ status: 200, body: list }]);
+    expect(await runCli(["channels"], ch.io)).toBe(0);
+    expect(JSON.parse(ch.out.join("\n"))).toEqual(list);
+    expect(ch.err).toEqual([
+      `note: the chain could not be read just now for 1 channel(s) (${reason}): their chain fields above (phase, challenge, ` +
+        'cooldown) are the last ones read; their games are current. Run "arena channels" again in a few seconds for a fresh view',
+    ]);
+    const fresh = io(home, [{ status: 200, body: { channelId: "0xaa", turnNum: "2" } }]);
+    expect(await runCli(["status"], fresh.io)).toBe(0);
+    expect(fresh.err).toEqual([]);
+    const freshList = io(home, [{ status: 200, body: [{ channelId: "0xbb", turnNum: "0" }] }]);
+    expect(await runCli(["channels"], freshList.io)).toBe(0);
+    expect(freshList.err).toEqual([]);
+  });
+
   it("live run #2 (f)3: offers come in a fresh crypto-random order on every call -- the same offers, never a fixed first", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-cli-"));
     await runCli(INIT, io(home).io);
