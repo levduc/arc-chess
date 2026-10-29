@@ -1,0 +1,89 @@
+name: release-server-image
+# The self-host server image (deploy/host): ghcr.io/levduc/arc-chess-server. The server and the CLI release together,
+# so a cli-v<version> tag publishes both (release-cli.yml publishes the npm package). A manual run builds the checked-out
+# ref. Either way the image's version tag is packages/cli/package.json's version: the arc-chess release the image
+# advertises by default. Every image also gets an immutable sha-<commit> tag, a registry provenance attestation and
+# an SBOM from BuildKit, and a GitHub build provenance attestation:
+#   gh attestation verify oci://ghcr.io/levduc/arc-chess-server:<version> -R levduc/arc-chess
+# Only GITHUB_TOKEN is used; no other secret exists for this workflow.
+on:
+  push:
+    tags: ["cli-v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+env:
+  IMAGE: ghcr.io/levduc/arc-chess-server
+jobs:
+  image:
+    # A fork has no write access to this package; it would only fail at the push.
+    if: github.repository == 'levduc/arc-chess'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The image version is the CLI version (a cli-v<version> tag must match it)
+        id: version
+        run: |
+          version="$(node -p "require('./packages/cli/package.json').version")"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "${GITHUB_REF_NAME#cli-v}" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match packages/cli/package.json's version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Built once for this runner and checked before anything is pushed: it runs as a non-root user, refuses Arc
+      # mainnet while no mainnet deployment is pinned, and holds no wallet or key file.
+      - name: Build for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/host/Dockerfile
+          load: true
+          tags: arena-server:ci
+      - name: Smoke test
+        run: |
+          test "$(docker run --rm --entrypoint id arena-server:ci -u)" != 0
+          set +e
+          out="$(docker run --rm -e DOMAIN=arena.example.org -e NETWORK=arc-mainnet arena-server:ci print-config)"
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" = 1
+          echo "$out" | grep -q "this image cannot serve Arc mainnet"
+          found="$(docker run --rm --entrypoint sh arena-server:ci -c 'find / -xdev \( -name "wallet*.json" -o -name ".arena*" -o -name "*.key" \) 2>/dev/null')"
+          if [ -n "$found" ]; then
+            echo "key-like files in the image: $found" >&2
+            exit 1
+          fi
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The final stage has no RUN step and the build stage runs on the runner's own platform, so arm64 needs no
+      # emulation.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/host/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:sha-${{ steps.version.outputs.sha }}
+            ${{ env.IMAGE }}:latest
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Digest
+        run: echo "${{ env.IMAGE }}@${{ steps.push.outputs.digest }} (${{ steps.version.outputs.version }}, sha-${{ steps.version.outputs.sha }})" >> "$GITHUB_STEP_SUMMARY"
