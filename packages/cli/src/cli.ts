@@ -59,7 +59,7 @@ import {
 } from "./owner.js";
 import { RecordStore } from "./records.js";
 import { startDaemonProcess } from "./run.js";
-import { cliPackage, cliVersion, hostCliVerdict, selfCommand } from "./version.js";
+import { cliPackage, cliVersion, hostCliVerdict, selfCommand, selfTarballUrl } from "./version.js";
 import { loadXmtpSdk, loadXmtpSdkFrom, XMTP_SDK_VERSION } from "./xmtp/loader.js";
 
 export type CliIo = {
@@ -744,8 +744,9 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
             // Plan 5.6 Task 4 (spec §3): only ever set by a host that has pinned a published CLI version.
             cli: chess.cli !== null && typeof chess.cli === "object" && !Array.isArray(chess.cli) ? (chess.cli as Record<string, unknown>) : undefined,
             // Remote agents: only ever set by a host that serves the CLI tarball itself; used only for the version
-            // gate's install hint (`hostCliVerdict` validates its URL before echoing it). Never fetched or pinned to
-            // the server's origin: house bots reach their host on 127.0.0.1, while it publishes its tailnet URL.
+            // gate's install hint, and only in a build a host served as its own tarball, which repeats it only on its
+            // own baked origin (`hostCliVerdict`, fix round 1 C-1). Never fetched, and never pinned to the server's
+            // origin: house bots reach their host on 127.0.0.1, while it publishes its tailnet URL.
             cliTarball:
               chess.cliTarball !== null && typeof chess.cliTarball === "object" && !Array.isArray(chess.cliTarball)
                 ? (chess.cliTarball as Record<string, unknown>)
@@ -929,7 +930,13 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
         // that pins a package other than this build's own. Still before anything is written.
         let cliUpgrade: string | undefined;
         if (template.cli !== undefined) {
-          const verdict = hostCliVerdict(template.cli, { ownPackage: cliPackage(), current: cliVersion(), server, tarball: template.cliTarball });
+          const verdict = hostCliVerdict(template.cli, {
+            ownPackage: cliPackage(),
+            current: cliVersion(),
+            server,
+            selfTarballUrl: selfTarballUrl(),
+            tarball: template.cliTarball,
+          });
           if ("refusal" in verdict) throw new Error(verdict.refusal);
           cliUpgrade = verdict.upgrade;
         }

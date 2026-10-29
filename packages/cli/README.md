@@ -532,9 +532,11 @@ generated manifest:
 `--self-url URL` is for a host that serves this build's tarball itself instead of npm (`pnpm testnet:up`; see
 `apps/server`'s README, "Serving the CLI tarball"). `URL` is where the tarball is served: a plain http(s) URL ending
 in `.tgz`. It is baked in, and `selfCommand()` then names `npx -y --prefer-offline --package=URL arena` in every
-message, never the `npx -y <package>@<version>` form of a package that was never published. When `/templates` carries
-`cliTarball`, `init`'s version refusal names that host's tarball command instead of the npm one. `--self-url` cannot be
-combined with `--release`.
+message, never the `npx -y <package>@<version>` form of a package that was never published. Such a build's version
+refusal never names the npm form either. It names the host's newer tarball command only when that tarball is on the
+build's own origin, at a `/cli/<name>.tgz` path, and names no command otherwise. A URL is code the host chose, not a
+version of this CLI (fix round 1, C-1). A build without `--self-url` (the npm release, and tsx) ignores `/templates`'
+`cliTarball` entirely. `--self-url` cannot be combined with `--release`.
 
 `--release` is for `.github/workflows/release-cli.yml` (written, never run by this repo's own tooling — see
 `mainnet-gates.md`'s "Plan 5.6" section for what the owner must set up by hand before the first real publish):

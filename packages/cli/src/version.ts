@@ -61,6 +61,27 @@ export function tarballCommand(url: string): string {
   return `npx -y --prefer-offline --package=${url} arena`;
 }
 
+/** Remote agents: the tarball URL baked into this build (`build-cli --self-url`) -- a build a host serves as its own
+ *  tarball -- or undefined in an npm (release) build and under tsx. */
+export function selfTarballUrl(): string | undefined {
+  return typeof __ARENA_CLI_TARBALL_URL__ === "string" ? __ARENA_CLI_TARBALL_URL__ : undefined;
+}
+
+/** The path a host serves its CLI tarball at (`GET /cli/<name>`, apps/server). */
+const SERVED_TARBALL_PATH = /^\/cli\/[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/;
+
+/**
+ * Fix round 1 (C-1): the host's tarball URL, only when this build may repeat it -- a plain URL on the same origin as
+ * the build's own baked one, at a `/cli/<name>.tgz` path: the host that served this build, serving a newer one. Any
+ * other origin is code the host chose, not a version of this CLI (the C1 rule: a host may pin a version of this CLI,
+ * never other code). Undefined otherwise, and always in a build with no baked URL.
+ */
+export function sameHostTarballUrl(url: unknown, self: string | undefined): string | undefined {
+  if (self === undefined || !isTarballUrl(url)) return undefined;
+  const there = new URL(url);
+  return there.origin === new URL(self).origin && SERVED_TARBALL_PATH.test(there.pathname) ? url : undefined;
+}
+
 /** Final fix wave (C1): the npm package name this build was published under -- `__ARENA_CLI_PACKAGE__`, defined only
  *  in the bundle -- or undefined under tsx (every unit test and dev run). */
 export function cliPackage(): string | undefined {
@@ -88,12 +109,14 @@ export type HostCliVerdict = { refusal: string } | { upgrade?: string };
  *   (or whose `minVersion` is above its `version`), is refused with a short description of what is wrong;
  * - in the bundle (`ownPackage` set), a host that pins a different package is refused, naming the validated name
  *   only and no install command: a host may pin a version of this CLI, never another package;
- * - below `minVersion`, it refuses with the install command for this same package at the host's `version`;
+ * - below `minVersion`, it refuses with the install command for this same package at the host's `version` -- or, in a
+ *   build a host serves as its own tarball (`selfTarballUrl`), with that host's tarball command when it is on the
+ *   build's own origin, and no command otherwise;
  * - below `version` only, it returns an `upgrade` note; otherwise `{}`.
  */
 export function hostCliVerdict(
   raw: Record<string, unknown>,
-  ctx: { ownPackage: string | undefined; current: string; server: string; tarball?: { url?: unknown } },
+  ctx: { ownPackage: string | undefined; current: string; server: string; selfTarballUrl?: string; tarball?: { url?: unknown } },
 ): HostCliVerdict {
   const malformed = (what: string) => ({ refusal: `the server's ${what}; refusing (ask your human)` });
   const pkg = raw.package;
@@ -115,13 +138,17 @@ export function hostCliVerdict(
     // is the caller's own --server; it goes into the command only if it holds no shell metacharacter.
     const server = /^https?:\/\/[A-Za-z0-9._~:/%@-]+$/.test(ctx.server) ? ctx.server : "<server URL>";
     const need = `this host requires arena CLI version ${minVersion} or newer (you are running ${ctx.current})`;
-    // Remote agents: a host that serves the CLI tarball itself names that file, never the (unpublished) npm package;
-    // a tarball URL that is not plain is never echoed.
-    if (ctx.tarball !== undefined) {
+    // Fix round 1 (C-1): only a build a host serves as its own tarball (one with a baked URL) ever looks at the host's
+    // `cliTarball`, and it repeats that URL only on its own origin (`sameHostTarballUrl`); otherwise it names no
+    // command at all -- never another origin, and never the npm form of its placeholder package name, which is not
+    // ours on npm. An npm build and tsx ignore `cliTarball` entirely: their refusal is the npm one, as before.
+    if (ctx.selfTarballUrl !== undefined) {
+      const url = sameHostTarballUrl(ctx.tarball?.url, ctx.selfTarballUrl);
       return {
-        refusal: isTarballUrl(ctx.tarball.url)
-          ? `${need}: install and run it with: ${tarballCommand(ctx.tarball.url)} init --server ${server}`
-          : `${need}: install it as step 0 of this host's skill.md says`,
+        refusal:
+          url !== undefined
+            ? `${need}: install and run it with: ${tarballCommand(url)} init --server ${server}`
+            : `${need}: install it as step 0 of this host's skill.md says`,
       };
     }
     return { refusal: `${need}: install and run it with: npx -y ${pkg}@${version} init --server ${server}` };
