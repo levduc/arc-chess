@@ -1,0 +1,10 @@
+# Caddy in front of the arena server: HTTPS for $DOMAIN, with a certificate it gets (and renews) from Let's Encrypt by
+# itself -- ports 80 and 443 must reach this machine for that. It proxies everything, the /ws WebSocket included
+# (reverse_proxy passes the upgrade through as is), to the server on the compose network.
+#
+# X-Forwarded-For: Caddy trusts no proxy in front of it, so it replaces whatever a client sent with the address it
+# saw, and the server (TRUST_PROXY=true) keys its per-IP limits on that entry. Put Caddy behind another proxy or a
+# CDN only with Caddy's trusted_proxies set for it, or every client counts as that proxy's address.
+{$DOMAIN} {
+	reverse_proxy arena-server:3000
+}

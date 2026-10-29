@@ -1,0 +1,12 @@
+# The local end-to-end test of this stack (tests/system/self-host.test.ts, or by hand): the same compose file, with
+# Caddy on loopback test ports instead of 80/443, the image built from this checkout, and DOMAIN=localhost, for which
+# Caddy issues the certificate from its own local CA (no Let's Encrypt). Run from deploy/host:
+#   docker compose -p arena-selfhost-test --env-file <env file> -f docker-compose.yml -f test/compose.e2e.yml up -d --build
+# with DOMAIN=localhost and PUBLIC_URL=https://localhost:8781 in the env file. Never for a real host.
+services:
+  arena-server:
+    image: ${ARENA_IMAGE:-arena-selfhost-test-server:local}
+  caddy:
+    ports: !override
+      - "127.0.0.1:${E2E_HTTP_PORT:-8780}:80"
+      - "127.0.0.1:${E2E_HTTPS_PORT:-8781}:443"

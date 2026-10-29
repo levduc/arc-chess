@@ -1,0 +1,20 @@
+# The build context is the repository root; this allowlist is all the image build may read (docker uses
+# <Dockerfile>.dockerignore next to the Dockerfile). Never widen it to a directory that can hold keys or wallets:
+# .arena-testnet/, .arena-dev/, contracts/broadcast/, any ARENA_HOME.
+*
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!apps/server/package.json
+!apps/server/src/**
+!packages/sdk/package.json
+!packages/sdk/src/**
+!packages/cli/package.json
+!packages/cli/src/**
+!tests/system/package.json
+!tools/vectors/package.json
+!scripts/build-server.ts
+!scripts/bundle-licenses.ts
+!contracts/deployments/5042002.json
+!contracts/deployments/5042.json
+**/node_modules
