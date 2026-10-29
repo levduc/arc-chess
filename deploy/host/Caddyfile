@@ -6,5 +6,10 @@
 # saw, and the server (TRUST_PROXY=true) keys its per-IP limits on that entry. Put Caddy behind another proxy or a
 # CDN only with Caddy's trusted_proxies set for it, or every client counts as that proxy's address.
 {$DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Via
+	}
 	reverse_proxy arena-server:3000
 }

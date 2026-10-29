@@ -1,13 +1,19 @@
-# Run your own Agent Chess Arena host: deploy/host/README.md. In short: cp .env.example .env, edit it, then
+# Run your own Agent Chess Arena host: deploy/host/README.md. In short: cp example.env .env, edit .env, then
 #   docker compose up -d
 # Two services: the arena server (no keys, no funds; its port is never published) and Caddy (HTTPS on 80/443).
 # The optional house bots (`--profile bots`) are off unless you start them.
 name: arena-host
 
+# Every container's log is rotated: at most 3 files of 10 MB.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   arena-server:
-    # The published image (.github/workflows/release-server-image.yml). Pin a release, or its digest, in .env:
-    #   ARENA_IMAGE=ghcr.io/levduc/arc-chess-server:0.1.0
+    # The published image (.github/workflows/release-server-image.yml). Pin its digest in .env:
     #   ARENA_IMAGE=ghcr.io/levduc/arc-chess-server@sha256:<digest>
     # Or build it from this clone instead of pulling: docker compose up -d --build
     image: ${ARENA_IMAGE:-ghcr.io/levduc/arc-chess-server:latest}
@@ -28,8 +34,8 @@ services:
       INDEXER_CHUNK_BLOCKS: ${INDEXER_CHUNK_BLOCKS:-}
       XMTP: ${XMTP:-off}
       XMTP_GATEWAY_HOST: ${XMTP_GATEWAY_HOST:-}
-      # Only Caddy reaches this server (no published port, one network shared with Caddy alone), so the right-most
-      # X-Forwarded-For entry, which Caddy writes, is the client's address.
+      # Only Caddy (and your house bots) reach this server: no published port, one network shared with them alone. So
+      # the right-most X-Forwarded-For entry, which Caddy writes, is the client's address.
       TRUST_PROXY: "true"
     volumes:
       - arena-data:/data
@@ -38,6 +44,9 @@ services:
       - /tmp:size=16m,mode=1777
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 256
+    logging: *logging
     networks: [arena]
     # No `ports:` on purpose: the server listens on the compose network only.
 
@@ -64,20 +73,28 @@ services:
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 256
+    logging: *logging
     networks: [arena]
 
   # Optional house bots: `docker compose --profile bots up -d` (README, "House bots"). They play with a hot wallet
   # you fund, read from a file you create (secrets/house-bot-wallet.json), never from the environment or the image.
   house-bot:
     profiles: [bots]
-    # The same Node base as the server image; the bot runs the published CLI agents run (npx arc-chess@<version>).
-    image: node:24.22.2-alpine3.24@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85
+    # The server's image, for its Node and its bot-run.mjs (the output redactor); the bot itself is the published CLI
+    # agents run, installed from npm on its first start (house-bot.sh).
+    image: ${ARENA_IMAGE:-ghcr.io/levduc/arc-chess-server:latest}
     restart: unless-stopped
     depends_on:
       arena-server:
         condition: service_healthy
     user: "1000:1000"
     entrypoint: ["/bin/sh", "/bot/house-bot.sh"]
+    # The image's healthcheck is the server's.
+    healthcheck:
+      disable: true
+    working_dir: /home/node
     environment:
       ARENA_CLI_PACKAGE: arc-chess
       ARENA_CLI_VERSION: ${ARENA_CLI_VERSION:-}
@@ -85,7 +102,9 @@ services:
       BOT_DEPOSIT: ${BOT_DEPOSIT:-1}
       BOT_STAKE: ${BOT_STAKE:-0.1}
       BOT_OFFERS: ${BOT_OFFERS:-1}
-      RPC_URL: ${RPC_URL:-}
+      # Not the server's RPC_URL: empty, the bot uses the RPC the host publishes (PUBLIC_RPC_URL).
+      BOT_RPC_URL: ${BOT_RPC_URL:-}
+      BOT_ALLOW_MAINNET: ${BOT_ALLOW_MAINNET:-}
       HOME: /home/node
       ARENA_HOME: /home/node/arena
       PATH: /home/node/bin:/usr/local/bin:/usr/bin:/bin
@@ -97,8 +116,13 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
+      # The image declares /data a volume (the server's database); the bot has no use for it.
+      - /data:size=1m,uid=1000,gid=1000
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 256
+    logging: *logging
     networks: [arena]
 
 secrets:
