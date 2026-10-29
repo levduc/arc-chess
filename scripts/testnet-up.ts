@@ -20,8 +20,9 @@
  *     (`KNOWN_DEPLOYMENTS`, read from packages/cli at run time): if they differ, every `arena init` would refuse. The
  *     hub's limits, fee and timeout bounds are read.
  *  3. The server port must be free and not one of `FORBIDDEN_PORTS` (the owner's demo stack, the test suites, the
- *     rehearsal). The server listens on 127.0.0.1, and also on `--host` when given: a private IPv4 address of this
- *     machine (loopback, Tailscale's 100.64.0.0/10, 10/8, 172.16/12 or 192.168/16; `hostProblem`), never a public one.
+ *     rehearsal). The server listens on 127.0.0.1, and also on `--host` when given: an IPv4 address of this machine on
+ *     loopback or Tailscale (100.64.0.0/10, on a `tailscale*` interface), or -- only with `--allow-lan`, which prints a
+ *     loud warning -- on a LAN (10/8, 172.16/12, 192.168/16); never a public one (`hostProblem`, `hostNotLocal`).
  *     Agents are given `http://<--host>:<port>`; the house bots, the pay helper and this script keep using 127.0.0.1,
  *     and the bots' APIs listen there only. A previous `up` whose processes are still alive is refused: `testnet:down` first.
  *     `<dir>/state.json` records the hub the directory was made for; a different hub in the deployments file is
@@ -212,8 +213,10 @@ const HOUSE_BOT_POLL_MS = "4000";
 export type UpArgs = {
   port: number;
   /** `--host`: the address agents reach the server at, besides 127.0.0.1 (which the bots and local tools keep using):
-   *  loopback or a private IPv4 address only (`hostProblem`). Default 127.0.0.1: this machine only. */
+   *  loopback or Tailscale, or a LAN address with `allowLan` (`hostProblem`). Default 127.0.0.1: this machine only. */
   host: string;
+  /** `--allow-lan`: accept a `--host` on a LAN (RFC 1918, or a 100.64/10 address off Tailscale), with a warning. */
+  allowLan: boolean;
   /** What the server and the house bots use; it must answer chain 5042002. Never published. */
   rpc: string;
   /** What the server publishes to agents (/templates, so skill.md); it must answer chain 5042002 too. */
@@ -261,35 +264,53 @@ function urlFlag(name: string, raw: string): string {
   return raw;
 }
 
-/** Remote agents: the private IPv4 ranges `--host` may name -- loopback, Tailscale's CGNAT range and RFC 1918's three --
- *  as [first address, prefix length, name]. */
-const PRIVATE_RANGES: ReadonlyArray<readonly [string, number, string]> = [
+/** Remote agents: the IPv4 ranges `--host` may name, as [first address, prefix length, kind]. Loopback and Tailscale's
+ *  100.64.0.0/10 by default; RFC 1918's three only with `--allow-lan`. */
+const HOST_RANGES: ReadonlyArray<readonly [string, number, "loopback" | "tailnet" | "lan"]> = [
   ["127.0.0.0", 8, "loopback"],
-  ["100.64.0.0", 10, "Tailscale / CGNAT"],
-  ["10.0.0.0", 8, "private"],
-  ["172.16.0.0", 12, "private"],
-  ["192.168.0.0", 16, "private"],
+  ["100.64.0.0", 10, "tailnet"],
+  ["10.0.0.0", 8, "lan"],
+  ["172.16.0.0", 12, "lan"],
+  ["192.168.0.0", 16, "lan"],
 ];
 
 function ipv4Number(ip: string): number {
   return ip.split(".").reduce((n, octet) => n * 256 + Number(octet), 0);
 }
 
-/** Why `--host ip` is refused, or null: it must be a plain IPv4 address in loopback, 100.64.0.0/10 (Tailscale), 10/8,
- *  172.16/12 or 192.168/16. A public address would put this unaudited test stack, and its plain-http lobby, on the
- *  internet; 0.0.0.0 would listen on every interface, public ones included. */
-export function hostProblem(ip: string): string | null {
-  if (!isIPv4(ip)) return `--host must be an IPv4 address (e.g. your Tailscale IP, 100.x.y.z), not ${JSON.stringify(ip).slice(0, 60)}`;
-  if (ip === "0.0.0.0") return "--host 0.0.0.0 would listen on every interface, public ones included: name one private address";
+/** Which of `HOST_RANGES` an IPv4 address is in, or null (a public address). */
+function rangeOf(ip: string): "loopback" | "tailnet" | "lan" | null {
   const n = ipv4Number(ip);
-  for (const [first, bits] of PRIVATE_RANGES) {
-    const size = 2 ** (32 - bits);
+  for (const [first, bits, kind] of HOST_RANGES) {
     const start = ipv4Number(first);
-    if (n >= start && n < start + size) return null;
+    if (n >= start && n < start + 2 ** (32 - bits)) return kind;
+  }
+  return null;
+}
+
+/** Fix round 1 (I-1): why a LAN is refused without `--allow-lan`, and what `--allow-lan` warns about. */
+const LAN_RISK =
+  "over a LAN everything this stack serves -- skill.md, /templates and the CLI tarball itself -- travels as plain, " +
+  "unauthenticated http, so anyone on that network can replace the CLI the agents run (and skill.md's sha256 with it)";
+
+/**
+ * Why `--host ip` is refused, or null: a plain IPv4 address on loopback or in Tailscale's 100.64.0.0/10 (whose
+ * interface `hostNotLocal` then checks); a LAN address (10/8, 172.16/12, 192.168/16) only with `allowLan`. A public
+ * address would put this unaudited test stack, and its plain-http lobby, on the internet; 0.0.0.0 would listen on
+ * every interface, public ones included. Fix round 1 (I-1): Tailscale's WireGuard authenticates the peer and protects
+ * the bytes; a LAN does neither, so it is the owner's explicit choice, never a default.
+ */
+export function hostProblem(ip: string, allowLan = false): string | null {
+  if (!isIPv4(ip)) return `--host must be an IPv4 address (e.g. your Tailscale IP, 100.x.y.z), not ${JSON.stringify(ip).slice(0, 60)}`;
+  if (ip === "0.0.0.0") return "--host 0.0.0.0 would listen on every interface, public ones included: name one address";
+  const kind = rangeOf(ip);
+  if (kind === "loopback" || kind === "tailnet" || (kind === "lan" && allowLan)) return null;
+  if (kind === "lan") {
+    return `--host ${ip} is a LAN address: ${LAN_RISK}. Use this machine's Tailscale IP (tailscale ip -4), or pass --allow-lan to accept that`;
   }
   return (
-    `--host ${ip} is not a private address: only loopback (127.0.0.0/8), Tailscale (100.64.0.0/10) and the private ` +
-    "ranges 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16 are allowed. This stack never listens on a public address"
+    `--host ${ip} is not a private address: only loopback (127.0.0.0/8) and Tailscale (100.64.0.0/10) are allowed, and ` +
+    "with --allow-lan the LAN ranges 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16. This stack never listens on a public address"
   );
 }
 
@@ -338,7 +359,7 @@ export function parseUpArgs(argv: string[]): UpArgs {
   const { values, bools } = readFlags(
     argv,
     ["port", "host", "rpc", "public-rpc", "house-bots", "bot-usdc", "bot-deposit", "bot-stake", "bot-timeout", "limits", "start-block", "dir"],
-    ["xmtp-bots"],
+    ["xmtp-bots", "allow-lan"],
   );
   const port = intFlag("port", values.get("port") ?? "8090", 1024, 65_535);
   if (FORBIDDEN_PORTS.has(port)) throw new Error(`--port ${port} is reserved (the demo stack, the test suites or the rehearsal use it)`);
@@ -346,11 +367,13 @@ export function parseUpArgs(argv: string[]): UpArgs {
   if (startBlockRaw !== undefined && !/^[0-9]+$/.test(startBlockRaw)) throw new Error("--start-block must be a block number");
   const timeoutRaw = values.get("bot-timeout");
   const host = values.get("host") ?? "127.0.0.1";
-  const badHost = hostProblem(host);
+  const allowLan = bools.has("allow-lan");
+  const badHost = hostProblem(host, allowLan);
   if (badHost !== null) throw new Error(badHost);
   return {
     port,
     host,
+    allowLan,
     rpc: urlFlag("rpc", values.get("rpc") ?? RPC_URL),
     publicRpc: urlFlag("public-rpc", values.get("public-rpc") ?? RPC_URL),
     houseBots: intFlag("house-bots", values.get("house-bots") ?? "2", 0, 10),
@@ -620,7 +643,8 @@ function npmBinary(): string {
  * server serves at `<publicUrl>/cli/<name>`, so an agent on another machine needs only Node 24 and this URL -- no npm
  * package, no file of this repo. Returns its path, sha256, and the package name and version in its manifest.
  *
- * `name` is `arena-cli-<version>-<id>.tgz`, where `id` digests a first build of the same code (without its URL). It
+ * `name` is `arena-cli-<version>-<id>.tgz`, where `id` digests a first build of the same code (without its URL), and
+ * the npm and Node versions that pack it. It
  * must change whenever the code does: `npx` runs an earlier install of the same URL as is, without looking at the
  * new bytes it downloads. The second build bakes the URL in (`--self-url`), so every command the CLI prints names
  * this same tarball, never `npx -y @arena/cli@<version>` -- a placeholder name on npm that is not ours. The same code
@@ -630,6 +654,11 @@ function npmBinary(): string {
 export async function buildCliTarball(dir: string, publicUrl: string): Promise<ServedCli> {
   const cliDir = join(dir, "cli");
   mkdirSync(cliDir, { recursive: true });
+  // Fix round 1 (m-6): npm and Node (its zlib) shape the packed bytes too, so they are part of the id: the same code
+  // packed by another npm gets another name, never other bytes under a name agents already installed.
+  const npm = npmBinary();
+  const npmVersion = await run(npm, ["--version"], { timeoutMs: 60_000, cwd: cliDir });
+  if (npmVersion.code !== 0) throw new Error(`${npm} --version failed (exit ${npmVersion.code}): ${npmVersion.stderr.trim().slice(-300)}`);
   const build = async (out: string, selfUrl?: string) => {
     const r = await run(process.execPath, [TSX_CLI, BUILD_CLI, "--out", out, ...(selfUrl !== undefined ? ["--self-url", selfUrl] : [])], { timeoutMs: 300_000 });
     if (r.code !== 0) throw new Error(`building the CLI failed (exit ${r.code}): ${r.stderr.trim().slice(-1000)}`);
@@ -637,13 +666,14 @@ export async function buildCliTarball(dir: string, publicUrl: string): Promise<S
   const idDir = join(cliDir, "build-id");
   await build(idDir);
   const manifest = JSON.parse(readFileSync(join(idDir, "package.json"), "utf8")) as { name: string; version: string };
-  const name = `arena-cli-${manifest.version}-${dirDigest(idDir).slice(0, 16)}.tgz`;
+  const id = createHash("sha256").update(`${dirDigest(idDir)}\0npm ${npmVersion.stdout.trim()}\0node ${process.version}`).digest("hex");
+  const name = `arena-cli-${manifest.version}-${id.slice(0, 16)}.tgz`;
   const distDir = join(cliDir, "dist");
   await build(distDir, `${publicUrl.replace(/\/$/, "")}/cli/${name}`);
   // Packed from inside the bundle's own directory, so no .npmrc or workspace of this checkout applies; with a cache of
   // its own (npm writes its logs there too), removed afterwards.
   const cache = join(cliDir, "npm-cache");
-  const packed = await run(npmBinary(), ["pack", "--json", "--pack-destination", cliDir, "--cache", cache, "--update-notifier=false"], {
+  const packed = await run(npm, ["pack", "--json", "--pack-destination", cliDir, "--cache", cache, "--update-notifier=false"], {
     timeoutMs: 120_000,
     cwd: distDir,
   });
@@ -1074,17 +1104,54 @@ async function isPortFree(port: number, host = "127.0.0.1"): Promise<boolean> {
   });
 }
 
+/** Remote agents: the network `--host` (already past `hostProblem`) puts the stack on. `tailnet` only for a
+ *  100.64.0.0/10 address on a `tailscale*` interface: elsewhere that range is a carrier's CGNAT address, a network
+ *  nobody here controls, so it counts as a LAN (fix round 1, I-1). */
+export function hostNetwork(host: string, interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): "loopback" | "tailnet" | "lan" {
+  const kind = rangeOf(host);
+  if (kind === "loopback") return "loopback";
+  if (kind !== "tailnet") return "lan";
+  const onTailscale = Object.entries(interfaces).some(
+    ([name, list]) => name.startsWith("tailscale") && (list ?? []).some((i) => i.family === "IPv4" && i.address === host),
+  );
+  return onTailscale ? "tailnet" : "lan";
+}
+
 /** Remote agents: why `--host` cannot be used on this machine, or null. A loopback address always can be (all of
  *  127/8 is on lo); any other must be one of this machine's own addresses, or listening on it would fail -- after
- *  the state directory was written. */
-export function hostNotLocal(host: string, interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string | null {
+ *  the state directory was written. Fix round 1 (I-1): a 100.64.0.0/10 address that is not on a Tailscale interface
+ *  needs `allowLan`, like any other LAN address. */
+export function hostNotLocal(host: string, interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces(), allowLan = false): string | null {
   if (host.startsWith("127.")) return null;
-  const mine = Object.values(interfaces)
-    .flatMap((list) => list ?? [])
-    .filter((i) => i.family === "IPv4")
-    .map((i) => i.address);
-  if (mine.includes(host)) return null;
-  return `refusing: --host ${host} is not an address of this machine (its IPv4 addresses: ${mine.join(", ") || "none"}). Nothing was started`;
+  const mine = Object.entries(interfaces).flatMap(([name, list]) =>
+    (list ?? []).filter((i) => i.family === "IPv4").map((i) => ({ name, address: i.address })),
+  );
+  const own = mine.find((i) => i.address === host);
+  if (own === undefined) {
+    return `refusing: --host ${host} is not an address of this machine (its IPv4 addresses: ${mine.map((i) => i.address).join(", ") || "none"}). Nothing was started`;
+  }
+  if (!allowLan && hostNetwork(host, interfaces) === "lan") {
+    return (
+      `refusing: --host ${host} is on ${own.name}, not a Tailscale interface: a 100.64.0.0/10 address there is a carrier's ` +
+      `CGNAT address, not your tailnet, and ${LAN_RISK}. Use your Tailscale IP (tailscale ip -4), or pass --allow-lan to ` +
+      "accept that. Nothing was started"
+    );
+  }
+  return null;
+}
+
+/** Fix round 1 (I-1): what `up` prints, loudly, when `--allow-lan` serves a LAN address. */
+export function lanWarning(host: string): string[] {
+  return [
+    "",
+    "  " + "!".repeat(100),
+    `  WARNING (--allow-lan): agents reach this stack at ${host}, on a LAN, over plain, unauthenticated http.`,
+    "  Anyone on that network can rewrite skill.md, /templates and the CLI tarball, and so run their own code on every",
+    "  agent machine that follows skill.md. skill.md's sha256 cannot catch it: it arrives over the same channel. Use",
+    "  this only on a network you alone control; on any other, use your Tailscale IP (--host $(tailscale ip -4)).",
+    "  " + "!".repeat(100),
+    "",
+  ];
 }
 
 async function waitForHttp(url: string, label: string, timeoutMs: number): Promise<void> {
@@ -1361,11 +1428,13 @@ export function agentPrompt(serverUrl: string, stake: string, agentPort: number)
 
 /** Remote agents: what the human needs to know besides the agent message: where the agent's machine must be, how to
  *  fund it, and the cash-out line to add. Printed under the message. */
-export function agentNotes(o: { publicUrl: string; host: string; payPath: string }): string[] {
+export function agentNotes(o: { publicUrl: string; network: "loopback" | "tailnet" | "lan"; payPath: string }): string[] {
   const where =
-    o.host === "127.0.0.1"
-      ? "The agent must run on THIS machine: the server listens on 127.0.0.1 only (rerun with --host <your Tailscale IP> for agents on other machines)."
-      : `The agent's machine must reach ${o.publicUrl}: it must be on this private network (your tailnet, for a 100.x address).`;
+    o.network === "loopback"
+      ? "The agent must run on THIS machine: the server listens on loopback only (rerun with --host <your Tailscale IP> for agents on other machines)."
+      : o.network === "tailnet"
+        ? `The agent's machine must reach ${o.publicUrl}: it must be on your tailnet.`
+        : `The agent's machine must reach ${o.publicUrl}: it must be on this LAN (see the warning about --allow-lan).`;
   return [
     where,
     "It needs Node 24 or newer (node --version) and nothing else: skill.md's command fetches the CLI from this server.",
@@ -1482,9 +1551,11 @@ async function up(args: UpArgs): Promise<void> {
   }
 
   if (!(await isPortFree(args.port))) throw new Error(`refusing: port ${args.port} is already in use. Pass --port. Nothing was started`);
+  const network = hostNetwork(args.host);
   if (args.host !== "127.0.0.1") {
-    const notLocal = hostNotLocal(args.host);
+    const notLocal = hostNotLocal(args.host, undefined, args.allowLan);
     if (notLocal !== null) throw new Error(notLocal);
+    if (network === "lan") for (const line of lanWarning(args.host)) process.stderr.write(`${line}\n`);
     if (!(await isPortFree(args.port, args.host))) {
       throw new Error(`refusing: port ${args.port} is already in use on ${args.host}. Pass --port. Nothing was started`);
     }
@@ -1764,7 +1835,8 @@ async function up(args: UpArgs): Promise<void> {
     process.stderr.write(`  ${b.name}: ${b.address}${b.offer ? "" : " (no offer yet)"}  API ${b.apiPort}  log ${b.log}\n`);
   }
   process.stderr.write(`\n  Give an agent this:\n\n    ${prompt}\n\n`);
-  for (const line of agentNotes({ publicUrl, host: args.host, payPath })) process.stderr.write(`  ${line}\n`);
+  for (const line of agentNotes({ publicUrl, network, payPath })) process.stderr.write(`  ${line}\n`);
+  if (network === "lan") for (const line of lanWarning(args.host)) process.stderr.write(`${line}\n`);
   process.stderr.write(
     `\n  More agents: each in its own directory, with its own port (${agentPorts.slice(1).join(", ")}, ...).\n\n`,
   );

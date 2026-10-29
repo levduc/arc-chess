@@ -210,15 +210,21 @@ packed CLI itself:
   `--prefer-offline` runs an installed copy without asking the host again. Without it, a host that is down costs
   about 70 s of npm retries per command.
 - `/templates` carries `cliTarball: {url, sha256}`, and skill.md's step 0 gives the URL, Node 24 and the
-  `curl -fsSL <url> | sha256sum` check.
+  `curl -fsSL <url> | sha256sum` check: a check that the download arrived intact, not of where it came from, since the
+  digest comes from the same host.
 - **The name must change with the content.** `npx` never re-installs a URL it has installed before, even when the
   bytes behind it change. `pnpm testnet:up` names the file `arena-cli-<version>-<code digest>.tgz` and bakes that URL
   into the bundle (`scripts/build-cli.ts --self-url`), so the CLI's own messages name the same command.
 - No host serves a tarball unless its config sets `cliTarball`. That includes Arc mainnet (5042).
+- **The `init` version gate.** An npm (release) build and tsx ignore `cliTarball`. A build a host serves as its own
+  tarball repeats a newer tarball's command only when it is on that build's own origin, at a `/cli/<name>.tgz` path.
+  Otherwise it names no command (fix round 1, C-1: a URL is code the host chose, not a version of this CLI).
 
 `extraHosts: ["100.70.62.92"]` adds listen addresses (IP literals) besides `host`, on the same port, with the same
-routes, rate limiters and WebSocket hub. `pnpm testnet:up --host <private IP>` uses it so that local tools keep
-`127.0.0.1` while agents on the tailnet get `publicUrl`.
+routes, rate limiters and WebSocket hub. `pnpm testnet:up --host <Tailscale IP>` uses it so that local tools keep
+`127.0.0.1` while agents on the tailnet get `publicUrl`. Like `host`, `extraHosts` adds no policy of its own: it binds
+whatever it names, `0.0.0.0` and `::` included. Which addresses are acceptable is the caller's rule (testnet:up allows
+loopback and Tailscale, and a LAN only with `--allow-lan`).
 
 ## Routes
 

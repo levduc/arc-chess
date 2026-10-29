@@ -33,10 +33,12 @@ import {
   hideDirRpcs,
   hideUrl,
   holdingsWei,
+  hostNetwork,
   hostNotLocal,
   hostProblem,
   hubPinProblem,
   isOurs,
+  lanWarning,
   openNeedWei,
   parseDownArgs,
   payUnconfirmed,
@@ -126,6 +128,7 @@ describe("testnet:up arguments", () => {
     expect(a).toEqual({
       port: 8090,
       host: "127.0.0.1",
+      allowLan: false,
       rpc: "https://rpc.testnet.arc.io",
       publicRpc: "https://rpc.testnet.arc.io",
       houseBots: 2,
@@ -142,11 +145,11 @@ describe("testnet:up arguments", () => {
     const a = parseUpArgs([
       "--port", "8095", "--host", "100.70.62.92", "--rpc", "https://example.invalid/arc-testnet/KEY", "--public-rpc", "https://example.invalid/public",
       "--house-bots", "4", "--bot-usdc", "1.25", "--bot-deposit", "0.5", "--bot-stake", "0.05",
-      "--bot-timeout", "300", "--xmtp-bots", "--limits", '{"maxOpenOffersPerIp": 10, "wsPerIp": 40}', "--start-block", "68000000",
+      "--bot-timeout", "300", "--xmtp-bots", "--allow-lan", "--limits", '{"maxOpenOffersPerIp": 10, "wsPerIp": 40}', "--start-block", "68000000",
       "--dir", "/tmp/x",
     ]);
     expect(a).toEqual({
-      port: 8095, host: "100.70.62.92", rpc: "https://example.invalid/arc-testnet/KEY", publicRpc: "https://example.invalid/public", houseBots: 4,
+      port: 8095, host: "100.70.62.92", allowLan: true, rpc: "https://example.invalid/arc-testnet/KEY", publicRpc: "https://example.invalid/public", houseBots: 4,
       botUsdc: "1.25", botDeposit: "0.5", botStake: "0.05", botTimeout: 300, xmtpBots: true,
       limits: { maxOpenOffersPerIp: 10, wsPerIp: 40 }, startBlock: 68_000_000n, dir: "/tmp/x",
     });
@@ -180,31 +183,65 @@ describe("testnet:up arguments", () => {
     expect(() => parseUpArgs(["--rpc", "ws://127.0.0.1:1"])).toThrow(/http\(s\) URL/);
   });
 
-  it("remote agents: --host takes loopback and private IPv4 addresses only, never a public one", () => {
-    for (const ok of ["127.0.0.1", "127.0.0.2", "100.70.62.92", "100.64.0.0", "100.127.255.255", "10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.254", "192.168.50.102"]) {
+  it("remote agents: --host takes loopback and Tailscale; a LAN only with --allow-lan; never a public address", () => {
+    for (const ok of ["127.0.0.1", "127.0.0.2", "100.70.62.92", "100.64.0.0", "100.127.255.255"]) {
       expect(hostProblem(ok), ok).toBeNull();
       expect(parseUpArgs(["--host", ok]).host).toBe(ok);
     }
-    for (const bad of ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.0", "172.15.255.255", "172.32.0.1", "192.169.0.1", "11.0.0.1", "169.254.1.1", "224.0.0.1", "255.255.255.255"]) {
-      expect(hostProblem(bad), bad).toMatch(/is not a private address: only loopback \(127\.0\.0\.0\/8\), Tailscale \(100\.64\.0\.0\/10\)/);
-      expect(() => parseUpArgs(["--host", bad]), bad).toThrow(/is not a private address/);
+    // Fix round 1 (I-1): RFC 1918 is plain, unauthenticated http on a shared network -- the owner's explicit choice only.
+    for (const lan of ["10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.254", "192.168.50.102"]) {
+      expect(hostProblem(lan), lan).toMatch(
+        new RegExp(`^--host ${lan.replace(/\./g, "\\.")} is a LAN address: over a LAN everything this stack serves .* anyone on that network can replace the CLI the agents run .* pass --allow-lan to accept that$`),
+      );
+      expect(() => parseUpArgs(["--host", lan]), lan).toThrow(/is a LAN address/);
+      expect(hostProblem(lan, true), lan).toBeNull();
+      expect(parseUpArgs(["--host", lan, "--allow-lan"])).toMatchObject({ host: lan, allowLan: true });
     }
-    expect(() => parseUpArgs(["--host", "0.0.0.0"])).toThrow(/every interface, public ones included/);
+    for (const bad of ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.0", "172.15.255.255", "172.32.0.1", "192.169.0.1", "11.0.0.1", "169.254.1.1", "224.0.0.1", "255.255.255.255"]) {
+      for (const allowLan of [false, true]) {
+        expect(hostProblem(bad, allowLan), bad).toMatch(/is not a private address: only loopback \(127\.0\.0\.0\/8\) and Tailscale \(100\.64\.0\.0\/10\) are allowed, and with --allow-lan/);
+      }
+      expect(() => parseUpArgs(["--host", bad, "--allow-lan"]), bad).toThrow(/is not a private address/);
+    }
+    expect(() => parseUpArgs(["--host", "0.0.0.0", "--allow-lan"])).toThrow(/every interface, public ones included/);
     for (const bad of ["::1", "fd7a:115c:a1e0::1", "localhost", "my-box.tailnet.ts.net", "100.70.62.092", "100.70.62", ""]) {
       expect(() => parseUpArgs(["--host", bad]), bad).toThrow(/--host must be an IPv4 address|needs a value/);
     }
   });
 
+  const IFACES = {
+    lo: [{ address: "127.0.0.1", family: "IPv4" }],
+    tailscale0: [{ address: "100.70.62.92", family: "IPv4" }, { address: "fd7a::1", family: "IPv6" }],
+    wwan0: [{ address: "100.80.1.2", family: "IPv4" }], // a carrier's CGNAT address, in the same 100.64/10 range
+    enp0s31f6: [{ address: "192.168.50.102", family: "IPv4" }],
+  } as unknown as Parameters<typeof hostNotLocal>[1];
+
   it("remote agents: --host must be one of this machine's addresses (loopback always is)", () => {
-    const ifaces = {
-      lo: [{ address: "127.0.0.1", family: "IPv4" }],
-      tailscale0: [{ address: "100.70.62.92", family: "IPv4" }, { address: "fd7a::1", family: "IPv6" }],
-    } as unknown as Parameters<typeof hostNotLocal>[1];
-    expect(hostNotLocal("100.70.62.92", ifaces)).toBeNull();
-    expect(hostNotLocal("127.0.0.5", ifaces)).toBeNull();
-    expect(hostNotLocal("100.70.62.93", ifaces)).toBe(
-      "refusing: --host 100.70.62.93 is not an address of this machine (its IPv4 addresses: 127.0.0.1, 100.70.62.92). Nothing was started",
+    expect(hostNotLocal("100.70.62.92", IFACES)).toBeNull();
+    expect(hostNotLocal("127.0.0.5", IFACES)).toBeNull();
+    expect(hostNotLocal("100.70.62.93", IFACES)).toBe(
+      "refusing: --host 100.70.62.93 is not an address of this machine (its IPv4 addresses: 127.0.0.1, 100.70.62.92, 100.80.1.2, 192.168.50.102). Nothing was started",
     );
+  });
+
+  it("fix round 1 (I-1): a 100.64/10 address counts as the tailnet only on a tailscale* interface; elsewhere it needs --allow-lan", () => {
+    expect(hostNetwork("127.0.0.1", IFACES)).toBe("loopback");
+    expect(hostNetwork("100.70.62.92", IFACES)).toBe("tailnet");
+    expect(hostNetwork("100.80.1.2", IFACES)).toBe("lan");
+    expect(hostNetwork("192.168.50.102", IFACES)).toBe("lan");
+    expect(hostNotLocal("100.80.1.2", IFACES)).toMatch(
+      /^refusing: --host 100\.80\.1\.2 is on wwan0, not a Tailscale interface: a 100\.64\.0\.0\/10 address there is a carrier's CGNAT address, not your tailnet, .* pass --allow-lan to accept that\. Nothing was started$/,
+    );
+    expect(hostNotLocal("100.80.1.2", IFACES, true)).toBeNull();
+    expect(hostNotLocal("192.168.50.102", IFACES, true)).toBeNull();
+  });
+
+  it("fix round 1 (I-1): --allow-lan's warning says the CLI can be replaced, that the sha256 cannot catch it, and what to use instead", () => {
+    const w = lanWarning("192.168.50.102").join("\n");
+    expect(w).toContain("WARNING (--allow-lan): agents reach this stack at 192.168.50.102, on a LAN, over plain, unauthenticated http.");
+    expect(w).toContain("Anyone on that network can rewrite skill.md, /templates and the CLI tarball");
+    expect(w).toContain("skill.md's sha256 cannot catch it: it arrives over the same channel");
+    expect(w).toContain("--host $(tailscale ip -4)");
   });
 
   it("down: --withdraw and --dir only", () => {
@@ -570,15 +607,17 @@ describe("house bots", () => {
   });
 
   it("remote agents: the notes under the message -- the network, Node 24, funding from this machine or the faucet, a cash-out line", () => {
-    const remote = agentNotes({ publicUrl: "http://100.70.62.92:8090", host: "100.70.62.92", payPath: "/x/.arena-testnet/human/pay" }).join("\n");
-    expect(remote).toContain("The agent's machine must reach http://100.70.62.92:8090: it must be on this private network (your tailnet, for a 100.x address).");
+    const remote = agentNotes({ publicUrl: "http://100.70.62.92:8090", network: "tailnet", payPath: "/x/.arena-testnet/human/pay" }).join("\n");
+    expect(remote).toContain("The agent's machine must reach http://100.70.62.92:8090: it must be on your tailnet.");
     expect(remote).toContain("Node 24 or newer");
     expect(remote).toContain("/x/.arena-testnet/human/pay <its address> <usdc>   (runs on THIS machine; at most 3 per call)");
     expect(remote).toContain("https://faucet.circle.com (choose Arc Testnet) or any Arc-testnet wallet");
     expect(remote).toContain("My Arc testnet address for cash-out is 0x<your address>.");
     expect(remote).toContain("withdraw pays only that owner");
-    const local = agentNotes({ publicUrl: "http://127.0.0.1:8090", host: "127.0.0.1", payPath: "/x/human/pay" }).join("\n");
-    expect(local).toContain("The agent must run on THIS machine: the server listens on 127.0.0.1 only (rerun with --host <your Tailscale IP>");
+    const local = agentNotes({ publicUrl: "http://127.0.0.1:8090", network: "loopback", payPath: "/x/human/pay" }).join("\n");
+    expect(local).toContain("The agent must run on THIS machine: the server listens on loopback only (rerun with --host <your Tailscale IP>");
+    const lan = agentNotes({ publicUrl: "http://192.168.50.102:8090", network: "lan", payPath: "/x/human/pay" }).join("\n");
+    expect(lan).toContain("it must be on this LAN (see the warning about --allow-lan)");
   });
 
   it("m-9: the agent prompt names skill.md, its own ARENA_HOME and its own port", () => {

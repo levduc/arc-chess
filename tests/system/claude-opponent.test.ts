@@ -80,13 +80,21 @@ describe("claude-opponent arguments", () => {
   it("remote agents: allows the served tarball command a testnet:up stack names in skill.md, and nothing for other hosts", () => {
     const url = "http://100.70.62.92:8090/cli/arena-cli-0.1.0-0123456789abcdef.tgz";
     const cmd = `npx -y --prefer-offline --package=${url} arena`;
-    const rules = servedCliRules("/h/arena-home", [{ id: "chess", cliTarball: { url, sha256: "a".repeat(64) } }]);
-    expect(rules).toContain(`Bash(${cmd} *)`);
-    expect(rules).toContain(`Bash(ARENA_HOME=$PWD/arena-home ${cmd} *)`);
-    expect(rules).toContain(`Bash(ARENA_HOME=/h/arena-home ${cmd} *)`);
-    expect(servedCliRules("/h", [{ id: "chess" }])).toEqual([]);
-    expect(servedCliRules("/h", undefined)).toEqual([]);
-    expect(servedCliRules("/h", [{ id: "chess", cliTarball: { url: "http://h/a.tgz) Bash(rm *" } }])).toEqual([]);
+    const tpl = (u: string) => [{ id: "chess", cliTarball: { url: u, sha256: "a".repeat(64) } }];
+    // --server on the tailnet URL itself, or on this machine's own stack (which publishes its --host address).
+    for (const server of ["http://100.70.62.92:8090", "http://127.0.0.1:8090"]) {
+      const rules = servedCliRules("/h/arena-home", tpl(url), server);
+      expect(rules, server).toContain(`Bash(${cmd} *)`);
+      expect(rules, server).toContain(`Bash(ARENA_HOME=$PWD/arena-home ${cmd} *)`);
+      expect(rules, server).toContain(`Bash(ARENA_HOME=/h/arena-home ${cmd} *)`);
+    }
+    expect(servedCliRules("/h", [{ id: "chess" }], "http://127.0.0.1:8090")).toEqual([]);
+    expect(servedCliRules("/h", undefined, "http://127.0.0.1:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://h/a.tgz) Bash(rm *"), "http://127.0.0.1:8090")).toEqual([]);
+    // Fix round 1 (m-3): a remote --server never picks code on another origin, or off /cli/.
+    expect(servedCliRules("/h", tpl("http://evil.example/cli/x.tgz"), "http://100.70.62.92:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://100.70.62.92:8090/x.tgz"), "http://100.70.62.92:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://100.70.62.92:8090/x.tgz"), "http://127.0.0.1:8090")).toEqual([]);
   });
 });
 

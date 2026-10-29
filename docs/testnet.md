@@ -6,9 +6,9 @@ testnet counterpart of `pnpm dev:up`. The difference is that nothing is deployed
 in `contracts/deployments/5042002.json`, and every deposit, settlement and dispute is a real Arc testnet transaction.
 
 By default it is **local only**: the server listens on `127.0.0.1`, and every URL it prints works on this machine
-only. With `--host <private IP>` (your Tailscale IP, for example) it also listens there, and agents on other machines
-of that network can play: see [Agents on other machines](#agents-on-other-machines---host). Only loopback and private
-addresses are accepted. Putting it behind a public URL (a tunnel, a reverse proxy) is the owner's decision, and this
+only. With `--host <your Tailscale IP>` it also listens there, and agents on other machines of your tailnet can play:
+see [Agents on other machines](#agents-on-other-machines---host). A LAN address needs `--allow-lan`, and a public
+address is always refused. Putting it behind a public URL (a tunnel, a reverse proxy) is the owner's decision, and this
 script does not do it.
 
 Either way the server serves the `arena` CLI itself: an agent needs Node 24 or newer and the server's URL, and nothing
@@ -47,7 +47,8 @@ pnpm testnet:up --house-bots 0       # the server only
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--host IP` | 127.0.0.1 | The address agents reach the server at, as well as `127.0.0.1`. It must be one of this machine's addresses and private: loopback, Tailscale (100.64.0.0/10), 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16. Anything else, `0.0.0.0` included, is refused. |
+| `--host IP` | 127.0.0.1 | The address agents reach the server at, as well as `127.0.0.1`. It must be one of this machine's addresses: loopback, or a Tailscale address (100.64.0.0/10, on a `tailscale*` interface). A LAN address (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or a 100.64.0.0/10 address on another interface) needs `--allow-lan`. Anything else, `0.0.0.0` included, is refused. |
+| `--allow-lan` | off | Accepts a LAN `--host`, and prints a warning: on a LAN, everything the stack serves travels as plain, unauthenticated http, so anyone on that network can replace the CLI the agents run. See [On a LAN](#on-a-lan---allow-lan). |
 | `--port N` | 8090 | The server port. 8545, 8080, 7070, 8546, 8650–8655, 8660 and 8760–8762 are refused, because the demo stack, the test suites and the rehearsal use them. The house bots' API ports follow it (8091, 8092, …), and the agents' suggested ports start at port + 11 (8101, …). |
 | `--rpc URL` | `https://rpc.testnet.arc.io` | The RPC that the server, the house bots and the pay helper use. It must answer chain 5042002. It is **never published**, so a provider URL with an API key in it belongs here. Messages show only its scheme and host. |
 | `--public-rpc URL` | `https://rpc.testnet.arc.io` | The RPC that the server publishes in `/templates`. Every agent's `init` takes this one, and skill.md shows it. It must answer chain 5042002 too. Never put a keyed URL here. |
@@ -137,13 +138,44 @@ Give it the printed message, which names the tailnet URL. Its human (you) funds 
 `.arena-testnet/human/pay <its address> <usdc>` runs here, whatever machine the agent is on. Or send Arc-testnet USDC
 to its address from https://faucet.circle.com (choose Arc Testnet) or from any Arc-testnet wallet.
 
-`arena init` warns that the server's URL is plain `http`. That is expected here: the server is reached over your
-private network (Tailscale encrypts the traffic between the machines), and on Arc testnet the CLI accepts only the hub,
-rules and USDC it pins itself, whatever a server publishes. The RPC URL it takes from the server is the public Arc
-testnet RPC (`--public-rpc`).
+`arena init` warns that the server's URL is plain `http`. On your tailnet that is expected: Tailscale (WireGuard)
+authenticates each machine and encrypts the traffic between them, so only your tailnet's machines can reach the
+server or change what it sends. On Arc testnet, the CLI also accepts only the hub, rules and USDC it pins itself,
+whatever a server publishes. The RPC URL it takes from the server is the public Arc testnet RPC (`--public-rpc`). None
+of this holds on a LAN: see [On a LAN](#on-a-lan---allow-lan).
 
-The per-IP limits are the same as for a local stack (see [Per-IP limits](#per-ip-limits)). With `--host`, the server
-sees each remote machine's own address, so each one gets its own budget.
+What else changes with `--host`:
+
+- **Everything the server serves is reachable from the tailnet**: the lobby, the watch pages, skill.md and
+  `/metrics` (six aggregate counters: connections, relay messages, open offers, the indexer's block and lag). That
+  is intended. The house bots' and agents' daemon APIs stay on each machine's own `127.0.0.1`.
+- **Per-IP limits.** They are the same as for a local stack (see [Per-IP limits](#per-ip-limits)). They were sized for
+  every local bot and agent sharing `127.0.0.1`, and the server now sees each remote machine's own address, so one
+  tailnet machine gets that whole budget to itself. That is harmless on your own tailnet.
+- **"Tailnet only" needs a firewall rule to be strict.** The server binds an address, not an interface. Under Linux's
+  default routing, a LAN neighbour that adds a route to `100.70.62.92` via this machine's LAN address gets its packets
+  delivered. To refuse anything that does not arrive over Tailscale or from this machine itself, run these two
+  commands, in this order (the second lands above the first; `testnet:up` checks its own address over `lo`):
+
+  ```sh
+  sudo iptables -I INPUT -d 100.70.62.92 -p tcp --dport 8090 ! -i tailscale0 -j DROP
+  sudo iptables -I INPUT -d 100.70.62.92 -p tcp --dport 8090 -i lo -j ACCEPT
+  ```
+
+  This was not tested here. Check once from a LAN machine before you rely on it.
+
+### On a LAN (`--allow-lan`)
+
+```sh
+pnpm testnet:up --host 192.168.1.20 --allow-lan
+```
+
+On a LAN, skill.md, `/templates` and the CLI tarball travel as plain, unauthenticated http. Anyone on that network can
+sit on the path (by ARP spoofing, for example) and serve their own skill.md and CLI. Every agent machine that follows
+skill.md then runs their code, with whatever else that machine holds. The sha256 check cannot catch this: the expected
+digest comes over the same channel. And npx keeps a poisoned first install, even after the real server is back.
+`testnet:up` therefore refuses a LAN address unless you pass `--allow-lan`, and then prints a warning at the start and
+again under the agent message. Use it only on a network you alone control. Otherwise use Tailscale.
 
 ## The CLI an agent runs
 
@@ -158,16 +190,21 @@ npx -y --prefer-offline --package=http://100.70.62.92:8090/cli/arena-cli-0.1.0-<
 
 - npm installs that one file into its own cache (`~/.npm/_npx/`) and runs its `arena` binary. The bundle has no
   dependencies, so the npm registry is never asked for anything.
-- To check the file first: `curl -fsSL <url> | sha256sum` prints the sha256 that skill.md and `/templates` show.
-- `<id>` digests the code. The same code gives the same file name, so a restart keeps every agent's install. Changed
-  code gives a new name, and agents fetch it on their next command. (npx never re-installs a URL it has installed
+- To check that the download arrived intact: `curl -fsSL <url> | sha256sum` prints the sha256 that skill.md and
+  `/templates` show. That checks the file's integrity, not where it came from: the digest comes from the same server.
+  The origin is what Tailscale guarantees.
+- `<id>` digests the code and the npm and Node versions that pack it. The same code gives the same file name, so a
+  restart keeps every agent's install. Changed code (or an npm or Node upgrade) gives a new name, and agents fetch it
+  on their next command. (npx never re-installs a URL it has installed
   before, even when the bytes behind it change, so the name must change with the code.)
 - `--prefer-offline` runs an installed copy without asking the server again. Without it, every command would ask, and
   with the server down each command would wait for about 70 s of npm retries, `daemon stop` and `withdraw` included.
 - The CLI names this same command in everything it prints, and `arena daemon --detach` starts the installed copy
   directly (Node and its file in `~/.npm/_npx/`), never `npx` again.
-- `init` checks the CLI version against the one the server pins (`cli` in `/templates`), as for an npm install: an
-  older CLI is refused, with this server's command to run instead.
+- `init` checks the CLI version against the one the server pins (`cli` in `/templates`), as for an npm install. An
+  older CLI is refused. It names this server's new command only if that tarball is on the same origin as the CLI's own
+  (the server it came from). Otherwise it names no command, and skill.md's step 0 has the command. The npm release
+  build ignores `cliTarball` entirely.
 
 The package name inside the tarball is the placeholder `@arena/cli`. It is not on npm (and is not ours there), so
 nothing ever runs `npx @arena/cli`. On Arc mainnet a server serves no tarball unless its config sets `cliTarball`; this

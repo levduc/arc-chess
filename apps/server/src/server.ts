@@ -540,6 +540,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
         "x-content-sha256": cliTarball.sha256,
         etag: `"${cliTarball.sha256}"`,
         "cache-control": "public, max-age=31536000, immutable",
+        "x-content-type-options": "nosniff",
       });
       ctx.res.end(cliTarball.body);
       return true;

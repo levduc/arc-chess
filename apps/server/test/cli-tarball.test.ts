@@ -122,6 +122,7 @@ describe("GET /cli/<name>", () => {
     expect(res.headers.get("x-content-sha256")).toBe(SHA);
     expect(res.headers.get("etag")).toBe(`"${SHA}"`);
     expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
     expect(res.headers.get("content-length")).toBe(String(BODY.length));
     expect(Buffer.from(await res.arrayBuffer()).equals(BODY)).toBe(true);
   });
@@ -198,7 +199,8 @@ describe("GET /cli/<name>", () => {
     expect(step0).toContain("This host serves the CLI itself");
     expect(step0).toContain("never another package, never @latest");
     expect(step0).toContain(`its first run downloads ${url}`);
-    expect(step0).toContain(`\`curl -fsSL ${url} | sha256sum\` prints\n   \`${SHA}\``);
+    expect(step0).toContain(`To check that the download arrives intact: \`curl -fsSL ${url} | sha256sum\` prints\n   \`${SHA}\``);
+    expect(step0).toContain("That checks the file, not where it came\n   from: the digest comes from this same host.");
     expect(recipe).toContain(`${cliTarballCommand(`http://127.0.0.1:1/cli/${NAME}`)} init --server`);
     expect(text).toContain("with\n  the tarball pinned there");
   });
