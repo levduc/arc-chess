@@ -344,7 +344,12 @@ export function channelBanners(status) {
   if (status.challenge?.mustMove) out.push({ kind: "must-move", text: "You must move before the deadline" });
   // humanAttention carries it while a human holds the seat (attention stays agent-only; see status.ts).
   if (status.attention === "opponent-silent" || status.humanAttention === "opponent-silent") {
-    out.push({ kind: "opponent-silent", text: "Opponent silent: consider a challenge" });
+    // Re-review r2: on a stale view (`chainStale`) silence was judged on the last chain read; the daemon suggests a
+    // re-check there, not a challenge, and so does the chip.
+    out.push({
+      kind: "opponent-silent",
+      text: status.chainStale ? "Opponent may be silent: chain view stale, re-check before any challenge" : "Opponent silent: consider a challenge",
+    });
   }
   return out;
 }

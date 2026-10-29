@@ -316,6 +316,11 @@ export type ChannelHandle = {
    *  the watchtower, the start-up restore, a read route), or 0 before the first read. Only the read routes look at it
    *  (`CHAIN_VIEW_MAX_AGE_MS`), and a stale status reports it (`chainReadAt`). */
   chainReadAt: number;
+  /** Re-review r1: how many chain writes this daemon has made for the channel (`chainWritten`), and that count when
+   *  `chainReadAt` was last stamped. A read that started before a write and landed after it is not stamped, so the
+   *  read routes never serve its pre-write view as fresh (`chainViewFresh` needs the two equal). */
+  chainWrites: number;
+  chainWritesAtRead: number;
 };
 
 /** Board fix round 1 (I2): how a read route's status may skip a chain read (`ArenaDaemon.readView`). */
@@ -1895,6 +1900,8 @@ export class ArenaDaemon {
       unseenRegistered: null,
       challengeUnseenWoken: null,
       chainReadAt: 0,
+      chainWrites: 0,
+      chainWritesAtRead: 0,
     };
     this.live.set(record.channelId, l);
     // Crash recovery / relay reconnect (§7): the re-send of our latest own state and any Close signature is
@@ -4050,9 +4057,11 @@ export class ArenaDaemon {
    *  have changed the chain, so the read routes' cached view is dropped: the next read goes to the chain. Before, a
    *  status within 5 s of a challenge answered the view from before it (a bot re-challenged on it). The watchtower's
    *  own transactions are followed by `settleCheck` in the same pass, which re-reads anyway. A write: never a read of
-   *  the cache, so dispute logic still never depends on it. */
+   *  the cache, so dispute logic still never depends on it. Re-review r1: a count, not a reset of `chainReadAt` -- so
+   *  a read already in flight is not stamped when it lands (`refreshChain`), and a stale answer still says when its
+   *  view was really read. */
   private chainWritten(l: ChannelHandle): void {
-    l.chainReadAt = 0;
+    l.chainWrites++;
   }
 
   /** Board fix round 1 (I2): whether `l`'s chain view is young enough for a read route to serve unread -- and was read
@@ -4061,6 +4070,7 @@ export class ArenaDaemon {
    *  could call an opponent silent who has just progressed, or miss a silence that starts at that progress. */
   private chainViewFresh(l: ChannelHandle): boolean {
     if (l.chainReadAt <= 0 || Date.now() - l.chainReadAt >= CHAIN_VIEW_MAX_AGE_MS || !l.chain) return false;
+    if (l.chainWritesAtRead !== l.chainWrites) return false; // re-review r1: written since that read
     return progressKeyOf(l.chain.phase, l.session.snapshot()) === l.progressKey;
   }
 
@@ -4290,6 +4300,7 @@ export class ArenaDaemon {
    *  refreshes, not once each). */
   private async refreshChain(l: ChannelHandle, now?: bigint): Promise<void> {
     const id = l.record.channelId;
+    const writes = l.chainWrites; // re-review r1: this daemon's chain writes so far, before the first read
     let info: Awaited<ReturnType<HubClient["channelInfo"]>>;
     let blockNow: bigint;
     if (now !== undefined) {
@@ -4315,8 +4326,13 @@ export class ArenaDaemon {
       now: blockNow,
     };
     // Board fix round 1 (I2): the whole view was just read (whoever asked): the read routes may serve it for
-    // CHAIN_VIEW_MAX_AGE_MS, and their rate-limit back-off is over -- the RPC answers again.
-    l.chainReadAt = Date.now();
+    // CHAIN_VIEW_MAX_AGE_MS, and their rate-limit back-off is over -- the RPC answers again. Re-review r1: unless this
+    // daemon wrote the chain while the read was in flight -- then the view may predate the write, and is not stamped
+    // (`l.chain` is still written, as before the cache: the next read replaces it, and its progress is observed).
+    if (l.chainWrites === writes) {
+      l.chainReadAt = Date.now();
+      l.chainWritesAtRead = writes;
+    }
     this.readBackoff = null;
     // Plan 5.7 (spec §3, I-1): the XMTP fallback is armed only once the channel is Open on chain -- both deposits in --
     // never at match time, so an accept that costs nothing never starts an XMTP client here. Idempotent.

@@ -451,7 +451,9 @@ ends with `arena status   (the chain view is stale: re-check before any challeng
 it; run `status` again in a few seconds. To spare the RPC, `status` and `channels` serve a channel's chain view
 without reading the chain while it is under 5 s old (the watchtower refreshes it every pass), and after a
 rate-limited read they answer stale at once, with no read, for 10 s or until a read succeeds. An action's own answer
-always reads the chain. Neither applies to the watchtower, which reads the chain itself on every pass. A rate limit
+never uses the 5 s cache; while the back-off runs, only `challenge`, `reclaim` and `close` read the chain for their
+answer (`move`, `resign`, `accept-draw`, `next-game` and `handoff` answer from the last view, stale). Neither applies to
+the watchtower, which reads the chain itself on every pass. A rate limit
 never makes the dispute scan skip a block: only an RPC that refuses the query itself (a range or response too large)
 can, and `status.skippedEventBlocks` shows it.
 

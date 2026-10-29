@@ -465,6 +465,50 @@ describe("board fix round 1 (I2): the read routes' chain-view cache and rate-lim
     }
   });
 
+  it("re-review r1: a read in flight across our own chain write does not re-stamp its pre-write view as fresh", async () => {
+    const { d, id, count, settleCheck } = await oneChannel();
+    d.hub.challenge = (async () => ({})) as unknown as typeof d.hub.challenge;
+    cold(d);
+    // A status read that has read the channel and waits (a slow, retried read under a limit) ...
+    const counted = d.hub.channelInfo;
+    let entered!: () => void;
+    const inFlight = new Promise<void>((r) => (entered = r));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let armed = true;
+    d.hub.channelInfo = async (cid: Hex) => {
+      const info = await counted(cid);
+      if (armed) {
+        armed = false;
+        entered();
+        await gate;
+      }
+      return info;
+    };
+    const pending = d.status(id);
+    await inFlight;
+    // ... while this daemon challenges; then the read lands.
+    await d.challenge(id, "agent");
+    release();
+    await pending;
+    // Before: the landed read stamped the cache, and this answered the pre-challenge view as fresh with 0 reads.
+    const at = count.info;
+    expect((await d.status(id)).chainStale).toBeUndefined();
+    expect(count.info - at).toBe(1);
+    // Our own write no longer forgets when the view was read (fix round 1's concern 4): a stale answer right after it
+    // still says when, and its countdowns still run on.
+    await settleCheck();
+    const readAt = d.handle(id).chainReadAt;
+    expect(readAt).toBeGreaterThan(0);
+    await d.challenge(id, "agent");
+    d.hub.channelInfo = async () => {
+      throw new LimitExceededRpcError(new Error("rate limit exceeded"));
+    };
+    const st = await d.status(id);
+    expect(st.chainStale).toBe(true);
+    expect(st.chainReadAt).toBe(new Date(readAt).toISOString());
+  });
+
   it("progress in this session since the cached read (a move, a relayed move, a signature) makes the next read go to the chain", async () => {
     const { d, bob, id, l, count, settleCheck } = await oneChannel();
     await settleCheck(); // warm

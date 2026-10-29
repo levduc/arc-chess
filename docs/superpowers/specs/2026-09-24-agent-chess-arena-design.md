@@ -1436,7 +1436,11 @@ hub.
           read is made only when a channel needs one. Any read failure stops the reads for the rest of the list (m2).
         - A transaction this daemon sends for a channel drops its cached view (`chainWritten`). That covers
           `challenge()`, `reclaim()`, a respond and the close submission. Otherwise a bot that just challenged would be
-          told "Open, silent" for up to 5 s.
+          told "Open, silent" for up to 5 s. `chainWritten` counts writes (`chainWrites`); it does not clear
+          `chainReadAt`. A view is fresh only if no write has happened since it was stamped, and `refreshChain` does
+          not stamp a read that a write overtook in flight (re-review r1). It still writes `l.chain`.
+      - **Re-review.** On a stale view, the agent seat's silence chip says "re-check before any challenge" (r2). The
+        README now says which action answers read the chain during the back-off (r3).
         - A view is not fresh once the session has progressed since it was read (`progressKeyOf` ≠ `progressKey`).
           Progress is observed only at a read (`lastProgressAt`), and silence is judged on it.
         - The watchtower's passes, `respondIfChallenged`, `settleCheck`, auto-return, withdraw and `wait()` never

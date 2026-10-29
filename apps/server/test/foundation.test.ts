@@ -562,6 +562,8 @@ describe("http foundation", () => {
     expect(text).toMatch(/`note: the chain could not be read just now`/);
     expect(text).toMatch(/`status` \(or `channels`\) answered with `chainStale: true`: the game in it is current/);
     expect(text).toMatch(/never `challenge` or `reclaim`\s+on it/);
+    // Re-review r2: a stale status keeps `attention: opponent-silent` (informational); the re-check comes first.
+    expect(text).toMatch(/even with `attention: opponent-silent`/);
   });
 
   it("Plan 5 Task 5 (spec §6.2/§12 item 44): skill.md teaches handoff etiquette (when, note, 409, status.controller)", async () => {

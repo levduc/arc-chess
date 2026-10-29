@@ -734,6 +734,16 @@ describe("board rate-limit fix: the chain-busy banner", () => {
     expect(channelBanners(silentStale).some((b) => b.kind === "opponent-silent")).toBe(false);
   });
 
+  it("re-review r2: on a stale view the agent seat's silence chip says to re-check the chain, not to challenge", () => {
+    // The agent holds the seat: attention stays opponent-silent on a stale view (informational; wait() never uses it).
+    const fresh = status({ controller: "agent", attention: "opponent-silent" });
+    expect(channelBanners(fresh)).toContainEqual({ kind: "opponent-silent", text: "Opponent silent: consider a challenge" });
+    const silentStale = stale({ controller: "agent", attention: "opponent-silent" });
+    const banner = channelBanners(silentStale).find((b) => b.kind === "opponent-silent");
+    expect(banner?.text).toBe("Opponent may be silent: chain view stale, re-check before any challenge");
+    expect(banner?.text).not.toMatch(/consider a challenge/);
+  });
+
   it("moves stay enabled on a stale status when it is the human's turn (POST /move works under a rate limit)", () => {
     const mine = stale({ myTurn: true, legalMovesUci: ["e2e4"] });
     expect(canMove(mine)).toBe(true);

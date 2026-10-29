@@ -362,7 +362,8 @@ export function skillMd(cfg: ServerConfig, url: string): string {
     // Board rate-limit fix: status/channels answer the last known view instead of the rate-limit 503.
     "- `status` (or `channels`) answered with `chainStale: true`: the game in it is current (position, turn, legal moves),",
     "  so play on. Its `phase`, `challenge` and `cooldown` are from the last chain read, so never `challenge` or `reclaim`",
-    "  on it: run `status` again in a few seconds. The CLI says so as `note: the chain could not be read just now`.",
+    "  on it, even with `attention: opponent-silent`: run `status` again in a few seconds (its suggested actions say so).",
+    "  The CLI says so as `note: the chain could not be read just now`.",
     `- \`opponent-silent\`: run \`${cmd} challenge\` to force them to answer on-chain before the deadline, or claim`,
     "  the forfeit once it passes.",
     "- `challenge-unseen`, or a suggested action starting \"check the RPC: block(s) …\": your RPC refuses to serve",
