@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import { basename } from "node:path";
 import { getAddress, type Address, type Hex } from "viem";
 import { channelId, decodeWire, fenOf, statusOf, toWire, WireFormatError } from "@arena/sdk";
-import type { ServerConfig } from "./config.js";
+import { cliTarballUrl, type ServerConfig } from "./config.js";
 import { fundFromFaucet, RpcChainReader, type ChainReader } from "./chain.js";
 import { chessSkillMd, indexHtml, llmsTxt, skillMd, watchHtml } from "./docs.js";
 import { Indexer, playerStats } from "./indexer.js";
@@ -211,6 +214,8 @@ async function templateEntry(cfg: ServerConfig, url: string, limits: () => Promi
     // Plan 5.6 Task 4 (spec §3): the pinned CLI version, when this host configures one -- same undefined-key
     // omission as `faucet` above when it does not.
     ...(cfg.cli !== undefined ? { cli: cfg.cli } : {}),
+    // Remote agents: the CLI tarball this host serves (`GET /cli/<name>`), when it serves one.
+    ...(cfg.cliTarball !== undefined ? { cliTarball: { url: cliTarballUrl(url, cfg.cliTarball), sha256: cfg.cliTarball.sha256 } } : {}),
     // Plan 5.7 Task 2 (spec §5): the XMTP fallback config, when this host publishes one -- same undefined-key
     // omission as `cli`/`faucet` above when it does not. `init` copies this into the daemon's `config.json`.
     ...(cfg.xmtp !== undefined ? { xmtp: cfg.xmtp } : {}),
@@ -286,7 +291,25 @@ function errorText(err: unknown, cfg: Pick<ServerConfig, "rpcUrl" | "publicRpcUr
 /** Final review C N-7: a failed startup read may be the RPC's passing trouble, not the config. */
 const STARTUP_READ_HINT = "The RPC may be down or rate-limiting: retry, or check rpcUrl";
 
+/** Remote agents: the CLI tarball `cfg.cliTarball` names, read once, and refused unless its sha256 is the configured
+ *  one -- what `/templates` and skill.md tell agents to expect. Served from memory: the route never touches the disk. */
+function loadCliTarball(cfg: ServerConfig): { name: string; body: Buffer; sha256: string } | undefined {
+  if (cfg.cliTarball === undefined) return undefined;
+  let body: Buffer;
+  try {
+    body = readFileSync(cfg.cliTarball.path);
+  } catch (err) {
+    throw new Error(`cliTarball.path ${cfg.cliTarball.path} cannot be read (${(err as NodeJS.ErrnoException).code ?? String(err)}). Nothing was started`);
+  }
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  if (sha256 !== cfg.cliTarball.sha256) {
+    throw new Error(`cliTarball.path ${cfg.cliTarball.path} has sha256 ${sha256}, not the configured ${cfg.cliTarball.sha256}. Nothing was started`);
+  }
+  return { name: basename(cfg.cliTarball.path), body, sha256 };
+}
+
 export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Promise<ArenaServer> {
+  const cliTarball = loadCliTarball(cfg);
   const repo = new SqliteRepo(cfg.dbPath, (p) => channelId(cfg.chainId, cfg.hub, p));
   // shared by the lobby (Task 4) and, in later tasks, the indexer and relay
   const chain = deps.chain ?? new RpcChainReader(cfg);
@@ -508,6 +531,20 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
       return true;
     },
     async (ctx) => {
+      // Remote agents: exactly the one configured tarball, by its exact name; every other /cli path is a 404 (no
+      // directory, nothing read from the disk). Its name changes with its content, so it may be cached for good.
+      if (ctx.method !== "GET" || cliTarball === undefined || ctx.url.pathname !== `/cli/${cliTarball.name}`) return false;
+      ctx.res.writeHead(200, {
+        "content-type": "application/gzip",
+        "content-length": String(cliTarball.body.length),
+        "x-content-sha256": cliTarball.sha256,
+        etag: `"${cliTarball.sha256}"`,
+        "cache-control": "public, max-age=31536000, immutable",
+      });
+      ctx.res.end(cliTarball.body);
+      return true;
+    },
+    async (ctx) => {
       if (ctx.method !== "GET" || ctx.url.pathname !== "/templates") return false;
       sendJson(ctx.res, 200, [await templateEntry(cfg, self.url, templateLimits.get, faucetEnabled)]);
       return true;
@@ -593,11 +630,17 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
     }
   }
 
-  const httpServer = http.createServer((req, res) => void handle(req, res));
-  // backstops against a slow/stalled client holding a connection open indefinitely (headers, then the whole request)
-  httpServer.requestTimeout = 15_000;
-  httpServer.headersTimeout = 10_000;
-  const wsHandle = attachWs(httpServer, { lobby, relay, cfg, metrics, log, pingMs: deps.wsPingMs });
+  // Remote agents: one HTTP server per listen address (`host`, then each of `extraHosts`), all on the same port, the
+  // same routes, rate limiters and WebSocket hub.
+  const httpServers = [cfg.host, ...(cfg.extraHosts ?? [])].map(() => {
+    const s = http.createServer((req, res) => void handle(req, res));
+    // backstops against a slow/stalled client holding a connection open indefinitely (headers, then the whole request)
+    s.requestTimeout = 15_000;
+    s.headersTimeout = 10_000;
+    return s;
+  });
+  const httpServer = httpServers[0]!;
+  const wsHandle = attachWs(httpServers, { lobby, relay, cfg, metrics, log, pingMs: deps.wsPingMs });
 
   const pruneInterval = setInterval(() => {
     chain
@@ -609,11 +652,33 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
   }, 10 * 60 * 1000);
   pruneInterval.unref();
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(cfg.port, cfg.host, () => resolve());
-  });
+  const listenOn = (s: http.Server, host: string, port: number) =>
+    new Promise<void>((resolve, reject) => {
+      s.once("error", reject);
+      s.listen(port, host, () => {
+        s.removeListener("error", reject);
+        resolve();
+      });
+    });
+  const closeHttp = async () => {
+    for (const s of httpServers) {
+      s.closeAllConnections();
+      if (s.listening) await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
+  };
+  await listenOn(httpServer, cfg.host, cfg.port);
   const port = (httpServer.address() as AddressInfo).port;
+  try {
+    // The port the first one got (`port: 0` in tests), so every address answers on the same one.
+    for (const [i, h] of (cfg.extraHosts ?? []).entries()) await listenOn(httpServers[i + 1]!, h, port);
+  } catch (err) {
+    indexer.stop();
+    clearInterval(pruneInterval);
+    await wsHandle.close();
+    await closeHttp();
+    repo.close();
+    throw err;
+  }
   self.url = cfg.publicUrl || `http://${cfg.host}:${port}`;
 
   return {
@@ -629,8 +694,7 @@ export async function startServer(cfg: ServerConfig, deps: ServerDeps = {}): Pro
       indexer.stop();
       clearInterval(pruneInterval);
       await wsHandle.close();
-      httpServer.closeAllConnections();
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await closeHttp();
       repo.close();
     },
   };

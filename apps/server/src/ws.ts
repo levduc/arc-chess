@@ -47,7 +47,7 @@ type ConnState = {
 };
 
 export function attachWs(
-  httpServer: http.Server,
+  httpServers: http.Server | http.Server[],
   deps: {
     lobby: Lobby;
     relay: Relay | null;
@@ -175,7 +175,7 @@ export function attachWs(
     send(ws, { type: "error", error: "malformed frame" });
   }
 
-  httpServer.on("upgrade", (req, rawSocket, head) => {
+  const onUpgrade = (req: http.IncomingMessage, rawSocket: import("node:stream").Duplex, head: Buffer) => {
     const socket = rawSocket as import("node:net").Socket;
     const url = new URL(req.url ?? "/", "http://internal");
     if (url.pathname !== "/ws") {
@@ -198,7 +198,9 @@ export function attachWs(
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
-  });
+  };
+  // Remote agents: a server listening on several addresses has one http.Server each, and one hub for all of them.
+  for (const s of Array.isArray(httpServers) ? httpServers : [httpServers]) s.on("upgrade", onUpgrade);
 
   wss.on("connection", (ws: WsWebSocket) => {
     const nonce = `0x${randomBytes(32).toString("hex")}` as Hex;
