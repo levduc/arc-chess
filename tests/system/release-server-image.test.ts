@@ -15,6 +15,10 @@ const WORKFLOW_PATH = join(REPO_ROOT, ".github/workflows/release-server-image.ym
 describe("release-server-image workflow", () => {
   const text = readFileSync(WORKFLOW_PATH, "utf8");
 
+  it("the smoke test scans for key files as root (as the app user, find exits 1 on unreadable dirs and bash -e aborts)", () => {
+    expect(text).toContain("docker run --rm -u 0 --entrypoint sh arena-server:ci -c 'find / -xdev");
+  });
+
   it("the smoke test reads the mainnet refusal from stderr too (the server logs it there)", () => {
     expect(text).toContain("arena-server:ci print-config 2>&1)");
   });

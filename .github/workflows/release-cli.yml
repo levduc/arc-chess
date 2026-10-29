@@ -45,4 +45,4 @@ jobs:
           v="$(npm --version)"
           node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$v" \
             || { echo "npm $v is older than 11.5.1, which trusted publishing needs" >&2; exit 1; }
-      - run: npm publish packages/cli/dist --provenance --access public
+      - run: npm publish packages/cli/dist --provenance --access public --loglevel verbose

@@ -64,7 +64,7 @@ describe("release-cli workflow", () => {
 
   it("publishes exactly packages/cli/dist, publicly, with provenance (not a dry-run or another package)", () => {
     // K2: this checks this one file's publish line only -- no other workflow is read here.
-    expect(text).toContain("npm publish packages/cli/dist --provenance --access public");
+    expect(text).toContain("npm publish packages/cli/dist --provenance --access public --loglevel verbose");
   });
 
   it("I1: checks out the Foundry submodules (forge build needs contracts/lib before the clean-room test)", () => {

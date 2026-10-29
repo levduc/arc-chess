@@ -71,7 +71,7 @@ jobs:
           echo "$out"
           test "$code" = 1
           echo "$out" | grep -q "this image cannot serve Arc mainnet"
-          found="$(docker run --rm --entrypoint sh arena-server:ci -c 'find / -xdev \( -name "wallet*.json" -o -name ".arena*" -o -name "*.key" \) 2>/dev/null')"
+          found="$(docker run --rm -u 0 --entrypoint sh arena-server:ci -c 'find / -xdev \( -name "wallet*.json" -o -name ".arena*" -o -name "*.key" \) 2>/dev/null')"
           if [ -n "$found" ]; then
             echo "key-like files in the image: $found" >&2
             exit 1
