@@ -54,7 +54,7 @@ const HUB: HubFacts = {
   maxCommittedEscrow: 1_000_000_000n,
 };
 
-const env = (extra: Record<string, string | undefined> = {}) => ({ DOMAIN: "arena.example.org", ...extra });
+const env = (extra: Record<string, string | undefined> = {}) => ({ DOMAIN: "arena.operator.dev", ...extra });
 
 function refusal(fn: () => unknown): string {
   try {
@@ -132,7 +132,7 @@ describe("hostSettings (the container's environment)", () => {
     expect(s).toMatchObject({
       network: "arc-testnet",
       chainId: 5042002,
-      publicUrl: "https://arena.example.org",
+      publicUrl: "https://arena.operator.dev",
       rpcUrl: "https://rpc.testnet.arc.io",
       publicRpcUrl: "https://rpc.testnet.arc.io",
       cli: { package: "arc-chess", version: "0.1.0" },
@@ -167,14 +167,28 @@ describe("hostSettings (the container's environment)", () => {
     expect(refusal(() => hostSettings(env({ RPC_URL: "ftp://rpc.example.org" }), testnetAssets()))).toMatch(/RPC_URL must be an http\(s\) URL/);
   });
 
+  it("M-3: PUBLIC_RPC_URL may not be RPC_URL (the place for a keyed URL), unless both are the network's public RPC", () => {
+    const keyed = "https://arc.provider.example.net/v2/SECRETKEY";
+    for (const pub of [keyed, keyed.replace("arc.provider", "ARC.PROVIDER")]) {
+      expect(refusal(() => hostSettings(env({ RPC_URL: keyed, PUBLIC_RPC_URL: pub }), testnetAssets()))).toMatch(/^PUBLIC_RPC_URL is RPC_URL: it is published to every agent/);
+    }
+    const both = hostSettings(env({ RPC_URL: "https://rpc.testnet.arc.io", PUBLIC_RPC_URL: "https://rpc.testnet.arc.io/" }), testnetAssets());
+    expect(both.publicRpcUrl).toBe("https://rpc.testnet.arc.io/");
+  });
+
   it("DOMAIN is required, a bare host name, and not the example value", () => {
     expect(refusal(() => hostSettings({}, testnetAssets()))).toMatch(/^DOMAIN is required/);
     expect(refusal(() => hostSettings({ DOMAIN: "  " }, testnetAssets()))).toMatch(/^DOMAIN is required/);
     for (const bad of ["https://arena.example.org", "arena.example.org:443", "arena.example.org/x", "-bad.org", "a b.org"]) {
       expect(refusal(() => hostSettings({ DOMAIN: bad }, testnetAssets()))).toMatch(/^DOMAIN must be a bare host name/);
     }
-    expect(refusal(() => hostSettings({ DOMAIN: "arena.example.com" }, testnetAssets()))).toMatch(/still the example value/);
-    expect(hostSettings({ DOMAIN: "Arena.Example.Org" }, testnetAssets()).publicUrl).toBe("https://arena.example.org");
+    // M-4: every RFC 2606 / 6761 example name, the README's own `arena.example.org` included; `localhost` stays allowed.
+    for (const reserved of ["arena.example.com", "example.org", "arena.example.org", "x.example.net", "arena.test", "host.example", "a.invalid"]) {
+      expect(refusal(() => hostSettings({ DOMAIN: reserved }, testnetAssets()))).toMatch(/a reserved example name: set it to your own host name/);
+    }
+    expect(hostSettings({ DOMAIN: "localhost" }, testnetAssets()).publicUrl).toBe("https://localhost");
+    expect(hostSettings({ DOMAIN: "Arena.Operator.Dev" }, testnetAssets()).publicUrl).toBe("https://arena.operator.dev");
+    expect(hostSettings({ DOMAIN: "example.org.operator.dev" }, testnetAssets()).publicUrl).toBe("https://example.org.operator.dev");
   });
 
   it("PUBLIC_URL: https with an optional port; plain http only on loopback; no path, query or credentials", () => {
@@ -253,7 +267,7 @@ describe("hostServerConfig (what the server runs with)", () => {
     expect(cfg).toMatchObject({
       host: "0.0.0.0",
       port: 3000,
-      publicUrl: "https://arena.example.org",
+      publicUrl: "https://arena.operator.dev",
       chainId: 5042002,
       hub: TESTNET_HUB,
       rules: TESTNET_RULES,

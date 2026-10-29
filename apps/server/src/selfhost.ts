@@ -14,7 +14,8 @@
 import { formatUnits, type Address } from "viem";
 import { DEFAULT_LIMITS, parseServerConfig, type Limits, type ServerConfig } from "./config.js";
 import { RpcChainReader } from "./chain.js";
-import { redactRpcUrls, startServer } from "./server.js";
+import { redactRpcUrls } from "./redact.js";
+import { startServer } from "./server.js";
 
 /** The networks a self-hosted host can serve, by the `NETWORK` value that names each. */
 export const HOST_NETWORKS = {
@@ -138,6 +139,15 @@ function fail(detail: string): never {
   throw new HostConfigError(detail);
 }
 
+/** RFC 2606 / RFC 6761 names no real host has: example.com/.net/.org and the .test, .example and .invalid TLDs.
+ *  (`localhost` stays allowed: the local e2e stack serves it.) */
+function isReservedName(domain: string): boolean {
+  return (
+    ["example.com", "example.net", "example.org"].some((d) => domain === d || domain.endsWith(`.${d}`)) ||
+    ["test", "example", "invalid"].some((tld) => domain === tld || domain.endsWith(`.${tld}`))
+  );
+}
+
 const HOSTNAME_RE = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -215,7 +225,7 @@ export function hostSettings(env: Env, assets: HostAssets): HostSettings {
   if (domainRaw === undefined) fail("DOMAIN is required: the host name your DNS points at this machine, e.g. arena.example.org");
   const domain = domainRaw.toLowerCase();
   if (!HOSTNAME_RE.test(domain)) fail(`DOMAIN must be a bare host name (no https://, port or path), not ${JSON.stringify(domainRaw).slice(0, 80)}`);
-  if (domain === "example.com" || domain.endsWith(".example.com")) fail(`DOMAIN is still the example value (${domain}): set it to your own host name in .env`);
+  if (isReservedName(domain)) fail(`DOMAIN is ${domain}, a reserved example name: set it to your own host name in .env`);
 
   const publicRaw = setting(env, "PUBLIC_URL") ?? `https://${domain}`;
   const pub = httpUrl("PUBLIC_URL", publicRaw);
@@ -234,6 +244,13 @@ export function hostSettings(env: Env, assets: HostAssets): HostSettings {
   }
   const publicRpcUrl = setting(env, "PUBLIC_RPC_URL") ?? net.publicRpcUrl;
   const pubRpc = httpUrl("PUBLIC_RPC_URL", publicRpcUrl, { noCredentials: true });
+  // RPC_URL is the one place for a keyed URL; publishing it would hand the key to every agent.
+  if (pubRpc.href === new URL(rpcUrl).href && pubRpc.href !== new URL(net.publicRpcUrl).href) {
+    fail(
+      "PUBLIC_RPC_URL is RPC_URL: it is published to every agent in /templates, and RPC_URL is where a keyed URL goes. " +
+        "Leave PUBLIC_RPC_URL empty for the network's public RPC, or set it to an RPC without a key",
+    );
+  }
   if (pubRpc.pathname !== "/" || pubRpc.search !== "") {
     warnings.push("PUBLIC_RPC_URL has a path or query: it is published to every agent in /templates, so make sure it carries no API key");
   }

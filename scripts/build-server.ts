@@ -9,7 +9,9 @@
  *   version) and the deployments the image may serve: per network, only one that `contracts/deployments/<chainId>.json`
  *   records with its `deployBlock` AND the CLI pins in `KNOWN_DEPLOYMENTS` (`hostDeployments`). Arc mainnet ships
  *   only once both exist; until then `missing` says what is absent and the container refuses `NETWORK=arc-mainnet`.
- * - `THIRD_PARTY_LICENSES`: the license text of every npm package the bundle inlines.
+ * - `bot-run.mjs`: the house bot's output redactor (apps/server/src/bot-run.ts), which deploy/host/bots/house-bot.sh
+ *   runs every CLI command through. It bundles the server's redaction code and no npm package.
+ * - `THIRD_PARTY_LICENSES`: the license text of every npm package `arena-host.mjs` inlines.
  *
  * The pins are read here, at build time, so the server's runtime never depends on the CLI package.
  */
@@ -78,6 +80,22 @@ async function main(): Promise<void> {
     // accelerators (`bufferutil`, `utf-8-validate`) are required inside their own try/catch and never installed.
     banner: { js: "import { createRequire as __arenaRequire } from 'node:module';\nconst require = __arenaRequire(import.meta.url);" },
   });
+  // The house bot's output redactor (house-bot.sh): only the server's own redaction code, no npm package.
+  const botRun = await build({
+    metafile: true,
+    entryPoints: [join(SERVER_DIR, "src/bot-run-entry.ts")],
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    target: "node24",
+    outfile: join(out, "bot-run.mjs"),
+    minify: false,
+    sourcemap: false,
+    legalComments: "inline",
+    absWorkingDir: REPO_ROOT,
+  });
+  const botRunPackages = Object.keys(botRun.metafile.inputs).filter((i) => i.includes("node_modules/"));
+  if (botRunPackages.length > 0) throw new Error(`bot-run.mjs must bundle no npm package, but bundled ${botRunPackages.join(", ")}`);
   writeFileSync(join(out, "THIRD_PARTY_LICENSES"), thirdPartyLicenses(result.metafile, REPO_ROOT, "arena-host.mjs"));
   writeFileSync(join(out, "share/assets.json"), `${JSON.stringify(assets, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify({ out, cli: assets.cli, networks: Object.keys(assets.deployments), missing: assets.missing })}\n`);
