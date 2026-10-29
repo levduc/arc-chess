@@ -2,7 +2,8 @@
  * Self-host: the server image's release workflow (`.github/workflows/release-server-image.yml`) is linted here as
  * text and never run from this repo's tooling (no pushed tag, no `docker push`), like release-workflow.test.ts does
  * for the CLI's. It pins the pieces the self-host brief asks for: the triggers, the permissions, GITHUB_TOKEN as the
- * only credential, provenance and attestation, the tags, and a smoke test of the image before anything is pushed.
+ * only credential, provenance and attestation, the tags (a version tag pushed once, by a tag run only), the npm gate
+ * (no image advertises an arc-chess version npm does not have), and a smoke test before anything is pushed.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -47,11 +48,48 @@ describe("release-server-image workflow", () => {
     expect(at("${GITHUB_REF_NAME#cli-v}")).toBeLessThan(at("docker/setup-buildx-action"));
   });
 
-  it("tags <version>, sha-<commit> and latest, for amd64 and arm64", () => {
-    expect(text).toContain("${{ env.IMAGE }}:${{ steps.version.outputs.version }}");
-    expect(text).toContain("${{ env.IMAGE }}:sha-${{ steps.version.outputs.sha }}");
-    expect(text).toContain("${{ env.IMAGE }}:latest");
+  it("I-3: a tag run tags <version>, sha-<commit> and latest; a manual run tags sha-<commit> only; amd64 and arm64", () => {
+    const block = text.slice(at('echo "tags<<EOF"'), at('echo "EOF"'));
+    expect(block).toBe(
+      'echo "tags<<EOF"\n            echo "$IMAGE:sha-$sha"\n            if [ "$GITHUB_EVENT_NAME" = "push" ]; then\n' +
+        '              echo "$IMAGE:$version"\n              echo "$IMAGE:latest"\n            fi\n            ',
+    );
+    expect(text).toContain("tags: ${{ steps.version.outputs.tags }}");
+    expect(text).not.toMatch(/\$\{\{ env\.IMAGE \}\}:latest/);
     expect(text).toContain("platforms: linux/amd64,linux/arm64");
+  });
+
+  it("I-3: a tag run refuses to overwrite an existing :<version>, and stops when it cannot tell", () => {
+    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: Build and push"));
+    expect(step).toContain("if: github.event_name == 'push'");
+    expect(step).toContain('if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then');
+    expect(step).toMatch(/already exists: a version tag always names the same image[\s\S]*?exit 1/);
+    expect(step).toContain('grep -qiE "not found|manifest unknown|denied|unauthorized"');
+    expect(step).toMatch(/cannot tell whether \$ref exists[\s\S]*?exit 1/);
+    expect(at("- name: A version tag is pushed once")).toBeGreaterThan(at("docker/login-action@"));
+  });
+
+  it("I-4: nothing is pushed until arc-chess@<version> is on npm (waiting up to 20 minutes for release-cli.yml)", () => {
+    const gate = at("- name: arc-chess@<version> is on npm");
+    const step = text.slice(gate, at("docker/login-action@"));
+    expect(text).toContain("CLI_PACKAGE: arc-chess");
+    expect(step).toContain('want="$CLI_PACKAGE@${{ steps.version.outputs.version }}"');
+    expect(step).toContain('for i in $(seq 1 40); do');
+    expect(step).toContain('if [ "$(npm view "$want" version 2>/dev/null)" = "${{ steps.version.outputs.version }}" ]; then');
+    expect(step).toContain("sleep 30");
+    expect(step).toMatch(/never appeared on npm[\s\S]*?exit 1/);
+    expect(gate).toBeGreaterThan(at("- name: Smoke test"));
+    expect(gate).toBeLessThan(at("docker/login-action@"));
+    expect(gate).toBeLessThan(at("push: true"));
+    // The image advertises the CLI package it was built for: the same name the gate checks.
+    expect(text.match(/build-args: ARENA_CLI_PACKAGE=\$\{\{ env\.CLI_PACKAGE \}\}/g)?.length).toBe(2);
+    expect(text).toContain("/app/share/assets.json | node -p");
+  });
+
+  it("M-8: the checkout keeps no token, and the pushed build reuses the smoke-tested build's cache", () => {
+    expect(text).toMatch(/- uses: actions\/checkout@[0-9a-f]{40} # v[0-9.]+\n {8}with:\n {10}persist-credentials: false\n/);
+    expect(text).toContain("cache-to: type=gha,mode=max");
+    expect(text.match(/cache-from: type=gha/g)?.length).toBe(2);
   });
 
   it("builds deploy/host/Dockerfile from the repository root (its dockerignore allowlists the context)", () => {
@@ -59,11 +97,11 @@ describe("release-server-image workflow", () => {
     expect(text.match(/context: \./g)?.length).toBe(2);
   });
 
-  it("smoke-tests the image before logging in or pushing: non-root, refuses mainnet, no key-like files", () => {
+  it("smoke-tests the image before logging in or pushing: non-root, refuses mainnet offline, no key-like files", () => {
     const smoke = at("- name: Smoke test");
     expect(at("load: true")).toBeLessThan(smoke);
     expect(text).toContain('test "$(docker run --rm --entrypoint id arena-server:ci -u)" != 0');
-    expect(text).toContain("-e NETWORK=arc-mainnet arena-server:ci print-config");
+    expect(text).toContain("--network none -e DOMAIN=arena.operator.dev -e NETWORK=arc-mainnet arena-server:ci print-config");
     expect(text).toContain('test "$code" = 1');
     expect(text).toContain('grep -q "this image cannot serve Arc mainnet"');
     expect(text).toContain('-name "wallet*.json" -o -name ".arena*" -o -name "*.key"');

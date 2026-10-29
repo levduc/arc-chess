@@ -1,11 +1,18 @@
 name: release-server-image
-# The self-host server image (deploy/host): ghcr.io/levduc/arc-chess-server. The server and the CLI release together,
-# so a cli-v<version> tag publishes both (release-cli.yml publishes the npm package). A manual run builds the checked-out
-# ref. Either way the image's version tag is packages/cli/package.json's version: the arc-chess release the image
-# advertises by default. Every image also gets an immutable sha-<commit> tag, a registry provenance attestation and
-# an SBOM from BuildKit, and a GitHub build provenance attestation:
-#   gh attestation verify oci://ghcr.io/levduc/arc-chess-server:<version> -R levduc/arc-chess
+# The self-host server image (deploy/host): ghcr.io/levduc/arc-chess-server. The server and the CLI release together:
+# a cli-v<version> tag publishes the npm package (release-cli.yml) and this image, whose version tag is
+# packages/cli/package.json's version -- the arc-chess release the image advertises by default.
+# - A tag run pushes :<version>, :sha-<commit> and :latest. It refuses to overwrite an existing :<version>, so a version
+#   tag, once pushed, always names the same image.
+# - A manual run pushes :sha-<commit> only (a test build of the checked-out ref; never :<version> or :latest).
+# - Either way, nothing is pushed until arc-chess@<version> is on npm: an image must never tell agents to run a CLI
+#   version npm does not have (release-cli.yml runs on the same tag, at the same time).
+# Every image gets a registry provenance attestation and an SBOM from BuildKit, and a GitHub build provenance
+# attestation:
+#   gh attestation verify oci://ghcr.io/levduc/arc-chess-server@<digest> -R levduc/arc-chess
 # Only GITHUB_TOKEN is used; no other secret exists for this workflow.
+# After the first push, the owner makes the package public once (GitHub > Packages > arc-chess-server > Package
+# settings > Change visibility): a new GHCR package is private, and every operator's pull fails until then.
 on:
   push:
     tags: ["cli-v*"]
@@ -17,6 +24,7 @@ permissions:
   attestations: write
 env:
   IMAGE: ghcr.io/levduc/arc-chess-server
+  CLI_PACKAGE: arc-chess
 jobs:
   image:
     # A fork has no write access to this package; it would only fail at the push.
@@ -24,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: The image version is the CLI version (a cli-v<version> tag must match it)
         id: version
         run: |
@@ -32,23 +42,36 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match packages/cli/package.json's version $version" >&2
             exit 1
           fi
+          sha="${GITHUB_SHA::12}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:sha-$sha"
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              echo "$IMAGE:$version"
+              echo "$IMAGE:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Built once for this runner and checked before anything is pushed: it runs as a non-root user, refuses Arc
-      # mainnet while no mainnet deployment is pinned, and holds no wallet or key file.
+      # mainnet while no mainnet deployment is pinned, and holds no wallet or key file. Its cache feeds the push build.
       - name: Build for the smoke test
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/host/Dockerfile
+          build-args: ARENA_CLI_PACKAGE=${{ env.CLI_PACKAGE }}
           load: true
           tags: arena-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       - name: Smoke test
         run: |
           test "$(docker run --rm --entrypoint id arena-server:ci -u)" != 0
           set +e
-          out="$(docker run --rm -e DOMAIN=arena.example.org -e NETWORK=arc-mainnet arena-server:ci print-config)"
+          out="$(docker run --rm --network none -e DOMAIN=arena.operator.dev -e NETWORK=arc-mainnet arena-server:ci print-config)"
           code=$?
           set -e
           echo "$out"
@@ -59,11 +82,41 @@ jobs:
             echo "key-like files in the image: $found" >&2
             exit 1
           fi
+          test "$(docker run --rm --entrypoint cat arena-server:ci /app/share/assets.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).cli.version')" = "${{ steps.version.outputs.version }}"
+      # release-cli.yml publishes arc-chess@<version> from the same tag, at the same time: wait for it, up to 20 minutes.
+      # If it never appears (that release failed), nothing is pushed.
+      - name: arc-chess@<version> is on npm
+        run: |
+          want="$CLI_PACKAGE@${{ steps.version.outputs.version }}"
+          for i in $(seq 1 40); do
+            if [ "$(npm view "$want" version 2>/dev/null)" = "${{ steps.version.outputs.version }}" ]; then
+              echo "$want is on npm"
+              exit 0
+            fi
+            echo "$want is not on npm yet ($i/40); waiting 30 s"
+            sleep 30
+          done
+          echo "$want never appeared on npm: an image advertising it would send every agent to a version that does not exist" >&2
+          exit 1
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: A version tag is pushed once
+        if: github.event_name == 'push'
+        run: |
+          ref="$IMAGE:${{ steps.version.outputs.version }}"
+          if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+            echo "$ref already exists: a version tag always names the same image. Bump packages/cli/package.json's version and tag that" >&2
+            exit 1
+          fi
+          # Absent (or a package not created yet). Any other failure means it cannot be told: stop rather than overwrite.
+          if ! echo "$out" | grep -qiE "not found|manifest unknown|denied|unauthorized"; then
+            echo "cannot tell whether $ref exists: $out" >&2
+            exit 1
+          fi
+          echo "$ref is not pushed yet"
       # The final stage has no RUN step and the build stage runs on the runner's own platform, so arm64 needs no
       # emulation.
       - name: Build and push
@@ -72,14 +125,13 @@ jobs:
         with:
           context: .
           file: deploy/host/Dockerfile
+          build-args: ARENA_CLI_PACKAGE=${{ env.CLI_PACKAGE }}
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
-            ${{ env.IMAGE }}:sha-${{ steps.version.outputs.sha }}
-            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          tags: ${{ steps.version.outputs.tags }}
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
