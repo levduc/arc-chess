@@ -12,6 +12,7 @@ contracts/deployments/31337.json
 .arena-dev/
 .arena-testnet/
 packages/cli/dist/
+apps/server/dist/
 tests/system/.tmp-sigint-*/
 .superpowers/
 *.db

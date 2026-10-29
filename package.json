@@ -21,7 +21,8 @@
     "dev:claude-opponent": "tsx scripts/claude-opponent.ts",
     "testnet:up": "tsx scripts/testnet-up.ts",
     "testnet:down": "tsx scripts/testnet-up.ts down",
-    "build:cli": "tsx scripts/build-cli.ts"
+    "build:cli": "tsx scripts/build-cli.ts",
+    "build:server": "tsx scripts/build-server.ts"
   },
   "devDependencies": {
     "esbuild": "0.28.2",

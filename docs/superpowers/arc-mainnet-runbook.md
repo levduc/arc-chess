@@ -265,7 +265,9 @@ The hub emitted `OwnershipTransferred(DEPLOYER, MULTISIG)`. Record both transact
 
 ## 9. Commit, pin, record
 
-- **Commit `contracts/deployments/5042.json`**, only after §6 has reconciled it.
+- **Commit `contracts/deployments/5042.json`**, only after §6 has reconciled it. First add `"deployBlock": <the
+  block both deploy receipts landed in>` to it, as `5042002.json` has: `Deploy.s.sol` does not write it, and the
+  self-host image (`deploy/host`, `pnpm build:server`) serves Arc mainnet only from a pinned file that records it.
 - **Pin `KNOWN_DEPLOYMENTS[5042]`** in `packages/cli/src/config.ts`: the hub, the rules and the token. Add the
   matching check to `packages/cli/test/chains.test.ts`, which compares the 5042002 pin with
   `contracts/deployments/5042002.json` today.
