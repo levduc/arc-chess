@@ -65,7 +65,7 @@ jobs:
         run: |
           test "$(docker run --rm --entrypoint id arena-server:ci -u)" != 0
           set +e
-          out="$(docker run --rm --network none -e DOMAIN=arena.operator.dev -e NETWORK=arc-mainnet arena-server:ci print-config)"
+          out="$(docker run --rm --network none -e DOMAIN=arena.operator.dev -e NETWORK=arc-mainnet arena-server:ci print-config 2>&1)"
           code=$?
           set -e
           echo "$out"

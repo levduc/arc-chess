@@ -40,6 +40,10 @@ describe("release-cli workflow", () => {
     expect(text).toContain("--provenance");
   });
 
+  it("lets setup-node write no npm auth line (no registry-url): its placeholder token would shadow OIDC", () => {
+    expect(text).not.toContain("registry-url");
+  });
+
   it("publishes by npm trusted publishing (OIDC): no npm token anywhere in the workflow", () => {
     // 2026-10-29: arc-chess trusts this repo's release-cli.yml on npm, so the workflow holds no token.
     expect(text).not.toContain("NODE_AUTH_TOKEN");

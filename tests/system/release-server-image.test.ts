@@ -14,6 +14,10 @@ const WORKFLOW_PATH = join(REPO_ROOT, ".github/workflows/release-server-image.ym
 
 describe("release-server-image workflow", () => {
   const text = readFileSync(WORKFLOW_PATH, "utf8");
+
+  it("the smoke test reads the mainnet refusal from stderr too (the server logs it there)", () => {
+    expect(text).toContain("arena-server:ci print-config 2>&1)");
+  });
   const at = (needle: string) => {
     const i = text.indexOf(needle);
     expect(i, `missing: ${needle}`).toBeGreaterThan(-1);

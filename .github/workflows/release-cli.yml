@@ -16,7 +16,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+          # No registry input on setup-node: with one, it writes an .npmrc auth line and fills its token variable with the
+          # placeholder XXXXX-XXXXX-XXXXX-XXXXX -- npm then sends that bogus token instead of using trusted
+          # publishing's OIDC identity, and the registry answers 404 (cli-v0.1.1's first run). npm's default registry
+          # is registry.npmjs.org anyway.
       - name: The tag names the CLI version being published
         run: |
           tag="${GITHUB_REF_NAME#cli-v}"
