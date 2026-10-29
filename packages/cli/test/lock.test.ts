@@ -75,8 +75,22 @@ describe("livePidHoldingLock", () => {
 
   it("returns the pid when the lock names a genuinely live process", () => {
     const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    // Another live process: this test runner's parent.
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.ppid, nonce: "ab".repeat(16) }), { mode: 0o600 });
+    expect(livePidHoldingLock(home)).toBe(process.ppid);
+    // A lock this process holds itself.
+    const home2 = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    const l = acquireHomeLock(home2);
+    expect(livePidHoldingLock(home2)).toBe(process.pid);
+    l.release();
+  });
+
+  it("N-1: returns null for a lock naming this process's own pid that this process did not write", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid, nonce: "cd".repeat(16) }), { mode: 0o600 });
+    expect(livePidHoldingLock(home)).toBeNull();
     writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
-    expect(livePidHoldingLock(home)).toBe(process.pid);
+    expect(livePidHoldingLock(home)).toBeNull();
   });
 
   it("returns null for a stale lock (dead pid) -- never a take-over, just not a block", () => {
@@ -91,6 +105,45 @@ describe("livePidHoldingLock", () => {
     const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
     writeFileSync(join(home, "daemon.lock"), "not valid json {{{", { mode: 0o600 });
     expect(livePidHoldingLock(home)).toBeNull();
+  });
+});
+
+describe("N-1 (self-host re-review): a lock naming our own pid that we did not write", () => {
+  it("is stale and taken over: a container restarted after an unclean kill reuses its pids", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    // What a killed daemon with this same pid leaves behind, with its own nonce.
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid, nonce: "ef".repeat(16) }), { mode: 0o600 });
+    const l = acquireHomeLock(home);
+    expect(l.nonce).not.toBe("ef".repeat(16));
+    expect(readLockFile(home)).toEqual({ pid: process.pid, nonce: l.nonce });
+    // Ours now: a second acquisition in this process is still refused.
+    expect(() => acquireHomeLock(home)).toThrow(/another arena daemon \(pid \d+\)/);
+    l.release();
+    expect(readLockFile(home)).toBeNull();
+    expect(tempLockFiles(home)).toEqual([]);
+  });
+
+  it("is stale too when it has no nonce (written by an older CLI with our pid)", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+    acquireHomeLock(home).release();
+    expect(tempLockFiles(home)).toEqual([]);
+  });
+
+  it("another live pid stays held, whatever its nonce", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.ppid, nonce: "01".repeat(16) }), { mode: 0o600 });
+    expect(() => acquireHomeLock(home)).toThrow(new RegExp(`another arena daemon \\(pid ${process.ppid}\\)`));
+    expect(JSON.parse(readFileSync(join(home, "daemon.lock"), "utf8"))).toEqual({ pid: process.ppid, nonce: "01".repeat(16) });
+  });
+
+  it("release never removes a lock that names our pid but another acquisition's nonce", () => {
+    const home = mkdtempSync(join(tmpdir(), "arena-lock-"));
+    const l = acquireHomeLock(home);
+    const other = { pid: process.pid, nonce: "23".repeat(16) };
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify(other), { mode: 0o600 });
+    l.release();
+    expect(JSON.parse(readFileSync(join(home, "daemon.lock"), "utf8"))).toEqual(other);
   });
 });
 

@@ -102,7 +102,9 @@ describe("arena init --server", () => {
 
   it("Final review I4: refuses to init while a live daemon holds this home's lock, naming the pid and how to stop it", async () => {
     const home = mkdtempSync(join(tmpdir(), "arena-init-"));
-    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+    // A live process other than this one (self-host re-review N-1: a lock naming this process's own pid that it did
+    // not write is stale): the test runner's parent.
+    writeFileSync(join(home, "daemon.lock"), JSON.stringify({ pid: process.ppid, nonce: "ab".repeat(16) }), { mode: 0o600 });
     const { fetchStub, calls } = stubFetch();
     const err: string[] = [];
     const code = await runCli(["init", "--server", "http://host.test"], {
@@ -112,7 +114,7 @@ describe("arena init --server", () => {
       err: (s) => err.push(s),
     });
     expect(code).toBe(1);
-    expect(err.join("\n")).toContain(`pid ${process.pid}`);
+    expect(err.join("\n")).toContain(`pid ${process.ppid}`);
     // H4 fix round 1 (I3, M4): how to stop it is "arena daemon stop" (a bare kill is denied under a narrow tool
     // allowlist), and a home that is already set up needs no init at all.
     expect(err.join("\n")).toContain('stop it first with "arena daemon stop"');
