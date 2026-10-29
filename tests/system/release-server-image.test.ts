@@ -48,12 +48,16 @@ describe("release-server-image workflow", () => {
     expect(at("${GITHUB_REF_NAME#cli-v}")).toBeLessThan(at("docker/setup-buildx-action"));
   });
 
-  it("I-3: a tag run tags <version>, sha-<commit> and latest; a manual run tags sha-<commit> only; amd64 and arm64", () => {
+  it("I-3, N-4: a tag run tags <version>, sha-<commit>, and latest only for the highest cli-v* version; a manual run tags sha-<commit> only", () => {
     const block = text.slice(at('echo "tags<<EOF"'), at('echo "EOF"'));
     expect(block).toBe(
       'echo "tags<<EOF"\n            echo "$IMAGE:sha-$sha"\n            if [ "$GITHUB_EVENT_NAME" = "push" ]; then\n' +
-        '              echo "$IMAGE:$version"\n              echo "$IMAGE:latest"\n            fi\n            ',
+        '              echo "$IMAGE:$version"\n' +
+        `              highest="$(git tag -l 'cli-v*' | sed 's/^cli-v//' | grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+$' | sort -V | tail -n 1)"\n` +
+        '              if [ "$version" = "$highest" ]; then echo "$IMAGE:latest"; fi\n            fi\n            ',
     );
+    // The tags the highest-version check reads.
+    expect(text).toMatch(/persist-credentials: false\n(?: {10}#.*\n)* {10}fetch-depth: 0\n/);
     expect(text).toContain("tags: ${{ steps.version.outputs.tags }}");
     expect(text).not.toMatch(/\$\{\{ env\.IMAGE \}\}:latest/);
     expect(text).toContain("platforms: linux/amd64,linux/arm64");
@@ -61,12 +65,26 @@ describe("release-server-image workflow", () => {
 
   it("I-3: a tag run refuses to overwrite an existing :<version>, and stops when it cannot tell", () => {
     const step = text.slice(at("- name: A version tag is pushed once"), at("- name: Build and push"));
+    expect(step).toContain("id: once");
     expect(step).toContain("if: github.event_name == 'push'");
-    expect(step).toContain('if out="$(docker buildx imagetools inspect "$ref" 2>&1)"; then');
+    expect(step).toContain(`if out="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}' 2>&1)"; then`);
     expect(step).toMatch(/already exists: a version tag always names the same image[\s\S]*?exit 1/);
     expect(step).toContain('grep -qiE "not found|manifest unknown|denied|unauthorized"');
     expect(step).toMatch(/cannot tell whether \$ref exists[\s\S]*?exit 1/);
     expect(at("- name: A version tag is pushed once")).toBeGreaterThan(at("docker/login-action@"));
+  });
+
+  it("N-4: a re-run of a tag run whose push went through attests the pushed digest instead of refusing", () => {
+    const step = text.slice(at("- name: A version tag is pushed once"), at("- name: Build and push"));
+    expect(step).toContain(`mine="$(docker buildx imagetools inspect "$IMAGE:sha-\${{ steps.version.outputs.sha }}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"`);
+    expect(step).toContain('if [ -n "$mine" ] && [ "$mine" = "$out" ]; then');
+    expect(step).toContain('echo "pushed=true" >> "$GITHUB_OUTPUT"');
+    expect(step).toContain('echo "digest=$out" >> "$GITHUB_OUTPUT"');
+    // The re-run detection comes before the refusal, and only a matching sha tag reaches it.
+    expect(step.indexOf("pushed=true")).toBeLessThan(step.indexOf("already exists"));
+    const push = text.slice(at("- name: Build and push"), at("actions/attest-build-provenance@"));
+    expect(push).toContain("if: steps.once.outputs.pushed != 'true'");
+    expect(text).toContain("subject-digest: ${{ steps.push.outputs.digest || steps.once.outputs.digest }}");
   });
 
   it("I-4: nothing is pushed until arc-chess@<version> is on npm (waiting up to 20 minutes for release-cli.yml)", () => {
@@ -115,7 +133,7 @@ describe("release-server-image workflow", () => {
     expect(text).toContain("sbom: true");
     const attest = at("actions/attest-build-provenance@");
     expect(attest).toBeGreaterThan(at("push: true"));
-    expect(text).toContain("subject-digest: ${{ steps.push.outputs.digest }}");
+    expect(text).toContain("subject-digest: ${{ steps.push.outputs.digest || steps.once.outputs.digest }}");
     expect(text).toContain("push-to-registry: true");
   });
 
