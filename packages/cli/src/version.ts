@@ -80,7 +80,10 @@ export function sameHostTarballUrl(url: unknown, self: string | undefined): stri
   if (self === undefined || !isTarballUrl(url)) return undefined;
   try {
     const there = new URL(url);
-    return there.origin === new URL(self).origin && SERVED_TARBALL_PATH.test(there.pathname) ? url : undefined;
+    // Re-review N-2: the parsed URL, not the raw string: `0x64.70.62.92`, `:08700` or `/cli/../cli/` would otherwise be
+    // repeated as written (npx keys its cache on that string). Its canonical form keeps to `TARBALL_URL`'s characters.
+    const same = there.origin === new URL(self).origin && SERVED_TARBALL_PATH.test(there.pathname) && isTarballUrl(there.href);
+    return same ? there.href : undefined;
   } catch {
     // `TARBALL_URL` admits a few hosts the URL parser refuses (`999.1.1.1`, `100.70.62.092`): no echo, never a crash.
     return undefined;

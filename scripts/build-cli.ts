@@ -143,7 +143,9 @@ async function main(): Promise<void> {
     define: {
       __ARENA_CLI_VERSION__: JSON.stringify(version),
       __ARENA_CLI_PACKAGE__: JSON.stringify(name),
-      ...(selfUrl !== undefined ? { __ARENA_CLI_TARBALL_URL__: JSON.stringify(selfUrl) } : {}),
+      // Re-review N-3: `undefined` in every other build, so the npm release carries no global of that name, and its
+      // tarball branch is dead code.
+      __ARENA_CLI_TARBALL_URL__: selfUrl !== undefined ? JSON.stringify(selfUrl) : "undefined",
     },
     // CJS dependencies bundled into ESM call require() for Node built-ins (and viem's WebSocket shim, `isows`,
     // statically imports `ws`, whose optional native accelerators `bufferutil`/`utf-8-validate` are requested

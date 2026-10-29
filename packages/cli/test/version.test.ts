@@ -147,6 +147,25 @@ describe("version", () => {
       expect(sameHostTarballUrl(URL, undefined)).toBeUndefined();
       expect(sameHostTarballUrl("http://evil.example/cli/x.tgz", URL)).toBeUndefined();
     });
+
+    it("re-review N-2: what is repeated is the parsed URL, never another spelling of it", () => {
+      const canonical = "http://100.70.62.92:8700/cli/arena-cli-0.2.0-ab.tgz";
+      // Spellings the URL parser maps onto the build's own origin and a /cli/ path.
+      for (const spelled of [
+        "http://0x64.70.62.92:8700/cli/arena-cli-0.2.0-ab.tgz",
+        "http://1682325084:8700/cli/arena-cli-0.2.0-ab.tgz",
+        "http://100.70.62.92.:8700/cli/arena-cli-0.2.0-ab.tgz",
+        "http://100.70.62.92:08700/cli/arena-cli-0.2.0-ab.tgz",
+        "http://100.70.62.92:8700/cli/../cli/arena-cli-0.2.0-ab.tgz",
+        "HTTP://100.70.62.92:8700/cli/arena-cli-0.2.0-ab.tgz",
+        canonical,
+      ]) {
+        if (!isTarballUrl(spelled)) continue; // the regex already refuses some (an upper-case scheme)
+        expect(sameHostTarballUrl(spelled, URL), spelled).toBe(canonical);
+        const v = hostCliVerdict({ package: "@arena/cli", version: "0.2.0" }, tarballBuild(spelled));
+        expect(v, spelled).toEqual({ refusal: `${NEED}: install and run it with: npx -y --prefer-offline --package=${canonical} arena init --server http://100.70.62.92:8700` });
+      }
+    });
   });
 
   describe("Final fix wave (C1): hostCliVerdict, the init version gate", () => {

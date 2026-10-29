@@ -220,8 +220,11 @@ describe("build-cli", () => {
     const env = { ...baseEnv(), ARENA_CLI_PACKAGE: "arc-chess", ARENA_CLI_LICENSE: "MIT", ARENA_CLI_REPOSITORY: "https://github.com/example/arc-chess" };
     const built = await run(TSX_BIN, [BUILD_SCRIPT, "--out", out, "--release"], { cwd: REPO_ROOT, env });
     expect(built.status, built.stderr).toBe(0);
-    // No baked URL: the define was never substituted, so selfTarballUrl() is undefined at run time.
-    expect(readFileSync(join(out, "arena.mjs"), "utf8")).toContain(`typeof __ARENA_CLI_TARBALL_URL__ === "string"`);
+    // Re-review N-3: no baked URL, and no global of that name either: the define is `undefined`, so the tarball branch
+    // is dead code in the npm release.
+    const bundle = readFileSync(join(out, "arena.mjs"), "utf8");
+    expect(bundle).not.toContain("__ARENA_CLI_TARBALL_URL__");
+    expect(bundle).toMatch(/function selfTarballUrl\(\) \{\n  return false \? void 0 : void 0;\n\}/);
     const host = await startStubHost({ package: "arc-chess", version: "9.9.9" }, { cliTarball: { url: "http://evil.example/x.tgz", sha256: "a".repeat(64) } });
     try {
       const home = freshDir("arena-cli-release-c1-home-");

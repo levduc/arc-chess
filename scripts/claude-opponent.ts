@@ -25,6 +25,7 @@
  */
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { networkInterfaces } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { isTarballUrl, tarballCommand } from "../packages/cli/src/version.js";
 import { buildAllowedTools, buildClaudeEnv, extractCost } from "../tests/system/claude-sandbox.js";
@@ -177,8 +178,10 @@ export function homePrefixRules(home: string, cli: string): string[] {
  *  every command of the agent's own recipe is denied. None for a server without a tarball, or one whose URL is not
  *  plain (it would go into a rule as is). Fix round 1 (m-3): the URL picks the code the agent's sandbox may run, so it
  *  must be a `/cli/<name>.tgz` on `--server`'s own origin -- or `--server` is this machine's own stack (loopback),
- *  which publishes its `--host` address instead. */
-export function servedCliRules(home: string, templates: unknown, server: string): string[] {
+ *  which publishes its `--host` address instead: then the URL's host must be loopback or one of this machine's own
+ *  addresses (`ownAddresses`, re-review N-1), never another machine. Only a URL in its canonical form (`href`) counts,
+ *  so the rule is exactly the command skill.md shows. */
+export function servedCliRules(home: string, templates: unknown, server: string, ownAddresses: string[] = machineAddresses()): string[] {
   const chess = Array.isArray(templates) ? (templates as Array<Record<string, unknown>>).find((t) => t?.id === "chess") : undefined;
   const url = (chess?.cliTarball as { url?: unknown } | undefined)?.url;
   if (!isTarballUrl(url)) return [];
@@ -190,10 +193,21 @@ export function servedCliRules(home: string, templates: unknown, server: string)
   } catch {
     return []; // a host the URL parser refuses (`999.1.1.1`): no rule
   }
-  const local = /^127\.\d+\.\d+\.\d+$/.test(here.hostname) || here.hostname === "localhost";
-  if (!/^\/cli\/[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/.test(there.pathname) || (!local && there.origin !== here.origin)) return [];
+  const loopback = (h: string) => /^127\.\d+\.\d+\.\d+$/.test(h) || h === "localhost";
+  if (there.href !== url || !/^\/cli\/[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/.test(there.pathname)) return [];
+  const sameOrigin = there.origin === here.origin;
+  const thisMachine = loopback(here.hostname) && (loopback(there.hostname) || ownAddresses.includes(there.hostname));
+  if (!sameOrigin && !thisMachine) return [];
   const cmd = tarballCommand(url);
   return [`Bash(${cmd} *)`, ...homePrefixRules(home, cmd)];
+}
+
+/** This machine's own IPv4 addresses (every interface), for `servedCliRules`. */
+function machineAddresses(): string[] {
+  return Object.values(networkInterfaces())
+    .flatMap((list) => list ?? [])
+    .filter((i) => i.family === "IPv4")
+    .map((i) => i.address);
 }
 
 async function main(): Promise<void> {
