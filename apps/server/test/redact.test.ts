@@ -27,11 +27,16 @@ describe("redactUrls", () => {
     expect(redactUrls("URL: https://127.0.0.1:9/?k=SECRET2", ["https://127.0.0.1:9?k=SECRET2"])).toBe("URL: https://127.0.0.1:9");
     // Credentials, which viem strips before it quotes the URL.
     expect(redactUrls("URL: https://rpc.example.net/x/SECRET3", ["https://user:pw@rpc.example.net/x/SECRET3"])).toBe("URL: https://rpc.example.net");
+    // Re-review N-2: a non-canonical IPv6 literal, which `new URL` prints in its short form.
+    expect(redactUrls("URL: http://[::1]:8545/v2/SECRET5", ["http://[0:0:0:0:0:0:0:1]:8545/v2/SECRET5"])).toBe("URL: http://[::1]:8545");
+    expect(redactUrls("URL: http://[FE80::1]/SECRET6", ["http://[fe80::1]/SECRET6"])).toBe("URL: http://[fe80::1]");
+    // The same host under another scheme (a WebSocket RPC URL) is redacted too, keeping its own scheme.
+    expect(redactUrls("ws wss://rpc.example.net/v2/K", ["https://rpc.example.net/v2/K"])).toBe("ws wss://rpc.example.net");
     // A default port, which `new URL` drops.
     expect(redactUrls("URL: https://rpc.example.net/SECRET4", ["https://rpc.example.net:443/SECRET4"])).toBe("URL: https://rpc.example.net");
   });
 
-  it("redacts any URL on a configured RPC's origin, keeps sentence punctuation, and leaves other URLs alone", () => {
+  it("redacts any URL on a configured RPC's host, keeps sentence punctuation, and leaves other URLs alone", () => {
     const out = redactUrls("tried https://rpc.example.net/v3/OTHERKEY. Then https://arena.operator.dev/skill.md, done", ["https://rpc.example.net/v2/KEY"]);
     expect(out).toBe("tried https://rpc.example.net. Then https://arena.operator.dev/skill.md, done");
     expect(redactUrls("nothing here", [])).toBe("nothing here");
