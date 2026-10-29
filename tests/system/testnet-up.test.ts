@@ -645,8 +645,9 @@ describe("remote agents: the CLI tarball the stack serves", () => {
       const port = await freeTcpPort();
       const publicUrl = `http://127.0.0.1:${port}`;
       const served = await buildCliTarball(join(root, "stack"), publicUrl);
-      expect(served.path).toMatch(/\/cli\/arena-cli-0\.1\.0-[0-9a-f]{16}\.tgz$/);
-      expect(served).toMatchObject({ package: "@arena/cli", version: "0.1.0" });
+      const cliVersion: string = JSON.parse(readFileSync(join(import.meta.dirname, "../../packages/cli/package.json"), "utf8")).version;
+      expect(served.path).toMatch(new RegExp(`/cli/arena-cli-${cliVersion.replace(/\./g, "\\.")}-[0-9a-f]{16}\\.tgz$`));
+      expect(served).toMatchObject({ package: "@arena/cli", version: cliVersion });
       expect(readdirSync(join(root, "stack", "cli"))).toEqual([served.path.split("/").at(-1)]);
       // The same code and URL give the same tarball: a restart serves the same URL, so agents' installs stay current.
       expect(await buildCliTarball(join(root, "stack"), publicUrl)).toEqual(served);
@@ -706,7 +707,7 @@ describe("remote agents: the CLI tarball the stack serves", () => {
         });
       const version = await agent(["--version"]);
       expect(version.status, version.stderr).toBe(0);
-      expect(version.stdout.trim()).toBe("0.1.0");
+      expect(version.stdout.trim()).toBe(cliVersion);
       // Its own messages name the server's command, never the placeholder npm package.
       const usage = await agent([]);
       expect(usage.stderr).toContain(`usage: ${cfg.cliCommand} <command>`);

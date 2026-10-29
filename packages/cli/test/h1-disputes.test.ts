@@ -173,10 +173,13 @@ describe("H1 (audit-contracts I1, oversized events): the dispute scan never wedg
     const m = await matched();
     const { alice, id } = m;
     const hub = alice.daemon.hub;
-    const before = alice.daemon.handle(id).record.scannedBlock;
     hub.disputeEvents = async () => {
       throw new Error("fetch failed");
     };
+    // A scan pass already in flight may still advance the cursor with what it read before the stub went in: let it
+    // finish, then take the starting point (a race under full-suite load otherwise: 1145n vs 1144n).
+    await alice.daemon.idle();
+    const before = alice.daemon.handle(id).record.scannedBlock;
     for (let i = 0; i < UNREADABLE_BLOCK_PASSES + 2; i++) {
       await alice.daemon.idle();
       await alice.daemon.tick();

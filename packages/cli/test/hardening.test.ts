@@ -334,8 +334,12 @@ describe("final review C1: the session key's dispute gas is refilled while the c
 
       // The wallet's balance rising ends the back-off and allows an immediate retry, even though it still fails.
       await setEthBalance(alice.address, ANVIL_DEFAULT_BALANCE);
-      await d.idle();
-      await d.tick();
+      // Immediate, not after the 30 s back-off: a few fast ticks (a pass already in flight can take the first one).
+      const retryBy = Date.now() + 10_000;
+      for (let i = 0; i < 5 && attempts < 2 && Date.now() < retryBy; i++) {
+        await d.idle();
+        await d.tick();
+      }
       expect(attempts).toBe(2);
       expect(logs.filter((l) => /refill back-off ended/.test(l))).toHaveLength(1);
       // That immediate retry failed too (still stubbed), so a fresh back-off episode is already running -- rising

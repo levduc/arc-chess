@@ -18,7 +18,7 @@ describe("version", () => {
   it("cliVersion() matches packages/cli/package.json in the dev entry", async () => {
     const pkg = JSON.parse(await (await import("node:fs/promises")).readFile(new URL("../package.json", import.meta.url), "utf8"));
     expect(cliVersion()).toBe(pkg.version);
-    expect(pkg.version).toBe("0.1.0");
+    expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
   });
   it("compareSemver orders x.y.z numerically and rejects anything else", () => {
     expect(compareSemver("0.1.0", "0.1.0")).toBe(0);

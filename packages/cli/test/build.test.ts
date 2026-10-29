@@ -9,6 +9,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RPC, deployArena } from "../../sdk/test/helpers/chain.js";
 import { initHome, livePidHoldingLock } from "../src/index.js";
 
+/** The version every build in this file carries: packages/cli/package.json's, so a release bump needs no test edits. */
+const CLI_VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+
 // packages/cli/test -> repo root
 const REPO_ROOT = join(import.meta.dirname, "../../..");
 const TSX_BIN = join(REPO_ROOT, "node_modules/.bin/tsx");
@@ -107,7 +110,7 @@ describe("build-cli", () => {
     const pkg = JSON.parse(readFileSync(join(outDir, "package.json"), "utf8"));
     expect(pkg).toEqual({
       name: "@arena/cli",
-      version: "0.1.0",
+      version: CLI_VERSION,
       type: "module",
       bin: { arena: "arena.mjs" },
       engines: { node: ">=24" },
@@ -146,7 +149,7 @@ describe("build-cli", () => {
       env: { PATH: dirname(process.execPath) },
     });
     expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toBe("0.1.0");
+    expect(result.stdout.trim()).toBe(CLI_VERSION);
   });
 
   it("exits non-zero with the usage text when run with no arguments", async () => {
@@ -159,7 +162,7 @@ describe("build-cli", () => {
     // Fix round 1 (M1): USAGE's header now names this build's own selfCommand() -- in this default build
     // (ARENA_CLI_PACKAGE unset) that's "npx -y @arena/cli@0.1.0", never the bare word "arena" an agent running
     // under a pinned npx install could not actually type back.
-    expect(result.stderr).toContain("usage: npx -y @arena/cli@0.1.0");
+    expect(result.stderr).toContain(`usage: npx -y @arena/cli@${CLI_VERSION}`);
   });
 
   it("final fix wave (M5): the bundle's own messages name the pinned npx command, never a bare \"arena\"", async () => {
@@ -169,7 +172,7 @@ describe("build-cli", () => {
       env: { PATH: dirname(process.execPath), HOME: home },
     });
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('run "npx -y @arena/cli@0.1.0 init" first');
+    expect(result.stderr).toContain(`run "npx -y @arena/cli@${CLI_VERSION} init" first`);
     // The startup line's board hint and the other agent-facing hints use the same selfCommand() form.
     expect(bundleText).toContain("boardHint: `run: ${CLI_COMMAND} board`");
   });
@@ -234,7 +237,7 @@ describe("build-cli", () => {
       });
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(
-        `error: this host requires arena CLI version 9.9.9 or newer (you are running 0.1.0): install and run it with: npx -y arc-chess@9.9.9 init --server ${host.url}`,
+        `error: this host requires arena CLI version 9.9.9 or newer (you are running ${CLI_VERSION}): install and run it with: npx -y arc-chess@9.9.9 init --server ${host.url}`,
       );
       expect(result.stderr).not.toContain("evil.example");
       expect(result.stderr).not.toContain("--package=");
@@ -346,7 +349,7 @@ describe("build-cli", () => {
 
     it("init accepts a host that serves this tarball at its own version; one pinning a newer version is refused with the host's tarball", async () => {
       const tarball = { cliTarball: { url: SELF, sha256: "a".repeat(64) } };
-      const ok = await startStubHost({ package: "@arena/cli", version: "0.1.0" }, tarball);
+      const ok = await startStubHost({ package: "@arena/cli", version: CLI_VERSION }, tarball);
       try {
         const home = freshDir("arena-cli-gate-home-");
         const result = await run(process.execPath, [join(selfOut, "arena.mjs"), "init", "--server", ok.url, "--no-faucet", "--port", "0"], {
@@ -368,7 +371,7 @@ describe("build-cli", () => {
         });
         expect(result.status).toBe(1);
         expect(result.stderr).toContain(
-          `this host requires arena CLI version 0.2.0 or newer (you are running 0.1.0): install and run it with: npx -y --prefer-offline --package=${SELF.replace("0.1.0-", "0.2.0-")} arena init --server ${newer.url}`,
+          `this host requires arena CLI version 0.2.0 or newer (you are running ${CLI_VERSION}): install and run it with: npx -y --prefer-offline --package=${SELF.replace("0.1.0-", "0.2.0-")} arena init --server ${newer.url}`,
         );
         expect(existsSync(join(home, ".arena", "config.json"))).toBe(false);
       } finally {
@@ -390,7 +393,7 @@ describe("build-cli", () => {
             env: { PATH: dirname(process.execPath), HOME: home },
           });
           expect(result.status).toBe(1);
-          expect(result.stderr).toContain(`or newer (you are running 0.1.0): install it as step 0 of this host's skill.md says`);
+          expect(result.stderr).toContain(`or newer (you are running ${CLI_VERSION}): install it as step 0 of this host's skill.md says`);
           for (const f of ["evil.example", "100.70.62.93", "npx -y @arena/cli@", "--package="]) expect(result.stderr).not.toContain(f);
           expect(existsSync(join(home, ".arena", "config.json"))).toBe(false);
         } finally {
