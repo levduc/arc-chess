@@ -1398,6 +1398,54 @@ hub.
     `0x3D8434455E4258a877a327De3B1201f94A558d38`, ChessRules `0xD3C7eA363A4d734d85abcB243B8D3135746C14Ba`, pinned in
     `KNOWN_DEPLOYMENTS[5042002]`); `init` refuses the superseded hub with the ERC-1271 fallback (`0x9b8B…bA41`), as it
     refuses the pre-hardening one.
+71. **Reads under a rate-limited RPC, and the board (owner report 2026-10-29: "in the take over … rpc limit … run arena
+    board again and again to move").** `GET /status` and `GET /channels` refreshed the chain first and failed with
+    item 67's 503 when that read failed, so a rate-limited RPC left the board unable to show the human's own move, the
+    opponent's reply, or the game at all, although these are the daemon's own session state. A reload to recover lost
+    the in-memory token (final fix wave M1), hence a new `arena board` link each time.
+    - **Reads answer the last known view.** A chain refresh that fails with anything but a `DaemonError` (as
+      `statusAfterAction` already treated it) answers `{ ...status, chainStale: true, chainStaleReason }`: the position,
+      turn, legal moves, balances and signatures are current; `phase`, `challenge`, `cooldown` and the attention and
+      actions they drive are from the last read. `channels()` does this per channel, so one failure no longer fails the
+      list. Once a read is rate-limited, or its one block read fails, the channels not yet refreshed are served stale for
+      that reason without further reads. `statusAfterAction` is now `status` plus `unconfirmed`. A failed refresh writes
+      no `lastError` and logs nothing; `l.chain` keeps its last view.
+    - **Nothing that acts trusts it.** The watchtower's passes, `respondIfChallenged`, `settleCheck` and `wait()` read the
+      chain or `statusOf` themselves and never call `status()`/`channels()`. The bot does not challenge on a
+      `chainStale` status; it still moves and co-signs. skill.md says the same to agents: play on, never `challenge` or
+      `reclaim` on a stale status. The CLI prints a read's note for `status` and `channels`.
+    - **The board.** A `chainStale` answer, or a background read answered with the rate-limit 503, raises one calm
+      banner ("The chain RPC is busy …", `role="status"`) instead of a "Could not refresh" toast per poll. Each route's
+      own fresh answer clears its part. Moves stay enabled. While a session is live, `beforeunload` asks before a reload
+      or a closed tab, but not for the reload a newly pasted link triggers. The token stays in memory only.
+    - **Fix round 1 (`board-review.md`).**
+      - **A stale view suggests no dispute step (I1).** `buildStatus` with `stale` drops every `arena challenge` and
+        `arena reclaim` suggestion, ends with `arena status   (the chain view is stale: re-check before any challenge)`,
+        and sets `humanAttention` to null. The board's Challenge button and its hint follow from the suggestions.
+        `attention` stays, and `wait()` never builds from a stale view. Its countdowns (`challenge.secondsLeft`,
+        `cooldown`) run on by the view's age; silence never does (m1). `chainReadAt` says when the view was read.
+      - **Read-route cache and back-off (I2).** The board polled `GET /status` about once a second, and each poll
+        re-read the view the watchtower had read one pass earlier: +44% on one daemon's RPC rate, measured.
+        - `status()` and `channels()` serve a view under `CHAIN_VIEW_MAX_AGE_MS` (5 s) old without a read.
+          `ChannelHandle.chainReadAt` is stamped by every full `refreshChain`, whoever calls it.
+        - After a read-route read is rate-limited, they answer stale with no read for `READ_BACKOFF_MS` (10 s).
+          The back-off is daemon-wide, and any successful `refreshChain` ends it.
+        - `statusAfterAction` always skips the cache. It honours the back-off except after `/challenge`,
+          `/reclaim` and `/close` (`chainWrite`).
+        - In `channels()`, each channel is checked against the cache, then the back-off, then read. The shared block
+          read is made only when a channel needs one. Any read failure stops the reads for the rest of the list (m2).
+        - A transaction this daemon sends for a channel drops its cached view (`chainWritten`). That covers
+          `challenge()`, `reclaim()`, a respond and the close submission. Otherwise a bot that just challenged would be
+          told "Open, silent" for up to 5 s. `chainWritten` counts writes (`chainWrites`); it does not clear
+          `chainReadAt`. A view is fresh only if no write has happened since it was stamped, and `refreshChain` does
+          not stamp a read that a write overtook in flight (re-review r1). It still writes `l.chain`.
+      - **Re-review.** On a stale view, the agent seat's silence chip says "re-check before any challenge" (r2). The
+        README now says which action answers read the chain during the back-off (r3).
+        - A view is not fresh once the session has progressed since it was read (`progressKeyOf` ≠ `progressKey`).
+          Progress is observed only at a read (`lastProgressAt`), and silence is judged on it.
+        - The watchtower's passes, `respondIfChallenged`, `settleCheck`, auto-return, withdraw and `wait()` never
+          read the cache nor honour the back-off.
+      - **A non-RPC refresh failure is logged once (m3).** It is still answered stale.
 
 ## 13. Guarded mainnet launch (decided 2026-09-26)
 

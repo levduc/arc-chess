@@ -344,7 +344,12 @@ export function channelBanners(status) {
   if (status.challenge?.mustMove) out.push({ kind: "must-move", text: "You must move before the deadline" });
   // humanAttention carries it while a human holds the seat (attention stays agent-only; see status.ts).
   if (status.attention === "opponent-silent" || status.humanAttention === "opponent-silent") {
-    out.push({ kind: "opponent-silent", text: "Opponent silent: consider a challenge" });
+    // Re-review r2: on a stale view (`chainStale`) silence was judged on the last chain read; the daemon suggests a
+    // re-check there, not a challenge, and so does the chip.
+    out.push({
+      kind: "opponent-silent",
+      text: status.chainStale ? "Opponent may be silent: chain view stale, re-check before any challenge" : "Opponent silent: consider a challenge",
+    });
   }
   return out;
 }
@@ -364,6 +369,26 @@ export function autoReturnText(status, deadline, formatTime = (ms) => new Date(m
   if (!status || status.controller !== "human" || !ch?.mustMove || ch.autoReturnAt == null || !deadline) return null;
   const returnsAtMs = deadline.endsAt - (Number(ch.deadline) - Number(ch.autoReturnAt)) * 1000;
   return `Move before ${formatTime(returnsAtMs)} or the seat returns to your agent`;
+}
+
+/**
+ * Board rate-limit fix: the calm banner shown while the daemon answers from its last chain read (a rate-limited RPC;
+ * api.js `createChainStaleGate`). The game -- position, turn, legal moves, channel balances -- is the daemon's own
+ * session state and current; only what it reads from the chain (the phase, a challenge's deadline, cooldowns) can lag.
+ * A reload loses the session (the token is kept in memory only, final fix wave M1), so it says not to.
+ */
+export const CHAIN_STALE_NOTICE =
+  "The chain RPC is busy — showing your game as this daemon knows it; chain details (phase, deadlines, cooldowns) " +
+  "may lag. Retrying automatically. Don't reload this page: a reload needs a new `arena board` link.";
+
+/**
+ * Board rate-limit fix: whether leaving the page asks first (`beforeunload`) -- only while it holds a live session
+ * (signed in and not locked out by a 401), and never for the reload a newly pasted `#code=` link triggers.
+ * @param {{ session: boolean, stopped: boolean, reloadingForNewLink: boolean }} page
+ * @returns {boolean}
+ */
+export function confirmUnload({ session, stopped, reloadingForNewLink }) {
+  return session && !stopped && !reloadingForNewLink;
 }
 
 /** The channel to show first: a forced move, then our turn (human-controlled first), then any live channel.

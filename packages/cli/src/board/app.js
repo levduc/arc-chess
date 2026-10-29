@@ -11,9 +11,11 @@ import {
   baseUnitsToUsdc,
   boardView,
   canMove,
+  CHAIN_STALE_NOTICE,
   channelBanners,
   channelChip,
   clickSquare,
+  confirmUnload,
   dialogClickAllowed,
   escapeIntent,
   formatCountdown,
@@ -42,6 +44,7 @@ import {
   ApiError,
   backoffDelay,
   createActionGate,
+  createChainStaleGate,
   createClient,
   createCoalescer,
   createErrorGate,
@@ -150,8 +153,20 @@ function lockOut() {
 }
 
 // A new link pasted into this same tab only changes the fragment (no navigation): reload to pick it up.
+let reloadingForNewLink = false;
 window.addEventListener("hashchange", () => {
-  if (/(^#|&)(code|token)=/.test(location.hash)) location.reload();
+  if (/(^#|&)(code|token)=/.test(location.hash)) {
+    reloadingForNewLink = true; // asked for: the beforeunload prompt below stays out of its way
+    location.reload();
+  }
+});
+
+// Board rate-limit fix: the token lives in this page's memory only (final fix wave M1), so a reload or a closed tab
+// ends the session and needs a new `arena board` link. While a session is live, the browser asks first.
+window.addEventListener("beforeunload", (e) => {
+  if (!confirmUnload({ session: state.client !== null, stopped: state.stopped, reloadingForNewLink })) return;
+  e.preventDefault(); // what asks, in current browsers
+  e.returnValue = ""; // the legacy idiom some older ones still look for
 });
 
 // ------------------------------------------------------------------ toasts and confirmation
@@ -233,6 +248,8 @@ function wireConfirm() {
 // ------------------------------------------------------------------ connection state
 
 const backgroundErrors = createErrorGate();
+/** Board rate-limit fix: whether the "chain RPC is busy" banner is up, per background read (see createChainStaleGate). */
+const chainStale = createChainStaleGate();
 
 function setConn(kind) {
   const labels = { connecting: "Connecting", live: "Live", polling: "Reconnecting, polling every 5 s", offline: "Daemon unreachable" };
@@ -247,11 +264,16 @@ function markReachable(route) {
   if ($("conn").classList.contains("conn-offline")) setConn(state.sseOpen ? "live" : "polling");
 }
 
-/** The error handler for background refreshes of `route`: one toast per new message per route, not one per poll. */
+/** The error handler for background refreshes of `route`: one toast per new message per route, not one per poll.
+ *  Board rate-limit fix: the daemon answers GET /status and GET /channels from its last chain read (`chainStale`,
+ *  handled by applyStatus and loadChannels) rather than failing on a rate limit. A rate-limit 503 for either -- from a
+ *  daemon before that fix -- raises the same calm banner here, as defence in depth, instead of a toast; it clears
+ *  once that route answers fresh, and the next poll is already scheduled. */
 function backgroundError(route) {
   return (err) => {
     if (state.stopped || (err instanceof ApiError && err.status === 401)) return;
     if (err instanceof ApiError && err.status === 0) setConn("offline");
+    if (chainStale.failed(route, err)) return renderChainStale();
     const message = errorText(err);
     if (backgroundErrors.report(route, message)) toast("error", "Could not refresh", message);
   };
@@ -280,10 +302,13 @@ const loadChannels = createCoalescer(async () => {
     else {
       state.selectedId = null;
       state.status = null;
+      chainStale.answered("status", null);
     }
   } else if (!state.status) {
     applyStatus(current);
   }
+  // Fix round 1 (m6): the list's part of the banner is the selected channel's -- the game on the board.
+  chainStale.answered("channels", state.channels, state.selectedId);
   renderAll();
 }, backgroundError("channels"));
 
@@ -305,10 +330,13 @@ const refreshOffers = createCoalescer(async () => {
   }
 }, backgroundError("offers"));
 
+/** The selected channel's status, from GET /status, an action's answer, or the channel list. Board rate-limit fix: a
+ *  `chainStale` one keeps the banner up; a fresh one lowers the status route's part of it. */
 function applyStatus(st) {
   const prev = state.status;
   const moved = !prev || prev.channelId !== st.channelId || prev.fen !== st.fen;
   state.status = st;
+  chainStale.answered("status", st);
   state.deadline = syncDeadline(prev?.channelId === st.channelId ? state.deadline : null, st.challenge, Date.now());
   const i = state.channels.findIndex((c) => c.channelId === st.channelId);
   if (i >= 0) state.channels[i] = st;
@@ -324,6 +352,8 @@ function selectChannel(id) {
   state.focus = null;
   closePromotion();
   state.status = state.channels.find((c) => c.channelId === id && !c.degraded) ?? null;
+  chainStale.answered("status", state.status); // the newly selected channel's, until its own GET /status answers
+  chainStale.answered("channels", state.channels, id); // fix round 1 (m6)
   state.deadline = syncDeadline(null, state.status?.challenge, Date.now());
   /** @type {HTMLTextAreaElement} */ ($("hand-back-note")).value = "";
   /** @type {HTMLInputElement} */ ($("offer-draw-toggle")).checked = false;
@@ -883,10 +913,22 @@ function setPlayerRow(rowId, nameId, balanceId, name, balance, toMove) {
   $(rowId).classList.toggle("is-to-move", toMove);
 }
 
+/** Board rate-limit fix: the calm "chain RPC is busy" banner (role="status", never a toast), its reasons on hover. */
+function renderChainStale() {
+  if (state.stopped) return;
+  const banner = $("chain-stale-banner");
+  const on = chainStale.active();
+  banner.hidden = !on;
+  setText(banner, on ? CHAIN_STALE_NOTICE : "");
+  const why = chainStale.reasons().join("; ");
+  setAttr(banner, "title", on && why ? why : null);
+}
+
 function renderBoardArea() {
   const st = state.status;
   $("board-empty").hidden = !!st || !state.channelsLoaded;
   $("must-move-banner").hidden = !st?.challenge?.mustMove;
+  renderChainStale();
   // Final fix wave (I1): the seat goes back to the agent near the deadline; say when.
   const autoReturn = autoReturnText(st, state.deadline);
   $("auto-return-banner").hidden = !autoReturn;

@@ -338,6 +338,10 @@ async function actOnChannel(daemon: ArenaDaemon, st: ChannelStatus, ctx: ActCtx)
       return runWithBackoff(ctx.actionBackoff, id, ctx.log, "idle-close", () => daemon.close(id, "agent"));
     }
     case "opponent-silent":
+      // Board rate-limit fix: `channels()` lists a channel whose chain refresh failed from its last read (`chainStale`)
+      // instead of throwing. Silence is judged on chain time and on-chain progress, so a dispute waits for a fresh read;
+      // the session-state actions above (move, next-game, close) do not need one.
+      if (st.chainStale) return false;
       return attemptChallenge(daemon, st, ctx);
     default:
       return false; // session-gas-low (the daemon refills on its own), settled, human-must-move, or nothing to do

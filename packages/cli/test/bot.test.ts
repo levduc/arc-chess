@@ -227,6 +227,51 @@ describe("runBot: the opponent-silent challenge retries instead of giving up aft
     await vi.advanceTimersByTimeAsync(100);
     await done;
   }, 5_000);
+
+  it("board rate-limit fix: never challenges on a chainStale status (silence judged on a stale chain view); does once it is fresh", async () => {
+    // channels() now lists a channel whose chain refresh failed from its last read, `chainStale`, instead of throwing
+    // (which left the bot with no channels that pass). Silence is a chain-time judgment: a dispute on it waits for a
+    // fresh read. Moves and co-signing (session state) still go ahead on such a status.
+    vi.useFakeTimers();
+    let stale = true;
+    let challenged = false;
+    const challenge = vi.fn(async () => {
+      challenged = true;
+    });
+    // Once challenged, attention goes quiet: a fake that kept reporting opponent-silent would be challenged on every
+    // pass with no idle sleep between (a successful action skips it) -- a hot loop under fake timers.
+    const daemon = fakeDaemon({
+      channels: async () => [
+        fakeStatus({
+          attention: challenged ? null : "opponent-silent",
+          ...(stale ? { chainStale: true, chainStaleReason: "the RPC is rate-limiting (HTTP 429)" } : {}),
+        }),
+      ],
+      challenge,
+    });
+    const controller = new AbortController();
+    const done = runBot(daemon, {
+      usdc: "0x0000000000000000000000000000000000000000" as Address,
+      deposit: 0n,
+      stake: 0n,
+      offers: 0,
+      offerRecheckMs: 1_000_000,
+      waitTimeoutMs: 50,
+      moveDelayMs: 0,
+      challengeBackoffStartMs: 3_000,
+      challengeBackoffMaxMs: 10_000,
+      signal: controller.signal,
+    });
+    await vi.advanceTimersByTimeAsync(5_000); // several passes
+    expect(challenge).not.toHaveBeenCalled();
+    stale = false;
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(challenge).toHaveBeenCalledTimes(1);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(100);
+    await done;
+  }, 5_000);
 });
 
 // ------------------------------------------------------------------------ runBot's generic action retry (fake daemon)

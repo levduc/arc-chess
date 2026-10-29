@@ -460,6 +460,13 @@ input[type="checkbox"] {
   border-color: color-mix(in srgb, var(--warn) 35%, transparent);
 }
 
+/* Board rate-limit fix: the calm "chain RPC is busy" notice -- informational, never an error. */
+.banner-info {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
 .banner-danger {
   color: var(--danger-text);
   background: var(--danger-bg);

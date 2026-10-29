@@ -556,6 +556,16 @@ describe("http foundation", () => {
     expect(text).toMatch(/when `chainStaleReason` says a receipt could not be read, check `status`/); // re-review M-e
   });
 
+  it("board rate-limit fix: skill.md says a chainStale status is current play but a stale chain view -- no challenge or reclaim on it", () => {
+    const text = skillMd(testConfig(), "http://127.0.0.1:3000");
+    // Before: GET /status failed with the rate-limit 503; now it answers the last known view (and the CLI's note says so).
+    expect(text).toMatch(/`note: the chain could not be read just now`/);
+    expect(text).toMatch(/`status` \(or `channels`\) answered with `chainStale: true`: the game in it is current/);
+    expect(text).toMatch(/never `challenge` or `reclaim`\s+on it/);
+    // Re-review r2: a stale status keeps `attention: opponent-silent` (informational); the re-check comes first.
+    expect(text).toMatch(/even with `attention: opponent-silent`/);
+  });
+
   it("Plan 5 Task 5 (spec §6.2/§12 item 44): skill.md teaches handoff etiquette (when, note, 409, status.controller)", async () => {
     server = await startServer(testConfig(), { chain: new FakeChain() });
     const text = await (await fetch(`${server.url}/skill.md`)).text();

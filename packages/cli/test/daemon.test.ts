@@ -213,6 +213,8 @@ describe("ArenaDaemon core", () => {
       return { ...info, phase: "Challenged" };
     };
     // status() reaches channelInfo synchronously, so the armed read is status()'s own, never a background tick's.
+    // (Board fix round 1: once past the read routes' 5 s cache of the watchtower's last read, which reads nothing.)
+    alice.daemon.handle(id).chainReadAt = 0;
     armed = true;
     const pending = alice.daemon.status(id);
     armed = false;
@@ -455,7 +457,12 @@ describe("ArenaDaemon core", () => {
   // R8.4: status()/channels()/wait() themselves, exercised against a real matched-and-funded channel.
   it("R8.4a: status() reports phase, attention and zero cooldown right after a match", async () => {
     const { alice, id } = await matched();
-    const status = await alice.daemon.status();
+    // Board fix round 1 (I2): status() serves the watchtower's view while it is under 5 s old, so right after the chain
+    // turned Open it can still show the watchtower's last read ("Funding") -- until its next pass.
+    const status = await waitFor(async () => {
+      const st = await alice.daemon.status();
+      return st.phase === "Open" ? st : null;
+    }, 10_000, "alice's view reads Open");
     expect(status.channelId).toBe(id);
     expect(status.phase).toBe("Open");
     expect(status.attention).toBe("your-turn");

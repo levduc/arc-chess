@@ -284,6 +284,73 @@ export function createErrorGate() {
 }
 
 /**
+ * Board rate-limit fix: true for the daemon's answer to a read the RPC rate-limited past its retries -- a 503 worded
+ * "the RPC is rate-limiting (…)", or "rate-limited (RPC or host) (…)" (api.ts). Not any 503: "the daemon is stopping"
+ * is one too.
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isRateLimitAnswer(err) {
+  return err instanceof ApiError && err.status === 503 && /^(the RPC is rate-limiting|rate-limited \(RPC or host\))/.test(err.message);
+}
+
+/**
+ * Board rate-limit fix: why a status -- or the first such channel of a `/channels` list -- was answered from the
+ * daemon's last chain read (`chainStale`, with `chainStaleReason`), or null when it is fresh. `""` when stale with no
+ * reason given. Fix round 1 (m6): with `channelId` (a string, or null for none), only that channel's entry counts --
+ * the banner speaks of "your game", the one on the board.
+ * @param {unknown} payload a status, a list, or null
+ * @param {string | null} [channelId]
+ * @returns {string | null}
+ */
+export function staleReasonOf(payload, channelId) {
+  const list = Array.isArray(payload) ? payload : [payload];
+  for (const s of list) {
+    if (channelId !== undefined && (!s || typeof s !== "object" || /** @type {{ channelId?: unknown }} */ (s).channelId !== channelId)) continue;
+    if (s && typeof s === "object" && !("degraded" in s) && /** @type {{ chainStale?: unknown }} */ (s).chainStale === true) {
+      const reason = /** @type {{ chainStaleReason?: unknown }} */ (s).chainStaleReason;
+      return typeof reason === "string" ? reason : "";
+    }
+  }
+  return null;
+}
+
+/**
+ * Board rate-limit fix: whether the board's "chain RPC is busy" banner is up, per background read ("status",
+ * "channels"). A route raises it when it is answered from the daemon's last chain read (`chainStale`) or with the
+ * daemon's rate-limit 503, and only that route's own fresh answer lowers it. A rate-limit 503 is taken here instead
+ * of the caller's "Could not refresh" toast (`failed` answers true); any other failure is left to the caller and
+ * changes nothing.
+ */
+export function createChainStaleGate() {
+  /** @type {Map<string, string>} */
+  const reasons = new Map();
+  return {
+    /** A successful read of `route`; `channelId` as for `staleReasonOf`.
+     *  @param {string} route @param {unknown} payload @param {string | null} [channelId] */
+    answered(route, payload, channelId) {
+      const reason = staleReasonOf(payload, channelId);
+      if (reason === null) reasons.delete(route);
+      else reasons.set(route, reason);
+    },
+    /** A failed read of `route`: true when it was a rate limit, now shown by the banner (the caller shows no toast).
+     *  @param {string} route @param {unknown} err @returns {boolean} */
+    failed(route, err) {
+      if (!isRateLimitAnswer(err)) return false;
+      reasons.set(route, /** @type {ApiError} */ (err).message);
+      return true;
+    },
+    active() {
+      return reasons.size > 0;
+    },
+    /** The distinct reasons behind it, for the banner's tooltip. @returns {string[]} */
+    reasons() {
+      return [...new Set([...reasons.values()].filter((r) => r !== ""))];
+    },
+  };
+}
+
+/**
  * Which user actions are in flight, per key: a channel id, or one key for the lobby. One action at a time per
  * key, but a slow close or challenge on one channel never blocks a forced move on another (nor the lobby).
  */

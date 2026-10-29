@@ -5,10 +5,12 @@ import {
   baseUnitsToUsdc,
   boardView,
   canMove,
+  CHAIN_STALE_NOTICE,
   channelBanners,
   channelChip,
   checkSquare,
   clickSquare,
+  confirmUnload,
   DIALOG_GRACE_MS,
   dialogClickAllowed,
   escapeIntent,
@@ -35,14 +37,18 @@ import {
   usdcToBaseUnits,
 } from "../src/board/board.js";
 import {
+  ApiError,
   backoffDelay,
   createActionGate,
+  createChainStaleGate,
   createClient,
   createCoalescer,
   createErrorGate,
   createThrottle,
   exchangeCode,
+  isRateLimitAnswer,
   parseSse,
+  staleReasonOf,
 } from "../src/board/api.js";
 
 // Plan 5 Task 3: the web board's pure helpers (no DOM, no fetch) -- see packages/cli/src/board/board.js.
@@ -622,6 +628,142 @@ describe("api.js helpers", () => {
     expect(backoffDelay(1)).toBe(2_000);
     expect(backoffDelay(4)).toBe(16_000);
     expect(backoffDelay(10)).toBe(30_000);
+  });
+});
+
+// Board rate-limit fix (owner: "in the take over. there is this rpc limit. that i have to run arena board again and
+// again to move"): while the daemon answers from its last chain read (`chainStale`), or a background read is answered
+// with the daemon's rate-limit 503, the board shows one calm banner instead of an error toast per poll, keeps the game
+// playable, and asks before a reload throws its in-memory session away.
+describe("board rate-limit fix: the chain-busy banner", () => {
+  const RATE_LIMITED = "the RPC is rate-limiting (HTTP 429): wait a few seconds, then retry (check status first after an action)";
+  const stale = (over: Record<string, unknown> = {}) =>
+    status({ chainStale: true, chainStaleReason: "the RPC is rate-limiting (HTTP 429)", ...over });
+
+  it("reads why a status, or any channel of a list, was answered from the last chain read", () => {
+    expect(staleReasonOf(status())).toBeNull();
+    expect(staleReasonOf(stale())).toBe("the RPC is rate-limiting (HTTP 429)");
+    expect(staleReasonOf(stale({ chainStaleReason: undefined }))).toBe("");
+    expect(staleReasonOf([status(), { channelId: "0x01", degraded: true, error: "x" }])).toBeNull();
+    expect(staleReasonOf([status(), stale({ channelId: "0x02", chainStaleReason: "HTTP 502" })])).toBe("HTTP 502");
+    expect(staleReasonOf(null)).toBeNull();
+    expect(staleReasonOf([])).toBeNull();
+  });
+
+  it("recognizes the daemon's rate-limit answer (a 503 in api.ts's words), and nothing else", () => {
+    expect(isRateLimitAnswer(new ApiError(503, RATE_LIMITED))).toBe(true);
+    expect(isRateLimitAnswer(new ApiError(503, "rate-limited (RPC or host) (rate limited): wait a few seconds, then retry"))).toBe(true);
+    expect(isRateLimitAnswer(new ApiError(503, "the daemon is stopping: the transfer may still land"))).toBe(false);
+    expect(isRateLimitAnswer(new ApiError(500, RATE_LIMITED))).toBe(false);
+    expect(isRateLimitAnswer(new ApiError(429, "too many /events clients (max 8)"))).toBe(false);
+    expect(isRateLimitAnswer(new ApiError(0, "Cannot reach the daemon."))).toBe(false);
+    expect(isRateLimitAnswer(new Error(RATE_LIMITED))).toBe(false);
+  });
+
+  it("a rate-limited read raises it without a toast; a stale answer keeps it; a fresh answer for the same route clears it", () => {
+    const gate = createChainStaleGate();
+    expect(gate.active()).toBe(false);
+    // GET /status answered 503 (a daemon older than this fix, or a route still failing): the banner, not a toast.
+    expect(gate.failed("status", new ApiError(503, RATE_LIMITED))).toBe(true);
+    expect(gate.active()).toBe(true);
+    expect(gate.reasons()).toEqual([RATE_LIMITED]);
+    // Any other failure is still the caller's toast, and leaves the banner as it was.
+    expect(gate.failed("status", new ApiError(500, "boom"))).toBe(false);
+    expect(gate.failed("status", new ApiError(0, "Cannot reach the daemon."))).toBe(false);
+    expect(gate.active()).toBe(true);
+    // A status answered from the last chain read: still up, with the daemon's reason.
+    gate.answered("status", stale());
+    expect(gate.active()).toBe(true);
+    expect(gate.reasons()).toEqual(["the RPC is rate-limiting (HTTP 429)"]);
+    // Fresh data for that route clears it.
+    gate.answered("status", status());
+    expect(gate.active()).toBe(false);
+    expect(gate.reasons()).toEqual([]);
+  });
+
+  it("each route clears only its own part: a stale channel list keeps the banner after a fresh status, and the other way round", () => {
+    const gate = createChainStaleGate();
+    gate.answered("channels", [status(), stale()]);
+    gate.answered("status", status());
+    expect(gate.active()).toBe(true);
+    gate.failed("status", new ApiError(503, RATE_LIMITED));
+    gate.answered("channels", [status()]);
+    expect(gate.active()).toBe(true);
+    expect(gate.reasons()).toEqual([RATE_LIMITED]);
+    gate.answered("status", status());
+    expect(gate.active()).toBe(false);
+    // Two routes stale for the same reason name it once.
+    gate.answered("status", stale());
+    gate.answered("channels", [stale()]);
+    expect(gate.reasons()).toEqual(["the RPC is rate-limiting (HTTP 429)"]);
+    // No status at all (no channel selected) is not stale.
+    gate.answered("status", null);
+    gate.answered("channels", []);
+    expect(gate.active()).toBe(false);
+  });
+
+  it("fix round 1 (m6): the list's part counts the selected channel only -- a stale channel you are not looking at raises nothing", () => {
+    const gate = createChainStaleGate();
+    const mine = status({ channelId: "0xa1" });
+    const other = stale({ channelId: "0xb2", chainStaleReason: "HTTP 502" });
+    gate.answered("channels", [mine, other], "0xa1");
+    expect(gate.active()).toBe(false); // before: up, saying "showing your game" while the game shown was fresh
+    gate.answered("channels", [mine, other], "0xb2");
+    expect(gate.reasons()).toEqual(["HTTP 502"]);
+    gate.answered("channels", [mine, other], null); // nothing selected: nothing is shown as "your game"
+    expect(gate.active()).toBe(false);
+    expect(staleReasonOf([mine, other], "0xa1")).toBeNull();
+    expect(staleReasonOf([mine, other], "0xb2")).toBe("HTTP 502");
+  });
+
+  it("the banner is calm, says the game is current, that it retries, and not to reload", () => {
+    expect(CHAIN_STALE_NOTICE).toMatch(/^The chain RPC is busy — showing your game as this daemon knows it/);
+    expect(CHAIN_STALE_NOTICE).toMatch(/Retrying automatically\./);
+    expect(CHAIN_STALE_NOTICE).toMatch(/Don't reload this page: a reload needs a new `arena board` link\.$/);
+  });
+
+  it("fix round 1 (I1): the daemon's stale answer (no challenge suggestion, no humanAttention) leaves Challenge disabled", () => {
+    const silentFresh = status({ humanAttention: "opponent-silent", suggestedActions: ["arena challenge   (no progress)", "arena wait"] });
+    expect(actionState(silentFresh).challenge).toBe(true);
+    // What buildStatus answers for the same channel from a stale view.
+    const silentStale = stale({
+      humanAttention: null,
+      suggestedActions: ["arena wait", "arena status   (the chain view is stale: re-check before any challenge)"],
+    });
+    expect(actionState(silentStale).challenge).toBe(false);
+    expect(channelBanners(silentStale).some((b) => b.kind === "opponent-silent")).toBe(false);
+  });
+
+  it("re-review r2: on a stale view the agent seat's silence chip says to re-check the chain, not to challenge", () => {
+    // The agent holds the seat: attention stays opponent-silent on a stale view (informational; wait() never uses it).
+    const fresh = status({ controller: "agent", attention: "opponent-silent" });
+    expect(channelBanners(fresh)).toContainEqual({ kind: "opponent-silent", text: "Opponent silent: consider a challenge" });
+    const silentStale = stale({ controller: "agent", attention: "opponent-silent" });
+    const banner = channelBanners(silentStale).find((b) => b.kind === "opponent-silent");
+    expect(banner?.text).toBe("Opponent may be silent: chain view stale, re-check before any challenge");
+    expect(banner?.text).not.toMatch(/consider a challenge/);
+  });
+
+  it("moves stay enabled on a stale status when it is the human's turn (POST /move works under a rate limit)", () => {
+    const mine = stale({ myTurn: true, legalMovesUci: ["e2e4"] });
+    expect(canMove(mine)).toBe(true);
+    expect(actionState(mine).move).toBe(true);
+  });
+
+  it("a client read answered with the rate-limit 503 is an ApiError the gate takes", async () => {
+    const fetchImpl = async () => new Response(JSON.stringify({ error: RATE_LIMITED }), { status: 503 });
+    const client = createClient("tok", { fetchImpl });
+    const err = await client.status("0xaa").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(isRateLimitAnswer(err)).toBe(true);
+    expect(createChainStaleGate().failed("status", err)).toBe(true);
+  });
+
+  it("asks before unloading only while the page holds a live session, and never for a reload onto a new link", () => {
+    expect(confirmUnload({ session: true, stopped: false, reloadingForNewLink: false })).toBe(true);
+    expect(confirmUnload({ session: false, stopped: false, reloadingForNewLink: false })).toBe(false); // the sign-in gate
+    expect(confirmUnload({ session: true, stopped: true, reloadingForNewLink: false })).toBe(false); // locked out (401)
+    expect(confirmUnload({ session: true, stopped: false, reloadingForNewLink: true })).toBe(false); // a new link pasted
   });
 });
 

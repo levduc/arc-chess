@@ -430,13 +430,15 @@ export async function startApi(
           case "POST /next-game":
             await daemon.nextGame(ch, actor);
             return send(res, 200, await daemon.statusAfterAction(ch));
+          // Board fix round 1 (I2): these three send (or may send) a transaction, so their status reads the chain once
+          // even while the read routes' rate-limit back-off runs (`chainWrite`); the others honour it.
           case "POST /close":
             await daemon.close(ch, actor);
-            return send(res, 200, await daemon.statusAfterAction(ch));
+            return send(res, 200, await daemon.statusAfterAction(ch, {}, { chainWrite: true }));
           case "POST /challenge":
-            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.challenge(ch, actor)));
+            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.challenge(ch, actor), { chainWrite: true }));
           case "POST /reclaim":
-            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.reclaim(ch)));
+            return send(res, 200, await daemon.statusAfterAction(ch, await daemon.reclaim(ch), { chainWrite: true }));
           case "POST /sweep":
             // Plan 5 Task 1: a daemon-wide sweep (no `channel`) has no single channel's status to return.
             return send(res, 200, await daemon.sweep(ch));

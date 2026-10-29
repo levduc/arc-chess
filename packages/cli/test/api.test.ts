@@ -131,7 +131,7 @@ describe("local API", () => {
     expect((await call(url, token, "POST", "/handoff", { to: "human", note: "lone\rcr" })).status).toBe(400);
   });
 
-  it("H3: an action that took effect answers 200 with chainStale when only the chain read after it fails; a rate limit is a 503", async () => {
+  it("H3: an action that took effect answers 200 with chainStale when only the chain read after it fails (board rate-limit fix: so does GET /status)", async () => {
     const pair = await startPair();
     const token = loadToken(pair.alice.home);
     const { server, url } = await startApi(pair.alice.daemon, { port: 0, token });
@@ -175,14 +175,23 @@ describe("local API", () => {
     expect(moved.body.turnNum).toBe("1");
     expect(moved.body.lastMove).toEqual({ from: "e2", to: "e4", san: "e4" });
     expect((await call(bobApi.url, bobToken, "GET", "/wait?timeout=10")).body.reason).toBe("your-turn"); // it took effect
-    // A read-only route has nothing to fall back on: it fails, but as a rate limit, with what to do.
+    // Board rate-limit fix: a read-only route answers the last known view the same way -- the move is in it. Before: a
+    // 503 ("the RPC is rate-limiting (…): wait a few seconds, then retry"), which left the board with nothing to show.
+    // (Board fix round 1: past the read routes' 5 s cache of the watchtower's last good read, which would answer fresh.)
+    for (const cid of d.channelIds()) d.handle(cid).chainReadAt = 0;
     const st = await call(url, token, "GET", "/status");
-    expect(st.status).toBe(503);
-    expect(st.body.error).toMatch(/^the RPC is rate-limiting \(-32005 "rate limit exceeded"\): wait a few seconds/);
+    expect(st.status).toBe(200);
+    expect(st.body.chainStale).toBe(true);
+    expect(st.body.chainStaleReason).toBe('the RPC is rate-limiting (-32005 "rate limit exceeded")');
+    expect(st.body.turnNum).toBe("1");
     // An action that fails is still an error.
     expect((await call(url, token, "POST", "/move", { move: "d4" })).status).toBe(409);
     limit.on = false;
-    const fresh = await call(url, token, "GET", "/status");
+    // Board fix round 1: the watchtower's next good read ends the read routes' rate-limit back-off.
+    const fresh = await waitFor(async () => {
+      const r = await call(url, token, "GET", "/status");
+      return r.body.chainStale === undefined ? r : null;
+    }, 15_000, "a fresh status");
     expect(fresh.status).toBe(200);
     expect(fresh.body.chainStale).toBeUndefined();
   });

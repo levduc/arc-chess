@@ -226,6 +226,62 @@ describe("buildStatus", () => {
     expect(view(a, rec(0), { ...OPEN, phase: "Challenged", deadline: 1600n, registeredTurn: 1n }, OPEN.now - 601n).attention).toBeNull();
   });
 
+  it("board fix round 1 (I1): a stale view never suggests a challenge or a reclaim, nor raises humanAttention; it says to re-check", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4")); // a waits on b's move: silent for 601 s on the last view read
+    const stale = { reason: "the RPC is rate-limiting (HTTP 429)", ageSeconds: 0, readAt: 1_700_000_000_000 };
+    const at = (record: ChannelRecord, over: Partial<StatusInput> = {}) =>
+      buildStatus({ record, snapshot: a.snapshot(), myTurn: a.isMyTurn(), chain: OPEN, lastError: null, lastProgressAt: OPEN.now - 601n, ...over });
+    // Fresh: challenge first, for the agent and for a human holding the seat.
+    expect(at(rec(0)).suggestedActions[0]).toMatch(/^arena challenge /);
+    expect(at({ ...rec(0), controller: "human" }).humanAttention).toBe("opponent-silent");
+    // Stale: silence was judged on a frozen chain clock and frozen progress. Before: the same `arena challenge` first,
+    // the board's Challenge button enabled and its hint shown -- while skill.md says never to challenge on it.
+    for (const record of [rec(0), { ...rec(0), controller: "human" as const }]) {
+      const s = at(record, { stale });
+      expect(s.chainStale).toBe(true);
+      expect(s.chainStaleReason).toBe("the RPC is rate-limiting (HTTP 429)");
+      expect(s.chainReadAt).toBe(new Date(1_700_000_000_000).toISOString());
+      expect(s.suggestedActions.some((x) => x.startsWith("arena challenge") || x.startsWith("arena reclaim"))).toBe(false);
+      expect(s.suggestedActions).toContain("arena wait");
+      expect(s.suggestedActions.at(-1)).toBe("arena status   (the chain view is stale: re-check before any challenge)");
+      expect(s.humanAttention).toBeNull();
+    }
+    // attention stays: informational, and wait() never builds from this path.
+    expect(at(rec(0), { stale }).attention).toBe("opponent-silent");
+    // A fresh view carries none of it.
+    const fresh = at(rec(0));
+    expect(fresh.chainStale).toBeUndefined();
+    expect(fresh.chainStaleReason).toBeUndefined();
+    expect(fresh.chainReadAt).toBeUndefined();
+  });
+
+  it("board fix round 1 (m1): a stale view's deadlines and cooldowns count down by the view's age, never below 0", async () => {
+    const { a, b, rec } = await sessions();
+    await b.receive(await a.move("e2e4"));
+    const challenged: ChainView = { ...OPEN, phase: "Challenged", deadline: 1600n, challenger: 0, registeredTurn: 1n, cooldownUntil: [1900n, 1030n] };
+    const human = { ...rec(1), controller: "human" as const };
+    const at = (ageSeconds: number | null) =>
+      buildStatus({
+        record: human,
+        snapshot: b.snapshot(),
+        myTurn: b.isMyTurn(),
+        chain: challenged,
+        lastError: null,
+        autoReturnSeconds: 200,
+        stale: { reason: "HTTP 429", ageSeconds, readAt: null },
+      });
+    // Read 45 s ago: 600 s left then is 555 s now. Before: 600 s, for as long as the storm lasted.
+    const s = at(45);
+    expect(s.challenge).toMatchObject({ deadline: "1600", secondsLeft: 555, mustMove: true, autoReturnAt: "1400" });
+    expect(s.cooldown).toEqual({ meSeconds: 0, opponentSeconds: 855 }); // seat 1: 30 s - 45 s, and 900 s - 45 s
+    expect(s.suggestedActions[0]).toMatch(/^tell your human: a challenge needs their move on the board within 555s/);
+    expect(s.chainReadAt).toBeNull();
+    expect(at(700).challenge?.secondsLeft).toBe(0);
+    // No age known (never read): the view's own clock.
+    expect(at(null).challenge?.secondsLeft).toBe(600);
+  });
+
   it("Plan 5 Task 3 fix round: humanAttention raises opponent-silent for a human in control, leaving attention (and so wait) unchanged", async () => {
     const { a, b, rec } = await sessions();
     await b.receive(await a.move("e2e4")); // a waits on b's move
