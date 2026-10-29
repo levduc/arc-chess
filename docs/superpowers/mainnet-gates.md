@@ -91,6 +91,9 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
     releases use npm **trusted publishing** (OIDC) from `.github/workflows/release-cli.yml`: no npm token is stored.
     The owner configures the trusted publisher on the package's npm settings page (user `levduc`, repo
     `arc-chess`, workflow `release-cli.yml`).
+  - after `.github/workflows/release-server-image.yml` first pushes `ghcr.io/levduc/arc-chess-server`, make the
+    package public (GitHub > Packages > arc-chess-server > Package settings > Change visibility): a new GHCR package
+    is private, and every self-host operator's `docker compose pull` fails until then (deploy/host).
 - **Host `cli` config set to a provenance-published version.** Only after a real `cli-v*` tag has gone through
   `.github/workflows/release-cli.yml` (build → the clean-room test → `npm publish --provenance`) should the
   host's `cli: {package, version, minVersion?}` point at that version — never at a version only built locally.

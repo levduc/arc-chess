@@ -140,7 +140,8 @@ Changing it takes `arena owner set` with the current owner's signature.
 - **Published image.** Run `docker compose pull && docker compose up -d`. `latest` follows each release. To stay on a
   known build, pin its digest in `.env`: `ARENA_IMAGE=ghcr.io/levduc/arc-chess-server@sha256:...`. The digest is on
   each release's workflow run. A release also pushes a version tag (`:0.1.0`) once and never moves it, but a digest
-  is what your `docker compose pull` can verify byte for byte. `sha-<commit>` tags are test builds. Each image carries
+  is what your `docker compose pull` can verify byte for byte. A `sha-<commit>` tag names the commit an image was built
+from; a manual run of the workflow pushes only that tag, never a version or `latest`. Each image carries
   a GitHub build attestation: `gh attestation verify oci://ghcr.io/levduc/arc-chess-server@sha256:... -R
   levduc/arc-chess`.
 - **Built from the clone.** Run `git pull && docker compose up -d --build`.
