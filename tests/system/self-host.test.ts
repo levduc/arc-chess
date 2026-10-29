@@ -244,12 +244,52 @@ describe("house-bot.sh (stubbed CLI, npm and server)", () => {
     expect(r.npm).toBe("");
   });
 
+  it("N-1: a daemon.lock left by an unclean stop is removed before the bot starts -- unless an arena daemon here holds it", async () => {
+    const lockPath = join(arenaHome, "daemon.lock");
+    // A dead pid, and a live pid that is no arena daemon (this test runner: a restarted container reuses its pids).
+    for (const pid of [2 ** 22 + 4321, process.pid]) {
+      writeFileSync(lockPath, JSON.stringify({ pid, nonce: "ab".repeat(16) }));
+      const r = await runBot({});
+      expect(r.status, r.output).toBe(0);
+      expect(r.output).toContain(`removing a stale daemon.lock (pid ${pid}, left by an unclean stop)`);
+      expect(existsSync(lockPath)).toBe(false);
+      expect(r.commands.map((c) => c[0])).toEqual(["bot"]);
+    }
+    // A live process whose command line is an arena daemon's: left alone (the CLI's own lock then decides).
+    const daemon = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "/x/arena.mjs", "bot", "--allow-real-chain"], { stdio: "ignore" });
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      writeFileSync(lockPath, JSON.stringify({ pid: daemon.pid, nonce: "cd".repeat(16) }));
+      const r = await runBot({});
+      expect(r.output).toContain(`daemon.lock names pid ${daemon.pid}, an arena daemon running in this container: leaving it`);
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      daemon.kill("SIGKILL");
+      rmSync(lockPath, { force: true });
+    }
+  });
+
+  it("N-1: a second container on the same volume is refused by the volume lock, not by daemon.lock", async () => {
+    // -o: the lock stays with flock itself, so killing it releases the lock (its sleep would otherwise inherit it).
+    const holder = spawn("flock", ["-o", "-x", join(home, ".house-bot.lock"), "sleep", "30"], { stdio: "ignore" });
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      const r = await runBot({});
+      expect(r.status).toBe(1);
+      expect(r.output).toMatch(/another house-bot container is using this volume/);
+      expect(r.commands).toEqual([]);
+    } finally {
+      holder.kill("SIGKILL");
+    }
+  });
+
   it("I-1/I-2: a new BOT_RPC_URL while a channel is open keeps the recorded RPC and still runs the bot; nothing prints the key", async () => {
     const r = await runBot({ BOT_RPC_URL: KEYED, FAKE_OPEN_CHANNEL: "1" });
     expect(r.status, r.output).toBe(0);
     expect(r.commands.map((c) => c[0])).toEqual(["init", "bot"]);
     expect(r.commands[0]).toEqual(["init", "--server", serverUrl, "--no-faucet", "--rpc", KEYED]);
     expect(r.output).toMatch(/kept the bot's recorded RPC: init cannot change it now/);
+    expect(r.output).not.toMatch(/same host/); // keyed.example.net is not public.example.net
     expect(r.output).toContain("refusing to change the RPC from https://public.example.net to https://keyed.example.net while");
     expect(r.output).not.toContain("SECRETKEY");
     expect(recordedRpc()).toBe("https://public.example.net");
@@ -264,6 +304,11 @@ describe("house-bot.sh (stubbed CLI, npm and server)", () => {
     expect(r.output).not.toContain("SECRETKEY");
     // The same RPC on the next start: nothing to change, no init.
     expect((await runBot({ BOT_RPC_URL: KEYED })).commands.map((c) => c[0])).toEqual(["bot"]);
+    // N-3: a new key on the same host says so, since the log shows both URLs the same.
+    const rotated = await runBot({ BOT_RPC_URL: KEYED.replace("SECRETKEY", "ROTATEDKEY") });
+    expect(rotated.output).toMatch(/the bot's RPC changed \(BOT_RPC_URL, or the RPC the host publishes\) \(same host: the log shows both URLs the same\)/);
+    expect(rotated.output).not.toMatch(/SECRETKEY|ROTATEDKEY/);
+    await runBot({ BOT_RPC_URL: KEYED });
   });
 
   it("M-7: on Arc mainnet the bot opens no offers unless BOT_ALLOW_MAINNET=1", async () => {
@@ -581,6 +626,23 @@ withE2e(e2eReason ? `self-host stack over HTTPS (SKIPPED: ${e2eReason})` : "self
     } finally {
       compose(["start", "arena-server"]);
     }
+  }, 600_000);
+
+  it("N-1: after an unclean kill of the bot (kill -9, as an OOM kill), the container restarts once and the bot runs again", async () => {
+    await waitForBotStarts(2);
+    const before = botLogs().split('"bot":true').length - 1;
+    const lock = JSON.parse(compose(["exec", "-T", "house-bot", "cat", "/home/node/arena/daemon.lock"]).stdout) as { pid: number };
+    expect(Number.isInteger(lock.pid)).toBe(true);
+    compose(["exec", "-T", "house-bot", "kill", "-9", String(lock.pid)]);
+    await waitForBotStarts(before + 1);
+    const logs = botLogs();
+    expect(logs).toMatch(/removing a stale daemon\.lock \(pid \d+, left by an unclean stop\)/);
+    expect(logs).not.toMatch(/another arena daemon \(pid \d+\) is using/);
+    // Settled: one restart, and still running a while later.
+    await new Promise((r) => setTimeout(r, 15_000));
+    const state = docker(["inspect", "-f", "{{.State.Status}} {{.RestartCount}}", `${NAME}-house-bot-1`]).stdout.trim();
+    expect(state).toBe("running 1");
+    expect(compose(["exec", "-T", "house-bot", "arena", "channels"]).stdout.trim()).toBe("[]");
   }, 600_000);
 
   it("the server container runs as node, read-only, with no capabilities and no published port", () => {

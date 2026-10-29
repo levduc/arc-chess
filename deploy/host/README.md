@@ -129,21 +129,26 @@ Only stop the bot (`docker compose --profile bots stop house-bot`) once `arena c
 `Finalized`. A stopped bot is no longer watching its open channels on-chain. To wind it down, set `BOT_OFFERS=0`, run
 `docker compose --profile bots up -d` again, and wait for its channels to close.
 
-A restart never stops the bot from watching its channels. Only its first start runs `arena init`. Every later start
-goes straight to `arena bot`, even while the arena server is down. A new `BOT_RPC_URL`, or a new RPC your host
-publishes, takes effect only once no channel is open: the CLI refuses to change the RPC under an open channel. Until
-then the bot keeps its recorded RPC, says so in its log, and retries on its next start. `BOT_OWNER` is recorded once.
-Changing it takes `arena owner set` with the current owner's signature.
+Once set up, a restart goes straight back to watching the bot's channels:
+- Only the first start runs `arena init`. Every later start goes to `arena bot`, even while the arena server is down.
+- After an unclean stop (an out-of-memory kill, a reboot, `docker compose kill`), it clears the `daemon.lock` the
+  killed bot left behind.
+- A new `BOT_RPC_URL`, or a new RPC your host publishes, takes effect only once no channel is open: the CLI refuses to
+  change the RPC under an open channel. Until then the bot keeps its recorded RPC, says so in its log, and retries on
+  its next start.
+
+A start still fails, and Docker retries it, when the wallet file is missing or malformed, or when another container
+already runs a bot on the same volume: run one bot per volume. `BOT_OWNER` is recorded once. Changing it takes
+`arena owner set` with the current owner's signature.
 
 ## Updating
 
-- **Published image.** Run `docker compose pull && docker compose up -d`. `latest` follows each release. To stay on a
-  known build, pin its digest in `.env`: `ARENA_IMAGE=ghcr.io/levduc/arc-chess-server@sha256:...`. The digest is on
-  each release's workflow run. A release also pushes a version tag (`:0.1.0`) once and never moves it, but a digest
-  is what your `docker compose pull` can verify byte for byte. A `sha-<commit>` tag names the commit an image was built
-from; a manual run of the workflow pushes only that tag, never a version or `latest`. Each image carries
-  a GitHub build attestation: `gh attestation verify oci://ghcr.io/levduc/arc-chess-server@sha256:... -R
-  levduc/arc-chess`.
+- **Published image.** Run `docker compose pull && docker compose up -d`. `latest` follows the newest release. To stay
+  on a known build, pin its digest in `.env`: `ARENA_IMAGE=ghcr.io/levduc/arc-chess-server@sha256:...`. The digest is on
+  each release's workflow run. A release also pushes a version tag (`:0.1.0`) once and never moves it, but a digest is
+  what your `docker compose pull` can verify byte for byte. A `sha-<commit>` tag names the commit an image was built
+  from; a manual run of the workflow pushes only that tag, never a version or `latest`. Each image carries a GitHub
+  build attestation: `gh attestation verify oci://ghcr.io/levduc/arc-chess-server@sha256:... -R levduc/arc-chess`.
 - **Built from the clone.** Run `git pull && docker compose up -d --build`.
 
 The database survives updates: it is on the `arena-data` volume. An image bound to a different hub refuses to reuse

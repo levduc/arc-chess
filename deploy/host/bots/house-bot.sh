@@ -38,6 +38,14 @@ node -e '
   if (typeof k !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(k)) process.exit(1);
 ' "$secret" || fail "the wallet file must hold {\"key\": \"0x\" followed by 64 hex characters}"
 
+# One bot per volume. A kernel lock on a file in the volume, held for the container's whole life (the bot inherits the
+# descriptor) and released when the container dies, however it dies. It refuses a second container on this volume on
+# this machine (`docker compose up --scale house-bot=2`, a copy of the service), which daemon.lock cannot: a pid means
+# nothing across containers.
+mkdir -p "$HOME"
+exec 9>>"$HOME/.house-bot.lock"
+flock -n 9 || fail "another house-bot container is using this volume ($HOME): run one bot per volume"
+
 # What the host publishes: its CLI version and its RPC. Empty when the server cannot be reached.
 templates=$(node -e '
   fetch(process.argv[1] + "/templates", { signal: AbortSignal.timeout(10000) })
@@ -84,6 +92,23 @@ chmod 700 "$ARENA_HOME"
 # Before any init: an init that found no wallet.json would make a new wallet.
 [ -e "$ARENA_HOME/wallet.json" ] || ln -s "$secret" "$ARENA_HOME/wallet.json"
 
+# Re-review N-1: a daemon.lock left by an unclean stop (an OOM kill, a reboot, `docker compose kill`) names a pid of
+# the dead container, and this one, started afresh, gets the same pids again. arc-chess 0.1.0 calls a lock naming its
+# own pid held, so the bot (and an init) would exit on every start. This container holds the volume lock above, so it
+# is the only one using this home: the lock is stale unless its pid is an arena daemon running here right now.
+lock_pid=$(node -e '
+  const l = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+  if (Number.isInteger(l.pid) && l.pid > 0) console.log(l.pid);
+' "$ARENA_HOME/daemon.lock" 2>/dev/null) || lock_pid=""
+if [ -n "$lock_pid" ]; then
+  if [ -r "/proc/$lock_pid/cmdline" ] && tr '\000' ' ' < "/proc/$lock_pid/cmdline" | grep -qE 'arena\.mjs (bot|daemon)( |$)'; then
+    say "daemon.lock names pid $lock_pid, an arena daemon running in this container: leaving it"
+  else
+    say "removing a stale daemon.lock (pid $lock_pid, left by an unclean stop)"
+    rm -f "$ARENA_HOME/daemon.lock"
+  fi
+fi
+
 # init's summary names the RPC URL: only its errors are shown (redacted).
 set -- init --server "$server" --no-faucet
 [ -z "${BOT_RPC_URL:-}" ] || set -- "$@" --rpc "$BOT_RPC_URL"
@@ -95,10 +120,15 @@ else
   recorded=$(node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).rpcUrl ?? "")' "$config" 2>/dev/null) || recorded=""
   want="${BOT_RPC_URL:-$host_rpc}"
   if [ -n "$want" ] && [ "$want" != "$recorded" ]; then
+    # Re-review N-3: the log shows RPC URLs as their scheme and host only, so two URLs on one host look the same.
+    same=$(node -e '
+      try { console.log(new URL(process.argv[1]).host === new URL(process.argv[2]).host ? " (same host: the log shows both URLs the same)" : ""); }
+      catch { console.log(""); }
+    ' "$want" "$recorded")
     if arena "$@" >/dev/null; then
-      say "the bot's RPC changed (BOT_RPC_URL, or the RPC the host publishes)"
+      say "the bot's RPC changed (BOT_RPC_URL, or the RPC the host publishes)$same"
     else
-      say "kept the bot's recorded RPC: init cannot change it now (see above), for instance while a channel is open. It is retried on the next start"
+      say "kept the bot's recorded RPC: init cannot change it now (see above), for instance while a channel is open. The new one differs$same. It is retried on the next start"
     fi
   fi
 fi
