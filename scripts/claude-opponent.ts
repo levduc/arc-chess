@@ -182,8 +182,14 @@ export function servedCliRules(home: string, templates: unknown, server: string)
   const chess = Array.isArray(templates) ? (templates as Array<Record<string, unknown>>).find((t) => t?.id === "chess") : undefined;
   const url = (chess?.cliTarball as { url?: unknown } | undefined)?.url;
   if (!isTarballUrl(url)) return [];
-  const there = new URL(url);
-  const here = new URL(server);
+  let there: URL;
+  let here: URL;
+  try {
+    there = new URL(url);
+    here = new URL(server);
+  } catch {
+    return []; // a host the URL parser refuses (`999.1.1.1`): no rule
+  }
   const local = /^127\.\d+\.\d+\.\d+$/.test(here.hostname) || here.hostname === "localhost";
   if (!/^\/cli\/[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/.test(there.pathname) || (!local && there.origin !== here.origin)) return [];
   const cmd = tarballCommand(url);

@@ -78,8 +78,13 @@ const SERVED_TARBALL_PATH = /^\/cli\/[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/;
  */
 export function sameHostTarballUrl(url: unknown, self: string | undefined): string | undefined {
   if (self === undefined || !isTarballUrl(url)) return undefined;
-  const there = new URL(url);
-  return there.origin === new URL(self).origin && SERVED_TARBALL_PATH.test(there.pathname) ? url : undefined;
+  try {
+    const there = new URL(url);
+    return there.origin === new URL(self).origin && SERVED_TARBALL_PATH.test(there.pathname) ? url : undefined;
+  } catch {
+    // `TARBALL_URL` admits a few hosts the URL parser refuses (`999.1.1.1`, `100.70.62.092`): no echo, never a crash.
+    return undefined;
+  }
 }
 
 /** Final fix wave (C1): the npm package name this build was published under -- `__ARENA_CLI_PACKAGE__`, defined only

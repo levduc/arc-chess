@@ -95,6 +95,7 @@ describe("claude-opponent arguments", () => {
     expect(servedCliRules("/h", tpl("http://evil.example/cli/x.tgz"), "http://100.70.62.92:8090")).toEqual([]);
     expect(servedCliRules("/h", tpl("http://100.70.62.92:8090/x.tgz"), "http://100.70.62.92:8090")).toEqual([]);
     expect(servedCliRules("/h", tpl("http://100.70.62.92:8090/x.tgz"), "http://127.0.0.1:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://999.1.1.1/cli/x.tgz"), "http://127.0.0.1:8090")).toEqual([]);
   });
 });
 

