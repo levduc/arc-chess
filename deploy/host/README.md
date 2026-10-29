@@ -49,6 +49,7 @@ See [Mainnet](#mainnet).
    docker compose up -d
    ```
    This pulls the published image. To build the image from this clone instead, run `docker compose up -d --build`.
+   Until the first image is published, that is the only way: a plain `up -d` then fails to pull it.
 6. **Check it.**
    ```sh
    docker compose ps                     # arena-server "healthy", caddy "running"
@@ -98,9 +99,10 @@ start them.
    (umask 077 && printf '{"key":"0x%s"}\n' "$(openssl rand -hex 32)" > secrets/house-bot-wallet.json)
    sudo chown 1000:1000 secrets/house-bot-wallet.json
    ```
-   The container reads it as a Docker secret, at `/run/secrets/house_bot_wallet`. It never enters the image, the
+   The container reads it as a Docker secret, at `/run/secrets/house_bot_wallet`. The key never enters the image, the
    environment, a command line or the bot's volume: the bot's `wallet.json` is a link to the secret. `secrets/` is
-   gitignored. Back the file up: it is the only copy of the key.
+   gitignored. Back the file up: it is the only copy of the key. Your `RPC_URL`, by contrast, is stored in the bot's
+   `config.json` on its volume, and its log may quote it in an error.
 2. In `.env`, set `BOT_OWNER` to an address you control on Arc Testnet. It is the only address the bot's USDC can be
    withdrawn to. Optionally set `BOT_DEPOSIT` and `BOT_STAKE` (USDC per channel and per game), and `BOT_OFFERS`.
 3. Start it, and read its wallet address from the log:
@@ -167,8 +169,9 @@ channels is open.
 - **Per-IP limits and X-Forwarded-For.** The server limits requests, WebSocket connections and open offers per client
   IP. Behind Caddy, it takes the client's IP from the right-most `X-Forwarded-For` entry (`TRUST_PROXY=true`). That
   entry is the one Caddy writes: Caddy replaces any `X-Forwarded-For` a client sends. The server trusts that header
-  from any peer, so it relies on Caddy being its only peer. Its port is never published, and only Caddy shares its
-  Docker network. Don't attach other containers to that network, and don't publish the server's port. A peer that
+  from any peer, so it relies on every peer being yours. Its port is never published, and only Caddy, and your house
+  bots if you run them, share its Docker network. Don't attach other containers to that network, and don't publish
+  the server's port. A peer that
   can reach the server directly can claim any IP and get around the per-IP limits. It still cannot touch anyone's
   funds.
 - **Testnet only** until the mainnet deployment is pinned. See below.
