@@ -86,7 +86,11 @@ Status after Plan 4.5, 2026-09-29. Nothing here has been deployed to mainnet. Ev
   - push the repo to GitHub and set `ARENA_CLI_REPOSITORY`; check npm's current provenance rules for the repo's
     visibility (public vs. private) at that time — provenance attestation needs a public source, or an npm plan
     that supports it for a private one;
-  - add the `NPM_TOKEN` secret the `release-cli` workflow publishes with.
+  - ~~add the `NPM_TOKEN` secret the `release-cli` workflow publishes with.~~ *Done differently, 2026-10-29:*
+    `arc-chess@0.1.0` was published by the owner with 2FA (checksum `6c2ea9fa…`, the CI-tested build), and later
+    releases use npm **trusted publishing** (OIDC) from `.github/workflows/release-cli.yml`: no npm token is stored.
+    The owner configures the trusted publisher on the package's npm settings page (user `levduc`, repo
+    `arc-chess`, workflow `release-cli.yml`).
 - **Host `cli` config set to a provenance-published version.** Only after a real `cli-v*` tag has gone through
   `.github/workflows/release-cli.yml` (build → the clean-room test → `npm publish --provenance`) should the
   host's `cli: {package, version, minVersion?}` point at that version — never at a version only built locally.

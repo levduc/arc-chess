@@ -35,6 +35,11 @@ jobs:
       - run: pnpm --filter @arena/system-tests exec vitest run cli-clean-room.test.ts
         env:
           ARENA_CLEAN_ROOM_DIST: ${{ github.workspace }}/packages/cli/dist
+      # Trusted publishing (OIDC): npm trusts this repo's release-cli.yml, configured on the package's npm settings
+      # page, so no npm token is stored anywhere. It needs npm >= 11.5.1 and `id-token: write` (above).
+      - name: npm is new enough for trusted publishing
+        run: |
+          v="$(npm --version)"
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&(b>5||(b===5&&c>=1)))?0:1)' "$v" \
+            || { echo "npm $v is older than 11.5.1, which trusted publishing needs" >&2; exit 1; }
       - run: npm publish packages/cli/dist --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

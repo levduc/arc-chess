@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 const REPO_ROOT = join(import.meta.dirname, "../..");
 const WORKFLOW_PATH = join(REPO_ROOT, ".github/workflows/release-cli.yml");
 
-describe("release-cli workflow (written, never run)", () => {
+describe("release-cli workflow", () => {
   const text = readFileSync(WORKFLOW_PATH, "utf8");
 
   it('triggers only on "cli-v*" tags', () => {
@@ -40,8 +40,13 @@ describe("release-cli workflow (written, never run)", () => {
     expect(text).toContain("--provenance");
   });
 
-  it("reads the npm auth token from the NPM_TOKEN secret", () => {
-    expect(text).toContain("NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}");
+  it("publishes by npm trusted publishing (OIDC): no npm token anywhere in the workflow", () => {
+    // 2026-10-29: arc-chess trusts this repo's release-cli.yml on npm, so the workflow holds no token.
+    expect(text).not.toContain("NODE_AUTH_TOKEN");
+    expect(text).not.toContain("NPM_TOKEN");
+    expect(text).toContain("npm is new enough for trusted publishing");
+    const guardIdx = text.indexOf("npm is new enough for trusted publishing");
+    expect(guardIdx).toBeLessThan(text.indexOf("npm publish"));
   });
 
   it("calls npm publish exactly once, after the clean-room test step", () => {

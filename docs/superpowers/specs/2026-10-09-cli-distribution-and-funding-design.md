@@ -236,7 +236,9 @@ Troubleshooting gains these entries:
   - triggered by a `cli-v*` tag, with `permissions: id-token: write, contents: read`;
   - runs checkout → pnpm install (frozen lockfile, same Node major as the engines floor and above) →
     `pnpm build:cli --release` → the clean-room test → `npm publish packages/cli/dist --provenance --access public`
-    with `NODE_AUTH_TOKEN` from the `NPM_TOKEN` secret.
+    with `NODE_AUTH_TOKEN` from the `NPM_TOKEN` secret. *Amended 2026-10-29:* npm now refuses publishes from
+    tokens that don't bypass 2FA, so the workflow publishes by npm trusted publishing (OIDC, `id-token: write`,
+    npm ≥ 11.5.1) and stores no token. `arc-chess@0.1.0` itself was published once by the owner with 2FA.
   - It is written and linted in this plan, never run by it.
 - **Before the first publish (the owner's steps, not automated):**
   - choose the npm package name and scope, and set `ARENA_CLI_PACKAGE`;
