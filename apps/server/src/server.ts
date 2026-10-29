@@ -11,9 +11,12 @@ import { chessSkillMd, indexHtml, llmsTxt, skillMd, watchHtml } from "./docs.js"
 import { Indexer, playerStats } from "./indexer.js";
 import { clientKey, RateLimiter } from "./limits.js";
 import { Lobby, LobbyError } from "./lobby.js";
+import { redactRpcUrls } from "./redact.js";
 import { Relay } from "./relay.js";
 import { SqliteRepo, type Repo } from "./repo.js";
 import { attachWs } from "./ws.js";
+
+export { redactRpcUrls } from "./redact.js";
 
 export type Metrics = {
   wsConnections: number;
@@ -260,27 +263,6 @@ const HEX32_ROUTE_RE = /^0x[0-9a-f]{64}$/i;
 /** Canonicalizes a channel id path segment: lower-cases it and rejects anything that isn't 0x + 64 hex chars. */
 function canonicalChannelId(raw: string): Hex | null {
   return HEX32_ROUTE_RE.test(raw) ? (raw.toLowerCase() as Hex) : null;
-}
-
-/**
- * Final review C N-6: `text` with this config's RPC URLs shown as their scheme and host only. A provider URL can carry
- * an API key in its path or query, and viem quotes a failed request's URL in full in its error messages (it strips
- * only a username and password). Every startup error and every log line of the server goes through this.
- */
-export function redactRpcUrls(text: string, cfg: Pick<ServerConfig, "rpcUrl" | "publicRpcUrl">): string {
-  let out = text;
-  // Longest first, so a URL that is a prefix of the other one never leaves the rest of it behind.
-  for (const url of [cfg.rpcUrl, cfg.publicRpcUrl].filter((u) => u !== "").sort((a, b) => b.length - a.length)) {
-    let shown: string;
-    try {
-      const u = new URL(url);
-      shown = `${u.protocol}//${u.host}`;
-    } catch {
-      shown = "(the RPC URL)";
-    }
-    out = out.split(url).join(shown);
-  }
-  return out;
 }
 
 /** The text of `err`, with the RPC URLs redacted (`redactRpcUrls`). */

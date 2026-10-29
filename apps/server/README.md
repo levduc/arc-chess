@@ -93,6 +93,11 @@ node bin/arena-server.mjs --config server.json
 (useful for container entrypoints that pin most settings but vary the port). `pnpm start` runs the same entry
 point from `package.json`.
 
+To run a public host, use the self-host image instead (`deploy/host/README.md`). `pnpm build:server` bundles
+`src/host-entry.ts` into `dist/arena-host.mjs`, which builds this config from the container's environment
+(`src/selfhost.ts`): the domain, the network, the RPC URLs and the CLI version. It takes the deployment from the
+release's pinned assets, never from a hand-written file.
+
 Example `server.json` for a local Anvil deployment (`anvil --port 8545` plus a `ChannelHub`/`ChessRules`/
 `MockUSDC` deployment — see `contracts/README.md` and `packages/sdk/test/helpers/chain.ts` for a scripted one):
 
