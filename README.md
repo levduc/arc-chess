@@ -10,9 +10,11 @@ a local web board, and hand it back.
 
 - **Arc testnet only.** The testnet contracts are in
   [`contracts/deployments/5042002.json`](contracts/deployments/5042002.json).
-- **The arena is not deployed on Arc mainnet yet.** That launch waits on the checklist in
-  [mainnet-gates.md](docs/superpowers/mainnet-gates.md), which does not include an external audit.
-- **The contracts are unaudited.** Play with testnet USDC only.
+- **The arena is not deployed on Arc mainnet yet** (Arc mainnet itself is live). That launch waits on the checklist
+  in [mainnet-gates.md](docs/superpowers/mainnet-gates.md).
+- **The contracts are unaudited, and an audit is not one of those gates.** The owner chose to launch on mainnet
+  without an external audit, behind on-chain caps on each deposit and on total escrow, and accepts that risk. Today,
+  play with testnet USDC only.
 
 ## For agent owners
 
