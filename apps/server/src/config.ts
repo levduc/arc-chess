@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+import { basename, isAbsolute } from "node:path";
 import type { Address } from "viem";
 
 export type Limits = {
@@ -24,6 +26,12 @@ export const DEFAULT_LIMITS: Limits = {
  *  refuses below; `version` is the one the derived `cliCommand` and skill.md's Install step actually pin to. */
 export type CliConfig = { package: string; version: string; minVersion?: string };
 
+/** Remote agents (testnet): a CLI tarball this host serves itself, at `GET /cli/<basename of path>`, for a CLI that is
+ *  not on npm. `path` is the file on this machine (read once at startup, which refuses to start unless its sha256 is
+ *  `sha256`); `/templates` publishes its URL and `sha256`. The basename must change whenever the content does: `npx`
+ *  reuses an earlier install of the same URL without looking at the new bytes. */
+export type CliTarballConfig = { path: string; sha256: string };
+
 /** Plan 5.7 Task 2 (spec §5): the same shape as the CLI's own `XmtpConfig` (packages/cli/src/config.ts), but
  *  defined locally -- `@arena/cli` is only a devDependency of `@arena/server` (used in tests), so the server's
  *  runtime has no dependency on the CLI package. `apiUrl` (tests, local node) and `gatewayHost` (dev and
@@ -33,6 +41,8 @@ export type XmtpConfig = { env: "local" | "dev" | "production"; apiUrl?: string;
 
 export type ServerConfig = {
   host: string;
+  /** Remote agents (testnet): more addresses to listen on, on the same port, besides `host` (an IP literal each). */
+  extraHosts?: string[];
   port: number;
   publicUrl: string;
   rpcUrl: string;
@@ -46,6 +56,8 @@ export type ServerConfig = {
   cliCommand: string;
   /** Set only when this host pins a published CLI (see `CliConfig`); published in `/templates` the same way. */
   cli?: CliConfig;
+  /** Set only when this host serves the CLI tarball itself (see `CliTarballConfig`); needs `cli` and `publicUrl`. */
+  cliTarball?: CliTarballConfig;
   /** Plan 5.7 Task 2 (spec §5): set only when this host publishes the XMTP fallback transport; published in
    *  `/templates` the same way. `init` copies it into the daemon's own `config.json`. */
   xmtp?: XmtpConfig;
@@ -211,6 +223,65 @@ function parseCli(obj: Record<string, unknown>): CliConfig | undefined {
   return { package: pkg, version, minVersion };
 }
 
+// Remote agents: the tarball's file name and the URL it is served at. Both end up in a shell command (`cliCommand`, so
+// skill.md), so only characters a shell never treats specially pass: no credentials, query, fragment, space, `$`,
+// quote or `;`. The URL check is duplicated in packages/cli/src/version.ts (`TARBALL_URL`), not imported -- the
+// server has no runtime dependency on the CLI package.
+const CLI_TARBALL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/;
+const CLI_TARBALL_URL_RE = /^https?:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?(\/[A-Za-z0-9._~-]+)*\.tgz$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+
+/** The URL a host serves its CLI tarball at: `<publicUrl>/cli/<basename of path>`. */
+export function cliTarballUrl(publicUrl: string, tarball: CliTarballConfig): string {
+  return `${publicUrl.replace(/\/$/, "")}/cli/${basename(tarball.path)}`;
+}
+
+/**
+ * The command that runs the CLI from a tarball URL. `--package=<url> arena` installs that one file (the bundle has no
+ * dependencies, so the registry is never asked) and runs its `arena` bin. `--prefer-offline`: once installed, npm
+ * otherwise re-asks the host for the tarball on every command, and an unreachable host then costs about 70 s of
+ * retries per command -- `daemon stop` and `withdraw` included. The URL names one content (its basename changes with
+ * it), so the cached copy is never stale. The CLI bakes the same string in (`selfCommand`, packages/cli/src/version.ts).
+ */
+export function cliTarballCommand(url: string): string {
+  return `npx -y --prefer-offline --package=${url} arena`;
+}
+
+/** Remote agents: `cliTarball`, or `undefined` when the config carries none. It needs `cli` (the package and version
+ *  inside, which `init`'s version gate checks) and `publicUrl` (where agents fetch it from). */
+function parseCliTarball(obj: Record<string, unknown>, cli: CliConfig | undefined, publicUrl: string): CliTarballConfig | undefined {
+  const raw = obj.cliTarball;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail("cliTarball", "must be an object");
+  const r = raw as Record<string, unknown>;
+  const path = r.path;
+  if (typeof path !== "string" || !isAbsolute(path)) fail("cliTarball.path", "must be an absolute path");
+  if (!CLI_TARBALL_NAME_RE.test(basename(path))) fail("cliTarball.path", "must name a .tgz file of letters, digits, '.', '_' and '-' only");
+  const sha256 = r.sha256;
+  if (typeof sha256 !== "string" || !SHA256_RE.test(sha256)) fail("cliTarball.sha256", "must be 64 lowercase hex characters");
+  if (cli === undefined) fail("cliTarball", "needs cli: the package name and version the tarball holds");
+  if (publicUrl === "") fail("cliTarball", "needs publicUrl: the URL agents fetch it from");
+  const tarball = { path, sha256 };
+  if (!CLI_TARBALL_URL_RE.test(cliTarballUrl(publicUrl, tarball))) {
+    fail("publicUrl", "must be a plain http(s) URL (no credentials, query or special characters) to serve cliTarball");
+  }
+  return tarball;
+}
+
+/** Remote agents: `extraHosts`, or `undefined`. Each an IP literal, none twice, none `host` itself. */
+function parseExtraHosts(obj: Record<string, unknown>, host: string): string[] | undefined {
+  const raw = obj.extraHosts;
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) fail("extraHosts", "must be a list of IP addresses");
+  const out: string[] = [];
+  for (const h of raw) {
+    if (typeof h !== "string" || isIP(h) === 0) fail("extraHosts", "must be a list of IP addresses");
+    if (h === host || out.includes(h)) fail("extraHosts", `lists ${h} twice (host included)`);
+    out.push(h);
+  }
+  return out;
+}
+
 const XMTP_ENVS = ["local", "dev", "production"] as const;
 type XmtpEnv = (typeof XMTP_ENVS)[number];
 
@@ -268,6 +339,7 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   const obj = asRecord(raw);
 
   const host = str(obj, "host", "127.0.0.1");
+  const extraHosts = parseExtraHosts(obj, host);
   const port = num(obj, "port", 8080);
   if (!Number.isInteger(port) || port < 0 || port > 65_535) fail("port", "must be an integer between 0 and 65535");
   const publicUrl = str(obj, "publicUrl", "");
@@ -299,11 +371,20 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   };
 
   const cli = parseCli(obj);
+  const cliTarball = parseCliTarball(obj, cli, publicUrl);
   const xmtp = parseXmtp(obj, chainId);
   // Plan 5.6 Task 4 (spec §3): derived only when the raw config has no `cliCommand` key at all -- an explicit
   // `cliCommand` always wins over a configured `cli`, even an empty string (`obj.cliCommand !== undefined`, not
-  // `str`'s own fallback, so this distinguishes "not given" from "given but falsy").
-  const cliCommand = obj.cliCommand !== undefined ? str(obj, "cliCommand") : cli !== undefined ? `npx -y ${cli.package}@${cli.version}` : "arena";
+  // `str`'s own fallback, so this distinguishes "not given" from "given but falsy"). Remote agents: a tarball this
+  // host serves wins over the npm pin, whose package may not be published at all.
+  const cliCommand =
+    obj.cliCommand !== undefined
+      ? str(obj, "cliCommand")
+      : cliTarball !== undefined
+        ? cliTarballCommand(cliTarballUrl(publicUrl, cliTarball))
+        : cli !== undefined
+          ? `npx -y ${cli.package}@${cli.version}`
+          : "arena";
   // Final review m21: `audit` is published in /templates. Outside a local Anvil chain it must be set, and must not be
   // the development default: the mainnet value states the truth (e.g. "unaudited; guarded launch, caps X/Y").
   const local = chainId === ANVIL_CHAIN_ID;
@@ -328,8 +409,9 @@ export function parseServerConfig(raw: unknown): ServerConfig {
   const devFaucet = bool(obj, "devFaucet", false);
 
   return {
-    host, port, publicUrl, rpcUrl, publicRpcUrl, chainId, hub, usdc, rules, dbPath,
+    host, ...(extraHosts !== undefined ? { extraHosts } : {}), port, publicUrl, rpcUrl, publicRpcUrl, chainId, hub, usdc, rules, dbPath,
     fundingWindow, offerMaxLifetime, defaults, cliCommand, ...(cli !== undefined ? { cli } : {}),
+    ...(cliTarball !== undefined ? { cliTarball } : {}),
     ...(xmtp !== undefined ? { xmtp } : {}), audit, indexer, limits, trustProxy, devFaucet,
   };
 }

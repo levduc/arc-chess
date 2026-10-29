@@ -16,20 +16,25 @@
  * `DIR/THIRD_PARTY_LICENSES` holds the license text of every npm package the bundle inlines (viem, chess.js, ...),
  * found from esbuild's metafile and read from each package's own LICENSE file in node_modules. The build fails if a
  * bundled package ships no license file, so the notice can never silently go missing.
+ *
+ * `--self-url URL` (remote agents; `pnpm testnet:up` passes it): the URL a host serves this build's tarball at, baked
+ * in so every message the CLI prints names `npx -y --prefer-offline --package=URL arena` (`selfCommand`), never the
+ * npm form of a package nobody published. A plain http(s) URL ending in `.tgz` only; never with `--release`.
  */
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { build, type Metafile } from "esbuild";
-import { isNpmPackageName } from "../packages/cli/src/version.ts";
+import { isNpmPackageName, isTarballUrl } from "../packages/cli/src/version.ts";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 const CLI_DIR = join(REPO_ROOT, "packages/cli");
 const BOARD_SRC = join(CLI_DIR, "src/board");
 const BOARD_FILES = ["index.html", "app.js", "board.js", "api.js", "style.css"];
 
-function parseArgs(argv: string[]): { out: string; release: boolean } {
+function parseArgs(argv: string[]): { out: string; release: boolean; selfUrl?: string } {
   let out = join(CLI_DIR, "dist");
   let release = false;
+  let selfUrl: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--out") {
@@ -37,13 +42,19 @@ function parseArgs(argv: string[]): { out: string; release: boolean } {
       if (v === undefined) throw new Error("--out needs a value");
       out = v;
       i++;
+    } else if (a === "--self-url") {
+      const v = argv[i + 1];
+      if (!isTarballUrl(v)) throw new Error("--self-url needs a plain http(s) URL ending in .tgz (letters, digits, '.', '_', '~', '-' and '/' only)");
+      selfUrl = v;
+      i++;
     } else if (a === "--release") {
       release = true;
     } else {
       throw new Error(`unknown argument ${a}`);
     }
   }
-  return { out, release };
+  if (release && selfUrl !== undefined) throw new Error("--self-url is for a host's own tarball, never a --release build");
+  return { out, release, ...(selfUrl !== undefined ? { selfUrl } : {}) };
 }
 
 /** The root directory of every npm package esbuild bundled: each input under `node_modules/` belongs to the package
@@ -87,7 +98,7 @@ function thirdPartyLicenses(metafile: Metafile): string {
 }
 
 async function main(): Promise<void> {
-  const { out, release } = parseArgs(process.argv.slice(2));
+  const { out, release, selfUrl } = parseArgs(process.argv.slice(2));
   const cliPkg = JSON.parse(readFileSync(join(CLI_DIR, "package.json"), "utf8")) as { version: string };
   const version = cliPkg.version;
 
@@ -129,7 +140,13 @@ async function main(): Promise<void> {
     sourcemap: false,
     legalComments: "inline",
     absWorkingDir: REPO_ROOT,
-    define: { __ARENA_CLI_VERSION__: JSON.stringify(version), __ARENA_CLI_PACKAGE__: JSON.stringify(name) },
+    define: {
+      __ARENA_CLI_VERSION__: JSON.stringify(version),
+      __ARENA_CLI_PACKAGE__: JSON.stringify(name),
+      // Re-review N-3: `undefined` in every other build, so the npm release carries no global of that name, and its
+      // tarball branch is dead code.
+      __ARENA_CLI_TARBALL_URL__: selfUrl !== undefined ? JSON.stringify(selfUrl) : "undefined",
+    },
     // CJS dependencies bundled into ESM call require() for Node built-ins (and viem's WebSocket shim, `isows`,
     // statically imports `ws`, whose optional native accelerators `bufferutil`/`utf-8-validate` are requested
     // inside their own try/catch and are never installed here) -- give the bundle one `require`.

@@ -12,7 +12,9 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { HttpRequestError, TransactionReceiptNotFoundError, createPublicClient, http, parseUnits, type Address, type Hex, type TransactionReceipt } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { parseServerConfig } from "../../apps/server/src/config.js";
+import { cliTarballCommand, parseServerConfig } from "../../apps/server/src/config.js";
+import { startServer, type ArenaServer } from "../../apps/server/src/server.js";
+import { FakeChain, testConfig } from "../../apps/server/test/helpers/fakeChain.js";
 import {
   CHAIN_ID,
   DEPLOYER,
@@ -20,17 +22,23 @@ import {
   FORBIDDEN_PORTS,
   RPC_URL,
   TESTNET_SERVER_LIMITS,
+  agentNotes,
   agentPrompt,
   assertChain,
   assertTestnetDir,
   botHomeProblems,
+  buildCliTarball,
   buildServerConfig,
   checkPayRequest,
   hideDirRpcs,
   hideUrl,
   holdingsWei,
+  hostNetwork,
+  hostNotLocal,
+  hostProblem,
   hubPinProblem,
   isOurs,
+  lanWarning,
   openNeedWei,
   parseDownArgs,
   payUnconfirmed,
@@ -119,6 +127,8 @@ describe("testnet:up arguments", () => {
     const a = parseUpArgs([]);
     expect(a).toEqual({
       port: 8090,
+      host: "127.0.0.1",
+      allowLan: false,
       rpc: "https://rpc.testnet.arc.io",
       publicRpc: "https://rpc.testnet.arc.io",
       houseBots: 2,
@@ -133,13 +143,13 @@ describe("testnet:up arguments", () => {
 
   it("takes every flag", () => {
     const a = parseUpArgs([
-      "--port", "8095", "--rpc", "https://example.invalid/arc-testnet/KEY", "--public-rpc", "https://example.invalid/public",
+      "--port", "8095", "--host", "100.70.62.92", "--rpc", "https://example.invalid/arc-testnet/KEY", "--public-rpc", "https://example.invalid/public",
       "--house-bots", "4", "--bot-usdc", "1.25", "--bot-deposit", "0.5", "--bot-stake", "0.05",
-      "--bot-timeout", "300", "--xmtp-bots", "--limits", '{"maxOpenOffersPerIp": 10, "wsPerIp": 40}', "--start-block", "68000000",
+      "--bot-timeout", "300", "--xmtp-bots", "--allow-lan", "--limits", '{"maxOpenOffersPerIp": 10, "wsPerIp": 40}', "--start-block", "68000000",
       "--dir", "/tmp/x",
     ]);
     expect(a).toEqual({
-      port: 8095, rpc: "https://example.invalid/arc-testnet/KEY", publicRpc: "https://example.invalid/public", houseBots: 4,
+      port: 8095, host: "100.70.62.92", allowLan: true, rpc: "https://example.invalid/arc-testnet/KEY", publicRpc: "https://example.invalid/public", houseBots: 4,
       botUsdc: "1.25", botDeposit: "0.5", botStake: "0.05", botTimeout: 300, xmtpBots: true,
       limits: { maxOpenOffersPerIp: 10, wsPerIp: 40 }, startBlock: 68_000_000n, dir: "/tmp/x",
     });
@@ -171,6 +181,67 @@ describe("testnet:up arguments", () => {
     expect(() => parseUpArgs(["--limits", '{"wsPerIp": 0}'])).toThrow(/positive whole number/);
     expect(() => parseUpArgs(["--limits", '{"wsPerIp": 1.5}'])).toThrow(/positive whole number/);
     expect(() => parseUpArgs(["--rpc", "ws://127.0.0.1:1"])).toThrow(/http\(s\) URL/);
+  });
+
+  it("remote agents: --host takes loopback and Tailscale; a LAN only with --allow-lan; never a public address", () => {
+    for (const ok of ["127.0.0.1", "127.0.0.2", "100.70.62.92", "100.64.0.0", "100.127.255.255"]) {
+      expect(hostProblem(ok), ok).toBeNull();
+      expect(parseUpArgs(["--host", ok]).host).toBe(ok);
+    }
+    // Fix round 1 (I-1): RFC 1918 is plain, unauthenticated http on a shared network -- the owner's explicit choice only.
+    for (const lan of ["10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.254", "192.168.50.102"]) {
+      expect(hostProblem(lan), lan).toMatch(
+        new RegExp(`^--host ${lan.replace(/\./g, "\\.")} is a LAN address: over a LAN everything this stack serves .* anyone on that network can replace the CLI the agents run .* pass --allow-lan to accept that$`),
+      );
+      expect(() => parseUpArgs(["--host", lan]), lan).toThrow(/is a LAN address/);
+      expect(hostProblem(lan, true), lan).toBeNull();
+      expect(parseUpArgs(["--host", lan, "--allow-lan"])).toMatchObject({ host: lan, allowLan: true });
+    }
+    for (const bad of ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.0", "172.15.255.255", "172.32.0.1", "192.169.0.1", "11.0.0.1", "169.254.1.1", "224.0.0.1", "255.255.255.255"]) {
+      for (const allowLan of [false, true]) {
+        expect(hostProblem(bad, allowLan), bad).toMatch(/is not a private address: only loopback \(127\.0\.0\.0\/8\) and Tailscale \(100\.64\.0\.0\/10\) are allowed, and with --allow-lan/);
+      }
+      expect(() => parseUpArgs(["--host", bad, "--allow-lan"]), bad).toThrow(/is not a private address/);
+    }
+    expect(() => parseUpArgs(["--host", "0.0.0.0", "--allow-lan"])).toThrow(/every interface, public ones included/);
+    for (const bad of ["::1", "fd7a:115c:a1e0::1", "localhost", "my-box.tailnet.ts.net", "100.70.62.092", "100.70.62", ""]) {
+      expect(() => parseUpArgs(["--host", bad]), bad).toThrow(/--host must be an IPv4 address|needs a value/);
+    }
+  });
+
+  const IFACES = {
+    lo: [{ address: "127.0.0.1", family: "IPv4" }],
+    tailscale0: [{ address: "100.70.62.92", family: "IPv4" }, { address: "fd7a::1", family: "IPv6" }],
+    wwan0: [{ address: "100.80.1.2", family: "IPv4" }], // a carrier's CGNAT address, in the same 100.64/10 range
+    enp0s31f6: [{ address: "192.168.50.102", family: "IPv4" }],
+  } as unknown as Parameters<typeof hostNotLocal>[1];
+
+  it("remote agents: --host must be one of this machine's addresses (loopback always is)", () => {
+    expect(hostNotLocal("100.70.62.92", IFACES)).toBeNull();
+    expect(hostNotLocal("127.0.0.5", IFACES)).toBeNull();
+    expect(hostNotLocal("100.70.62.93", IFACES)).toBe(
+      "refusing: --host 100.70.62.93 is not an address of this machine (its IPv4 addresses: 127.0.0.1, 100.70.62.92, 100.80.1.2, 192.168.50.102). Nothing was started",
+    );
+  });
+
+  it("fix round 1 (I-1): a 100.64/10 address counts as the tailnet only on a tailscale* interface; elsewhere it needs --allow-lan", () => {
+    expect(hostNetwork("127.0.0.1", IFACES)).toBe("loopback");
+    expect(hostNetwork("100.70.62.92", IFACES)).toBe("tailnet");
+    expect(hostNetwork("100.80.1.2", IFACES)).toBe("lan");
+    expect(hostNetwork("192.168.50.102", IFACES)).toBe("lan");
+    expect(hostNotLocal("100.80.1.2", IFACES)).toMatch(
+      /^refusing: --host 100\.80\.1\.2 is on wwan0, not a Tailscale interface: a 100\.64\.0\.0\/10 address there is a carrier's CGNAT address, not your tailnet, .* pass --allow-lan to accept that\. Nothing was started$/,
+    );
+    expect(hostNotLocal("100.80.1.2", IFACES, true)).toBeNull();
+    expect(hostNotLocal("192.168.50.102", IFACES, true)).toBeNull();
+  });
+
+  it("fix round 1 (I-1): --allow-lan's warning says the CLI can be replaced, that the sha256 cannot catch it, and what to use instead", () => {
+    const w = lanWarning("192.168.50.102").join("\n");
+    expect(w).toContain("WARNING (--allow-lan): agents reach this stack at 192.168.50.102, on a LAN, over plain, unauthenticated http.");
+    expect(w).toContain("Anyone on that network can rewrite skill.md, /templates and the CLI tarball");
+    expect(w).toContain("skill.md's sha256 cannot catch it: it arrives over the same channel");
+    expect(w).toContain("--host $(tailscale ip -4)");
   });
 
   it("down: --withdraw and --dir only", () => {
@@ -409,6 +480,38 @@ describe("the server config", () => {
     expect(cfg.limits.maxJoinsPerConnection).toBe(64); // the server's own default
   });
 
+  it("remote agents: --host listens on 127.0.0.1 and the private address, publishes the latter, and serves the CLI tarball", () => {
+    const common = {
+      dir: "/x/.arena-testnet",
+      port: 8700,
+      rpcUrl: RPC_URL,
+      publicRpcUrl: RPC_URL,
+      deployment: readDeployment(),
+      limits: { maxDepositPerPlayer: 2_000_000n, maxCommittedEscrow: 50_000_000n, feePerPlayer: 5_000n },
+      startBlock: 1n,
+      deposit: "1",
+      stake: "0.1",
+    };
+    const sha256 = "ab".repeat(32);
+    const cli = { path: "/x/.arena-testnet/cli/arena-cli-0.1.0-0123456789abcdef.tgz", sha256, package: "@arena/cli", version: "0.1.0" };
+    const cfg = parseServerConfig(JSON.parse(JSON.stringify(buildServerConfig({ ...common, host: "100.70.62.92", cli }))));
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.extraHosts).toEqual(["100.70.62.92"]);
+    expect(cfg.publicUrl).toBe("http://100.70.62.92:8700");
+    expect(cfg.cli).toEqual({ package: "@arena/cli", version: "0.1.0" });
+    expect(cfg.cliTarball).toEqual({ path: cli.path, sha256 });
+    expect(cfg.cliCommand).toBe("npx -y --prefer-offline --package=http://100.70.62.92:8700/cli/arena-cli-0.1.0-0123456789abcdef.tgz arena");
+    expect(cfg.audit).toMatch(/served on 100\.70\.62\.92 \(a private network\) and 127\.0\.0\.1\./);
+    // Per-IP limits are unchanged by --host.
+    expect(cfg.limits).toMatchObject(TESTNET_SERVER_LIMITS);
+    // Without --host: 127.0.0.1 only, as before, and the tarball on that address.
+    const local = parseServerConfig(JSON.parse(JSON.stringify(buildServerConfig({ ...common, cli }))));
+    expect(local.extraHosts).toBeUndefined();
+    expect(local.publicUrl).toBe("http://127.0.0.1:8700");
+    expect(local.cliCommand).toBe("npx -y --prefer-offline --package=http://127.0.0.1:8700/cli/arena-cli-0.1.0-0123456789abcdef.tgz arena");
+    expect(local.audit).toMatch(/served on 127\.0\.0\.1\. Hub limits/);
+  });
+
   it("m-11: the deployments file must match the CLI's pinned Arc-testnet deployment", () => {
     const d = readDeployment();
     const pinned = { 5042002: { name: "Arc Testnet", hub: d.hub, rules: d.rules, usdc: d.usdc } };
@@ -503,6 +606,20 @@ describe("house bots", () => {
     await expect(unlessExits(lives, "house bot house-2", sleep(200).then(() => "ok"))).resolves.toBe("ok");
   });
 
+  it("remote agents: the notes under the message -- the network, Node 24, funding from this machine or the faucet, a cash-out line", () => {
+    const remote = agentNotes({ publicUrl: "http://100.70.62.92:8090", network: "tailnet", payPath: "/x/.arena-testnet/human/pay" }).join("\n");
+    expect(remote).toContain("The agent's machine must reach http://100.70.62.92:8090: it must be on your tailnet.");
+    expect(remote).toContain("Node 24 or newer");
+    expect(remote).toContain("/x/.arena-testnet/human/pay <its address> <usdc>   (runs on THIS machine; at most 3 per call)");
+    expect(remote).toContain("https://faucet.circle.com (choose Arc Testnet) or any Arc-testnet wallet");
+    expect(remote).toContain("My Arc testnet address for cash-out is 0x<your address>.");
+    expect(remote).toContain("withdraw pays only that owner");
+    const local = agentNotes({ publicUrl: "http://127.0.0.1:8090", network: "loopback", payPath: "/x/human/pay" }).join("\n");
+    expect(local).toContain("The agent must run on THIS machine: the server listens on loopback only (rerun with --host <your Tailscale IP>");
+    const lan = agentNotes({ publicUrl: "http://192.168.50.102:8090", network: "lan", payPath: "/x/human/pay" }).join("\n");
+    expect(lan).toContain("it must be on this LAN (see the warning about --allow-lan)");
+  });
+
   it("m-9: the agent prompt names skill.md, its own ARENA_HOME and its own port", () => {
     const p = agentPrompt("http://127.0.0.1:8090", "0.1", 8101);
     expect(p).toBe(
@@ -510,6 +627,107 @@ describe("house bots", () => {
         "Follow http://127.0.0.1:8090/skill.md; run every arena command with ARENA_HOME=$PWD/arena-home, and pass --port 8101 to arena init.",
     );
   });
+});
+
+// -------------------------------------------------------------------------------------------- CLI tarball
+
+describe("remote agents: the CLI tarball the stack serves", () => {
+  let server: ArenaServer | undefined;
+  afterEach(async () => {
+    await server?.close();
+    server = undefined;
+  });
+
+  it(
+    "is built once per code, served by the server, and runs from npx with nothing of this repo -- naming itself by the server's own command",
+    async () => {
+      const root = tmpRoot();
+      const port = await freeTcpPort();
+      const publicUrl = `http://127.0.0.1:${port}`;
+      const served = await buildCliTarball(join(root, "stack"), publicUrl);
+      expect(served.path).toMatch(/\/cli\/arena-cli-0\.1\.0-[0-9a-f]{16}\.tgz$/);
+      expect(served).toMatchObject({ package: "@arena/cli", version: "0.1.0" });
+      expect(readdirSync(join(root, "stack", "cli"))).toEqual([served.path.split("/").at(-1)]);
+      // The same code and URL give the same tarball: a restart serves the same URL, so agents' installs stay current.
+      expect(await buildCliTarball(join(root, "stack"), publicUrl)).toEqual(served);
+
+      const cfg = parseServerConfig(
+        JSON.parse(
+          JSON.stringify(
+            buildServerConfig({
+              dir: join(root, "stack"),
+              port,
+              rpcUrl: RPC_URL,
+              publicRpcUrl: RPC_URL,
+              deployment: readDeployment(),
+              limits: { maxDepositPerPlayer: 2_000_000n, maxCommittedEscrow: 50_000_000n, feePerPlayer: 5_000n },
+              startBlock: 1n,
+              cli: served,
+              deposit: "1",
+              stake: "0.1",
+            }),
+          ),
+        ),
+      );
+      const chain = new FakeChain();
+      chain.rpcChainId = CHAIN_ID;
+      server = await startServer({ ...testConfig(), ...cfg, dbPath: ":memory:", indexer: { ...cfg.indexer, pollMs: 0 } }, { chain });
+      const [t] = (await (await fetch(`${publicUrl}/templates`)).json()) as Array<{ cliTarball: { url: string; sha256: string } }>;
+      expect(t!.cliTarball).toEqual({ url: `${publicUrl}/cli/${served.path.split("/").at(-1)}`, sha256: served.sha256 });
+      expect(cfg.cliCommand).toBe(cliTarballCommand(t!.cliTarball.url));
+
+      // An agent's machine: a fresh HOME (no npm cache), Node's own directory and the system's on PATH, no
+      // ARENA_HOME, a cwd outside the repo, and a registry nobody answers -- the install needs none.
+      const home = join(root, "agent-home");
+      const work = join(root, "agent-work");
+      mkdirSync(home);
+      mkdirSync(work);
+      const env = {
+        HOME: home,
+        PATH: `${join(process.execPath, "..")}:/usr/bin:/bin`,
+        npm_config_registry: "http://127.0.0.1:9/",
+        npm_config_update_notifier: "false",
+      };
+      const [cmd, ...cmdArgs] = cfg.cliCommand.split(" ");
+      // Asynchronous: the server answering it runs in this very process.
+      const agent = (args: string[]) =>
+        new Promise<{ status: number | null; stdout: string; stderr: string }>((resolvePromise, reject) => {
+          const child = spawn(cmd!, [...cmdArgs, ...args], { cwd: work, env, stdio: ["ignore", "pipe", "pipe"] });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
+          child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+          const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+          child.once("error", reject);
+          child.once("close", (status) => {
+            clearTimeout(timer);
+            resolvePromise({ status, stdout, stderr });
+          });
+        });
+      const version = await agent(["--version"]);
+      expect(version.status, version.stderr).toBe(0);
+      expect(version.stdout.trim()).toBe("0.1.0");
+      // Its own messages name the server's command, never the placeholder npm package.
+      const usage = await agent([]);
+      expect(usage.stderr).toContain(`usage: ${cfg.cliCommand} <command>`);
+      const wallet = await agent(["wallet"]);
+      expect(wallet.stderr).toContain(`run "${cfg.cliCommand} init" first`);
+      expect(`${usage.stderr}${wallet.stderr}`).not.toContain("@arena/cli@");
+      // Installed from the URL, into npx's own cache under the agent's HOME.
+      const installed = readdirSync(join(home, ".npm", "_npx"));
+      expect(installed).toHaveLength(1);
+      expect(existsSync(join(home, ".npm", "_npx", installed[0]!, "node_modules", "@arena", "cli", "board", "index.html"))).toBe(true);
+
+      // With the host down, the installed copy still runs at once (--prefer-offline): no 70 s of npm retries.
+      await server.close();
+      server = undefined;
+      const started = Date.now();
+      const offline = await agent(["--version"]);
+      expect(offline.status, offline.stderr).toBe(0);
+      expect(Date.now() - started).toBeLessThan(15_000);
+    },
+    300_000,
+  );
 });
 
 // --------------------------------------------------------------------------------------------- pay helper

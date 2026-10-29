@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fundDisclosure, fundMessage, tellYourHuman } from "../../packages/cli/src/funding.js";
-import { buildPrompt, homePrefixRules, parseArgs, runPaths } from "../../scripts/claude-opponent.js";
+import { buildPrompt, homePrefixRules, parseArgs, runPaths, servedCliRules } from "../../scripts/claude-opponent.js";
 import { payUnconfirmed } from "../../scripts/testnet-up.js";
 import {
   agentTexts,
@@ -75,6 +75,37 @@ describe("claude-opponent arguments", () => {
     expect(rules).toContain("Bash(ARENA_HOME=$PWD/arena-home /x/bin/arena *)");
     expect(rules).toContain("Bash(ARENA_HOME=/h/arena-home /x/bin/arena *)");
     for (const r of rules) expect(r).toMatch(/^Bash\(ARENA_HOME=\S+ (\/x\/bin\/)?arena \*\)$/);
+  });
+
+  it("remote agents: allows the served tarball command a testnet:up stack names in skill.md, and nothing for other hosts", () => {
+    const url = "http://100.70.62.92:8090/cli/arena-cli-0.1.0-0123456789abcdef.tgz";
+    const cmd = `npx -y --prefer-offline --package=${url} arena`;
+    const tpl = (u: string) => [{ id: "chess", cliTarball: { url: u, sha256: "a".repeat(64) } }];
+    // --server on the tailnet URL itself, or on this machine's own stack (which publishes its --host address).
+    const OWN = ["127.0.0.1", "100.70.62.92", "192.168.50.102"];
+    for (const server of ["http://100.70.62.92:8090", "http://127.0.0.1:8090"]) {
+      const rules = servedCliRules("/h/arena-home", tpl(url), server, OWN);
+      expect(rules, server).toContain(`Bash(${cmd} *)`);
+      expect(rules, server).toContain(`Bash(ARENA_HOME=$PWD/arena-home ${cmd} *)`);
+      expect(rules, server).toContain(`Bash(ARENA_HOME=/h/arena-home ${cmd} *)`);
+    }
+    // Re-review N-1: a loopback --server allows a tarball only on loopback or this machine's own addresses.
+    expect(servedCliRules("/h", tpl("http://127.0.0.1:8090/cli/a.tgz"), "http://127.0.0.1:8090", OWN)).toHaveLength(4);
+    expect(servedCliRules("/h", tpl("http://192.168.50.102:8090/cli/a.tgz"), "http://localhost:8090", OWN)).toHaveLength(4);
+    for (const foreign of ["http://evil.example/cli/a.tgz", "https://attacker.example/cli/x.tgz", "http://100.70.62.93:8090/cli/a.tgz"]) {
+      expect(servedCliRules("/h", tpl(foreign), "http://127.0.0.1:8090", OWN), foreign).toEqual([]);
+      expect(servedCliRules("/h", tpl(foreign), "http://localhost:8090", OWN), foreign).toEqual([]);
+    }
+    // Only the canonical spelling (what skill.md shows): another spelling of the same host gets no rule.
+    expect(servedCliRules("/h", tpl("http://100.70.62.92:08090/cli/a.tgz"), "http://100.70.62.92:8090", OWN)).toEqual([]);
+    expect(servedCliRules("/h", [{ id: "chess" }], "http://127.0.0.1:8090")).toEqual([]);
+    expect(servedCliRules("/h", undefined, "http://127.0.0.1:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://h/a.tgz) Bash(rm *"), "http://127.0.0.1:8090")).toEqual([]);
+    // Fix round 1 (m-3): a remote --server never picks code on another origin, or off /cli/.
+    expect(servedCliRules("/h", tpl("http://evil.example/cli/x.tgz"), "http://100.70.62.92:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://100.70.62.92:8090/x.tgz"), "http://100.70.62.92:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://100.70.62.92:8090/x.tgz"), "http://127.0.0.1:8090")).toEqual([]);
+    expect(servedCliRules("/h", tpl("http://999.1.1.1/cli/x.tgz"), "http://127.0.0.1:8090")).toEqual([]);
   });
 });
 
