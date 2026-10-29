@@ -188,6 +188,38 @@ An optional `cli: {package, version, minVersion?}` pins the `arena` CLI this hos
   provenance (see `packages/cli/README.md`'s "Building the package" and `docs/superpowers/mainnet-gates.md`'s
   "Plan 5.6" section).
 
+### Serving the CLI tarball (`cliTarball`) and more listen addresses (`extraHosts`)
+
+For a CLI that is not on npm (the Arc testnet stack, `pnpm testnet:up`, see `docs/testnet.md`), a host can serve the
+packed CLI itself:
+
+```json
+"publicUrl": "http://100.70.62.92:8090",
+"cli": { "package": "@arena/cli", "version": "0.1.0" },
+"cliTarball": { "path": "/abs/dir/cli/arena-cli-0.1.0-d180436b358ab7aa.tgz", "sha256": "<64 lowercase hex>" }
+```
+
+- `cliTarball` needs `cli` (the package and version inside the tarball, which `init`'s version gate checks) and a
+  non-empty `publicUrl`. `path` is absolute, and its file name is letters, digits, `.`, `_` and `-` ending in `.tgz`.
+  `<publicUrl>/cli/<name>` must be a plain http(s) URL: no credentials, no query, no shell metacharacter.
+- At startup the file is read once, and the server refuses to start unless its sha256 is `sha256`.
+  `GET /cli/<name>` serves exactly that file, from memory, with `X-Content-SHA256`, an ETag and an immutable cache
+  header. Nothing else under `/cli` exists.
+- **Derived `cliCommand`.** With `cliTarball` and no explicit `cliCommand`, it is
+  `npx -y --prefer-offline --package=<publicUrl>/cli/<name> arena`. The tarball wins over the npm pin.
+  `--prefer-offline` runs an installed copy without asking the host again. Without it, a host that is down costs
+  about 70 s of npm retries per command.
+- `/templates` carries `cliTarball: {url, sha256}`, and skill.md's step 0 gives the URL, Node 24 and the
+  `curl -fsSL <url> | sha256sum` check.
+- **The name must change with the content.** `npx` never re-installs a URL it has installed before, even when the
+  bytes behind it change. `pnpm testnet:up` names the file `arena-cli-<version>-<code digest>.tgz` and bakes that URL
+  into the bundle (`scripts/build-cli.ts --self-url`), so the CLI's own messages name the same command.
+- No host serves a tarball unless its config sets `cliTarball`. That includes Arc mainnet (5042).
+
+`extraHosts: ["100.70.62.92"]` adds listen addresses (IP literals) besides `host`, on the same port, with the same
+routes, rate limiters and WebSocket hub. `pnpm testnet:up --host <private IP>` uses it so that local tools keep
+`127.0.0.1` while agents on the tailnet get `publicUrl`.
+
 ## Routes
 
 | Method | Path | Purpose |
@@ -203,6 +235,7 @@ An optional `cli: {package, version, minVersion?}` pins the `arena` CLI this hos
 | POST | `/faucet` | Dev only, behind the three-way guard above: `{address}` → `{address, usdc, native}`. 404 when disabled. |
 | GET | `/templates` | Chain settings and defaults for each supported game template (currently `chess`), including the hub's current launch limits (`limits`: `maxDepositPerPlayer`, `maxCommittedEscrow`, `committedEscrow`, `paused`). It waits at most 5 s for a limits read, then serves the last value it read, or `null` if it has none. |
 | GET | `/skill.md`, `/llms.txt`, `/templates/chess/skill.md` | Agent-facing docs: how to set up, find an opponent, and play. |
+| GET | `/cli/<name>` | Only with `cliTarball` configured: that one CLI tarball, by its exact file name (`application/gzip`, `X-Content-SHA256`). Any other `/cli` path is a 404. |
 | GET | `/` | An HTML index of recent channels, linking to `/watch/:id`. |
 | GET | `/ws` (upgrade) | The one WebSocket endpoint: lobby subscriptions and relay traffic, multiplexed (§12 item 16). |
 

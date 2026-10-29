@@ -1,6 +1,6 @@
 /**
- * `pnpm testnet:up [--port 8090] [--rpc URL] [--public-rpc URL] [--house-bots 2] [--bot-usdc 2.5] [--bot-deposit 1]
- *   [--bot-stake 0.1] [--bot-timeout SECONDS] [--xmtp-bots] [--limits JSON] [--start-block N] [--dir PATH]`
+ * `pnpm testnet:up [--port 8090] [--host IP] [--rpc URL] [--public-rpc URL] [--house-bots 2] [--bot-usdc 2.5]
+ *   [--bot-deposit 1] [--bot-stake 0.1] [--bot-timeout SECONDS] [--xmtp-bots] [--limits JSON] [--start-block N] [--dir PATH]`
  * `pnpm testnet:down [--withdraw] [--settle-seconds 120] [--dir PATH]`
  * `<dir>/human/pay <agent address> <usdc>` | `<dir>/human/pay balance` (also `pnpm testnet:up pay ...`)
  *
@@ -19,23 +19,30 @@
  *  2. The hub, rules and USDC must hold code, and must be the deployment the CLI pins for Arc testnet
  *     (`KNOWN_DEPLOYMENTS`, read from packages/cli at run time): if they differ, every `arena init` would refuse. The
  *     hub's limits, fee and timeout bounds are read.
- *  3. The server port (127.0.0.1 only) must be free and not one of `FORBIDDEN_PORTS` (the owner's demo stack, the
- *     test suites, the rehearsal). A previous `up` whose processes are still alive is refused: `testnet:down` first.
+ *  3. The server port must be free and not one of `FORBIDDEN_PORTS` (the owner's demo stack, the test suites, the
+ *     rehearsal). The server listens on 127.0.0.1, and also on `--host` when given: a private IPv4 address of this
+ *     machine (loopback, Tailscale's 100.64.0.0/10, 10/8, 172.16/12 or 192.168/16; `hostProblem`), never a public one.
+ *     Agents are given `http://<--host>:<port>`; the house bots, the pay helper and this script keep using 127.0.0.1,
+ *     and the bots' APIs listen there only. A previous `up` whose processes are still alive is refused: `testnet:down` first.
  *     `<dir>/state.json` records the hub the directory was made for; a different hub in the deployments file is
  *     refused, because the server's database and every bot home are bound to the old one (and may hold funds). Every
  *     existing bot home is checked here too, before anything starts: its hub, and `--bot-timeout` against its own
  *     `minChallengeTimeout` (a bot asked for offers below it exits at once).
- *  4. Writes `<dir>/bin/arena` (the CLI wrapper, advertised as the server's `cliCommand`) and `<dir>/human/pay` (the
- *     human's funding helper, see below), then starts the host server with `xmtp: {env: "dev"}`, no faucet, and
- *     per-IP limits sized for a loopback-only server (`TESTNET_SERVER_LIMITS`, overridable with `--limits`).
+ *  4. Writes `<dir>/bin/arena` (the CLI wrapper, for the owner's own use on this machine) and `<dir>/human/pay` (the
+ *     human's funding helper, see below). Builds the CLI from this checkout into `<dir>/cli/arena-cli-<version>-<id>.tgz`
+ *     (`buildCliTarball`), which the server serves at `/cli/<name>` and names in skill.md as `npx -y --prefer-offline
+ *     --package=<url> arena`: an agent on another machine needs Node 24 and the URL, no npm package and no file of this
+ *     repo. Then starts the host server with `xmtp: {env: "dev"}`, no faucet, and per-IP limits sized for a server
+ *     shared by every local bot and agent (`TESTNET_SERVER_LIMITS`, overridable with `--limits`).
  *  5. `--house-bots` house bots, each in its own ARENA_HOME `<dir>/house-bots/house-<i>`: `arena init` once (owner
  *     recorded as the deployer, so `withdraw` pays back there), then `arena bot --allow-real-chain`. Once its API
  *     answers, the bot is topped up through `<dir>/human/pay` to `--bot-usdc` counted over everything it holds: its
  *     wallet, its share of every channel that is not finalized, and the session gas not yet swept back. A restart
  *     mid-game pays nothing for the escrow. `--bot-usdc 0` funds nothing. `--xmtp-bots` also runs `arena xmtp
  *     enable` (one install, symlinked into every other bot home). A bot that exits before `up` is ready fails `up`.
- *  6. Prints the skill.md URL, the watch page, the hub's explorer link, what this run paid, and the agent prompt
- *     (with its own ARENA_HOME and API port), then a JSON ready line on stdout, and runs in the foreground. Ctrl-C or
+ *  6. Prints the skill.md URL, the watch page, the hub's explorer link, the CLI command and its tarball's sha256, what
+ *     this run paid, and the agent prompt (with its own ARENA_HOME and API port) with what the human needs besides it
+ *     (Node 24, the network, funding, a cash-out line), then a JSON ready line on stdout, and runs in the foreground. Ctrl-C or
  *     SIGTERM stops the bots, then the server: only the children this process started, by pid.
  *
  * The server and the bots are started detached (their own process groups, logging to `<dir>/logs/`), so a Ctrl-C in
@@ -76,6 +83,7 @@
  * send anything on any real chain.
  */
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -90,9 +98,9 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
-import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { createServer, isIPv4 } from "node:net";
+import { homedir, networkInterfaces } from "node:os";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import {
   createPublicClient,
   defineChain,
@@ -110,7 +118,7 @@ import {
   TransactionReceiptNotFoundError,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { DEFAULT_LIMITS } from "../apps/server/src/config.js";
+import { DEFAULT_LIMITS, cliTarballCommand, cliTarballUrl } from "../apps/server/src/config.js";
 import {
   DEFAULT_MIN_CHALLENGE_TIMEOUT,
   KNOWN_DEPLOYMENTS,
@@ -135,6 +143,7 @@ const SELF = __filename;
 const CLI_BIN = join(REPO_ROOT, "packages/cli/bin/arena.mjs");
 const SERVER_BIN = join(REPO_ROOT, "apps/server/bin/arena-server.mjs");
 const TSX_CLI = join(REPO_ROOT, "node_modules/tsx/dist/cli.mjs");
+const BUILD_CLI = join(REPO_ROOT, "scripts/build-cli.ts");
 const DEPLOYMENT_FILE = join(REPO_ROOT, "contracts/deployments/5042002.json");
 const DEFAULT_DIR = join(REPO_ROOT, ".arena-testnet");
 
@@ -177,9 +186,9 @@ export const FORBIDDEN_PORTS: ReadonlySet<number> = new Set([
 ]);
 
 /**
- * T5b fix round 1 (I-2): the server's per-IP limits, sized for a server that listens on 127.0.0.1 only. Every house
- * bot and every local agent reaches it from that one address, so the defaults (5 open offers, 16 sockets, 1 POST/s
- * per IP) would make the whole stack one throttled client. These leave room for 10 bots and about 20 agents: an open
+ * T5b fix round 1 (I-2): the server's per-IP limits, sized for the 127.0.0.1 address every house bot and every local
+ * agent reaches it from, so the defaults (5 open offers, 16 sockets, 1 POST/s per IP) would make the whole stack one
+ * throttled client. (An agent on another machine, through `--host`, is counted by its own address.) These leave room for 10 bots and about 20 agents: an open
  * offer or two each, a socket each plus browser watch pages, and a busy agent's curl and CLI calls. The on-chain caps
  * (deposit per player, total escrow) are the hub's and unchanged. `--limits '{"maxOpenOffersPerIp": 10}'` overrides
  * any of them, by the server's own field names.
@@ -202,6 +211,9 @@ const HOUSE_BOT_POLL_MS = "4000";
 
 export type UpArgs = {
   port: number;
+  /** `--host`: the address agents reach the server at, besides 127.0.0.1 (which the bots and local tools keep using):
+   *  loopback or a private IPv4 address only (`hostProblem`). Default 127.0.0.1: this machine only. */
+  host: string;
   /** What the server and the house bots use; it must answer chain 5042002. Never published. */
   rpc: string;
   /** What the server publishes to agents (/templates, so skill.md); it must answer chain 5042002 too. */
@@ -249,6 +261,38 @@ function urlFlag(name: string, raw: string): string {
   return raw;
 }
 
+/** Remote agents: the private IPv4 ranges `--host` may name -- loopback, Tailscale's CGNAT range and RFC 1918's three --
+ *  as [first address, prefix length, name]. */
+const PRIVATE_RANGES: ReadonlyArray<readonly [string, number, string]> = [
+  ["127.0.0.0", 8, "loopback"],
+  ["100.64.0.0", 10, "Tailscale / CGNAT"],
+  ["10.0.0.0", 8, "private"],
+  ["172.16.0.0", 12, "private"],
+  ["192.168.0.0", 16, "private"],
+];
+
+function ipv4Number(ip: string): number {
+  return ip.split(".").reduce((n, octet) => n * 256 + Number(octet), 0);
+}
+
+/** Why `--host ip` is refused, or null: it must be a plain IPv4 address in loopback, 100.64.0.0/10 (Tailscale), 10/8,
+ *  172.16/12 or 192.168/16. A public address would put this unaudited test stack, and its plain-http lobby, on the
+ *  internet; 0.0.0.0 would listen on every interface, public ones included. */
+export function hostProblem(ip: string): string | null {
+  if (!isIPv4(ip)) return `--host must be an IPv4 address (e.g. your Tailscale IP, 100.x.y.z), not ${JSON.stringify(ip).slice(0, 60)}`;
+  if (ip === "0.0.0.0") return "--host 0.0.0.0 would listen on every interface, public ones included: name one private address";
+  const n = ipv4Number(ip);
+  for (const [first, bits] of PRIVATE_RANGES) {
+    const size = 2 ** (32 - bits);
+    const start = ipv4Number(first);
+    if (n >= start && n < start + size) return null;
+  }
+  return (
+    `--host ${ip} is not a private address: only loopback (127.0.0.0/8), Tailscale (100.64.0.0/10) and the private ` +
+    "ranges 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16 are allowed. This stack never listens on a public address"
+  );
+}
+
 function limitsFlag(raw: string | undefined): Record<string, number> {
   if (raw === undefined) return {};
   let o: unknown;
@@ -293,7 +337,7 @@ function readFlags(argv: string[], valueFlags: string[], boolFlags: string[]): {
 export function parseUpArgs(argv: string[]): UpArgs {
   const { values, bools } = readFlags(
     argv,
-    ["port", "rpc", "public-rpc", "house-bots", "bot-usdc", "bot-deposit", "bot-stake", "bot-timeout", "limits", "start-block", "dir"],
+    ["port", "host", "rpc", "public-rpc", "house-bots", "bot-usdc", "bot-deposit", "bot-stake", "bot-timeout", "limits", "start-block", "dir"],
     ["xmtp-bots"],
   );
   const port = intFlag("port", values.get("port") ?? "8090", 1024, 65_535);
@@ -301,8 +345,12 @@ export function parseUpArgs(argv: string[]): UpArgs {
   const startBlockRaw = values.get("start-block");
   if (startBlockRaw !== undefined && !/^[0-9]+$/.test(startBlockRaw)) throw new Error("--start-block must be a block number");
   const timeoutRaw = values.get("bot-timeout");
+  const host = values.get("host") ?? "127.0.0.1";
+  const badHost = hostProblem(host);
+  if (badHost !== null) throw new Error(badHost);
   return {
     port,
+    host,
     rpc: urlFlag("rpc", values.get("rpc") ?? RPC_URL),
     publicRpc: urlFlag("public-rpc", values.get("public-rpc") ?? RPC_URL),
     houseBots: intFlag("house-bots", values.get("house-bots") ?? "2", 0, 10),
@@ -486,25 +534,39 @@ async function readHub(pub: PublicClient, d: Deployment): Promise<HubLimits> {
 
 // ---------------------------------------------------------------------------------------- server config
 
-/** The host server's config for this stack: a pure function of its inputs, so it is unit tested as is. */
+/** The CLI tarball this stack serves (`buildCliTarball`), as the server config needs it. */
+export type ServedCli = { path: string; sha256: string; package: string; version: string };
+
+/**
+ * The host server's config for this stack: a pure function of its inputs, so it is unit tested as is.
+ *
+ * Remote agents: it always listens on 127.0.0.1 (the house bots, the pay helper and the owner's own tools use that),
+ * and also on `host` when that is another address; `publicUrl` -- what skill.md, /templates and the agent message
+ * name -- is on `host`. With `cli`, it serves that tarball and pins its version (`cli` + `cliTarball`), and the
+ * server derives `cliCommand` from it; an explicit `cliCommand` (tests) still wins.
+ */
 export function buildServerConfig(o: {
   dir: string;
   port: number;
+  host?: string;
   rpcUrl: string;
   publicRpcUrl: string;
   deployment: Deployment;
   limits: Pick<HubLimits, "maxDepositPerPlayer" | "maxCommittedEscrow" | "feePerPlayer">;
   serverLimits?: Record<string, number>;
   startBlock: bigint;
-  cliCommand: string;
+  cliCommand?: string;
+  cli?: ServedCli;
   deposit: string;
   stake: string;
 }): Record<string, unknown> {
   const usdc = (v: bigint) => formatUnits(v, 6);
+  const host = o.host ?? "127.0.0.1";
   return {
     host: "127.0.0.1",
+    ...(host !== "127.0.0.1" ? { extraHosts: [host] } : {}),
     port: o.port,
-    publicUrl: `http://127.0.0.1:${o.port}`,
+    publicUrl: `http://${host}:${o.port}`,
     rpcUrl: o.rpcUrl,
     // What /templates (so skill.md and every agent's init) shows: never the host's own --rpc, which may be keyed.
     publicRpcUrl: o.publicRpcUrl,
@@ -516,9 +578,13 @@ export function buildServerConfig(o: {
     fundingWindow: "3600",
     offerMaxLifetime: "86400",
     defaults: { deposit: parseUnits(o.deposit, 6).toString(), stakePerGame: parseUnits(o.stake, 6).toString(), challengeTimeout: "900" },
-    cliCommand: o.cliCommand,
+    ...(o.cliCommand !== undefined ? { cliCommand: o.cliCommand } : {}),
+    ...(o.cli !== undefined
+      ? { cli: { package: o.cli.package, version: o.cli.version }, cliTarball: { path: o.cli.path, sha256: o.cli.sha256 } }
+      : {}),
     audit:
-      `unaudited; Arc TESTNET test stack (pnpm testnet:up), faucet USDC only, served on 127.0.0.1. Hub limits: ` +
+      `unaudited; Arc TESTNET test stack (pnpm testnet:up), faucet USDC only, served on ` +
+      `${host === "127.0.0.1" ? "127.0.0.1" : `${host} (a private network) and 127.0.0.1`}. Hub limits: ` +
       `${usdc(o.limits.maxDepositPerPlayer)} USDC deposit per player, ${usdc(o.limits.maxCommittedEscrow)} USDC total ` +
       `committed escrow; fee ${usdc(o.limits.feePerPlayer)} USDC per player; owner and fee recipient are the testnet deployer`,
     // 3 s, not dev-up's 1 s: the public RPC's per-IP rate limit is shared with every bot and local agent.
@@ -530,6 +596,65 @@ export function buildServerConfig(o: {
     // XMTP's dev network charges no fees, so no gateway is needed.
     xmtp: { env: "dev" },
   };
+}
+
+// ------------------------------------------------------------------------------------------- CLI tarball
+
+/** One digest of every file under `dir` (relative path and content, in sorted order). */
+function dirDigest(dir: string): string {
+  const hash = createHash("sha256");
+  const walk = (d: string): string[] =>
+    readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]));
+  for (const f of walk(dir).sort()) hash.update(`${relative(dir, f)}\0`).update(readFileSync(f)).update("\0");
+  return hash.digest("hex");
+}
+
+/** The npm that ships with this Node (`<node dir>/npm`, as nvm and the official builds lay it out), else the one on PATH. */
+function npmBinary(): string {
+  const candidate = join(dirname(process.execPath), "npm");
+  return existsSync(candidate) ? candidate : "npm";
+}
+
+/**
+ * Remote agents: builds the CLI bundle (scripts/build-cli.ts) and packs it into `<dir>/cli/<name>`, the tarball the
+ * server serves at `<publicUrl>/cli/<name>`, so an agent on another machine needs only Node 24 and this URL -- no npm
+ * package, no file of this repo. Returns its path, sha256, and the package name and version in its manifest.
+ *
+ * `name` is `arena-cli-<version>-<id>.tgz`, where `id` digests a first build of the same code (without its URL). It
+ * must change whenever the code does: `npx` runs an earlier install of the same URL as is, without looking at the
+ * new bytes it downloads. The second build bakes the URL in (`--self-url`), so every command the CLI prints names
+ * this same tarball, never `npx -y @arena/cli@<version>` -- a placeholder name on npm that is not ours. The same code
+ * and URL give the same tarball (npm pack fixes every mtime), so a restart serves the same URL and agents' installs
+ * stay current. Everything else in `<dir>/cli/` -- the build directories and earlier tarballs -- is removed.
+ */
+export async function buildCliTarball(dir: string, publicUrl: string): Promise<ServedCli> {
+  const cliDir = join(dir, "cli");
+  mkdirSync(cliDir, { recursive: true });
+  const build = async (out: string, selfUrl?: string) => {
+    const r = await run(process.execPath, [TSX_CLI, BUILD_CLI, "--out", out, ...(selfUrl !== undefined ? ["--self-url", selfUrl] : [])], { timeoutMs: 300_000 });
+    if (r.code !== 0) throw new Error(`building the CLI failed (exit ${r.code}): ${r.stderr.trim().slice(-1000)}`);
+  };
+  const idDir = join(cliDir, "build-id");
+  await build(idDir);
+  const manifest = JSON.parse(readFileSync(join(idDir, "package.json"), "utf8")) as { name: string; version: string };
+  const name = `arena-cli-${manifest.version}-${dirDigest(idDir).slice(0, 16)}.tgz`;
+  const distDir = join(cliDir, "dist");
+  await build(distDir, `${publicUrl.replace(/\/$/, "")}/cli/${name}`);
+  // Packed from inside the bundle's own directory, so no .npmrc or workspace of this checkout applies; with a cache of
+  // its own (npm writes its logs there too), removed afterwards.
+  const cache = join(cliDir, "npm-cache");
+  const packed = await run(npmBinary(), ["pack", "--json", "--pack-destination", cliDir, "--cache", cache, "--update-notifier=false"], {
+    timeoutMs: 120_000,
+    cwd: distDir,
+  });
+  if (packed.code !== 0) throw new Error(`npm pack failed (exit ${packed.code}): ${packed.stderr.trim().slice(-1000)}`);
+  const filename = (lastJson(packed.stdout) as Array<{ filename?: unknown }>)[0]?.filename;
+  if (typeof filename !== "string" || filename.includes("/")) throw new Error(`npm pack named no tarball: ${packed.stdout.trim().slice(0, 300)}`);
+  const path = join(cliDir, name);
+  renameSync(join(cliDir, filename), path);
+  for (const entry of readdirSync(cliDir)) if (entry !== name) rmSync(join(cliDir, entry), { recursive: true, force: true });
+  const sha256 = createHash("sha256").update(readFileSync(path)).digest("hex");
+  return { path, sha256, package: manifest.name, version: manifest.version };
 }
 
 // ------------------------------------------------------------------------------------------- pay helper
@@ -941,12 +1066,25 @@ async function stopPid(label: string, pid: number, startTime: string, graceMs: n
   }
 }
 
-async function isPortFree(port: number): Promise<boolean> {
+async function isPortFree(port: number, host = "127.0.0.1"): Promise<boolean> {
   return new Promise((resolvePromise) => {
     const srv = createServer();
     srv.once("error", () => resolvePromise(false));
-    srv.listen(port, "127.0.0.1", () => srv.close(() => resolvePromise(true)));
+    srv.listen(port, host, () => srv.close(() => resolvePromise(true)));
   });
+}
+
+/** Remote agents: why `--host` cannot be used on this machine, or null. A loopback address always can be (all of
+ *  127/8 is on lo); any other must be one of this machine's own addresses, or listening on it would fail -- after
+ *  the state directory was written. */
+export function hostNotLocal(host: string, interfaces: ReturnType<typeof networkInterfaces> = networkInterfaces()): string | null {
+  if (host.startsWith("127.")) return null;
+  const mine = Object.values(interfaces)
+    .flatMap((list) => list ?? [])
+    .filter((i) => i.family === "IPv4")
+    .map((i) => i.address);
+  if (mine.includes(host)) return null;
+  return `refusing: --host ${host} is not an address of this machine (its IPv4 addresses: ${mine.join(", ") || "none"}). Nothing was started`;
 }
 
 async function waitForHttp(url: string, label: string, timeoutMs: number): Promise<void> {
@@ -1020,9 +1158,13 @@ export function testnetChildEnv(home?: string, parent: NodeJS.ProcessEnv = proce
 }
 
 /** Runs a one-shot command to completion, capturing its output (never its environment). */
-function run(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; timeoutMs: number }): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function run(
+  cmd: string,
+  args: string[],
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs: number; cwd?: string },
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, args, { cwd: REPO_ROOT, env: opts.env ?? testnetChildEnv(), stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { cwd: opts.cwd ?? REPO_ROOT, env: opts.env ?? testnetChildEnv(), stdio: ["ignore", "pipe", "pipe"] });
     inflight.add(child);
     let stdout = "";
     let stderr = "";
@@ -1217,6 +1359,25 @@ export function agentPrompt(serverUrl: string, stake: string, agentPort: number)
   );
 }
 
+/** Remote agents: what the human needs to know besides the agent message: where the agent's machine must be, how to
+ *  fund it, and the cash-out line to add. Printed under the message. */
+export function agentNotes(o: { publicUrl: string; host: string; payPath: string }): string[] {
+  const where =
+    o.host === "127.0.0.1"
+      ? "The agent must run on THIS machine: the server listens on 127.0.0.1 only (rerun with --host <your Tailscale IP> for agents on other machines)."
+      : `The agent's machine must reach ${o.publicUrl}: it must be on this private network (your tailnet, for a 100.x address).`;
+  return [
+    where,
+    "It needs Node 24 or newer (node --version) and nothing else: skill.md's command fetches the CLI from this server.",
+    "When it asks for USDC, pay it from here:",
+    `  ${o.payPath} <its address> <usdc>   (runs on THIS machine; at most ${PAY_MAX_USDC} per call)`,
+    "  or send Arc-testnet USDC to its address from https://faucet.circle.com (choose Arc Testnet) or any Arc-testnet wallet.",
+    "To get its winnings back, add a cash-out line to the message, with an address you control on Arc testnet:",
+    "  My Arc testnet address for cash-out is 0x<your address>.",
+    `  (withdraw pays only that owner: the deployer ${DEPLOYER}, or a wallet of your own)`,
+  ];
+}
+
 /** The first `n` ports from `from` upward that are not reserved. */
 function portsFrom(from: number, n: number): number[] {
   const out: number[] = [];
@@ -1321,6 +1482,13 @@ async function up(args: UpArgs): Promise<void> {
   }
 
   if (!(await isPortFree(args.port))) throw new Error(`refusing: port ${args.port} is already in use. Pass --port. Nothing was started`);
+  if (args.host !== "127.0.0.1") {
+    const notLocal = hostNotLocal(args.host);
+    if (notLocal !== null) throw new Error(notLocal);
+    if (!(await isPortFree(args.port, args.host))) {
+      throw new Error(`refusing: port ${args.port} is already in use on ${args.host}. Pass --port. Nothing was started`);
+    }
+  }
   const previous = readPids(dir);
   const stillRunning = [
     ...(previous.up && isOurs("up", previous.up, dir) ? [`testnet:up (pid ${previous.up.pid})`] : []),
@@ -1398,24 +1566,35 @@ async function up(args: UpArgs): Promise<void> {
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
+  // Remote agents: the CLI, built from this checkout and served by the server itself (`GET /cli/<name>`), so an agent
+  // on another machine needs only Node 24 and the URL. skill.md's command is derived from it.
+  const publicUrl = `http://${args.host}:${args.port}`;
+  process.stderr.write("testnet-up: building the CLI tarball the server serves to agents\n");
+  const served = await buildCliTarball(dir, publicUrl);
+  const tarballUrl = cliTarballUrl(publicUrl, served);
+  const cliCommand = cliTarballCommand(tarballUrl);
+
   const configPath = join(dir, "server.json");
   const serverConfig = buildServerConfig({
     dir,
     port: args.port,
+    host: args.host,
     rpcUrl,
     publicRpcUrl: args.publicRpc,
     deployment,
     limits,
     serverLimits: args.limits,
     startBlock: BigInt(state.startBlock),
-    cliCommand: wrapperPath,
+    cli: served,
     deposit: args.botDeposit,
     stake: args.botStake,
   });
   writeFileSync(configPath, `${JSON.stringify(serverConfig, null, 2)}\n`, { mode: 0o600 });
 
   const serverLog = join(logsDir, "server.log");
-  process.stderr.write(`testnet-up: starting the host server on 127.0.0.1:${args.port} (logging to ${serverLog})\n`);
+  process.stderr.write(
+    `testnet-up: starting the host server on 127.0.0.1:${args.port}${args.host !== "127.0.0.1" ? ` and ${args.host}:${args.port}` : ""} (logging to ${serverLog})\n`,
+  );
   const serverFd = openSync(serverLog, "a");
   server = spawn(process.execPath, [SERVER_BIN, "--config", configPath], { cwd: REPO_ROOT, env: testnetChildEnv(), detached: true, stdio: ["ignore", serverFd, serverFd] });
   server.on("exit", (code, signal) => {
@@ -1423,8 +1602,16 @@ async function up(args: UpArgs): Promise<void> {
   });
   pids.server = { pid: server.pid!, startTime: await startTimeOrThrow(server.pid, "the server"), config: configPath };
   writePids(dir, pids);
+  // What the house bots and this script use; agents get `publicUrl` (the same server, on `--host`).
   const serverUrl = `http://127.0.0.1:${args.port}`;
   await unlessExits(server, "the server", waitForHttp(`${serverUrl}/healthz`, "server", 60_000));
+  if (publicUrl !== serverUrl) await unlessExits(server, "the server", waitForHttp(`${publicUrl}/healthz`, `server on ${args.host}`, 10_000));
+  // The tarball as an agent fetches it: on the advertised address, with the advertised sha256.
+  const fetched = await fetch(tarballUrl, { signal: AbortSignal.timeout(10_000) });
+  const fetchedSha = createHash("sha256").update(Buffer.from(await fetched.arrayBuffer())).digest("hex");
+  if (!fetched.ok || fetchedSha !== served.sha256) {
+    throw new Error(`the server does not serve the CLI tarball as built (${tarballUrl}: HTTP ${fetched.status}, sha256 ${fetchedSha})`);
+  }
 
   const ready: Array<{ name: string; address: Address; apiPort: number; log: string; offer: boolean; paid: string | null }> = [];
   const takenPorts = new Set<number>([args.port]);
@@ -1563,30 +1750,35 @@ async function up(args: UpArgs): Promise<void> {
   for (const b of bots) await unlessExits(b.child, `house bot ${b.name}`, Promise.resolve());
 
   const agentPorts = portsFrom(args.port + 11, 3);
-  const prompt = agentPrompt(serverUrl, args.botStake, agentPorts[0]!);
+  const prompt = agentPrompt(publicUrl, args.botStake, agentPorts[0]!);
   const hubLink = `${EXPLORER}/address/${deployment.hub}`;
   process.stderr.write("\ntestnet-up: ready (Arc TESTNET, chain 5042002; faucet USDC only).\n\n");
-  process.stderr.write(`  skill.md:  ${serverUrl}/skill.md\n`);
-  process.stderr.write(`  watch:     ${serverUrl}/  (every channel, each with a live board at /watch/<id>; open offers: ${serverUrl}/offers)\n`);
+  process.stderr.write(`  skill.md:  ${publicUrl}/skill.md\n`);
+  process.stderr.write(`  watch:     ${publicUrl}/  (every channel, each with a live board at /watch/<id>; open offers: ${publicUrl}/offers)\n`);
   process.stderr.write(`  hub:       ${hubLink}${limits.paused ? "  (PAUSED: no new channels)" : ""}\n`);
-  process.stderr.write(`  arena CLI: ${wrapperPath}\n`);
+  process.stderr.write(`  arena CLI: ${cliCommand}\n`);
+  process.stderr.write(`             (served by this stack; sha256 ${served.sha256}). On this machine, ${wrapperPath} runs the same code\n`);
   process.stderr.write(`  pay:       ${payPath} <agent address> <usdc>   (at most ${PAY_MAX_USDC} per call; ${payPath} balance)\n`);
   process.stderr.write(`  paid this run: ${formatUnits(paidWei, 18)} USDC to house bots\n\n`);
   for (const b of ready) {
     process.stderr.write(`  ${b.name}: ${b.address}${b.offer ? "" : " (no offer yet)"}  API ${b.apiPort}  log ${b.log}\n`);
   }
   process.stderr.write(`\n  Give an agent this:\n\n    ${prompt}\n\n`);
+  for (const line of agentNotes({ publicUrl, host: args.host, payPath })) process.stderr.write(`  ${line}\n`);
   process.stderr.write(
-    `  More agents: each in its own directory, with its own port (${agentPorts.slice(1).join(", ")}, ...).\n\n`,
+    `\n  More agents: each in its own directory, with its own port (${agentPorts.slice(1).join(", ")}, ...).\n\n`,
   );
   process.stderr.write("  Ctrl-C here stops the house bots and the server (only those). pnpm testnet:down does the same from elsewhere.\n\n");
   console.log(
     JSON.stringify({
       ready: true,
       chainId: CHAIN_ID,
-      serverUrl,
-      skillMd: `${serverUrl}/skill.md`,
-      watch: `${serverUrl}/`,
+      serverUrl: publicUrl,
+      localUrl: serverUrl,
+      skillMd: `${publicUrl}/skill.md`,
+      watch: `${publicUrl}/`,
+      cliCommand,
+      cliTarball: { url: tarballUrl, sha256: served.sha256 },
       hub: deployment.hub,
       hubExplorer: hubLink,
       dir,
